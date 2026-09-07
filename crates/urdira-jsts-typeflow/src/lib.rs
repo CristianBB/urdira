@@ -7046,4 +7046,131 @@ mod tests {
             );
         }
     }
+
+    /// Frente E-P0g adversarial review, attack #3:
+    /// `apply_import_target_updates`'s own `owning_paths_considered`
+    /// parameter (the fix under review) must (a) keep an owning path's
+    /// UNCHANGED keys when only ANOTHER key drops out of its own set, (b)
+    /// drop EXACTLY the one key that stopped resolving (never the whole
+    /// set), (c) refresh a key's target id in place, (d) register a
+    /// brand-new owning path the same call introduces, and (e) fully
+    /// clear an owning path whose ENTIRE needed-import set stopped
+    /// resolving this round (present in `owning_paths_considered`, absent
+    /// from `updates`' own keys entirely) -- the exact case this fix's own
+    /// doc comment names as the bug an earlier draft (deriving `owning_
+    /// paths` solely from `updates.keys()`) left broken.
+    #[test]
+    fn apply_import_target_updates_owning_paths_considered_clears_dropped_keeps_kept_and_adds_new()
+    {
+        let mut index = ProgramIndex::build(&BTreeMap::new(), &HashMap::new(), &HashMap::new());
+
+        // Round 1: "a.ts" resolves 3 imports.
+        let mut updates: HashMap<(String, String, String), String> = HashMap::new();
+        updates.insert(
+            ("a.ts".to_string(), "./x".to_string(), "X".to_string()),
+            "entity:x".to_string(),
+        );
+        updates.insert(
+            ("a.ts".to_string(), "./y".to_string(), "Y".to_string()),
+            "entity:y".to_string(),
+        );
+        updates.insert(
+            ("a.ts".to_string(), "./z".to_string(), "Z".to_string()),
+            "entity:z".to_string(),
+        );
+        let considered: HashSet<String> = ["a.ts".to_string()].into_iter().collect();
+        index.apply_import_target_updates(&updates, &considered);
+        assert_eq!(
+            index.file_import_keys.get("a.ts").map(|keys| keys.len()),
+            Some(3),
+            "round 1: a.ts must own exactly the 3 keys it resolved"
+        );
+        assert_eq!(index.import_targets.len(), 3);
+
+        // Round 2: "a.ts" now resolves only 2 (./y/Y dropped, ./z/Z's
+        // target id changes), and a BRAND-NEW owning path "b.ts" appears.
+        let mut updates2: HashMap<(String, String, String), String> = HashMap::new();
+        updates2.insert(
+            ("a.ts".to_string(), "./x".to_string(), "X".to_string()),
+            "entity:x".to_string(),
+        );
+        updates2.insert(
+            ("a.ts".to_string(), "./z".to_string(), "Z".to_string()),
+            "entity:z2".to_string(),
+        );
+        updates2.insert(
+            ("b.ts".to_string(), "./x".to_string(), "X".to_string()),
+            "entity:x".to_string(),
+        );
+        let considered2: HashSet<String> = ["a.ts".to_string(), "b.ts".to_string()]
+            .into_iter()
+            .collect();
+        index.apply_import_target_updates(&updates2, &considered2);
+        let a_keys = index
+            .file_import_keys
+            .get("a.ts")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            a_keys.len(),
+            2,
+            "round 2: a.ts must keep exactly its 2 still-resolving keys, dropping ONLY ./y/Y \
+             (never the whole set); got {a_keys:?}"
+        );
+        assert!(
+            !index.import_targets.contains_key(&(
+                "a.ts".to_string(),
+                "./y".to_string(),
+                "Y".to_string()
+            )),
+            "the dropped key must be removed from import_targets"
+        );
+        assert_eq!(
+            index
+                .import_targets
+                .get(&("a.ts".to_string(), "./x".to_string(), "X".to_string())),
+            Some(&"entity:x".to_string()),
+            "an unchanged key must survive untouched"
+        );
+        assert_eq!(
+            index
+                .import_targets
+                .get(&("a.ts".to_string(), "./z".to_string(), "Z".to_string())),
+            Some(&"entity:z2".to_string()),
+            "a refreshed key's target id must be updated in place"
+        );
+        assert_eq!(
+            index.file_import_keys.get("b.ts").map(|keys| keys.len()),
+            Some(1),
+            "a brand-new owning path in the same call must be registered"
+        );
+
+        // Round 3: "a.ts" resolves NOTHING at all (present in `owning_
+        // paths_considered`, absent from `updates`' own keys entirely) --
+        // must be cleared COMPLETELY, not left stale. "b.ts" is absent
+        // from `owning_paths_considered` this round -- must be untouched.
+        let updates3: HashMap<(String, String, String), String> = HashMap::new();
+        let considered3: HashSet<String> = ["a.ts".to_string()].into_iter().collect();
+        index.apply_import_target_updates(&updates3, &considered3);
+        assert_eq!(
+            index
+                .file_import_keys
+                .get("a.ts")
+                .map(|keys| keys.len())
+                .unwrap_or(0),
+            0,
+            "a.ts whose ENTIRE needed-import set stopped resolving must be fully cleared -- \
+             owning_paths_considered's whole reason to exist; got {:?}",
+            index.file_import_keys.get("a.ts")
+        );
+        assert!(
+            !index.import_targets.keys().any(|key| key.0 == "a.ts"),
+            "no import_targets entry may remain owned by a.ts after its entire set went stale"
+        );
+        assert_eq!(
+            index.file_import_keys.get("b.ts").map(|keys| keys.len()),
+            Some(1),
+            "b.ts was not in owning_paths_considered this round -- it must stay untouched"
+        );
+    }
 }

@@ -2006,4 +2006,137 @@ mod tests {
              passes today at this reduced fixture scale (see this test's own doc comment)"
         );
     }
+
+    /// Frente E-P0g adversarial review, attack #4: a re-export CYCLE
+    /// (`a.ts` bare-`export *`s `b.ts`, `b.ts` bare-`export *`s `a.ts`,
+    /// neither ever directly declaring the queried name) must not spin
+    /// `collect_reexport_chain_paths` forever -- its own `visiting` cycle
+    /// guard (mirroring `resolver::resolve_named_export_inner`'s) must
+    /// terminate it after visiting each `(path, name)` pair at most once,
+    /// returning exactly the two files it actually walked through, never
+    /// looping forever nor silently returning an empty/partial set.
+    #[test]
+    fn collect_reexport_chain_paths_terminates_on_a_cycle() {
+        fn minimal_star_reexporter(path: &str, star_targets: &[&str]) -> SyntaxFileResult {
+            SyntaxFileResult {
+                path: path.to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: urdira_jsts_syntax_worker::Language::Typescript,
+                script_kind: urdira_jsts_syntax_worker::ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: Vec::new(),
+                export_star_specifiers: star_targets
+                    .iter()
+                    .map(|target| urdira_jsts_syntax_worker::ExportStarSpecifier {
+                        specifier: format!("./{target}"),
+                        target_path: Some((*target).to_owned()),
+                    })
+                    .collect(),
+                ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
+                line_index: urdira_jsts_syntax_worker::LineIndex::from_text(""),
+            }
+        }
+        let mut files: BTreeMap<String, SyntaxFileResult> = BTreeMap::new();
+        files.insert(
+            "a.ts".to_owned(),
+            minimal_star_reexporter("a.ts", &["b.ts"]),
+        );
+        files.insert(
+            "b.ts".to_owned(),
+            minimal_star_reexporter("b.ts", &["a.ts"]),
+        );
+
+        let visited = collect_reexport_chain_paths(&files, "a.ts", "NeverDeclaredAnywhere");
+
+        assert_eq!(
+            visited,
+            ["a.ts".to_owned(), "b.ts".to_owned()]
+                .into_iter()
+                .collect::<BTreeSet<String>>(),
+            "a re-export cycle must terminate at exactly the two files it actually visits"
+        );
+    }
+
+    /// Frente E-P0g adversarial review, attack #4 (nested/nonlinear chain,
+    /// no cycle): `a.ts` -> `b.ts` -> `c.ts` (bare `export *` all the way
+    /// down), `c.ts` directly declares the name -- confirms the walk
+    /// includes every intermediate hop (`a.ts`, `b.ts`, `c.ts`) and stops
+    /// AT the direct declarer rather than recursing past it (there is
+    /// nothing beyond `c.ts` to visit here, but a bug that ignored the
+    /// direct-declaration base case would still show up as a panic/loop
+    /// on a deliberately malformed `files` map elsewhere -- this pins the
+    /// straight-line case's exact expected set).
+    #[test]
+    fn collect_reexport_chain_paths_includes_every_hop_in_a_three_file_chain() {
+        fn direct_declarer(path: &str, name: &str) -> SyntaxFileResult {
+            SyntaxFileResult {
+                path: path.to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: urdira_jsts_syntax_worker::Language::Typescript,
+                script_kind: urdira_jsts_syntax_worker::ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: vec![urdira_jsts_syntax_worker::SyntaxExportBinding {
+                    exported_name: name.to_owned(),
+                    local_name: name.to_owned(),
+                    source_specifier: None,
+                    source_target_path: None,
+                }],
+                export_star_specifiers: Vec::new(),
+                ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
+                line_index: urdira_jsts_syntax_worker::LineIndex::from_text(""),
+            }
+        }
+        fn star_reexporter(path: &str, target: &str) -> SyntaxFileResult {
+            SyntaxFileResult {
+                path: path.to_owned(),
+                content_digest: "sha256:0".to_owned(),
+                language: urdira_jsts_syntax_worker::Language::Typescript,
+                script_kind: urdira_jsts_syntax_worker::ScriptKind::Ts,
+                byte_length: 0,
+                parsed: true,
+                direct_imports: Vec::new(),
+                entities: Vec::new(),
+                relations: Vec::new(),
+                diagnostics: Vec::new(),
+                export_bindings: Vec::new(),
+                export_star_specifiers: vec![urdira_jsts_syntax_worker::ExportStarSpecifier {
+                    specifier: format!("./{target}"),
+                    target_path: Some(target.to_owned()),
+                }],
+                ambient_modules: Vec::new(),
+                ambient_globals: Vec::new(),
+                namespace_members: Vec::new(),
+                line_index: urdira_jsts_syntax_worker::LineIndex::from_text(""),
+            }
+        }
+        let mut files: BTreeMap<String, SyntaxFileResult> = BTreeMap::new();
+        files.insert("a.ts".to_owned(), star_reexporter("a.ts", "b.ts"));
+        files.insert("b.ts".to_owned(), star_reexporter("b.ts", "c.ts"));
+        files.insert("c.ts".to_owned(), direct_declarer("c.ts", "Thing"));
+
+        let visited = collect_reexport_chain_paths(&files, "a.ts", "Thing");
+
+        assert_eq!(
+            visited,
+            ["a.ts".to_owned(), "b.ts".to_owned(), "c.ts".to_owned()]
+                .into_iter()
+                .collect::<BTreeSet<String>>(),
+            "every intermediate hop plus the terminal declaring file must be visited; got \
+             {visited:?}"
+        );
+    }
 }
