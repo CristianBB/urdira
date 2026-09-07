@@ -1280,3 +1280,171 @@ All temporary `URDIRA_EP0D_DEBUG*`-gated diagnostic `eprintln!`s (in `resolve_ra
 `resolve_import_targets_for`/`build_index`, both crates) and the matching temporary env-var
 forwarding line in `indexing-core-process-transport.ts` added and removed within this session --
 confirmed absent from the final diff (§12.8).
+
+## §13. E-P0d adversarial review (2026-09-07, `frente-ep0d-typeflow-reflow`, commit `d0328b0`)
+
+Reviewer session, worktree `.claude/worktrees/agent-a3835ec59c4fd1383`, `CARGO_TARGET_DIR` override
+`.claude/worktrees/cargo-target-ep0d-rev` (removed at the end of this session).
+
+### 13.1 Findings
+
+1. **`cargo fmt --all -- --check` FAILED at `d0328b0`** (build-gating, not a logic bug):
+   `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`'s 7 mechanical `ProgramIndex::build`
+   call-site updates (§12.8's own "third-argument update" note) were never run through `cargo fmt`
+   before the commit -- 7 call sites exceeded the line-length limit unwrapped. §12.8 claims "clean
+   (after `cargo fmt --all` reformatted the new test bodies)", which was true for the test bodies
+   but not these call sites. Fixed by running `cargo fmt --all` (whitespace-only, re-verified with
+   `--check`).
+
+2. **`ProgramIndex::remove_file` never cleared `pending_importers_of`'s TARGET-keyed entry for the
+   removed path itself** (`crates/urdira-jsts-typeflow/src/lib.rs`, `remove_file`, pre-fix ~line
+   3904) -- a real, if narrow, violation of the field's own doc comment ("real corpora keep this
+   small"). The pre-fix cleanup, `apply_pending_target_updates(&{path: {}})`, only ever removes
+   `path` as a VALUE inside some OTHER target's importer set (the IMPORTER side, correctly handled
+   -- confirmed by inspection, this is the half the review's attack #1 asked about: "¿se limpian al
+   reemplazar/borrar el fichero importador?" -- yes). It never touches the entry keyed by `path`
+   ITSELF, i.e. the case where `path` is a barrel/target OTHER files still have an unresolved need
+   pointing at. Deleting such a file (a real event: any barrel/re-export file can be deleted, not
+   just edited) left that entry permanently stranded -- self-healing only if the orphaned importer
+   happens to be reprocessed later for an unrelated reason, otherwise an unbounded-over-a-long-
+   session leak. Confirmed asymmetric with the RESOLVED graph's own handling:
+   `purge_import_targets_targeting_file` (same file) cleans up `import_targets`/`importers_of` in
+   BOTH directions when a file is removed; `pending_importers_of` only had one of the two. **Not**
+   the "unbounded growth from external/node_modules imports" shape attack #1 led with -- that shape
+   does NOT occur: `resolve_import_targets_for` (`crates/urdira-indexing-worker/src/v4/typeflow.rs`
+   :442) only ever inserts into `pending_targets` after `resolver.resolve(...)` already succeeded
+   (a specifier that resolves to NO workspace file at all -- every third-party package, every
+   genuinely broken import -- hits the `continue` above it and is never recorded), confirmed
+   empirically in §13.2 below. **Fix**: `remove_file` now also calls
+   `self.pending_importers_of.remove(path)`, with a doc comment explaining why (the orphaned
+   importer is not itself lost -- it was already captured into `affected` via
+   `transitive_importers_closure` BEFORE the removal, using the same map, so it still gets reflowed
+   and correctly degrades to "unresolved", exactly like a from-scratch rebuild without `path`).
+   Regression test: `remove_file_clears_the_pending_importers_of_entry_keyed_by_the_removed_target_itself`
+   (`crates/urdira-jsts-typeflow/src/lib.rs`) -- a new `#[cfg(test)]`-only accessor,
+   `pending_importers_of_entry_count`, was added since `pending_importers_of(path)`'s own public
+   accessor cannot distinguish "key absent" from "key present but empty" from the outside, and the
+   leak is specifically about the KEY surviving.
+
+3. **Attack #2 (alias/value name collision in `entity_owner`)**: reviewed by inspection, no bug
+   found, no fix needed. `entity_owner` is keyed by `entity_id` (a per-declaration-node id, not a
+   bare name), and `insert_file_pass1`'s new `type_aliases` loop (§12.3) inserts under `alias.id` --
+   `export type Foo = ...` and `export const Foo = ...` in the same module produce two DIFFERENT
+   entity ids (different declaration kinds/positions), so there is no key collision in the map
+   itself. Which of the two a named import resolves to for a given usage (type position vs value
+   position) is `resolve_named_export`'s own concern (`urdira-jsts-syntax-worker`), independent of
+   this fix.
+
+4. **Attack #3 (determinism / two-generation coverage)**: the 6 new tests in `v4/typeflow.rs` DO
+   cover reverse path order (`..._reverse_path_order`) and both "pre-existing pair" / "add-add pair"
+   orderings, confirmed by reading them. **Gap found**: NONE of the 6 actually calls `build_index`
+   TWICE with the barrel's own edit landing in a SEPARATE, LATER call -- every one upserts all
+   three files (declarer/consumer/barrel) before a SINGLE `build_index` call, which only exercises
+   the WARM SETTLING LOOP's within-one-call fixed point (`MAX_SETTLING_ROUNDS`), never
+   `pending_importers_of`'s own claimed cross-call persistence -- the literal mechanism this whole
+   task's first root cause (§12.2) targets, and the literal shape `delta.rs::run`'s structural/
+   content split produces in production. Added
+   `member_access_through_a_reexporting_barrel_edited_in_a_later_separate_build_index_call`
+   (`crates/urdira-indexing-worker/src/v4/typeflow.rs`), which calls `build_index` once for the
+   two brand-new files (barrel still stale) and AGAIN, separately, after the barrel's own edit --
+   **passes**, confirming the persistence claim holds end-to-end at this API layer, not just in
+   principle.
+
+5. **Attack #4 (§12.6 finding #1) -- targeted synthetic, NEGATIVE RESULT**: built
+   `brand_new_declarer_and_consumer_linked_through_a_same_batch_edited_barrel_matches_an_independent_oracle`
+   (`crates/urdira-indexing-worker/src/v4/tests_e2e.rs`) against the REAL production path
+   (`scan::run_with_residual` -> `delta::run`'s mixed-burst split), using the `task-planner` fixture:
+   a brand-new declarer (`src/domain/new-thing.ts`) and a brand-new consumer
+   (`src/new-consumer.ts`, importing `NewThing` from the barrel `./index.js` through a constructor
+   parameter property) both `Created` in the same batch as the barrel (`src/index.ts`, pre-existing)
+   being `Modified` to add the re-export -- forces the exact two-generation structural/content
+   split. Graph and dependency roots matched an independent from-scratch oracle of the same final
+   tree. **Did not reproduce** finding #1 (the import-declaration's own `jsts:references` staying
+   stale) at this fixture's scale, through the real pipeline -- consistent with the evidence doc's
+   own §12.6 note that the two real n8n git switches (§12.4) also never hit it. Not investigated
+   further (would require reconstructing the evidence author's own removed raw e2e attempt, whose
+   exact trigger is not preserved anywhere in the tree); recorded here as the negative result per
+   plan §0's own instruction, with the exact fixture kept in the tree as production-path coverage
+   for this shape either way.
+
+6. **Attack #5 (§12.6 finding #2) -- targeted synthetic, NEGATIVE RESULT**: built
+   `swept_in_untouched_owner_reflects_the_same_batchs_edited_dependency_and_matches_an_independent_oracle`
+   (`crates/urdira-indexing-worker/src/v4/tests_e2e.rs`), the exact shape the review brief
+   specified: `a.ts` (edited, its exported class's method return type shifts `number` -> `string`),
+   `b.ts` (never edited, never named in the batch's own `ChangedPath`s -- purely swept in via
+   `importers_of`, reads `a.ts` through a constructor parameter property), `c.ts` (edited in the
+   SAME batch, imports BOTH `a.ts` directly and `b.ts`, whose own return type now transitively
+   depends on `a.ts`'s new shape). A pure two-file content edit (`a.ts`+`c.ts` both `Modified`)
+   deliberately never needs the mixed-burst split, isolating the same-generation reverse-affected
+   sweep alone. Graph and dependency roots matched an independent from-scratch oracle. **Did not
+   reproduce** finding #2 (a swept-in owner reprocessed against a stale dependency snapshot) at
+   this fixture's scale either. Same disposition as #5 above -- negative result recorded, fixture
+   kept as coverage.
+
+### 13.2 `pending_importers_of` size on a real n8n cold scan
+
+Measured with a temporary, session-only `eprintln!` in `ProgramIndex::build`
+(`crates/urdira-jsts-typeflow/src/lib.rs`, gated behind the ALREADY-forwarded `URDIRA_DEBUG_TIMING`
+env var -- confirmed via `grep` that the child-process transport
+(`packages/plugin-javascript-typescript/src/indexing-core-process-transport.ts`) only forwards an
+explicit allowlist of env vars to the worker subprocess, so a brand-new ad hoc var name would
+silently never reach it; this is exactly why the FIRST attempt at this measurement, using a new
+`URDIRA_EP0D_REVIEW_DEBUG` var, printed nothing), added and fully reverted this session (confirmed
+absent via `grep -rn "ep0d-review\|EP0D_REVIEW_DEBUG" crates/` returning empty at the final
+checkpoint). Built to an ISOLATED `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0d-measure`,
+removed at the end) to avoid disturbing the shared release binary the git-switch verification
+(§13.3) was using concurrently. Cold-scanned `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`
+(14,082 JS/TS files) via `scripts/v4-scan.mjs`:
+
+```
+[ep0d-review] pending_importers_of: 16 target keys, 47 total importer edges
+```
+
+16 target keys / 47 importer edges out of 14,082 files -- confirms the field's own doc comment
+("real corpora keep this small") empirically, and confirms finding #1's own worry (unbounded growth
+from external/`node_modules` imports) does not occur in practice, consistent with the design-level
+reasoning in §13.1 item 2 above (`resolve_import_targets_for` never records a specifier with no
+resolved target file at all).
+
+### 13.3 Real git-switch re-verification (this branch's own binary + fix #2 above)
+
+`node scripts/v4-reconcile-threshold.mjs --git-switch --git-repo ~/Proyectos/n8n --only-switch
+tags-3-months --git-tag-a n8n@1.123.25 --git-tag-b n8n@1.123.56 --git-head-back 200` (the
+`--git-head-back` flag is required by the script's own arg parser even when `--only-switch` narrows
+to one switch, unused for `tags-3-months`), against the release binary built from this session's
+final tree (fix #2 above included):
+
+```
+[git-switch:tags-3-months] cold@n8n@1.123.25: 14542.5ms; reconcile(T=1)@n8n@1.123.56: 34095.3ms mode=delta metadata_refreshed=0
+[git-switch:tags-3-months] roots_ok vs independent oracle of n8n@1.123.56: dependency=true graph=true
+```
+
+504 changed files (168 added, 330 changed, 7 deleted), `dependency=true`, `graph=true` -- 0
+missing/0 phantom, matching §12.4's own result and confirming this session's `remove_file` fix (item
+2, §13.1) did not regress the real-corpus switch it did not target.
+
+### 13.4 Verification (this session, final)
+
+- `cargo fmt --all -- --check`: clean (after the fmt fix, item 1 above).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test -p urdira-jsts-typeflow -p urdira-jsts-syntax-worker -p urdira-indexing-worker
+  --locked`: **urdira-indexing-worker 133 passed** (130 baseline + 1 remove_file regression test +
+  2 new `tests_e2e.rs` negative-result coverage tests), 18 ignored; **urdira-jsts-syntax-worker 300
+  passed**; **urdira-jsts-typeflow 58 passed** (57 baseline + 1 remove_file regression test); 0
+  failed.
+- `cargo test -p urdira-indexing-worker --locked -- --ignored
+  inferred_types_and_diagnostics_across_two_runs_and_an_edit
+  residual_emits_types_and_diagnostics_with_zero_pending_sites` (`URDIRA_TSGO_BINARY` set): both
+  `ok`.
+- `cargo build --release --locked -p urdira-indexing-worker`: succeeds.
+- Real n8n `tags-3-months` git switch (§13.3): `dependency=true graph=true`, 0 missing/0 phantom.
+
+### 13.5 Verdict
+
+**APPROVED with fixes applied.** Two real bugs found and fixed in this session (fmt-clean build gate,
+`remove_file`'s pending-graph leak); one design worry (unbounded pending-graph growth from external
+imports) investigated and ruled out by both inspection and a real 14k-file measurement (16 keys/47
+edges); one test-coverage gap (cross-generation persistence never actually exercised) closed with a
+new, passing test; both §12.6 out-of-scope findings re-attempted with targeted synthetics through the
+real production path and NOT reproduced, recorded as negative results per plan §0. The real
+`tags-3-months` n8n switch remains `graph=true`/`dependency=true` with this session's fix applied.

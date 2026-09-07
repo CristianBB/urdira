@@ -2796,6 +2796,317 @@ fn mixed_burst_two_deletes_two_creates_and_an_edit_does_not_panic_and_matches_an
     let _ = std::fs::remove_dir_all(&oracle_root);
 }
 
+/// E-P0d adversarial review (2026-09-07), targeted repro of `docs/evidence/
+/// 2026-09-06-v4-reconcile-threshold.md` §12.6 finding #1: the LITERAL real
+/// n8n shape (two BRAND-NEW files, declarer + consumer, linked through a
+/// THIRD, pre-existing barrel that is itself EDITED in the SAME mixed batch
+/// to add the re-export the consumer needs) driven through the REAL
+/// production path (`scan::run_with_residual` -> `delta::run`'s own
+/// structural/content generation split), not the raw `TypeflowCache`/
+/// `ProgramIndex` API `crates/urdira-indexing-worker/src/v4/typeflow.rs`'s
+/// own unit tests use. `src/index.ts` (the fixture's own barrel) is edited
+/// to re-export a brand-new `src/domain/new-thing.ts`, consumed by a
+/// brand-new `src/new-consumer.ts` through a constructor parameter
+/// property (the same "member access through a parameter property" shape
+/// `typeflow.rs`'s own regression tests use) -- if `urdira-jsts-typeflow`'s
+/// own `pending_importers_of` fix (§12.2/§12.3) is sufficient end-to-end
+/// (not just at the raw API level), the graph/dependency roots below must
+/// match an independent from-scratch oracle of the same final tree.
+#[test]
+fn brand_new_declarer_and_consumer_linked_through_a_same_batch_edited_barrel_matches_an_independent_oracle()
+ {
+    let scratch_root = scratch_dir("new-declarer-consumer-barrel-edit");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-new-declarer-consumer-barrel-edit";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Create #1 (structural): the brand-new DECLARER.
+    let declarer_relative = "src/domain/new-thing.ts";
+    std::fs::write(
+        workspace_root.join(declarer_relative),
+        "export class NewThing {\n  greet(): string {\n    return \"hi\";\n  }\n}\n",
+    )
+    .expect("write new-thing.ts");
+
+    // Create #2 (structural): the brand-new CONSUMER, importing the
+    // declarer THROUGH the barrel (`./index`), never directly -- reads it
+    // via a constructor parameter property, exactly like the real n8n
+    // pair's own `provider.ts` reading `ExpressionEngineConfig`.
+    let consumer_relative = "src/new-consumer.ts";
+    std::fs::write(
+        workspace_root.join(consumer_relative),
+        "import { NewThing } from \"./index.js\";\n\nexport class NewConsumer {\n  constructor(private readonly thing: NewThing) {}\n  run(): string {\n    return this.thing.greet();\n  }\n}\n",
+    )
+    .expect("write new-consumer.ts");
+
+    // Modify (content): the PRE-EXISTING barrel, in the SAME batch, to
+    // re-export the declarer -- forcing `delta.rs::run`'s mixed-burst
+    // structural/content split (two creates need generation N+1, this
+    // edit needs N+2, exactly like the real git diff's own two-generation
+    // shape).
+    let barrel_relative = "src/index.ts";
+    let barrel_absolute = workspace_root.join(barrel_relative);
+    let barrel_before = std::fs::read_to_string(&barrel_absolute).expect("read index.ts");
+    let barrel_after =
+        format!("{barrel_before}export {{ NewThing }} from \"./domain/new-thing.js\";\n");
+    std::fs::write(&barrel_absolute, &barrel_after).expect("write mutated index.ts");
+
+    let mixed = run_scan(
+        "request:new-declarer-consumer-barrel-edit",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: declarer_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+                ChangedPath {
+                    path: consumer_relative.to_string(),
+                    kind: ChangeKind::Created,
+                },
+                ChangedPath {
+                    path: barrel_relative.to_string(),
+                    kind: ChangeKind::Modified,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&mixed),
+        3,
+        "two creates + one edit through the same barrel must still consume \
+         two internal generations (structural, then content) -- the exact \
+         shape that separates the declarer/consumer's own build_index call \
+         from the barrel's"
+    );
+    let mixed_roots = roots_of(&mixed);
+
+    let oracle_root = scratch_dir("new-declarer-consumer-barrel-edit-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-new-declarer-consumer-barrel-edit-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if mixed_roots.dependency != oracle_roots.dependency || mixed_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&mixed),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+        dump_graph_set_diff(
+            &structural_root,
+            generation_of(&mixed),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        mixed_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle when a brand-new \
+         declarer and consumer are linked through a barrel edited in the SAME mixed batch"
+    );
+    assert_eq!(
+        mixed_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- new-consumer.ts's own \
+         member access AND its own import-declaration reference to NewThing must both resolve, \
+         exactly like §12.6 finding #1 in the evidence doc describes"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// E-P0d adversarial review (2026-09-07), targeted repro of `docs/evidence/
+/// 2026-09-06-v4-reconcile-threshold.md` §12.6 finding #2: a swept-in
+/// (NOT directly edited) owner reprocessed against a STALE snapshot of its
+/// own dependency. `a.ts` is EDITED (its exported class's return type
+/// changes number -> string); `b.ts` (never edited, never listed in this
+/// batch's own `ChangedPath`s at all) imports `a.ts` through a constructor
+/// parameter property and is only swept in via `importers_of`/reverse-
+/// affected closure; `c.ts` is ALSO edited in the SAME batch and imports
+/// BOTH `a.ts` (directly) and `b.ts` (which itself now depends on `a.ts`'s
+/// new shape). A pure two-file content edit (`a.ts`+`c.ts` both
+/// `Modified`) never needs `delta.rs`'s mixed-burst structural/content
+/// split (unlike finding #1's own repro) -- this isolates whether the
+/// SAME-generation reverse-affected sweep alone (no cross-generation
+/// persistence involved) can still see a stale dependency snapshot for the
+/// swept-in, untouched file.
+#[test]
+fn swept_in_untouched_owner_reflects_the_same_batchs_edited_dependency_and_matches_an_independent_oracle()
+ {
+    let scratch_root = scratch_dir("swept-owner-stale-dependency");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let a_relative = "src/domain/urdira-swept-a.ts";
+    let a_v1 = "export class UrdiraSweptA {\n  value(): number {\n    return 1;\n  }\n}\n";
+    let a_v2 = "export class UrdiraSweptA {\n  value(): string {\n    return \"s\";\n  }\n}\n";
+    std::fs::write(workspace_root.join(a_relative), a_v1).expect("write a.ts (v1, seed)");
+
+    let b_relative = "src/urdira-swept-b.ts";
+    let b_text = "import { UrdiraSweptA } from \"./domain/urdira-swept-a.js\";\n\nexport class UrdiraSweptB {\n  constructor(private readonly a: UrdiraSweptA) {}\n  getValue() {\n    return this.a.value();\n  }\n}\n";
+    std::fs::write(workspace_root.join(b_relative), b_text).expect("write b.ts (seed)");
+
+    let c_relative = "src/urdira-swept-c.ts";
+    let c_v1 = "import { UrdiraSweptA } from \"./domain/urdira-swept-a.js\";\nimport { UrdiraSweptB } from \"./urdira-swept-b.js\";\n\nexport class UrdiraSweptC {\n  constructor(\n    private readonly a: UrdiraSweptA,\n    private readonly b: UrdiraSweptB,\n  ) {}\n  run() {\n    return [this.a.value(), this.b.getValue()];\n  }\n}\n";
+    std::fs::write(workspace_root.join(c_relative), c_v1).expect("write c.ts (v1, seed)");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-swept-owner-stale-dependency";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    // Edit `a.ts` (its exported method's return type shifts number ->
+    // string) AND `c.ts` (a new method, to force it into `changed` too) in
+    // the SAME batch. `b.ts` is untouched and NOT named in `ChangedPath`s
+    // at all -- purely swept in through the reverse-affected closure.
+    std::fs::write(workspace_root.join(a_relative), a_v2).expect("write a.ts (v2, edited)");
+    let c_v2 = format!(
+        "{c_v1}\nexport function urdiraSweptC_marker(): string {{\n  return \"marker\";\n}}\n"
+    );
+    std::fs::write(workspace_root.join(c_relative), &c_v2).expect("write c.ts (v2, edited)");
+
+    let edited = run_scan(
+        "request:swept-owner-edit",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![
+                ChangedPath {
+                    path: a_relative.to_string(),
+                    kind: ChangeKind::Modified,
+                },
+                ChangedPath {
+                    path: c_relative.to_string(),
+                    kind: ChangeKind::Modified,
+                },
+            ],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(
+        generation_of(&edited),
+        2,
+        "a pure two-file content edit never needs the mixed-burst split -- \
+         this isolates the SAME-generation reverse-affected sweep alone"
+    );
+    let edited_roots = roots_of(&edited);
+
+    let oracle_root = scratch_dir("swept-owner-stale-dependency-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-swept-owner-stale-dependency-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if edited_roots.dependency != oracle_roots.dependency
+        || edited_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&edited),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+        dump_graph_set_diff(
+            &structural_root,
+            generation_of(&edited),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        edited_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle when an untouched \
+         owner (b.ts) is swept in against a same-batch-edited dependency (a.ts), while a \
+         SEPARATE file (c.ts) that depends on BOTH is also edited"
+    );
+    assert_eq!(
+        edited_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- b.ts's own reprocessing \
+         must use a.ts's NEW shape, and c.ts's own reprocessing must use BOTH a.ts's and \
+         b.ts's new shapes, exactly like §12.6 finding #2 in the evidence doc describes"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
 /// Frente E-P0b (2026-09-06), P0-2 root cause: a `Changed`/`Reconcile`
 /// batch that names a CONFIG ASSET path (`tsconfig.json`/`jsconfig.json`/
 /// `package.json`/`pnpm-workspace.yaml`) alongside an ordinary content edit

@@ -3508,6 +3508,18 @@ impl ProgramIndex {
             .unwrap_or_default()
     }
 
+    /// Test-only: the number of TARGET keys currently held in `pending_
+    /// importers_of`, regardless of whether any of them are queried --
+    /// `pending_importers_of(path)` alone cannot distinguish "key absent"
+    /// from "key present with an empty set" from the outside, so a
+    /// regression test asserting a stale target-key entry was actually
+    /// dropped (not merely unreachable through the one path it queries)
+    /// needs this.
+    #[cfg(test)]
+    fn pending_importers_of_entry_count(&self) -> usize {
+        self.pending_importers_of.len()
+    }
+
     /// P3-8a: `{path}` plus every file transitively reachable by following
     /// `importers_of` edges -- the affected component an edit to `path`
     /// must reflow for the fixed point (pass 3/4) to converge to the same
@@ -3911,6 +3923,24 @@ impl ProgramIndex {
         // still-pending) to retry later -- mirrors `clear_owning_path_
         // import_targets` just above, for the pending-edge graph.
         self.apply_pending_target_updates(&HashMap::from([(path.to_owned(), HashSet::new())]));
+        // E-P0d review fix (2026-09-07): `path` may ALSO be a TARGET other
+        // files are still waiting on (`self.pending_importers_of[path]`,
+        // e.g. `path` was a barrel some importer's need resolved a
+        // specifier to but whose export was never found) -- the line above
+        // only clears edges where `path` is the IMPORTER (a value inside
+        // some other target's set), never the entry keyed by `path` itself.
+        // Without this, deleting a file that had pending importers leaves a
+        // permanent, unbounded-over-time entry in `pending_importers_of`
+        // (violates that field's own doc comment, "real corpora keep this
+        // small") -- it only ever self-heals if the stranded importer
+        // happens to be reprocessed for an unrelated reason later. The
+        // importer itself is not orphaned by this: it was already captured
+        // into `affected` above (`transitive_importers_closure` reads this
+        // same map before we clear it) and gets reflowed below like any
+        // other affected file, correctly degrading its own pending need
+        // to "no target file at all" -- exactly what a from-scratch rebuild
+        // without `path` would also produce.
+        self.pending_importers_of.remove(path);
         let reflow_targets: Vec<String> = affected.into_iter().filter(|f| f != path).collect();
         self.reflow_files(&reflow_targets);
     }
@@ -5599,6 +5629,68 @@ mod tests {
         assert_eq!(
             index.member_type_ref(&c_id, "m", false),
             fresh.member_type_ref(&c_id, "m", false)
+        );
+    }
+
+    /// E-P0d review fix: `remove_file` must clear `pending_importers_of`'s
+    /// TARGET-keyed entry too, not just the removed path's own outgoing
+    /// (importer-side) edges. `apply_pending_target_updates(&{path: {}})`
+    /// (pre-fix, the ONLY cleanup `remove_file` did for this map) only ever
+    /// removes `path` as a VALUE inside some other target's set -- it never
+    /// touches `pending_importers_of[path]` itself, so deleting a file that
+    /// OTHER files were still waiting to resolve an export from (a barrel
+    /// with a still-unresolved re-export, say) left a permanent, dangling
+    /// entry keyed by the now-nonexistent path, growing unboundedly across
+    /// a long-running daemon's own file churn -- violating this field's own
+    /// doc comment ("real corpora keep this small"). `consumer.ts`'s own
+    /// need degrading to "no target file at all" (never retried again,
+    /// matching a from-scratch rebuild without `declarer.ts`) is the
+    /// correct end state either way; this test asserts the MAP ITSELF
+    /// shrinks, which `pending_importers_of(path)`'s own public accessor
+    /// cannot distinguish from "key present but empty" from the outside.
+    #[test]
+    fn remove_file_clears_the_pending_importers_of_entry_keyed_by_the_removed_target_itself() {
+        let declarer_v1 = "export class Other {}\n";
+        let consumer_source = "import { Repo } from \"./declarer\";\nclass C {\n  m(): Repo { return undefined as any; }\n}\n";
+
+        let declarer_summary_v1 = summary_for("declarer.ts", declarer_v1);
+        let consumer_summary = summary_for("consumer.ts", consumer_source);
+
+        let mut summaries = BTreeMap::new();
+        summaries.insert("declarer.ts".to_owned(), declarer_summary_v1);
+        summaries.insert("consumer.ts".to_owned(), consumer_summary);
+        let mut pending_targets: HashMap<String, HashSet<String>> = HashMap::new();
+        pending_targets.insert(
+            "consumer.ts".to_owned(),
+            HashSet::from(["declarer.ts".to_owned()]),
+        );
+        let mut index = ProgramIndex::build(&summaries, &HashMap::new(), &pending_targets);
+
+        assert_eq!(
+            index.pending_importers_of("declarer.ts"),
+            vec!["consumer.ts".to_owned()],
+            "precondition: declarer.ts is a pending target"
+        );
+        assert_eq!(
+            index.pending_importers_of_entry_count(),
+            1,
+            "precondition: exactly one target key in the map"
+        );
+
+        index.remove_file("declarer.ts");
+
+        assert!(
+            index.pending_importers_of("declarer.ts").is_empty(),
+            "consumer.ts's need must degrade to unresolved, never resurface \
+             for a deleted target"
+        );
+        assert_eq!(
+            index.pending_importers_of_entry_count(),
+            0,
+            "the target-keyed entry itself must be dropped, not merely \
+             left present-but-empty or unreachable through one accessor -- \
+             otherwise it survives forever as a leak for any target file \
+             that is deleted while still having a pending importer"
         );
     }
 

@@ -1332,4 +1332,143 @@ mod tests {
             "x_svc.ts",
         );
     }
+
+    /// E-P0d review addition: the ACTUAL production shape this whole task
+    /// exists to fix is NOT "three files upserted in one `build_index`
+    /// batch" (every test above this one) -- it is `delta.rs::run`'s own
+    /// structural/content generation split, which upserts the two brand-new
+    /// files (`repo.ts`, `svc.ts`) in ONE `build_index` call and the
+    /// pre-existing barrel's own content edit in a LATER, SEPARATE
+    /// `build_index` call, with `TypeflowCache`/`ProgramIndex` PERSISTING on
+    /// `self` across the two (see `pending_importers_of`'s own field doc
+    /// comment: "it persists on `self.index` across SEPARATE `build_index`
+    /// calls the same way `importers_of` does"). None of the six tests
+    /// above this one actually exercises that persistence -- every one
+    /// upserts all three files before a SINGLE `build_index` call, which
+    /// only ever needs the WARM SETTLING LOOP's within-one-call fixed point
+    /// (bounded by `MAX_SETTLING_ROUNDS`), never the cross-call
+    /// `pending_importers_of` persistence this task's own first root cause
+    /// (§12.2) specifically targets. This test calls `build_index` TWICE,
+    /// with the barrel's own edit landing in the second, separate call --
+    /// the literal repro shape.
+    #[test]
+    fn member_access_through_a_reexporting_barrel_edited_in_a_later_separate_build_index_call() {
+        let dir = scratch_dir("typeflow-barrel-two-generations");
+        let seed_blob = dir.join("seed.blob");
+        let barrel_blob = dir.join("barrel.blob");
+        let repo_blob = dir.join("repo.blob");
+        let svc_blob = dir.join("svc.blob");
+
+        let seed_text = "export class Seed {}\n";
+        let barrel_v1 = "export class Other {}\n";
+        let repo_text = "export class Repo {\n  find(): number {\n    return 1;\n  }\n}\n";
+        let barrel_v2 = "import { Repo } from './repo';\nexport { Repo } from './repo';\nexport class Other {\n  repo: Repo;\n}\n";
+        let svc_text = "import { Repo } from './barrel';\nexport class Svc {\n  constructor(private readonly repo: Repo) {}\n  run(): number {\n    return this.repo.find();\n  }\n}\n";
+
+        // Cold seed: just `seed.ts` + the barrel at v1 (no re-export yet) --
+        // mirrors a workspace already `ready` before the git switch lands.
+        let seed_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner("barrel.ts", &barrel_blob, barrel_v1),
+        ];
+        let project_key = "typeflow-barrel-two-generations";
+        let seed_files =
+            analyze_project_files(project_key, &["seed.ts", "barrel.ts"], &seed_sources);
+        let mut cache =
+            TypeflowCache::build_full(&seed_sources, None).expect("build_full succeeds (seed)");
+        let resolver = WorkspaceResolver::build(&[]);
+        let seed_available: BTreeSet<String> = seed_files.keys().cloned().collect();
+        let _ = cache.build_index(&resolver, &seed_available, &seed_files);
+
+        // GENERATION 1 (structural, `delta.rs`'s own vocabulary): the two
+        // BRAND-NEW files land. `barrel.ts` is untouched, still v1 --
+        // `svc.ts`'s own need resolves the specifier to `barrel.ts` (a known
+        // file) but not the named export `Repo` (barrel does not re-export
+        // it yet): the exact "pending", not "no target file at all", shape.
+        cache.replace_file("repo.ts", repo_text);
+        cache.replace_file("svc.ts", svc_text);
+        let repo_id = cache.summaries["repo.ts"].classes[0].entity_id.clone();
+        let svc_id = cache.summaries["svc.ts"].classes[0].entity_id.clone();
+        let gen1_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner("barrel.ts", &barrel_blob, barrel_v1),
+            owner("repo.ts", &repo_blob, repo_text),
+            owner("svc.ts", &svc_blob, svc_text),
+        ];
+        let gen1_files = analyze_project_files(
+            project_key,
+            &["seed.ts", "barrel.ts", "repo.ts", "svc.ts"],
+            &gen1_sources,
+        );
+        let gen1_available: BTreeSet<String> = gen1_files.keys().cloned().collect();
+        let gen1_index = cache.build_index(&resolver, &gen1_available, &gen1_files);
+        assert_eq!(
+            gen1_index.member_type_ref(&svc_id, "repo", false),
+            None,
+            "GEN 1: barrel.ts has not re-exported Repo yet -- must stay \
+             unresolved, never a guess"
+        );
+        assert_eq!(
+            gen1_index.pending_importers_of("barrel.ts"),
+            vec!["svc.ts".to_owned()],
+            "GEN 1: svc.ts's still-failing need must be tracked against \
+             barrel.ts, so it survives into the NEXT, separate build_index \
+             call"
+        );
+
+        // GENERATION 2 (content): ONLY the pre-existing barrel is upserted
+        // this time -- a SEPARATE, LATER `build_index` call, exactly like
+        // `delta.rs::run`'s own second sub-batch for a mixed
+        // Created+Modified generation split. `repo.ts`/`svc.ts` are NOT
+        // touched again here.
+        cache.replace_file("barrel.ts", barrel_v2);
+        let gen2_sources = vec![
+            owner("seed.ts", &seed_blob, seed_text),
+            owner("barrel.ts", &barrel_blob, barrel_v2),
+            owner("repo.ts", &repo_blob, repo_text),
+            owner("svc.ts", &svc_blob, svc_text),
+        ];
+        let gen2_files = analyze_project_files(
+            project_key,
+            &["seed.ts", "barrel.ts", "repo.ts", "svc.ts"],
+            &gen2_sources,
+        );
+        let gen2_available: BTreeSet<String> = gen2_files.keys().cloned().collect();
+        let incremental_index = cache.build_index(&resolver, &gen2_available, &gen2_files);
+        let incremental_repo_type = incremental_index.member_type_ref(&svc_id, "repo", false);
+        let incremental_find = incremental_index.members(&repo_id, "find", false);
+
+        let mut fresh =
+            TypeflowCache::build_full(&gen2_sources, None).expect("build_full succeeds (fresh)");
+        let fresh_index = fresh.build_index(&resolver, &gen2_available, &gen2_files);
+        let fresh_repo_type = fresh_index.member_type_ref(&svc_id, "repo", false);
+        let fresh_find = fresh_index.members(&repo_id, "find", false);
+
+        assert_eq!(
+            incremental_repo_type, fresh_repo_type,
+            "Svc.repo must match a from-scratch rebuild even when the \
+             barrel's own re-export edit lands in a SEPARATE, LATER \
+             build_index call than the two brand-new files it mediates \
+             between -- the literal production repro shape"
+        );
+        assert_eq!(
+            incremental_repo_type,
+            Some(urdira_jsts_typeflow::ResolvedTypeRef::Entity(repo_id)),
+            "Svc.repo must resolve to Repo's entity id through the barrel \
+             re-export once it lands, not stay permanently unresolved"
+        );
+        assert_eq!(incremental_find, fresh_find);
+        assert!(
+            matches!(incremental_find, urdira_jsts_typeflow::MemberLookup::One(_)),
+            "this.repo.find() must resolve through the barrel-mediated \
+             parameter property type across the generation boundary: \
+             {incremental_find:?}"
+        );
+        assert!(
+            incremental_index
+                .pending_importers_of("barrel.ts")
+                .is_empty(),
+            "svc.ts's now-resolved need must stop being retried"
+        );
+    }
 }
