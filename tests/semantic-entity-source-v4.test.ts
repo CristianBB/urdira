@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createDurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
-import { createNativeSemanticEntityRecordSource, type CanonicalQueryRecord, type EntityScanPort } from "../packages/engine/src/index.js";
+import { createNativeSemanticEntityRecordSource, type CanonicalQueryRecord, type EntityScanPort, type SemanticEntityCandidateRow } from "../packages/engine/src/index.js";
 import type { QueryScope } from "../packages/contracts/src/index.js";
 
 /**
@@ -17,6 +17,16 @@ import type { QueryScope } from "../packages/contracts/src/index.js";
  * stand-in for `NativeCanonicalQuerySnapshotPort`) plus a REAL
  * `artifact_versions`/`source_artifacts` catalog (both tables byte-identical
  * between v3 and v4), so the SQL join it runs is exercised for real.
+ *
+ * Frente S-E (2026-09-07): `entityCandidates()` is now a page-callback (see
+ * that method's own doc comment) -- fixed a confirmed OOM at n8n scale
+ * (326,817 entity-category candidates materialized as ONE array before this
+ * fix). `fakePort` below implements `records_for_query_batches` (splitting
+ * its own fixed record list into caller-requested page sizes) instead of
+ * the removed one-shot `records_for_query`, so this file also proves the
+ * adapter genuinely respects the page boundary it's asked for -- no page
+ * this file constructs is ever silently coalesced back into one array
+ * before reaching a caller's `onPage`.
  */
 
 const now = "2026-09-07T00:00:00.000Z";
@@ -29,15 +39,27 @@ function record(input: { readonly record_id: string; readonly kind: string; read
 
 function fakePort(records: readonly CanonicalQueryRecord[]): EntityScanPort {
   return {
-    records_for_query: async (querScope: QueryScope): Promise<readonly CanonicalQueryRecord[]> => {
-      expect(querScope).toEqual(scope);
-      return records;
+    async *records_for_query_batches(queryScope: QueryScope, batchSize?: number): AsyncIterable<readonly CanonicalQueryRecord[]> {
+      expect(queryScope).toEqual(scope);
+      const size = batchSize ?? (records.length || 1);
+      for (let start = 0; start < records.length; start += size) yield records.slice(start, start + size);
     },
     records_by_ids: async (_querScope: QueryScope, ids: readonly string[]): Promise<readonly CanonicalQueryRecord[]> => {
       const idSet = new Set(ids);
       return records.filter((row) => idSet.has(row.record_id));
     },
   };
+}
+
+/** Collects every page `entityCandidates` delivers into one array, plus the page sizes observed -- a test-only convenience; production code never does this (see `entityCandidates`'s own doc comment for why). */
+async function collectAllPages(source: { entityCandidates(onPage: (page: readonly SemanticEntityCandidateRow[]) => Promise<void>): Promise<void> }): Promise<{ readonly all: readonly SemanticEntityCandidateRow[]; readonly pageSizes: readonly number[] }> {
+  const all: SemanticEntityCandidateRow[] = [];
+  const pageSizes: number[] = [];
+  await source.entityCandidates(async (page) => {
+    pageSizes.push(page.length);
+    all.push(...page);
+  });
+  return { all, pageSizes };
 }
 
 async function withWorkspace(test: (opened: WorkspaceDatabase) => Promise<void>): Promise<void> {
@@ -65,7 +87,7 @@ async function seedArtifactVersion(opened: WorkspaceDatabase, input: { readonly 
 }
 
 describe("createNativeSemanticEntityRecordSource", () => {
-  it("entityCandidates() filters to category='entity', joins owner CAS metadata, drops binary-owned records, and sorts by (owner_artifact_version_id, record_id)", async () => {
+  it("entityCandidates() filters to category='entity', joins owner CAS metadata, and drops binary-owned records", async () => {
     await withWorkspace(async (opened) => {
       await seedArtifactVersion(opened, { artifactId: "art-b", artifactVersionId: "artv-b", displayPath: "src/b.ts", encoding: "utf-8" });
       await seedArtifactVersion(opened, { artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", encoding: "utf-8" });
@@ -81,17 +103,59 @@ describe("createNativeSemanticEntityRecordSource", () => {
       ];
       const source = createNativeSemanticEntityRecordSource({ database: opened.database, port: fakePort(records), workspace_id: WORKSPACE_ID });
 
-      const candidates = await source.entityCandidates();
-      expect(candidates.map((row) => row.record_id)).toEqual(["rec-a", "rec-container", "rec-z"]);
+      const { all: candidates } = await collectAllPages(source);
+      expect(candidates.map((row) => row.record_id).sort()).toEqual(["rec-a", "rec-container", "rec-z"]);
       const a = candidates.find((row) => row.record_id === "rec-a")!;
       expect(a).toMatchObject({ record_kind: "jsts:entity_callable", owner_artifact_id: "art-a", owner_artifact_version_id: "artv-a", content_hash: "hash-artv-a", byte_length: 42, display_path: "src/a.ts", body: { kind: "function", name: "a" } });
     });
   });
 
-  it("entityCandidates() returns [] when there are no entity-category records at all", async () => {
+  it("entityCandidates() delivers zero pages when there are no entity-category records at all", async () => {
     await withWorkspace(async (opened) => {
       const source = createNativeSemanticEntityRecordSource({ database: opened.database, port: fakePort([]), workspace_id: WORKSPACE_ID });
-      expect(await source.entityCandidates()).toEqual([]);
+      const { all, pageSizes } = await collectAllPages(source);
+      expect(all).toEqual([]);
+      expect(pageSizes).toEqual([]);
+    });
+  });
+
+  // Frente S-E (2026-09-07): the fix's own load-bearing property -- proves
+  // `entityCandidates()` genuinely streams bounded pages (never coalescing
+  // them back into one array before calling `onPage`), and that every page,
+  // however small the underlying port's own batch boundary, still resolves
+  // its OWN owner metadata correctly (a record's owner CAS row is joined
+  // per-page, not once globally).
+  it("entityCandidates() streams multiple bounded pages -- never one combined array -- and each page resolves its own owner metadata correctly", async () => {
+    await withWorkspace(async (opened) => {
+      const ownerCount = 5;
+      for (let index = 0; index < ownerCount; index += 1) {
+        await seedArtifactVersion(opened, { artifactId: `art-${index}`, artifactVersionId: `artv-${index}`, displayPath: `src/file-${index}.ts`, encoding: "utf-8" });
+      }
+      const records: readonly CanonicalQueryRecord[] = Array.from({ length: ownerCount }, (_, index) =>
+        record({ record_id: `rec-${index}`, kind: "jsts:entity_callable", owner_artifact_id: `art-${index}`, owner_artifact_version_id: `artv-${index}`, body: { kind: "function", name: `fn${index}` } }));
+      // Force the underlying port to deliver ONE record per batch -- the
+      // smallest possible page size -- so a bug that accumulated pages
+      // internally before calling `onPage` would be immediately visible as
+      // `pageSizes` collapsing to one giant entry instead of `ownerCount`
+      // separate ones.
+      const port: EntityScanPort = {
+        async *records_for_query_batches(): AsyncIterable<readonly CanonicalQueryRecord[]> {
+          for (const rec of records) yield [rec];
+        },
+        records_by_ids: async (_qs: QueryScope, ids: readonly string[]): Promise<readonly CanonicalQueryRecord[]> => {
+          const idSet = new Set(ids);
+          return records.filter((row) => idSet.has(row.record_id));
+        },
+      };
+      const source = createNativeSemanticEntityRecordSource({ database: opened.database, port, workspace_id: WORKSPACE_ID });
+      const { all, pageSizes } = await collectAllPages(source);
+      expect(pageSizes).toEqual(Array.from({ length: ownerCount }, () => 1));
+      expect(all.map((row) => row.record_id).sort()).toEqual(Array.from({ length: ownerCount }, (_, index) => `rec-${index}`).sort());
+      for (const row of all) {
+        const index = Number(row.record_id.replace("rec-", ""));
+        expect(row.content_hash).toBe(`hash-artv-${index}`);
+        expect(row.display_path).toBe(`src/file-${index}.ts`);
+      }
     });
   });
 

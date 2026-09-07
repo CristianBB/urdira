@@ -234,7 +234,96 @@ export interface ParcelWatcherAdapterOptions {
  * nested. Git worktree bindings retain `.git` because branch/index and
  * worktree-administration events are part of that provider contract.
  */
-export function watcherOptionsForSourceProvider(sourceProvider: string): parcelWatcher.Options {
+/**
+ * Frente S-E (2026-09-07): the fd-leak investigation's root cause.
+ * `@parcel/watcher`'s kqueue backend registers one kernel-level
+ * `EVFILT_VNODE` watch PER FILE at `subscribe()` time (confirmed by reading
+ * `KqueueBackend.cc` -- see the doc comment on `watcherOptionsForSourceProvider`
+ * below for the full P3-7 history) -- and EVFILT_VNODE requires an OPEN FILE
+ * DESCRIPTOR per watched file, held for the ENTIRE life of the subscription.
+ * This is NOT a forgotten-close bug anywhere in this codebase's own source:
+ * it is @parcel/watcher's own kqueue implementation's inherent per-file cost,
+ * invisible to any instrumentation of this codebase's own `fs` call sites
+ * (confirmed live: `lsof -p <daemon pid>` showed exactly one open `REG`
+ * descriptor per corpus source file -- not a `KQUEUE`-typed descriptor,
+ * which is why `docs/evidence/2026-09-06-v4-reconcile-threshold.md` and
+ * `docs/evidence/2026-09-03-v4-p3-1-incremental.md`'s own "only 5 KQUEUE
+ * descriptors" observation wrongly ruled the watcher out -- kqueue's
+ * per-file registration fd is opened as an ordinary regular-file descriptor,
+ * not a second kqueue instance).
+ *
+ * P3-7 (`docs/evidence/2026-09-03-v4-p3-7-watcher-latency.md`) made kqueue
+ * the default specifically because fs-events showed an unacceptable ~12s
+ * median detection delay at n8n scale (20,280 files) -- a real, measured
+ * latency regression, but never an operational failure. This fd cost, by
+ * contrast, IS an operational failure at the same scale: it is the confirmed
+ * root cause of `spawn EBADF` when the daemon tries to fork ANY additional
+ * child process (semantic maintenance, a rescan, ...) once enough files are
+ * watched (`docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`
+ * §0.1). Per this frente's own criterion (integrity over milliseconds): an
+ * `EBADF`-crippled daemon that cannot spawn its own maintenance children is
+ * strictly worse than one with multi-second change-detection latency, so
+ * this budget trades kqueue's latency win away ONLY once the corpus is large
+ * enough for its fd cost to threaten process stability -- every workspace at
+ * or under the budget (the overwhelming common case: a single package or
+ * small-to-medium repository) keeps kqueue's sub-10ms detection exactly as
+ * P3-7 measured it.
+ */
+export const KQUEUE_FILE_WATCH_BUDGET = 2000;
+
+/**
+ * Frente S-E (2026-09-07): a FAST, budget-capped count of eligible files
+ * under `root` -- stops walking the instant the running total exceeds
+ * `budget`, so a huge tree costs only as much `readdir` fan-out as it takes
+ * to prove it is over budget, never a full enumeration. Applies the SAME
+ * top-level `.git`/`node_modules`/`.urdira` skip `detectWorkspacePreview`
+ * already uses (a cheap, directory-name-only filter -- this is a BUDGET
+ * ESTIMATE for backend selection, not the authoritative inclusion-rule walk
+ * the real scan performs, so it deliberately does not need to match that
+ * walk exactly: undercounting by a small, excluded-generated-tree margin
+ * only ever biases toward kqueue, never past the point that would
+ * reintroduce the fd-cost problem this budget exists to bound).
+ *
+ * Returns `{ count, over_budget: false }` with the EXACT count when the
+ * whole tree is at or under budget, or `{ count: budget + 1, over_budget:
+ * true }` (the count is a lower bound, not exact, once over budget -- the
+ * walk stops as soon as it is proven, never finishes counting) otherwise.
+ * `over_budget` is a DISTINCT boolean, deliberately never folded into a
+ * `number | undefined` return shape: an `undefined` "no estimate" (every
+ * pre-existing caller of `watcherOptionsForSourceProvider`, which must keep
+ * defaulting to kqueue) and a `false`-under-budget "yes, an estimate, and it
+ * is fine" must never collapse into the same falsy/absent value, or a
+ * caller reading `undefined` as "not over budget" would silently keep using
+ * kqueue for the EXACT trees this budget exists to protect against -- the
+ * opposite of this function's purpose. Errors reading any one directory
+ * (permissions, a race with a concurrent delete) are swallowed exactly like
+ * `detectWorkspacePreview`'s own walk -- a partial, best-effort count is
+ * safe here (worst case: an over-budget tree the walk happened to
+ * undercount due to a transient error still gets kqueue, no worse than
+ * before this budget existed).
+ */
+export async function countFilesUpToBudget(root: string, budget: number, readDirectory: (path: string) => Promise<readonly { readonly name: string; readonly is_directory: boolean }[]> = async (path) => {
+  const { readdir } = await import("node:fs/promises");
+  const entries = await readdir(path, { withFileTypes: true });
+  return entries.map((entry) => ({ name: entry.name, is_directory: entry.isDirectory() }));
+}): Promise<{ readonly count: number; readonly over_budget: boolean }> {
+  let count = 0;
+  const walk = async (directory: string): Promise<boolean> => {
+    let entries: readonly { readonly name: string; readonly is_directory: boolean }[];
+    try { entries = await readDirectory(directory); } catch { return true; }
+    for (const entry of entries) {
+      if (entry.name === ".git" || entry.name === "node_modules" || entry.name === ".urdira") continue;
+      const path = `${directory}/${entry.name}`;
+      if (entry.is_directory) { if (!(await walk(path))) return false; }
+      else { count += 1; if (count > budget) return false; }
+    }
+    return true;
+  };
+  const withinBudget = await walk(root);
+  return { count, over_budget: !withinBudget };
+}
+
+export function watcherOptionsForSourceProvider(sourceProvider: string, fileCountEstimate?: { readonly count: number; readonly over_budget: boolean }): parcelWatcher.Options {
   const excludedGlobs = DEFAULT_WORKSPACE_INCLUSION.exclude.filter((pattern) => sourceProvider !== "core:git_worktree_source_provider" || pattern !== ".git/**");
   const excludedPaths = excludedGlobs.map((pattern) => pattern.endsWith("/**") ? pattern.slice(0, -3) : pattern);
   // FSEvents reports a client-side drop when the Node callback cannot drain
@@ -292,8 +381,21 @@ export function watcherOptionsForSourceProvider(sourceProvider: string): parcelW
   // `URDIRA_WATCHER_BACKEND=fs-events` is kept only as an opt-in,
   // never-on-by-default escape hatch for a future investigation, made safer
   // (not silent) by this task's `normalize_events` fix.
+  //
+  // Frente S-E (2026-09-07): ABOVE this budget, kqueue's own per-file fd
+  // cost (see `KQUEUE_FILE_WATCH_BUDGET`'s own doc comment) is traded away
+  // for fs-events despite its higher latency -- an operational-stability
+  // concern (this fd cost is the confirmed root cause of `spawn EBADF`
+  // once a corpus is large enough) outranks watch latency once a corpus is
+  // large enough for the fd cost to threaten the daemon's ability to spawn
+  // its own child processes at all. `estimatedFileCount === undefined`
+  // (every pre-existing caller, and this function's own test coverage)
+  // preserves kqueue-by-default exactly as P3-7 shipped it -- this budget
+  // only ever narrows the default for a caller that opts into passing a
+  // real estimate (`startWorkspaceWatcher`, `packages/daemon/src/runtime.ts`).
   const forcedBackend = process.env["URDIRA_WATCHER_BACKEND"];
-  const useKqueue = process.platform === "darwin" && forcedBackend !== "fs-events";
+  const overFdBudget = fileCountEstimate?.over_budget === true;
+  const useKqueue = process.platform === "darwin" && forcedBackend !== "fs-events" && !overFdBudget;
   return {
     ignore: [...new Set([...excludedPaths, ...excludedGlobs])],
     ...(useKqueue ? { backend: "kqueue" as unknown as parcelWatcher.Options["backend"] } : {}),

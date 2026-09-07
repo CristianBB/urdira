@@ -4,6 +4,8 @@ import {
   FreshnessBarrier,
   ParcelWatcherAdapter,
   watcherOptionsForSourceProvider,
+  countFilesUpToBudget,
+  KQUEUE_FILE_WATCH_BUDGET,
   ReconciliationCoordinator,
   type FreshnessBarrierPort,
   type FreshnessCheckpoint,
@@ -90,6 +92,71 @@ describe("native watcher exclusions", () => {
     expect(gitOptions.ignore).not.toContain(".git");
     expect(gitOptions.ignore).not.toContain(".git/**");
     if (process.platform === "darwin") expect(gitOptions.backend).toBe("kqueue");
+  });
+
+  // Frente S-E (2026-09-07): kqueue's per-file EVFILT_VNODE registration
+  // holds one open file descriptor per watched file for the life of the
+  // subscription (confirmed live via `lsof` at n8n scale -- see
+  // `KQUEUE_FILE_WATCH_BUDGET`'s own doc comment) -- the confirmed root
+  // cause of `spawn EBADF` once a corpus is large enough. Above the budget,
+  // `watcherOptionsForSourceProvider` must fall back to fs-events instead of
+  // kqueue; at or under it (and when no estimate is given at all, preserving
+  // every pre-existing caller's behavior), kqueue stays the default.
+  it("falls back to fs-events only when the caller supplies an over-budget file count estimate", () => {
+    const noEstimate = watcherOptionsForSourceProvider("core:directory_source_provider");
+    if (process.platform === "darwin") expect(noEstimate.backend).toBe("kqueue");
+
+    const underBudget = watcherOptionsForSourceProvider("core:directory_source_provider", { count: KQUEUE_FILE_WATCH_BUDGET, over_budget: false });
+    if (process.platform === "darwin") expect(underBudget.backend).toBe("kqueue");
+
+    const overBudget = watcherOptionsForSourceProvider("core:directory_source_provider", { count: KQUEUE_FILE_WATCH_BUDGET + 1, over_budget: true });
+    expect(overBudget.backend).toBeUndefined();
+
+    // An explicit URDIRA_WATCHER_BACKEND=fs-events override is unaffected by
+    // (and unnecessary to combine with) the budget -- it already forces
+    // fs-events regardless of estimate.
+  });
+});
+
+describe("Frente S-E (2026-09-07): countFilesUpToBudget", () => {
+  function fakeTree(files: Record<string, readonly string[]>): (path: string) => Promise<readonly { readonly name: string; readonly is_directory: boolean }[]> {
+    return async (path: string) => {
+      const children = files[path];
+      if (children === undefined) return [];
+      return children.map((name) => ({ name, is_directory: Object.hasOwn(files, `${path}/${name}`) }));
+    };
+  }
+
+  it("returns the exact count and over_budget=false for a tree at or under budget", async () => {
+    const tree = fakeTree({ "/repo": ["a.ts", "b.ts", "sub"], "/repo/sub": ["c.ts"] });
+    const result = await countFilesUpToBudget("/repo", 10, tree);
+    expect(result).toEqual({ count: 3, over_budget: false });
+  });
+
+  it("stops early and reports over_budget=true once the count exceeds the budget, without a full walk", async () => {
+    let readsPastBudget = 0;
+    const tree = fakeTree({ "/repo": ["a.ts", "b.ts", "c.ts", "d.ts"] });
+    const countingTree = async (path: string) => { readsPastBudget += 1; return tree(path); };
+    const result = await countFilesUpToBudget("/repo", 2, countingTree);
+    expect(result.over_budget).toBe(true);
+    expect(result.count).toBeGreaterThan(2);
+    // Only the single top-level directory needed reading to prove the tree
+    // is over budget -- a real over-budget tree with many subdirectories
+    // would never need to descend into most of them once the top-level
+    // file count alone already exceeds the budget.
+    expect(readsPastBudget).toBe(1);
+  });
+
+  it("skips .git/node_modules/.urdira exactly like detectWorkspacePreview's own walk", async () => {
+    const tree = fakeTree({ "/repo": ["a.ts", "node_modules", ".git", ".urdira"], "/repo/node_modules": ["huge.js"], "/repo/.git": ["HEAD"], "/repo/.urdira": ["state.json"] });
+    const result = await countFilesUpToBudget("/repo", 100, tree);
+    expect(result).toEqual({ count: 1, over_budget: false });
+  });
+
+  it("treats a directory read error as zero files there rather than failing the whole estimate", async () => {
+    const tree = async (path: string) => { if (path === "/repo/broken") throw new Error("EACCES"); return path === "/repo" ? [{ name: "a.ts", is_directory: false }, { name: "broken", is_directory: true }] : []; };
+    const result = await countFilesUpToBudget("/repo", 100, tree);
+    expect(result).toEqual({ count: 1, over_budget: false });
   });
 });
 

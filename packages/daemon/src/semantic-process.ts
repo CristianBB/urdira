@@ -244,24 +244,28 @@ function asError(error: ProcessError): Error {
 
 /**
  * Frente S-D (2026-09-07): the semantic maintenance child's own V8 old-space
- * heap ceiling. Discovered live at n8n scale: `createNativeSemanticEntityRecordSource`'s
- * `entityCandidates()` (`@urdira/engine`'s `semantic-entity-source-v4.ts`)
- * materializes EVERY visible entity-category candidate record (n8n: 326,817,
- * per `docs/evidence/2026-09-07-v4-n8n-parity-and-semantic-segments.md` §B.2's
+ * heap ceiling. Originally raised after discovering live, at n8n scale, that
+ * `createNativeSemanticEntityRecordSource`'s `entityCandidates()`
+ * (`@urdira/engine`'s `semantic-entity-source-v4.ts`) materialized EVERY
+ * visible entity-category candidate record (n8n: 326,817, per
+ * `docs/evidence/2026-09-07-v4-n8n-parity-and-semantic-segments.md` §B.2's
  * own histogram) as decoded JS objects in ONE array before any eligibility
- * filtering happens -- comfortably exceeding Node's DEFAULT old-space limit
+ * filtering happened -- comfortably exceeding Node's DEFAULT old-space limit
  * (observed: two concurrent shard children both hit `FATAL ERROR: ...
- * JavaScript heap out of memory` around ~4.1GB). Raising the ceiling here is
- * a targeted, low-risk mitigation for a real embed-viability blocker this
- * session found -- NOT a claim that `entityCandidates()`'s own O(corpus)
- * eager-materialization memory profile is fixed (that is a
- * `semantic-entity-source-v4.ts` concern, out of this module's scope; a
- * genuine fix would stream/batch that scan instead of building one giant
- * array). 6144 MiB comfortably clears the observed ~4.1GB ceiling with
- * headroom on this class of machine (32GB physical RAM observed) while
- * still leaving room for 2 CONCURRENT shard children (Lever 2) without
- * over-committing; tunable via `URDIRA_SEMANTIC_CHILD_MAX_OLD_SPACE_MB` for
- * a smaller machine that needs a lower ceiling instead.
+ * JavaScript heap out of memory` around ~4.1GB).
+ *
+ * Frente S-E (2026-09-07): `entityCandidates()`'s own O(corpus) eager
+ * materialization is now FIXED at the source -- it streams bounded pages
+ * (`ENTITY_CANDIDATE_PAGE_SIZE`, `semantic-entity-source-v4.ts`) via a page
+ * callback instead of returning one array, and `semantic-reconciler.ts`'s
+ * two consumers (the container backfill and the entity missing-insert loop)
+ * consume pages incrementally. This raised ceiling is KEPT as defense in
+ * depth (a real 2,000-row page of verbose entity bodies, plus everything
+ * else a semantic child's own embed pipeline holds concurrently, is still
+ * worth more headroom than Node's ~4.1GB default old-space limit on a
+ * 32GB-class machine) rather than reverted to the stock default -- not
+ * because the eager-materialization bug this constant was originally sized
+ * against is still present.
  */
 const SEMANTIC_CHILD_MAX_OLD_SPACE_MB = (() => {
   const raw = process.env["URDIRA_SEMANTIC_CHILD_MAX_OLD_SPACE_MB"];

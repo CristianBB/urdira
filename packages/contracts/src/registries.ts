@@ -693,10 +693,36 @@ const operationFrontiers: Readonly<Record<string, { readonly required_frontier: 
   "core:inspect_architecture": { required_frontier: "structural", required_stage: 3 },
   "core:compare": { required_frontier: "structural", required_stage: 3 },
   "core:build_context": { required_frontier: "structural", required_stage: 3 },
-  "core:search_semantic": { required_frontier: "semantic", required_stage: 3 },
-  "core:search_hybrid": { required_frontier: "semantic", required_stage: 3 },
+  // Frente S-E (2026-09-07): these three were `required_stage: 3` (full
+  // structural completeness -- type inference, control/data flow, residual
+  // -- the SAME bar as `core:compare`/`core:build_context`) even though NONE
+  // of their own answers ever touch structural stage 2/3 capabilities: the
+  // pinned spec (`canonical-query-data-port.ts`'s own `trySemanticSearch` doc
+  // comment) is explicit that `search_semantic`/`search_hybrid` "must never
+  // pay corpus-load cost" and should never reach a coverage/admission gate
+  // at all. `required_stage: 3` violated that at the DAEMON's own RPC
+  // admission layer (`packages/daemon/src/runtime.ts`'s `requiredStructuralStage`
+  // gate, checked BEFORE the engine's own semantic fast path ever runs):
+  // reproduced live on a 2,492-file v4 workspace whose `core:index_status`
+  // already reported every capability `complete` -- the query still threw
+  // `core:coverage_incomplete` with `blocking_stage: "3"` and `capabilities`
+  // listing nearly every structural capability (`core:type_information`,
+  // `core:control_flow`, ...), none of which semantic search's own answer
+  // (vectors read from `semantic_document_status`/`vector_projection_rows`,
+  // entity candidates sourced at structural stage 1) ever depends on.
+  // `required_stage: 0` (matching `core:search_text`/`core:get_source`'s own
+  // source-frontier-only admission) removes that spurious FIRST gate
+  // entirely; the SEPARATE, correct `required_frontier: "semantic"` gate
+  // (`frontierReady`, `readiness.semantic_ready`) still applies and is the
+  // only readiness check these three operations should ever pay -- when
+  // semantic materialization genuinely lags, THAT gate reports it (naming
+  // the missing generation via `readiness.readiness_reason_codes`), never a
+  // structural-stage message that has nothing to do with what these
+  // operations actually need.
+  "core:search_semantic": { required_frontier: "semantic", required_stage: 0 },
+  "core:search_hybrid": { required_frontier: "semantic", required_stage: 0 },
   "core:index_status": { required_frontier: "source", required_stage: 0 },
-  "core:semantic_affected_page": { required_frontier: "semantic", required_stage: 3 },
+  "core:semantic_affected_page": { required_frontier: "semantic", required_stage: 0 },
 };
 
 export const operationFrontierRegistry = operationFrontiers;
