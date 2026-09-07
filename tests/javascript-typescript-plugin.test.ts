@@ -377,7 +377,7 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
           work_item: {
             candidate_generation_id: "candidate:prepared-cas", workspace_id: "workspace:prepared-cas", artifact_id: "artifact:main",
             target_artifact_version_id: "version:main", work_item_id: "work:prepared-cas", plugin_id: "urdira:javascript_typescript",
-            plugin_version: "0.5.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:prepared-cas", owner_artifact_id: "artifact:main",
+            plugin_version: "0.6.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:prepared-cas", owner_artifact_id: "artifact:main",
               owner_artifact_version_id: "version:main", capability: "core:call_relationships", record_categories: ["entity", "relation", "diagnostic"],
               record_kinds: ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"],
               base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
@@ -413,7 +413,7 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
     const workItem = (id: string) => ({
       candidate_generation_id: `candidate:${id}`, workspace_id: `workspace:${id}`, artifact_id: "artifact:main",
       target_artifact_version_id: "version:main", work_item_id: `work:${id}`, plugin_id: "urdira:javascript_typescript",
-      plugin_version: "0.5.0", expected_replacement_scopes: [{ replacement_scope_id: `scope:${id}`, owner_artifact_id: "artifact:main",
+      plugin_version: "0.6.0", expected_replacement_scopes: [{ replacement_scope_id: `scope:${id}`, owner_artifact_id: "artifact:main",
         owner_artifact_version_id: "version:main", capability: "core:call_relationships", record_categories: ["entity", "relation", "diagnostic"],
         record_kinds: ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"],
         base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
@@ -537,7 +537,7 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
           work_item: {
             candidate_generation_id: "candidate:stage2-spool", workspace_id: "workspace:stage2-spool", artifact_id: "artifact:main",
             target_artifact_version_id: "version:main", work_item_id: "work:stage2-spool", plugin_id: "urdira:javascript_typescript",
-            plugin_version: "0.5.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:stage2-spool", owner_artifact_id: "artifact:main",
+            plugin_version: "0.6.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:stage2-spool", owner_artifact_id: "artifact:main",
               owner_artifact_version_id: "version:main", capability: "core:call_relationships", record_categories: ["entity", "relation", "diagnostic"],
               record_kinds: ["jsts:relation_call", "jsts:relation_references", "jsts:relation_inherits", "jsts:relation_implements"],
               base_record_set_digest: "sha256:empty", output_completeness: "complete" }],
@@ -564,7 +564,7 @@ describe("bundled JavaScript/TypeScript analyzer", () => {
           work_item: {
             candidate_generation_id: "candidate:stage3", workspace_id: "workspace:stage3", artifact_id: "artifact:main",
             target_artifact_version_id: "version:main", work_item_id: "work:stage3", plugin_id: "urdira:javascript_typescript",
-            plugin_version: "0.5.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:stage3", owner_artifact_id: "artifact:main",
+            plugin_version: "0.6.0", expected_replacement_scopes: [{ replacement_scope_id: "scope:stage3", owner_artifact_id: "artifact:main",
               owner_artifact_version_id: "version:main", capability: "core:type_information", record_categories: ["entity", "relation", "diagnostic"],
               record_kinds: ["jsts:entity_inferred_type", "jsts:relation_type_of", "jsts:relation_covers", "jsts:diagnostic"],
               base_record_set_digest: "sha256:empty", output_completeness: "complete" }],

@@ -796,6 +796,40 @@ describe("CanonicalRecordQueryDataPort core:get_source", () => {
     expect(bundles[0]!.optional_source_snippets[0]!.text).toBe("function greet() {");
   });
 
+  /**
+   * E-P0j adversarial review (2026-09-07, fix-ep0j-review): as of Frente
+   * E-P0j (`docs/decisions/26-v4-structural-store.md`), a v4 entity's own
+   * `body["start"]`/`["end"]` is the WHOLE declaration span, which for a
+   * decorated class/interface member begins at that member's own leading
+   * decorator(s) -- confirmed live against the real Rust producer
+   * (`urdira-jsts-syntax-worker`'s
+   * `decl_span_covers_member_decorators_but_not_a_top_level_declarations_own_leading_decorator`).
+   * Before this fix, "signature" mode took the first line starting at
+   * `start` unconditionally, so a decorated member's "signature" snippet
+   * was the DECORATOR line (`@Injectable()`), never the member's actual
+   * signature. `body["name_start"]` (additive, same task) anchors the
+   * signature on the member's own name's line instead.
+   */
+  it("signature mode anchors on the declaration's own name line, not a leading decorator, when name_start is present", async () => {
+    const decoratedFileText = "class Widget {\n  @Injectable()\n  method(x: number): void {\n    return;\n  }\n}\n";
+    const methodStart = decoratedFileText.indexOf("@Injectable");
+    const methodEnd = decoratedFileText.length;
+    const nameStart = decoratedFileText.indexOf("method(x");
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => [stubRecord("rec-method", "artv-decorated", { path: "src/widget.ts", start: methodStart, end: methodEnd, name_start: nameStart, name: "method" })],
+      async artifact_text(_scope, artifactVersionId) {
+        return artifactVersionId === "artv-decorated" ? { text: decoratedFileText } : undefined;
+      },
+    }));
+    const evaluation = await port.execute(getSourceOperation(["rec-method"], { mode: "signature", max_characters_per_snippet: 4000, max_total_characters: 16000, context_lines: 0 }));
+    const bundles = sourceBundles(evaluation);
+    expect(bundles[0]!.optional_source_snippets[0]!.text).toBe("  method(x: number): void {");
+    // `rec-greet` (this file's shared fixture) never sets `name_start` --
+    // the immediately preceding test already covers that fallback path
+    // ("returns only the first line of the span in signature mode" still
+    // anchors on `start` unchanged).
+  });
+
   it("extends the snippet backward with a whole line of context", async () => {
     const port = new CanonicalRecordQueryDataPort(stubPort());
     const evaluation = await port.execute(getSourceOperation(["rec-farewell"], { mode: "body", max_characters_per_snippet: 4000, max_total_characters: 16000, context_lines: 1 }));

@@ -2841,15 +2841,35 @@ fn proposal_entity_record(
     };
     // A3b: fields written in strict lexicographic key order (`end`,
     // `is_test`?, `kind`, `language`, `name`, `name_end`, `name_start`,
-    // `parent_id`?, `path`, `qualified_name`?, `start`) -- the same order
-    // `serde_json::Map`'s `BTreeMap` iteration already produced for the
-    // equivalent `Value` tree (no `preserve_order` feature anywhere in this
-    // workspace). Frente E-P0j (2026-09-07): `name_start`/`name_end` are
-    // new, additive fields -- the entity's own IDENTIFIER span (what
-    // `start`/`end` used to publish before this task) -- so a body-decoding
-    // consumer can still recover "where is this declaration's own name",
-    // never just its wider (as of this task) `start`/`end`.
-    let mut field_count = 8;
+    // `name_start_line`, `parent_id`?, `path`, `qualified_name`?, `start`)
+    // -- the same order `serde_json::Map`'s `BTreeMap` iteration already
+    // produced for the equivalent `Value` tree (no `preserve_order` feature
+    // anywhere in this workspace). Frente E-P0j (2026-09-07): `name_start`/
+    // `name_end` are new, additive fields -- the entity's own IDENTIFIER
+    // span (what `start`/`end` used to publish before this task) -- so a
+    // body-decoding consumer can still recover "where is this declaration's
+    // own name", never just its wider (as of this task) `start`/`end`.
+    //
+    // E-P0j adversarial review (2026-09-07, fix-ep0j-review): `name_start_
+    // line` is additive here -- confirmed live
+    // (`decl_span_covers_member_decorators_but_not_a_top_level_declarations_own_leading_decorator`)
+    // that a class/interface member's own `start` (hence `primary_source_
+    // span.start_line`, computed from `entity.start` below) can be its
+    // leading decorator's line, not the line the declaration's NAME
+    // actually appears on. `describeLine` (`packages/mcp/src/index.ts`) has
+    // no file text to compute a line number from a byte offset itself, so
+    // without this field an outline entry for a decorated member shows the
+    // decorator's line number, not the member's. Same `line_index.line_of`
+    // convention `span_start_line` already uses (`0` when `line_index` is
+    // `None`, the isolated-unit-test call sites only -- never a real
+    // analysis pass); unconditionally present (not `Option`-gated like
+    // `parent_id`/`qualified_name`/`is_test`) for the same reason `name_
+    // start`/`name_end` are unconditional: every entity kind has one.
+    let name_start_line = match line_index {
+        Some(index) => index.line_of(entity.name_start),
+        None => 0,
+    };
+    let mut field_count = 9;
     if entity.parent_id.is_some() {
         field_count += 1;
     }
@@ -2889,6 +2909,12 @@ fn proposal_entity_record(
     encoder
         .uint(u64::from(entity.name_start))
         .expect("entity name_start is a finite u32");
+    encoder
+        .key("name_start_line")
+        .expect("entity body key order");
+    encoder
+        .uint(u64::from(name_start_line))
+        .expect("entity name_start_line is a finite u32");
     if let Some(parent_id) = &entity.parent_id {
         encoder.key("parent_id").expect("entity body key order");
         encoder.string(parent_id).expect("string never fails");
@@ -8783,5 +8809,85 @@ declare module 'markdown-it-task-lists' {
             ),
             resolver::ExportResolution::Unresolved
         );
+    }
+
+    /// E-P0j adversarial review (2026-09-07, fix-ep0j-review): confirms
+    /// live, per kind, exactly what `Frente E-P0j` widened `start`/`end` to
+    /// -- the evidence doc's own table describes this only in prose, with
+    /// no direct test coverage added by that task (checked: zero new
+    /// `#[test]` functions anywhere in that diff). Findings that motivate
+    /// this review's own fixes (`sourceSnippet`'s "signature" mode,
+    /// `canonical-query-data-port.ts`):
+    /// - A class MEMBER's decorator (`@Input()`) IS included in its
+    ///   published `start` (`ClassElement::span()` starts at the
+    ///   decorator) -- so `value`'s span begins at `@Input()`, not at
+    ///   `value:`. This is real and asymmetric with the next point.
+    /// - A TOP-LEVEL declaration's own leading decorator (`@Component()`
+    ///   on `export class Widget`) is NOT included -- `pending_export_
+    ///   span_start` widens only to the `export` keyword
+    ///   (`ExportNamedDeclaration::span.start`), which oxc places AFTER a
+    ///   leading class decorator. The decorator text is not covered by any
+    ///   entity's span either way (dropped from the structural record
+    ///   entirely, same as before this task).
+    /// - An interface method/property signature's own trailing `;` IS
+    ///   included in `end` (`perimeter(): number;`).
+    /// - A `const a = 1, b = 2;` declarator's own `end` does NOT include
+    ///   its trailing `,`/`;` (matches the evidence doc's own claim).
+    #[test]
+    fn decl_span_covers_member_decorators_but_not_a_top_level_declarations_own_leading_decorator() {
+        let text = "@Component()\nexport class Widget {\n  @Input()\n  value: number = 1;\n}\n\ninterface Shape {\n  area(): number;\n  perimeter(): number;\n}\n\nconst a = 1, b = 2;\n";
+        let file = parse_source_for_test("widget.ts", text);
+        let slice = |start: u32, end: u32| &text[start as usize..end as usize];
+
+        let class_entity = file
+            .entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Class)
+            .expect("class entity");
+        assert_eq!(
+            slice(class_entity.start, class_entity.end),
+            "export class Widget {\n  @Input()\n  value: number = 1;\n}"
+        );
+        assert_eq!(
+            slice(class_entity.name_start, class_entity.name_end),
+            "Widget"
+        );
+
+        let property_entity = file
+            .entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Property)
+            .expect("property entity");
+        assert_eq!(
+            slice(property_entity.start, property_entity.end),
+            "@Input()\n  value: number = 1;"
+        );
+        assert_eq!(
+            slice(property_entity.name_start, property_entity.name_end),
+            "value"
+        );
+
+        let perimeter = file
+            .entities
+            .iter()
+            .find(|e| e.name == "perimeter")
+            .expect("perimeter signature entity");
+        assert_eq!(
+            slice(perimeter.start, perimeter.end),
+            "perimeter(): number;"
+        );
+
+        let declarator_a = file
+            .entities
+            .iter()
+            .find(|e| e.name == "a")
+            .expect("declarator a");
+        assert_eq!(slice(declarator_a.start, declarator_a.end), "a = 1");
+        let declarator_b = file
+            .entities
+            .iter()
+            .find(|e| e.name == "b")
+            .expect("declarator b");
+        assert_eq!(slice(declarator_b.start, declarator_b.end), "b = 2");
     }
 }

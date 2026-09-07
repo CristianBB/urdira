@@ -2337,10 +2337,32 @@ fn try_synthesize_member_entity(
     let kind = kind.to_string();
     let universal_kind = universal_kind.to_string();
     // A3b: strict lexicographic key order (`end`, `kind`, `language`,
-    // `name`, `path`, `start`, `synthesized_by`).
+    // `name`, `name_end`, `name_start`, `path`, `start`, `synthesized_by`).
+    //
+    // E-P0j adversarial review (2026-09-07, fix-ep0j-review): `name_end`/
+    // `name_start` are ADDITIVE here -- before this fix, this hand-rolled
+    // encoder (the only entity-body producer NOT routed through
+    // `urdira-jsts-syntax-worker::proposal_entity_record`) never gained the
+    // two fields Frente E-P0j added to every other member entity's body.
+    // A cold-start-synthesized member entity (decision 28's own gap --
+    // exactly the case this function exists to cover) would otherwise be
+    // the ONE shape whose body lacks `name_start`/`name_end` once a
+    // consumer starts relying on them (e.g. `describeLine`/`sourceSnippet`
+    // signature-mode fidelity for a decorated member), silently
+    // inconsistent with the shape a live `push_member_entities` pass
+    // produces for the exact same member once confirmed normally.
+    // `name_start_utf16` is this function's own identifier-anchor
+    // parameter (`entity_id`/`identity_key` were already built from it);
+    // `name_end` is recovered the same way `identifier_text_at_path`
+    // already locates the name text -- as `name_start_utf16 + name.len()`
+    // measured in UTF-16 code units, matching every other producer's own
+    // `identifier.span.end` convention for a plain identifier name (no
+    // separate end position is tracked anywhere upstream of this
+    // synthesis path).
+    let name_end_utf16 = name_start_utf16 + i32::try_from(name.encode_utf16().count()).unwrap_or(0);
     let mut encoder = urdira_native_core::BodyEncoder::new();
     encoder
-        .begin_object(7)
+        .begin_object(9)
         .expect("member entity body field count is fixed");
     encoder.key("end").expect("member entity body key order");
     encoder.int(i64::from(decl_end)).expect("int never fails");
@@ -2352,6 +2374,18 @@ fn try_synthesize_member_entity(
     encoder.string("typescript").expect("string never fails");
     encoder.key("name").expect("member entity body key order");
     encoder.string(&name).expect("string never fails");
+    encoder
+        .key("name_end")
+        .expect("member entity body key order");
+    encoder
+        .int(i64::from(name_end_utf16))
+        .expect("int never fails");
+    encoder
+        .key("name_start")
+        .expect("member entity body key order");
+    encoder
+        .int(i64::from(name_start_utf16))
+        .expect("int never fails");
     encoder.key("path").expect("member entity body key order");
     encoder.string(&real_path).expect("string never fails");
     encoder.key("start").expect("member entity body key order");

@@ -2024,8 +2024,34 @@ async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: Query
   if (end > file.text.length) return undefined;
   const text = file.text;
   let coreEnd = end;
+  // E-P0j adversarial review (2026-09-07, fix-ep0j-review): "signature"
+  // used to always cut the first line starting at `start` -- correct back
+  // when `start` was the identifier's own span (pre-Frente-E-P0j), but
+  // `start` is now the WHOLE declaration span, which for a class/interface
+  // member can begin at that member's own leading decorator(s)
+  // (`@Injectable()\n  method() {}` -- `ClassElement::span()`/the Rust
+  // producer's own `decl_start` include the decorator; confirmed live,
+  // `decl_span_covers_member_decorators_but_not_a_top_level_declarations_own_leading_decorator`,
+  // `urdira-jsts-syntax-worker`). Left as `start`, "signature" mode would
+  // render `@Injectable()` instead of the member's actual signature line --
+  // exactly the fidelity regression Frente E-P0j's own consumer review
+  // (`docs/evidence/2026-09-07-v4-entity-declaration-spans.md` §3) missed
+  // (its only worked example was a plain `export function foo(...)`, never
+  // a decorated member). `body["name_start"]` (additive as of that same
+  // task) is the identifier's own position within `[start, end)` when
+  // present -- anchoring the signature's line on IT instead, when in
+  // range, recovers the real signature line (`method() {` or `value:
+  // number = 1;`) regardless of what precedes it on an earlier line.
+  // Falls back to `start` unchanged (byte-identical to before this fix)
+  // when `name_start` is absent/out of range -- an older record predating
+  // this field, a non-jsts subject, or a degenerate span (module/external
+  // entities, whose `name_start === start`, changes nothing either way).
+  const nameStart = record.body["name_start"];
+  const signatureAnchor = mode === "signature" && typeof nameStart === "number" && Number.isFinite(nameStart) && nameStart >= start && nameStart < end
+    ? lineStart(text, nameStart)
+    : start;
   if (mode === "signature") {
-    const newline = text.indexOf("\n", start);
+    const newline = text.indexOf("\n", signatureAnchor);
     coreEnd = newline === -1 || newline >= end ? end : newline;
   }
   // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): "line" always renders the
@@ -2036,7 +2062,7 @@ async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: Query
   // would defeat R13's one-line-per-bundle budget accounting).
   const { start: sliceStart, end: sliceEnd } = mode === "line"
     ? { start: lineStart(text, start), end: lineEnd(text, Math.max(coreEnd - 1, start)) }
-    : extendSpanForContext(text, start, coreEnd, contextLines);
+    : extendSpanForContext(text, signatureAnchor, coreEnd, contextLines);
   let snippetText = text.slice(sliceStart, sliceEnd);
   let truncated = false;
   if (snippetText.length > maxCharactersPerSnippet) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, maxCharactersPerSnippet); truncated = true; }
