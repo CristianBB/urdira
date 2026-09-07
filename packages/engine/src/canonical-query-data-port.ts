@@ -2,6 +2,7 @@ import { canonicalBytes, digestBytes, digestCanonicalArray } from "@urdira/canon
 import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryScope, type SemanticAffectedArtifactPage, type SemanticAffectedArtifactView, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
 import type { RelationalValueRow } from "@urdira/storage";
 import type { SqliteDatabase } from "@urdira/storage";
+import { mapWithConcurrency } from "./concurrency.js";
 import { EngineError, EngineErrorWithDetails } from "./errors.js";
 import { QueryPlanError } from "./query-plan.js";
 import { toSubjectSelector } from "./recipe-executor.js";
@@ -415,6 +416,8 @@ const DELTA_CHURN_FALLBACK_RATIO = 0.3;
 // (...)` statement well clear of it while still batching effectively, matching
 // the batch size other large-IN-list code in this repo targets.
 const DELTA_ID_CHUNK_SIZE = 200;
+/** Bounds concurrent CAS reads in `semantic_vectors` (Frente S-C, 2026-09-07) -- same magnitude as `source-indexer.ts`'s `DEFAULT_READ_CONCURRENCY`/`directory-provider.ts`'s `DEFAULT_WALK_CONCURRENCY`. */
+const SEMANTIC_SHARD_READ_CONCURRENCY = 16;
 // A selector can legally contain a large registered kind/category set.  Keep
 // every generated statement below SQLite's smallest supported variable limit,
 // including the five visibility parameters added by queryRecordRows().
@@ -1232,7 +1235,12 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    */
   async semantic_vectors(scope: QueryScope, profileId: string, executableBindingId: string): Promise<readonly SemanticVectorRow[]> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
-    if (this.content === undefined) return [];
+    // Captured into a local `const` (not left as `this.content` accesses
+    // below) so TypeScript's narrowing from the guard above survives into
+    // the `mapWithConcurrency` callback closure -- a per-call member-access
+    // narrow does not persist across a nested function boundary.
+    const content = this.content;
+    if (content === undefined) return [];
     const generation = await this.currentGeneration(scope);
     if (generation === undefined) return [];
     const rows = await this.database.all<{ projection_record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; shard_id: string; shard_offset: number; byte_length: number; dimensions: number; element_type: string; normalization: string; distance_metric: string; document_grain: string | null; document_ref: string | null; segment_index: number | null; segment_start: number | null; segment_end: number | null }>(
@@ -1245,20 +1253,34 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     );
     if (rows.length === 0) return [];
     const shardIds = [...new Set(rows.map((row) => row.shard_id))];
-    const shardRows: Array<{ shard_id: string; content_hash: string }> = [];
     // SQLite's variable ceiling is a runtime property (and can be as low as
-    // 999).  A semantic result may reference many packed shards, so never
-    // construct one unbounded IN-list here.
-    for (const ids of chunk(shardIds, DELTA_ID_CHUNK_SIZE)) {
-      shardRows.push(...await this.database.all<{ shard_id: string; content_hash: string }>(
+    // 999). A semantic result may reference many packed shards, so never
+    // construct one unbounded IN-list here -- each chunk is still its own
+    // bounded query, but the chunks themselves run concurrently (Frente S-C,
+    // 2026-09-07 latency work) rather than one after another.
+    const shardRowChunks = await Promise.all(chunk(shardIds, DELTA_ID_CHUNK_SIZE).map((ids) =>
+      this.database.all<{ shard_id: string; content_hash: string }>(
         `SELECT shard_id, content_hash FROM vector_shards WHERE workspace_id = ? AND shard_id IN (${ids.map(() => "?").join(", ")})`,
         [scope.workspace_id, ...ids],
-      ));
-    }
+      ),
+    ));
+    const shardRows = shardRowChunks.flat();
+    // Latency (2026-09-07, Frente S-C): a real workspace's vectors span many
+    // DISTINCT packed shards (one per embed-batch commit -- see
+    // `semantic-reconciler.ts`'s `embedAndCommitBatch`), and this used to
+    // read them one at a time in a plain sequential loop -- measured live as
+    // the dominant cost of `core:search_semantic`'s own latency on a
+    // realistically-sized corpus (far more than the query embedding itself,
+    // which is ~1-2ms against an already-warm resident model -- see
+    // `trySemanticSearch`'s own doc comment on the snapshot-port batching
+    // right above it). `mapWithConcurrency` bounds fan-out the same way
+    // `source-indexer.ts`/`directory-provider.ts` already bound their own
+    // CAS/filesystem read concurrency, so a workspace with thousands of
+    // shards cannot exhaust file descriptors just to answer one query.
     const shardBytes = new Map<string, Uint8Array>();
-    for (const shard of shardRows) {
-      try { shardBytes.set(shard.shard_id, await this.content.read(shard.content_hash)); } catch { /* unreadable shard -> its rows are dropped below, same "best effort" discipline artifact_text's CAS-read catch uses */ }
-    }
+    await mapWithConcurrency(shardRows, SEMANTIC_SHARD_READ_CONCURRENCY, async (shard) => {
+      try { shardBytes.set(shard.shard_id, await content.read(shard.content_hash)); } catch { /* unreadable shard -> its rows are dropped below, same "best effort" discipline artifact_text's CAS-read catch uses */ }
+    });
     const result: SemanticVectorRow[] = [];
     for (const row of rows) {
       const packed = shardBytes.get(row.shard_id);
@@ -3415,13 +3437,50 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
 
     const provider = this.options.semantic;
     const portReady = this.snapshots.semantic_index_state !== undefined && this.snapshots.semantic_vectors !== undefined && this.snapshots.semantic_scope_counts !== undefined;
-    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
-
-    const marker = portReady ? await this.snapshots.semantic_index_state!(operation.scope) : undefined;
+    // Latency (2026-09-07, Frente S-C): these seven snapshot-port reads are
+    // mutually independent (none consumes another's RESULT -- `semantic_vectors`
+    // only ever gated the original sequential code on whether a marker
+    // exists at all, never on the marker's VALUE, and `semantic_vectors`
+    // resolves its own current generation internally, exactly like
+    // `semantic_index_state` does) -- so they are fired together and
+    // awaited once, instead of one at a time. Measured live against a real
+    // daemon with the neural provider (a workspace database served through
+    // the SQLite worker-thread adapter): the original sequential form paid
+    // one worker-thread IPC round trip PER call, back to back, dominating
+    // `core:search_semantic`'s own ~300ms p50/p99 (query embedding itself,
+    // separately measured against the SAME persistent neural host, costs
+    // ~1-2ms -- the model was already resident/warm, never the bottleneck
+    // this task's own brief speculated it might be). `semantic_vectors` is
+    // fetched unconditionally now (previously skipped when no marker existed
+    // yet) -- a one-time, harmless extra read on a workspace whose semantic
+    // index has never initialized at all; every other branch's result is
+    // unchanged, and the "unused-when-marker-is-undefined" result is
+    // dropped exactly as before via `allVectors` below.
+    const [capabilityStates, marker, allVectorsRaw, counts, entityCounts, realCounts, affectedRows] = await Promise.all([
+      this.snapshots.capability_states?.(operation.scope) ?? Promise.resolve([]),
+      portReady ? this.snapshots.semantic_index_state!(operation.scope) : Promise.resolve(undefined),
+      portReady && provider !== undefined
+        ? this.snapshots.semantic_vectors!(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
+        : Promise.resolve([]),
+      portReady ? this.snapshots.semantic_scope_counts!(operation.scope, SEMANTIC_MAX_DOCUMENT_BYTES) : Promise.resolve({ artifact_count: 0, oversized_count: 0 }),
+      this.snapshots.semantic_entity_scope_counts !== undefined ? this.snapshots.semantic_entity_scope_counts(operation.scope) : Promise.resolve({ entity_count: 0 }),
+      // Plan 2026-09-06 (Frente S-A): real status-table counts and the
+      // embedded first affected page, computed ONCE for whichever coverage
+      // view this call ends up returning (the unavailable/hybrid-degrade
+      // branch below, or the normal ranked-result branch further down) --
+      // both share the exact same real-coverage inputs. `undefined` whenever
+      // there is no resolved provider (nothing to key the status table by)
+      // or the port lacks the new capability, preserving the pre-existing
+      // inferred/`0` fields exactly.
+      provider !== undefined && this.snapshots.semantic_document_status_counts !== undefined
+        ? this.snapshots.semantic_document_status_counts(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
+        : Promise.resolve(undefined),
+      provider !== undefined && this.snapshots.semantic_affected_documents !== undefined
+        ? this.snapshots.semantic_affected_documents(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
+        : Promise.resolve(undefined),
+    ]);
     const isCurrent = isSemanticMarkerCurrent(marker, provider);
-    const allVectors = portReady && provider !== undefined && marker !== undefined
-      ? await this.snapshots.semantic_vectors!(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
-      : [];
+    const allVectors = marker !== undefined ? allVectorsRaw : [];
     // Decision 17: an entity-grain row must NEVER enter `dedupeVectorsByOwner`
     // (many legitimately share one `owner_artifact_version_id` -- every
     // eligible entity in one file) -- so the combined `allVectors` list is
@@ -3429,22 +3488,6 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // key (`dedupeVectorsByDocumentRef` for entity rows).
     const dedupedVectors = dedupeVectorsByOwner(allVectors.filter((vector) => vector.document_grain !== "entity"));
     const dedupedEntityVectors = dedupeVectorsByDocumentRef(allVectors.filter((vector) => vector.document_grain === "entity"));
-    const counts = portReady ? await this.snapshots.semantic_scope_counts!(operation.scope, SEMANTIC_MAX_DOCUMENT_BYTES) : { artifact_count: 0, oversized_count: 0 };
-    const entityCounts = this.snapshots.semantic_entity_scope_counts !== undefined ? await this.snapshots.semantic_entity_scope_counts(operation.scope) : { entity_count: 0 };
-    // Plan 2026-09-06 (Frente S-A): real status-table counts and the
-    // embedded first affected page, computed ONCE for whichever coverage
-    // view this call ends up returning (the unavailable/hybrid-degrade
-    // branch below, or the normal ranked-result branch further down) --
-    // both share the exact same real-coverage inputs. `undefined` whenever
-    // there is no resolved provider (nothing to key the status table by) or
-    // the port lacks the new capability, preserving the pre-existing
-    // inferred/`0` fields exactly.
-    const realCounts = provider !== undefined && this.snapshots.semantic_document_status_counts !== undefined
-      ? await this.snapshots.semantic_document_status_counts(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
-      : undefined;
-    const affectedRows = provider !== undefined && this.snapshots.semantic_affected_documents !== undefined
-      ? await this.snapshots.semantic_affected_documents(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
-      : undefined;
     const affectedPage = provider !== undefined && affectedRows !== undefined
       ? buildAffectedArtifactPage(affectedRows, {
           setId: computeAffectedSetId(affectedRows, {

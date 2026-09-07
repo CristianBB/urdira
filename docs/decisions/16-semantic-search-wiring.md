@@ -149,3 +149,83 @@ No CLI flag currently mirrors any of these (see the "Decided in
 implementation" paragraph above) -- this table, plus `apps/urdira/src/index.ts`'s
 `resolveSemanticDescriptor` doc comment, is the documented surface an
 operator or agent needs to configure the HTTP provider end to end.
+
+### Amendment 2026-09-07 (Frente S-C): v4 storage wiring + query-latency batching
+
+**v4 storage wiring.** `runV4WorkspaceScan` (`packages/daemon/src/runtime.ts`)
+used to deliberately never call `submitSemanticMaintenance` at all -- a v4
+workspace's entity-grain lane would have thrown outright against
+`record_occurrences`/`record_value_nodes`, tables the v4 catalog schema does
+not have (docs/evidence/2026-09-02-v4-p2-1-schema.md). Fixed: `reconcileSemanticProjection`
+(`@urdira/engine`'s `semantic-reconciler.ts`) now accepts an optional
+`entity_record_source: SemanticEntityRecordSource` -- when provided, it
+replaces the entity stale-close/missing-insert SQL and the two entity-shaped
+`syncDocumentStatusBulk` statements; `undefined` (every v3 caller) keeps the
+original `record_occurrences`-backed behavior byte-for-byte. A v4 workspace's
+real source (`createNativeSemanticEntityRecordSource`, `semantic-entity-source-v4.ts`)
+enumerates entity-category records from the native structural store's
+`CanonicalQuerySnapshotPort` and joins them against `artifact_versions`/
+`source_artifacts` (kept byte-identical between v3/v4) for owning-file CAS
+metadata. Wired into the daemon by `resolveV4SemanticEntitySource`
+(`packages/daemon/src/semantic-v4-wiring.ts`): ATTACHes the v4 semantic
+sidecar directly onto the workspace's own catalog connection (mirroring
+`warmWorkspaceQueryEngine`'s existing read-path ATTACH, not `submitLexicalMaintenance`'s
+reversed ATTACH-catalog-onto-sidecar approach), so `database`/`database.projections`
+need no duck-typed wrapping. `submitSemanticMaintenance`'s own
+`v4ReadinessState.has(workspaceId)` early-return guard is gone; `runV4WorkspaceScan`
+now calls it right after `submitLexicalMaintenance` on every successful scan.
+`v4WorkspaceReadinessFrom`/`v4StatusFields` (`runtime.ts`) now compute
+`semantic_ready`/`semantic_availability`/`semantic.current` from the real
+`semanticMaterializationView`, the same way v3's `workspaceReadiness` always
+has -- they used to hardcode `false`/`"unavailable"` unconditionally for v4.
+
+Two documented simplifications in the v4 entity source (both decided in
+implementation, correctness over historical exactness): every v4-sourced
+row's `valid_from_generation`/stale-close `closing_generation` is the
+workspace's CURRENT generation, not the record's own historical "first seen"/
+"last visible" generation the v3 join recovers -- the native store's
+`CanonicalQuerySnapshotPort` only answers "visible now", not "when exactly".
+This never affects which vector answers a CURRENT query, only the historical
+accuracy of `vector_projection_rows`' own generation bookkeeping.
+
+**P0 discovered live, reported, NOT fixed (out of this frente's scope):**
+`crates/urdira-jsts-syntax-worker`'s `push_entity_with_type_surface` publishes
+every entity's `start`/`end` as the IDENTIFIER's own span
+(`identifier.span.start`/`.end`), not the whole declaration's span -- unlike
+v3's TS analyzer (`analyzer.ts`'s `entityForDeclaration`), which explicitly
+separates `identityStart` (name-anchored, identity only) from the PUBLISHED
+`start`/`end` (`node.getStart(file)`/`node.getEnd()`, the full declaration).
+Verified live: every real v4 function/variable entity record fails decision
+17's 120-character span eligibility check (`below_min_length`) regardless of
+its real body length, because only its (typically far shorter) NAME is ever
+measured. `tests/phase-daemon-v4-semantic.test.ts` works around this with a
+deliberately >=120-character identifier name so its own coverage does not
+depend on the fix landing first.
+
+**Query-latency: model residency confirmed, two real batching fixes shipped.**
+Measured live against the persistent neural host (`startNeuralSemanticProviderHost`,
+`packages/daemon/src/semantic-process.ts`): the model is ALREADY resident and
+warm across queries (an IPC `generateVector` round trip costs ~1-2ms; in-process,
+already-warm embedding costs ~1ms) -- NOT the bottleneck this task's own brief
+speculated it might be. The real, measured bottleneck was two sequential-await
+patterns in `canonical-query-data-port.ts`'s `trySemanticSearch`/`semantic_vectors`:
+(1) seven independent snapshot-port reads (`capability_states`/`semantic_index_state`/
+`semantic_vectors`/`semantic_scope_counts`/`semantic_entity_scope_counts`/
+`semantic_document_status_counts`/`semantic_affected_documents`) awaited one at a
+time, each paying its own `SqliteWorkerAdapter` worker-thread round trip --
+now fired together via one `Promise.all`; (2) `semantic_vectors`'s own packed-shard
+CAS reads (one per DISTINCT `vector_shards` row, and a real workspace has many
+-- one per embed-batch commit) read one at a time in a plain loop -- now
+bounded-concurrency (`mapWithConcurrency`, limit 16, same magnitude as
+`source-indexer.ts`/`directory-provider.ts`'s own CAS/filesystem concurrency
+caps) via `@urdira/engine`'s `concurrency.ts`. Measured on a 45-real-file
+workspace (multiple `vector_shards`, exceeding one `embed_batch_size`):
+`core:search_semantic` p50 395.7ms -> 328.4ms, p99 493.4ms -> 444.7ms. On a
+2-3-file workspace, latency was already ~42ms before this fix (well under the
+"<100ms on a small workspace" bar) -- both fixes are zero-risk there (nothing
+to parallelize when there is only one shard/one snapshot round trip already
+fast). See `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
+for the full before/after breakdown and the two REMAINING, larger, NOT-fixed-
+this-session cost centers (`exactVectorScan`'s per-candidate `canonicalVectorBytes`
+cost over an uncapped entity-candidate set; `hydrateSemanticCandidates`'s
+sequential, snippet-budget-order-dependent per-candidate CAS read).

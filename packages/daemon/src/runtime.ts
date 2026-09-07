@@ -13,6 +13,7 @@ import { runLexicalReconcileInThread, type LexicalThreadRun } from "./lexical-th
 import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths } from "./ownership.js";
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
 import { ensureSemanticAssetsInProcess, runSemanticReconcileInProcess, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
+import { resolveV4SemanticEntitySource } from "./semantic-v4-wiring.js";
 import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
 import { DAEMON_PRIVATE_INTERFACE_VERSION, daemonRpcCapabilities } from "./compatibility.js";
@@ -954,20 +955,22 @@ function v4WorkspaceReadinessFrom(
   // are one Rust-owned pass) -- source and structural readiness coincide.
   const sourceReady = structuralReady;
   const sourceSnapshotId = durable ? `source-snapshot:${state.durable_generation}` : undefined;
-  // Referenced for parity with v3's signature and to keep a future
-  // entity-grain-aware semantic reconciler a pure addition here (this
-  // function would start reading `semantic.get(...)` the same way v3's
-  // `workspaceReadiness` does); semantic maintenance is not wired for v4
-  // yet (`runV4WorkspaceScan`'s own doc comment), so it is always
-  // unavailable regardless of what this map holds for the workspace.
-  void semantic;
+  // v4 storage wiring (2026-09-07): semantic maintenance now runs for v4
+  // (`submitSemanticMaintenance`, `resolveV4SemanticEntitySource`) -- mirrors
+  // v3's `workspaceReadiness` readiness computation exactly:
+  // `semanticView.materialization_state === "complete"` AND its
+  // `source_snapshot_id` matches the workspace's CURRENT structural
+  // snapshot (guards against a stale view left over from a PRIOR scan while
+  // a newer one is still in flight/pending its own semantic pass).
+  const semanticView = semantic.get(workspace.workspace_id);
+  const semanticReady = structuralReady && semanticView?.materialization_state === "complete" && semanticView.source_snapshot_id === workspace.current_snapshot_id;
   return {
     storage_format: "v4",
     source_ready: sourceReady,
     syntax_ready: structuralReady,
     structural_stage_1_ready: structuralReady,
     structural_ready: structuralReady,
-    semantic_ready: false,
+    semantic_ready: semanticReady,
     ...(sourceSnapshotId === undefined ? {} : { source_snapshot_id: sourceSnapshotId }),
     ...(workspace.current_snapshot_id === undefined ? {} : { structural_snapshot_id: workspace.current_snapshot_id, ...(sourceSnapshotId === undefined ? {} : { structural_source_snapshot_id: sourceSnapshotId }) }),
     source_availability: sourceReady ? "available" : "unavailable",
@@ -978,13 +981,13 @@ function v4WorkspaceReadinessFrom(
     structural_completeness: structuralReady ? "complete" : queryable ? "partial" : "unknown",
     structural_freshness: structuralReady ? "equivalent" : "degraded",
     structural_build_state: structuralReady ? "idle" : scanRunning ? "building" : "not_started",
-    semantic_availability: "unavailable",
-    semantic_completeness: "unsupported",
-    semantic_build_state: "disabled",
+    semantic_availability: semanticReady ? "available" : "unavailable",
+    semantic_completeness: semanticReady ? "complete" : "unknown",
+    semantic_build_state: semanticReady ? "idle" : structuralReady ? "building" : "not_started",
     readiness_reason_codes: [
       ...(sourceReady ? [] : ["core:source_catalog_unavailable"]),
       ...(structuralReady ? [] : [scanRunning ? "core:analysis_in_progress" : "core:structural_snapshot_unavailable"]),
-      "core:plugin_unavailable",
+      ...(semanticReady ? [] : [structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"]),
     ],
     ...(scanRunning && !structuralReady ? { retry_after_ms: 1000 } : {}),
     ...(state.queryable_generation === undefined ? {} : { structural_queryable_generation: state.queryable_generation }),
@@ -1304,9 +1307,11 @@ function v4StatusFields(
     ? lexicalCompletedGeneration !== undefined && structuralDurableGeneration !== undefined && lexicalCompletedGeneration >= structuralDurableGeneration
     : readiness.structural_ready;
   const semanticCompletedGeneration = readiness.semantic_completed_generation;
-  // Semantic maintenance is not wired for v4 yet (`runV4WorkspaceScan`'s own
-  // doc comment) -- always "not current" there, which is simply accurate.
-  const semanticCurrent = isV4 ? false : readiness.semantic_ready;
+  // v4 storage wiring (2026-09-07): `readiness.semantic_ready` is now
+  // meaningful for v4 too (`v4WorkspaceReadinessFrom` computes it from the
+  // SAME `semanticMaterializationView`/current-snapshot comparison v3 uses)
+  // -- no more `isV4`-only override to "always not current".
+  const semanticCurrent = readiness.semantic_ready;
   return {
     storage_format: readiness.storage_format,
     structural: {
@@ -2197,6 +2202,8 @@ interface RunV4WorkspaceScanInput {
   readonly registry: WorkspaceRegistry;
   readonly resolveTransport?: ((workspace: RegisteredWorkspace) => Promise<RustWorkspaceScanTransport | undefined>) | undefined;
   readonly submitLexicalMaintenance: (workspaceId: string) => void;
+  /** v4 storage wiring (2026-09-07): submitted right alongside `submitLexicalMaintenance` on every successful v4 scan -- see this function's own success-path comment for why semantic maintenance is no longer skipped for v4. */
+  readonly submitSemanticMaintenance: (workspaceId: string) => void;
   /** Frente P-1 (`generic-waddling-hartmanis.md` §7.1): the SAME
    * workspace_id -> pack path side channel `core:workspace_add`'s v3 branch
    * already consumes (`pendingIndexPackPaths`, `scheduleWorkspaceScan`'s
@@ -2342,7 +2349,7 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
  * copy of the same policy.
  */
 async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void> {
-  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance, pendingIndexPackPaths } = input;
+  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance, submitSemanticMaintenance, pendingIndexPackPaths } = input;
   // Visible to a readiness poll racing this scan's own first await, before
   // any generation has actually landed: still v4, still "not ready yet",
   // exactly like a v3 workspace mid its own first scan.
@@ -2571,21 +2578,21 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   registry.markReady(workspaceId, outcome.snapshot_id, "ready");
   v4ActiveScanTimelines.delete(workspaceId);
   v4LastScanTimelines.set(workspaceId, timeline);
-  // Semantic maintenance (`reconcileSemanticProjection`) is deliberately NOT
-  // submitted for a v4 workspace here: its entity-grain lane (decision 17,
-  // `@urdira/engine`'s `semantic-reconciler.ts`) reads `record_occurrences`/
-  // `record_value_nodes` -- structural v3 tables that do not exist at all in
-  // the v4 catalog schema (structural data lives entirely in the native
-  // segment store, not SQL, per docs/evidence/2026-09-02-v4-p2-1-schema.md).
-  // Running it against a v4 sidecar+ATTACHed-catalog connection (the way
-  // lexical maintenance below is wired) would fail outright on that lane's
-  // very first query. A structural-store-aware semantic reconciler is real
-  // future work (tracked in docs/evidence/2026-09-02-v4-p2-7-daemon-wiring.md),
-  // not something this task's scope can safely paper over. Lexical
-  // maintenance has no such dependency (it only ever touches catalog +
-  // lexical-sidecar tables), so it is wired for real -- see
-  // `submitLexicalMaintenance`'s v4 branch.
+  // v4 storage wiring (2026-09-07): semantic maintenance (`reconcileSemanticProjection`)
+  // used to be deliberately skipped here -- its entity-grain lane (decision
+  // 17, `@urdira/engine`'s `semantic-reconciler.ts`) read `record_occurrences`/
+  // `record_value_nodes` directly, structural v3 tables that do not exist at
+  // all in the v4 catalog schema (docs/evidence/2026-09-02-v4-p2-1-schema.md).
+  // `submitSemanticMaintenance` now resolves a native-store-backed
+  // `SemanticEntityRecordSource` for a v4 workspace (`resolveV4SemanticEntitySource`,
+  // `semantic-v4-wiring.ts`) and feeds it to the SAME reconciler, so this is
+  // submitted unconditionally, exactly like lexical maintenance below it.
+  // `reconcileSemanticProjection`'s own already-complete fast path means a
+  // scan that published nothing new (e.g. a `reconcile` no-op whose
+  // `completed_generation` already matches the current one) costs this call
+  // two cheap point lookups, never a re-embed.
   submitLexicalMaintenance(workspaceId);
+  submitSemanticMaintenance(workspaceId);
 }
 
 function hasPotentialWorkspaceForkDonor(workspace: RegisteredWorkspace, registry: WorkspaceRegistry): boolean {
@@ -3292,6 +3299,7 @@ export class DaemonRuntime {
                       registry,
                       resolveTransport: options.resolve_workspace_scan_transport,
                       submitLexicalMaintenance,
+                      submitSemanticMaintenance,
                       pendingIndexPackPaths,
                     });
                     workspaceWriterBusyRetries.delete(workspaceId);
@@ -3982,16 +3990,15 @@ export class DaemonRuntime {
         if (provider === undefined) return;
         const durableStorage = indexingStorage;
         if (!durableStorage) return;
-        // v4 (plan §9, P2-7): semantic maintenance is not wired for v4
-        // workspaces at all -- see `runV4WorkspaceScan`'s own doc comment
-        // for why (the entity-grain lane reads structural v3-only tables
-        // that do not exist in the v4 catalog schema). Guarded here, not
-        // only by never calling this from `runV4WorkspaceScan`, so every
-        // OTHER call site (startup prewarm, the coalesced-pending retry,
-        // the periodic sweep) also no-ops instead of repeatedly failing
-        // (caught, logged, harmless, but pure noise) against a v4
-        // workspace's database.
-        if (v4ReadinessState.has(workspaceId)) return;
+        // v4 storage wiring (2026-09-07): semantic maintenance now runs for a
+        // v4 workspace too -- `reconcileSemanticProjection`'s entity-grain
+        // lane is fed a native-store-backed `SemanticEntityRecordSource`
+        // (`resolveV4SemanticEntitySource`, `semantic-v4-wiring.ts`) instead
+        // of the v3-only `record_occurrences`/`record_value_nodes` SQL it
+        // used to require unconditionally. `v4ReadinessState.has(workspaceId)`
+        // is no longer consulted here at all; every call site (post-scan,
+        // post-fork/pack-import, startup prewarm, the coalesced-pending
+        // retry) now behaves identically for v3 and v4.
         if (semanticMaintenanceInFlight.has(workspaceId)) { semanticMaintenancePending.add(workspaceId); return; }
         semanticMaintenanceInFlight.add(workspaceId);
         try {
@@ -4033,10 +4040,24 @@ export class DaemonRuntime {
                   const waitForQueryDrain = async (): Promise<void> => {
                     while (scheduler.hasQueryPressure()) await new Promise<void>((resolve) => setTimeout(resolve, 5));
                   };
-                  reconciled = await reconcileSemanticProjection({ database, workspace_id: workspaceId, content: durableStorage.cas, provider, wait_for_query_drain: waitForQueryDrain, ...(options.semantic_embed_batch_size === undefined ? {} : { embed_batch_size: options.semantic_embed_batch_size }) });
+                  // v4 storage wiring: `undefined` for a v3 workspace, which
+                  // keeps the original SQL path unmodified -- see
+                  // `resolveV4SemanticEntitySource`'s own doc comment.
+                  const entityRecordSource = await resolveV4SemanticEntitySource(database, durableStorage.cas, workspaceId);
+                  reconciled = await reconcileSemanticProjection({ database, workspace_id: workspaceId, content: durableStorage.cas, provider, wait_for_query_drain: waitForQueryDrain, ...(options.semantic_embed_batch_size === undefined ? {} : { embed_batch_size: options.semantic_embed_batch_size }), ...(entityRecordSource === undefined ? {} : { entity_record_source: entityRecordSource }) });
                 }
                 const workspace = options.workspace_registry?.get(workspaceId);
                 semanticMaterializations.set(workspaceId, semanticMaterializationView(workspaceId, reconciled, provider, workspace?.current_snapshot_id ?? ""));
+                // v4 storage wiring (2026-09-07): mirrors `submitLexicalMaintenance`'s
+                // v4 branch updating `lexical_completed_generation` -- a no-op
+                // for a v3 workspace (`v4ReadinessState.has` is false there).
+                // `v4WorkspaceReadinessFrom`/`v4StatusFields` read this back
+                // into `core:index_status`'s `semantic.completed_generation`/
+                // `semantic.current` fields.
+                if (reconciled.marker_written && v4ReadinessState.has(workspaceId)) {
+                  const priorV4Readiness = v4ReadinessState.get(workspaceId);
+                  v4ReadinessState.set(workspaceId, { ...priorV4Readiness, semantic_completed_generation: reconciled.generation });
+                }
               } catch (error) {
                 // Best-effort: same reasoning as `submitLexicalMaintenance`'s
                 // identical catch -- a maintenance failure must never affect
