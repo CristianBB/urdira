@@ -33,6 +33,7 @@ import type {
   PendingSiteRow,
   RecordColumnSelector,
   SemanticAffectedDocumentRow,
+  SemanticCoverageSummaryRow,
   SemanticDocumentStatusCounts,
   SemanticIndexStateSnapshot,
   SemanticVectorRow,
@@ -91,6 +92,31 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     private readonly sqlite: SqliteCanonicalQuerySnapshotPort,
     private readonly interner?: RecordBodyInterner,
   ) {}
+
+  /**
+   * Frente S-F (2026-09-08): `semantic_entity_scope_counts`'s own full
+   * corpus walk (`scanAll`, an FFI batch call PER `VISIBLE_BATCH_SIZE` rows
+   * plus a JS-side filter over every row) is O(corpus), not O(1) -- unlike
+   * every other `semantic_*` method here, it cannot simply delegate to the
+   * SQLite port, because `record_occurrences` (the table that method's
+   * SQLite counterpart counts) is never populated when the structural
+   * corpus lives in the native store (this class's own doc comment). Called
+   * on EVERY `core:search_semantic`/`core:search_hybrid` -- measured live
+   * at 5.0-5.4s on a 2,490-file/~40k-record real corpus (queueing every
+   * OTHER concurrently-fired `semantic_*` call behind it on the same
+   * connection, reproducing the exact multi-second symptom this frente's
+   * own materialized-summary fix was built to eliminate for a DIFFERENT
+   * cost center -- see `docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md`).
+   * The corpus this counts is immutable for a fixed `generation` (only a
+   * NEW generation can change which entities are visible), so caching the
+   * result by generation makes every call after the first, for the SAME
+   * generation, an O(1) map lookup -- exactly the "warm/hot" scenario this
+   * frente's own p99 target (`docs/evidence`'s "n8n completo caliente") is
+   * about. Unbounded by design (one small integer per generation this port
+   * instance has ever seen; a workspace's generation count over a daemon's
+   * lifetime is not adversarial-sized).
+   */
+  private readonly entityScopeCountCache = new Map<number, number>();
 
   static open(database: SqliteDatabase, storeDir: string, sqlite: SqliteCanonicalQuerySnapshotPort, interner?: RecordBodyInterner): NativeCanonicalQuerySnapshotPort {
     const addon = loadNativeStructuralStoreAddon();
@@ -188,7 +214,12 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   }
 
   evictWarmRecords(): void {
-    /* nothing to evict */
+    // Frente S-F (2026-09-08): `entityScopeCountCache`'s own doc comment --
+    // tiny (one integer per generation), but cleared here too so a
+    // long-lived daemon's eviction loop has one uniform "drop everything
+    // this port is caching" entry point, matching the SQLite port's own
+    // `evictWarmRecords()` contract.
+    this.entityScopeCountCache.clear();
   }
 
   async records(scope: QueryScope): Promise<readonly CanonicalQueryRecord[]> {
@@ -460,10 +491,13 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
     const generation = await this.ensureGeneration(scope);
     if (generation === undefined) return { entity_count: 0 };
+    const cached = this.entityScopeCountCache.get(generation);
+    if (cached !== undefined) return { entity_count: cached };
     let entityCount = 0;
     for (const row of this.scanAll(generation)) {
       if (row.category === "entity" && row.kind !== INELIGIBLE_ENTITY_RECORD_KIND) entityCount += 1;
     }
+    this.entityScopeCountCache.set(generation, entityCount);
     return { entity_count: entityCount };
   }
 
@@ -473,5 +507,26 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   async semantic_affected_documents(scope: QueryScope, profileId: string, executableBindingId: string): Promise<readonly SemanticAffectedDocumentRow[]> {
     return this.sqlite.semantic_affected_documents!(scope, profileId, executableBindingId);
+  }
+
+  /**
+   * Frente S-F (2026-09-08): delegates to the wrapped `SqliteCanonicalQuerySnapshotPort`
+   * exactly like every other `semantic_*` method in this class -- this
+   * table lives in SQLite regardless of whether the structural corpus was
+   * moved to the native store (this class's own doc comment: "the catalog,
+   * snapshots, FTS, and vectors stay in SQLite exactly as today"). Missing
+   * this delegation would silently disable the fast path for every v4
+   * native-storage workspace (the daemon's own default and the ONLY
+   * configuration this frente's own live measurements ran against) --
+   * `trySemanticSearch`'s capability check
+   * (`this.snapshots.semantic_coverage_summary !== undefined`) would always
+   * read `undefined` on a bare `NativeCanonicalQuerySnapshotPort` instance,
+   * permanently taking the live-fallback branch and reproducing the exact
+   * multi-second cost this frente's own materialization was built to
+   * eliminate -- caught live via the packages/cli-scale latency
+   * measurement (`docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md`).
+   */
+  async semantic_coverage_summary(scope: QueryScope, profileId: string, executableBindingId: string): Promise<SemanticCoverageSummaryRow | undefined> {
+    return this.sqlite.semantic_coverage_summary!(scope, profileId, executableBindingId);
   }
 }
