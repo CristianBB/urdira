@@ -2910,6 +2910,28 @@ struct ResolvedContainer {
     implements: Vec<String>,
     members: Vec<ResolvedMember>,
     is_interface: bool,
+    /// E-P0k (2026-09-08, same-file member/parameter shadowing task): true
+    /// when this container's OWN source syntactically declared an `extends`
+    /// clause (class `extends <expr>`, or at least one interface `extends`
+    /// entry) that `resolve_heritage_target` could NOT resolve to a known
+    /// container -- a mixin factory call, a qualified/generic name this
+    /// crate does not classify, or a plain identifier naming a class this
+    /// crate never indexed (an external/vendored base, or one from a file
+    /// outside the corpus). `extends` (the `Vec<String>` above) collapses
+    /// "no extends clause at all" and "an unresolvable one" to the exact
+    /// same empty state -- indistinguishable to `collect_members`'s own
+    /// traversal without this flag. That collapse is exactly what let
+    /// `collect_members`'s `implements` fallback fire on a class whose REAL
+    /// member lives on an untracked ancestor further up an extends chain
+    /// this crate gave up on partway (found live against the VS Code
+    /// corpus, 2026-09-07: `MarkersTree extends WorkbenchObjectTree<...>`
+    /// -- `WorkbenchObjectTree`'s own further heritage was never fully
+    /// walkable -- `implements IProblemsWidget` was used as a stand-in for
+    /// `getSelection`/`getHTMLElement`, when the real declaration is
+    /// `AbstractTree.getSelection`, several `extends` hops up an untracked
+    /// chain). See `collect_members`'s own doc comment for how this flag is
+    /// consumed.
+    has_unresolved_extends: bool,
 }
 
 /// Cross-file class/interface member index (P0-S2/P1-A). Built once per
@@ -3092,18 +3114,21 @@ fn insert_file_pass1(
         let resolve = |target: &HeritageTarget| {
             resolve_heritage_target(target, path, import_targets, alias_targets)
         };
+        let resolved_extends: Vec<String> = class
+            .extends
+            .as_ref()
+            .and_then(resolve)
+            .into_iter()
+            .collect();
+        let has_unresolved_extends = class.extends.is_some() && resolved_extends.is_empty();
         containers.insert(
             class.entity_id.clone(),
             ResolvedContainer {
-                extends: class
-                    .extends
-                    .as_ref()
-                    .and_then(resolve)
-                    .into_iter()
-                    .collect(),
+                extends: resolved_extends,
                 implements: class.implements.iter().filter_map(resolve).collect(),
                 members: resolve_members_for(&class.members, path, import_targets, alias_targets),
                 is_interface: false,
+                has_unresolved_extends,
             },
         );
         owned_entities.push(class.entity_id.clone());
@@ -3123,10 +3148,12 @@ fn insert_file_pass1(
         let resolve = |target: &HeritageTarget| {
             resolve_heritage_target(target, path, import_targets, alias_targets)
         };
+        let resolved_extends: Vec<String> = interface.extends.iter().filter_map(resolve).collect();
+        let has_unresolved_extends = resolved_extends.len() != interface.extends.len();
         containers.insert(
             interface.entity_id.clone(),
             ResolvedContainer {
-                extends: interface.extends.iter().filter_map(resolve).collect(),
+                extends: resolved_extends,
                 implements: Vec::new(),
                 members: resolve_members_for(
                     &interface.members,
@@ -3135,6 +3162,7 @@ fn insert_file_pass1(
                     alias_targets,
                 ),
                 is_interface: true,
+                has_unresolved_extends,
             },
         );
         owned_entities.push(interface.entity_id.clone());
@@ -3195,6 +3223,7 @@ fn insert_file_pass1(
                 implements: Vec::new(),
                 members: resolve_members_for(&shape.members, path, import_targets, alias_targets),
                 is_interface: true,
+                has_unresolved_extends: false,
             },
         );
         owned_entities.push(shape.entity_id.clone());
@@ -3285,6 +3314,13 @@ fn run_pass2_for_summary(
         };
         if let Some(container) = containers.get_mut(&class.entity_id) {
             container.extends = vec![target_id];
+            // E-P0k: pass 1 conservatively marked this container's `extends`
+            // unresolved (a `CallMember` mixin target is never resolvable
+            // in pass 1 -- see `resolve_heritage_target`'s own doc comment)
+            // -- now that pass 2 DID resolve it to a real container, the
+            // `extends` chain is exactly as confidently known as an
+            // ordinary resolved `extends` would have been from the start.
+            container.has_unresolved_extends = false;
         }
     }
 }
@@ -4201,15 +4237,51 @@ impl ProgramIndex {
     /// an interface-typed base (see `member_entry_of_signature`'s doc
     /// comment). Depth-capped and cycle-guarded (a malformed/mutually
     /// recursive heritage graph degrades to `None` instead of looping).
+    ///
+    /// E-P0k (2026-09-08): the `implements` fallback above is only ever
+    /// SOUND when the `extends` chain it is standing in for was fully and
+    /// confidently walked to its own end with NO matching member anywhere
+    /// -- i.e. every container from `entity_id` up through its (possibly
+    /// empty) `extends` chain is one this index actually indexed
+    /// (`ResolvedContainer::has_unresolved_extends` doc comment). When ANY
+    /// container along that walk has an `extends` clause this crate could
+    /// not resolve (an external base, a mixin factory, ...), the member
+    /// might genuinely live on that untracked ancestor, several hops above
+    /// where this crate gave up -- using `implements` as a stand-in in that
+    /// situation is a guess this crate's whole discipline exists to refuse
+    /// (found live: `MarkersTree extends WorkbenchObjectTree<...> implements
+    /// IProblemsWidget` resolving `getSelection`/`getHTMLElement` to
+    /// `IProblemsWidget`'s own method SIGNATURE instead of the real
+    /// implementation several `extends` hops up in `AbstractTree`, which
+    /// this crate's heritage classification never fully threaded through).
+    /// `collect_members` now threads an `uncertain` flag back up alongside
+    /// `found`: `Many` (never `One`) as soon as the search comes back both
+    /// EMPTY and uncertain, since "empty and uncertain" and "genuinely
+    /// ambiguous" both mean the same thing here -- do not guess.
     pub fn members(&self, entity_id: &str, name: &str, is_static: bool) -> MemberLookup {
         let mut visited = std::collections::HashSet::new();
         let mut found = Vec::new();
-        self.collect_members(entity_id, name, is_static, &mut visited, &mut found, true);
+        let uncertain =
+            self.collect_members(entity_id, name, is_static, &mut visited, &mut found, true);
         found.sort();
         found.dedup();
-        match found.len() {
-            0 => MemberLookup::None,
-            1 => MemberLookup::One(found.into_iter().next().expect("checked len == 1")),
+        match (found.len(), uncertain) {
+            // `found` empty and uncertain (an untracked ancestor might
+            // genuinely declare `name`) collapses to the SAME `None` a
+            // plain "not found anywhere reachable" already produces -- a
+            // caller already treats `None` as "try another resolution path,
+            // or stay pending", exactly the right response to "we don't
+            // know", never a guess.
+            (0, _) => MemberLookup::None,
+            // `found` is only ever non-empty when SOME level of the walk
+            // matched on ITS OWN `members` list directly, which returns
+            // `uncertain: false` immediately (see `collect_members`'s own
+            // doc comment) -- so `uncertain` is always `false` whenever
+            // `found.len() == 1` in practice; `_` (rather than `false`)
+            // here is defensive, not load-bearing: a future edit that ever
+            // produced `(1, true)` would still land on the safe `Many` arm
+            // below, never a guessed `One`.
+            (1, false) => MemberLookup::One(found.into_iter().next().expect("checked len == 1")),
             _ => MemberLookup::Many(found),
         }
     }
@@ -4271,6 +4343,20 @@ impl ProgramIndex {
         }
     }
 
+    /// Walks `entity_id`'s own members, then its `extends` chain, then (only
+    /// when both `allow_implements_fallback` and the whole `extends` walk
+    /// came back CONFIDENTLY empty) its `implements` chain, collecting every
+    /// match into `found`. Returns `true` ("uncertain") when the search
+    /// came back with `found` still empty AND at least one container along
+    /// the way (including `entity_id` itself) had an `extends` clause this
+    /// crate could not resolve -- see `ResolvedContainer::has_unresolved_
+    /// extends` and `members`'s own doc comment for why an uncertain-and-
+    /// empty result must never fall through to the `implements` fallback,
+    /// and why a caller must treat it exactly like "not found" rather than
+    /// keep searching. A match found directly on some container's own
+    /// members always returns `false` immediately, regardless of any
+    /// unresolved ancestor further up -- an own declaration always wins,
+    /// with total certainty, over anything it might also inherit.
     fn collect_members(
         &self,
         entity_id: &str,
@@ -4279,13 +4365,22 @@ impl ProgramIndex {
         visited: &mut std::collections::HashSet<String>,
         found: &mut Vec<String>,
         allow_implements_fallback: bool,
-    ) {
+    ) -> bool {
         const MAX_DEPTH: usize = 32;
         if visited.len() >= MAX_DEPTH || !visited.insert(entity_id.to_owned()) {
-            return;
+            // A depth-capped or cyclic heritage graph degrades to "nothing
+            // found here" exactly like before this task -- not "uncertain"
+            // (that would block a SIBLING branch's own implements fallback
+            // too, which this specific safety valve has nothing to do
+            // with); vanishingly rare in real TS besides.
+            return false;
         }
         let Some(container) = self.containers.get(entity_id) else {
-            return;
+            // `entity_id` itself is not a known container (e.g. an external
+            // base class from a file this crate never indexed) -- the real
+            // member might live here, several hops past what this crate can
+            // see. Uncertain, never "not found".
+            return true;
         };
         let effective_static = is_static && !container.is_interface;
         for member in &container.members {
@@ -4294,22 +4389,129 @@ impl ProgramIndex {
             }
         }
         if !found.is_empty() {
-            return;
+            return false;
         }
+        if container.has_unresolved_extends {
+            // This container syntactically extends something this crate
+            // could not resolve at all -- same reasoning as the "not a
+            // known container" case above, just one level higher: the real
+            // member may be declared there. Stop here (an unresolvable
+            // `extends` target has no `implements` of its own we could ever
+            // reach anyway) and report uncertain rather than fall through
+            // to THIS container's own `implements` list.
+            return true;
+        }
+        let mut uncertain = false;
         for base in &container.extends {
-            self.collect_members(base, name, is_static, visited, found, false);
+            let base_uncertain = self.collect_members(base, name, is_static, visited, found, false);
             if !found.is_empty() {
-                return;
+                return false;
             }
+            uncertain = uncertain || base_uncertain;
+        }
+        if uncertain {
+            // The `extends` chain came back empty but NOT with full
+            // confidence -- some ancestor along it was itself unresolved or
+            // unindexed. Falling through to `implements` here would use an
+            // interface's own method SIGNATURE as a guessed stand-in for
+            // whatever the untracked ancestor might really declare -- never
+            // sound. Propagate uncertain instead of trying `implements`.
+            return true;
+        }
+        // E-P0k: `allow_implements_fallback` is only ever `true` on the
+        // OUTERMOST call (from `members()` itself -- every recursive call
+        // above passes `false`), so `entity_id` here is the receiver's OWN
+        // container, not some ancestor several hops up. Before using
+        // `implements` as a stand-in for "this class's own body never
+        // declared `name`", check whether some OTHER known container in
+        // this SAME index is a (transitive) `extends` DESCENDANT of
+        // `entity_id` that DOES declare its own `name` -- i.e. a concrete
+        // subclass overrides the very member the interface only describes
+        // the SHAPE of. When one exists, the receiver's REAL runtime type
+        // could legitimately be that narrower subclass (this crate does no
+        // control-flow narrowing at all -- see `has_known_subclass_
+        // override`'s own doc comment for the exact live pattern this
+        // closes: `WorkbenchLayoutStateKey implements IWorkbenchLayoutState
+        // Key`, with `IWorkbenchLayoutStateKey` declaring `zenModeIgnore`
+        // and ONLY the concrete subclass `RuntimeStateKey` (never the
+        // abstract base) declaring its own override) -- guessing the
+        // interface's own signature in that situation is provably UNSOUND
+        // (v3's real checker, honoring control-flow narrowing this crate
+        // does not model, picks the subclass's own declaration instead).
+        if allow_implements_fallback && self.has_known_subclass_override(entity_id, name, is_static)
+        {
+            return true;
         }
         if allow_implements_fallback {
             for interface in &container.implements {
-                self.collect_members(interface, name, false, visited, found, false);
+                let iface_uncertain =
+                    self.collect_members(interface, name, false, visited, found, false);
                 if !found.is_empty() {
-                    return;
+                    return false;
                 }
+                uncertain = uncertain || iface_uncertain;
             }
         }
+        uncertain
+    }
+
+    /// E-P0k (2026-09-08): is there some OTHER known container in this
+    /// index that (a) is a transitive `extends` DESCENDANT of `ancestor_id`
+    /// and (b) declares its OWN `name` member (at the given static/instance
+    /// disposition)? Used ONLY to decide whether `collect_members`'s
+    /// `implements` fallback is safe to use at all -- see that call site's
+    /// own doc comment for the exact live pattern this closes
+    /// (`WorkbenchLayoutStateKey implements IWorkbenchLayoutStateKey`,
+    /// `src/vs/workbench/browser/layout.ts`: the interface declares
+    /// `zenModeIgnore`, the abstract base class does not declare its own,
+    /// and ONLY the concrete subclass `RuntimeStateKey` does, via a
+    /// constructor parameter property). A linear scan over every container
+    /// this index knows about -- deliberately NOT a precomputed reverse
+    /// index (this crate's own incremental add/remove/replace machinery
+    /// would then need to keep a FOURTH index consistent, for a check this
+    /// rare: `collect_members` only ever reaches this point when a
+    /// container's own members AND its ENTIRE resolved `extends` chain both
+    /// came back confidently empty) -- correctness over the extra
+    /// bookkeeping a hot-path index would need.
+    fn has_known_subclass_override(&self, ancestor_id: &str, name: &str, is_static: bool) -> bool {
+        self.containers.iter().any(|(other_id, other_container)| {
+            if other_id == ancestor_id {
+                return false;
+            }
+            let effective_static = is_static && !other_container.is_interface;
+            let declares_own = other_container
+                .members
+                .iter()
+                .any(|member| member.name == name && member.is_static == effective_static);
+            declares_own && self.extends_chain_reaches(other_id, ancestor_id)
+        })
+    }
+
+    /// Whether walking `start_id`'s own `extends` chain (never `implements`
+    /// -- this is specifically about CLASS subclassing, the relationship
+    /// `super`/an overriding declaration follows, not interface
+    /// conformance) reaches `target_id`, at any depth. Depth-capped and
+    /// cycle-guarded exactly like `collect_members`'s own ancestor walk (a
+    /// malformed/cyclic heritage graph degrades to `false`, never a hang).
+    fn extends_chain_reaches(&self, start_id: &str, target_id: &str) -> bool {
+        const MAX_DEPTH: usize = 32;
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![start_id.to_owned()];
+        while let Some(current) = stack.pop() {
+            if visited.len() >= MAX_DEPTH || !visited.insert(current.clone()) {
+                continue;
+            }
+            let Some(container) = self.containers.get(&current) else {
+                continue;
+            };
+            for base in &container.extends {
+                if base == target_id {
+                    return true;
+                }
+                stack.push(base.clone());
+            }
+        }
+        false
     }
 
     /// P1-A: the declared TYPE of member `name` on `entity_id` (at the given
@@ -5939,6 +6141,93 @@ mod tests {
         assert_eq!(
             index.members(&impl_id, "greet", false),
             MemberLookup::One(greeter_greet_id)
+        );
+    }
+
+    /// E-P0k (2026-09-08): found live against the VS Code corpus --
+    /// `MarkersTree extends WorkbenchObjectTree<...> implements
+    /// IProblemsWidget` resolved `getSelection`/`getHTMLElement` to
+    /// `IProblemsWidget`'s own method SIGNATURE, not the real
+    /// implementation several `extends` hops up an untracked chain
+    /// (`WorkbenchObjectTree`'s own further heritage was never fully
+    /// resolvable by this crate). This fixture reproduces the SAME shape
+    /// minimally: `Sub`'s `extends UnknownBase` names an identifier this
+    /// crate cannot resolve to any known container at all (never declared,
+    /// never imported) -- `has_unresolved_extends` must be `true` for
+    /// `Sub`, and `members` must refuse to guess via `implements` (`None`,
+    /// never `IFace`'s own member signature).
+    #[test]
+    fn members_never_guesses_implements_when_the_extends_chain_is_unresolved() {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface IFace {\n  run(): void;\n}\nclass Sub extends UnknownBase implements IFace {\n  other() {}\n}\n",
+        );
+        let sub_id = file_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.members(&sub_id, "run", false),
+            MemberLookup::None,
+            "must never guess IFace's own signature when Sub's real extends \
+             chain (UnknownBase) could not be resolved at all"
+        );
+    }
+
+    /// E-P0k companion: the SAME shape, but `Sub`'s own extends chain IS
+    /// fully resolvable and genuinely empty of the member -- `Base` (no
+    /// heritage of its own) confidently declares no `run` anywhere in its
+    /// chain, so falling through to `IFace`'s own signature is the
+    /// legitimate, pre-existing behavior `members_falls_back_to_implements_
+    /// when_own_chain_misses` already covers for a DIRECT `implements`
+    /// (no `extends` at all); this variant proves the same soundness holds
+    /// when there IS a resolvable `extends` in between.
+    #[test]
+    fn members_still_falls_back_to_implements_when_the_extends_chain_is_fully_resolved_and_empty() {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Base {\n  other2() {}\n}\ninterface IFace {\n  run(): void;\n}\nclass Sub extends Base implements IFace {\n  other() {}\n}\n",
+        );
+        let iface_run_id = file_summary.interfaces[0].members[0].entity_id.clone();
+        let sub_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.members(&sub_id, "run", false),
+            MemberLookup::One(iface_run_id)
+        );
+    }
+
+    /// E-P0k (2026-09-08): found live against the VS Code corpus --
+    /// `abstract class WorkbenchLayoutStateKey implements
+    /// IWorkbenchLayoutStateKey` (the interface declares `zenModeIgnore`;
+    /// the abstract base never declares its own) with a KNOWN subclass,
+    /// `RuntimeStateKey`, that DOES declare its own `zenModeIgnore`
+    /// (a constructor parameter property) -- resolving a `WorkbenchLayout
+    /// StateKey`-typed receiver's `.zenModeIgnore` must never confidently
+    /// pick the interface's own signature over the subclass's real
+    /// override: this crate does no control-flow narrowing, so the
+    /// receiver's actual runtime type could legitimately be the subclass.
+    /// Companion to `members_still_falls_back_to_implements_when_the_
+    /// extends_chain_is_fully_resolved_and_empty`, which proves the
+    /// implements fallback STAYS legitimate when no such subclass exists.
+    #[test]
+    fn members_never_guesses_implements_when_a_known_subclass_overrides_the_same_member() {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface IFace {\n  run(): void;\n}\nabstract class Base implements IFace {\n  other() {}\n}\nclass Sub extends Base {\n  run(): void {}\n}\n",
+        );
+        let base_id = file_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.members(&base_id, "run", false),
+            MemberLookup::None,
+            "must never guess IFace's own signature when Sub's own \
+             override of `run` exists -- the receiver's real runtime type \
+             might be Sub, not Base"
         );
     }
 
