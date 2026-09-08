@@ -245,6 +245,86 @@ describeIfBuilt("v4 daemon semantic maintenance end-to-end (real urdira-indexing
     }
   }, 180_000);
 
+  // Frente S-H (2026-09-08, Part 1, `generic-waddling-hartmanis.md` §4):
+  // fixes Bug 4 of `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`
+  // -- `scheduleWorkspaceScan` used to call `semanticThreadRuns.get(id)?.abort()`
+  // UNCONDITIONALLY the instant ANY scan was admitted, including the
+  // periodic reconciliation sweep's own "just double-check nothing changed"
+  // scan (`activity: "checking_for_updates"`), which by construction cannot
+  // know in advance whether anything changed. At real n8n scale this meant
+  // the semantic maintenance child process was torn down and restarted from
+  // scratch every sweep tick, FOREVER, before it could ever reach its own
+  // finalize step. This test reproduces the exact race hermetically: a very
+  // short `reconciliation_sweep_interval_ms` (25ms) fires many sweep ticks
+  // while the FIRST semantic maintenance pass for this workspace is still
+  // spawning/running (real child process(es) via `runSemanticReconcileSharded`,
+  // the same threaded path the two tests above already exercise, so
+  // `semanticThreadRuns` is genuinely populated and genuinely abortable --
+  // an in-process/injected-hook provider would never touch that map at all
+  // and would make this test pass vacuously, proving nothing). Before the
+  // fix: this either times out (a livelock -- the pass never survives long
+  // enough to reach `semantic.current`, matching this frente's own live
+  // n8n-scale observation) or, if it does eventually win the race, reports
+  // more than one semantic-maintenance start. After the fix: `semantic.current`
+  // is reached quickly and `on_semantic_maintenance_started` fired EXACTLY
+  // once -- every sweep tick admitted while that first pass was still
+  // running resolved to a `Reconcile`/`Noop` scan (no file changed) and
+  // therefore never called `preemptMaintenanceForPublish` at all.
+  it("a short reconciliation sweep interval does not restart in-flight semantic maintenance (Bug 4 fix): semantic.current is reached with exactly 1 semantic-maintenance start", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-semantic-e2e-sweep-data-"));
+    const workspaceRoot = await seedFixtureWorkspace();
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    const semanticMaintenanceStarts: string[] = [];
+    try {
+      process.env["URDIRA_V4"] = "1";
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-semantic-e2e-sweep",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async (): Promise<WorkspaceScanPluginProvider> => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_descriptor: { kind: "hash" },
+        // Deliberately much shorter than the ~5min production default and
+        // than the 0 (disabled) every OTHER test in this file uses -- the
+        // whole point of this test is to fire many sweep ticks WHILE the
+        // first real semantic-maintenance pass is still in flight.
+        reconciliation_sweep_interval_ms: 25,
+        on_semantic_maintenance_started: (workspaceId) => { semanticMaintenanceStarts.push(workspaceId); },
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+      const added = await client.call("core:workspace_add", { args: [workspaceRoot], confirmed: true });
+      expect(added.outcome, JSON.stringify(added)).toBe("success");
+      const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilStructuralReady(client, workspaceId);
+
+      // Before the fix, this poll could time out entirely (livelock) --
+      // see this test's own doc comment above.
+      const readyStatus = await pollUntilSemanticCurrent(client, workspaceId, 60_000);
+      expect(readyStatus.semantic?.completed_generation).toBeGreaterThan(0);
+
+      const startsForThisWorkspace = semanticMaintenanceStarts.filter((id) => id === workspaceId);
+      expect(startsForThisWorkspace, `semantic maintenance restarted ${startsForThisWorkspace.length} times instead of running to completion once -- Bug 4 (docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md) regressed`).toHaveLength(1);
+    } finally {
+      if (runtime) await runtime.stop();
+      for (const transport of sessions.values()) {
+        await transport.shutdown().catch(() => undefined);
+        await transport.terminate().catch(() => undefined);
+      }
+      delete process.env["URDIRA_V4"];
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 180_000);
+
   // Frente S-D (2026-09-07, Lever 2): the SAME v4 e2e flow above, but with
   // `semantic_shard_count: 2` -- `submitSemanticMaintenance` now runs
   // `runSemanticReconcileSharded` with 2 concurrent child processes instead

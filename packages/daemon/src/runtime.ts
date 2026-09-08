@@ -143,6 +143,19 @@ export interface DaemonRuntimeOptions {
    */
   readonly reconciliation_sweep_interval_ms?: number;
   /**
+   * Frente S-H (`generic-waddling-hartmanis.md` §4, Part 1, fixing Bug 4 of
+   * `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`): fires
+   * once per genuine (`scheduler.submit` admitted, i.e. not coalesced into
+   * `semanticMaintenancePending`) semantic-maintenance run, right as that
+   * run starts -- BEFORE `runSemanticReconcileSharded`/`runSemanticReconcileInProcess`
+   * is called. Test-only instrumentation (a plain counter in the test, not a
+   * behavioral hook: nothing in production reads this) proving that a
+   * no-change periodic reconciliation sweep no longer restarts an in-flight
+   * semantic maintenance pass -- see `preemptMaintenanceForPublish`'s own
+   * doc comment in `DaemonRuntime.start` for the fix this counts.
+   */
+  readonly on_semantic_maintenance_started?: (workspace_id: string) => void;
+  /**
    * Burst-aggregation window (in ms) for watcher-triggered edit scans (see
    * `scheduleWorkspaceScan`'s `scanAggregationBuffers`/`flushScanAggregation`
    * below, `packages/daemon/src/runtime.ts`). Measured problem: when no scan
@@ -2105,6 +2118,24 @@ interface V4WorkspaceReadinessState {
    * until the first residual pass for this workspace completes in this
    * daemon process's lifetime. */
   readonly upgrade_pending_sites?: number | undefined;
+  /**
+   * Frente S-H (`generic-waddling-hartmanis.md` §4, Part 1): `true` once
+   * `runV4WorkspaceScan` has called `submitSemanticMaintenance` for this
+   * workspace at least once in this daemon process's lifetime -- lets a
+   * LATER scan that turns out to be a `Reconcile`/`Noop` (nothing changed)
+   * skip calling it again (see that call site's own doc comment for why:
+   * without this, the periodic reconciliation sweep's coalesced-pending
+   * retry mechanism spawns a whole new semantic-maintenance child process
+   * on every sweep tick that lands while an earlier real pass is still
+   * running, purely to re-confirm the already-complete fast path holds).
+   * The very first call for a workspace always fires regardless of this
+   * flag being unset -- including the one legitimate case where the FIRST
+   * scan a workspace ever sees is itself a `Reconcile` (an index-pack
+   * import onto an already-current donor tree, plan §7.1.3): `undefined`
+   * here is indistinguishable from "never submitted", so that call is never
+   * skipped.
+   */
+  readonly semantic_maintenance_submitted?: boolean | undefined;
 }
 const v4ReadinessState = new Map<string, V4WorkspaceReadinessState>();
 /**
@@ -2285,6 +2316,18 @@ interface RunV4WorkspaceScanInput {
    * branch can consume it too. Optional only so v4-scan unit tests that do
    * not exercise index-pack import at all can omit it. */
   readonly pendingIndexPackPaths?: Map<string, string>;
+  /**
+   * Frente S-H (`generic-waddling-hartmanis.md` §4, Part 1): called from
+   * `onQueryableLive` below, the moment this scan's OWN run confirms a real
+   * generation is about to publish (never invoked for a `Reconcile` scan
+   * that resolves to `ReconcileMode.Noop` -- see
+   * `preemptMaintenanceForPublish`'s own doc comment in
+   * `DaemonRuntime.start` for the full mechanism this closes). Optional so
+   * v4-scan unit tests that never populate `semanticThreadRuns`/
+   * `lexicalThreadRuns` at all can omit it -- a no-op then, same as calling
+   * `.abort()` on a map with no entry for this workspace.
+   */
+  readonly preemptMaintenanceForPublish?: (workspaceId: string) => void;
 }
 
 /**
@@ -2440,7 +2483,7 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
  * copy of the same policy.
  */
 async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void> {
-  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance, submitSemanticMaintenance, pendingIndexPackPaths } = input;
+  const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance, submitSemanticMaintenance, pendingIndexPackPaths, preemptMaintenanceForPublish } = input;
   // Visible to a readiness poll racing this scan's own first await, before
   // any generation has actually landed: still v4, still "not ready yet",
   // exactly like a v3 workspace mid its own first scan.
@@ -2574,6 +2617,13 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // leaves a dangling `queryable_generation` with no corresponding durable
   // state.
   const onQueryableLive = (event: { readonly generation: number }): void => {
+    // Frente S-H (Part 1): the earliest point THIS scan's own run body can
+    // confirm a real generation is actually about to publish -- never
+    // reached at all for a `Reconcile` scan that resolves to
+    // `ReconcileMode.Noop` (see `preemptMaintenanceForPublish`'s own doc
+    // comment). Redundant (and harmless) when `scheduleWorkspaceScan`
+    // already pre-empted eagerly at admission for this scan's `activity`.
+    preemptMaintenanceForPublish?.(workspaceId);
     timeline.queryable_at = Date.now();
     debugTiming(`workspace=${workspaceId} queryable_at generation=${event.generation}`);
     v4ReadinessState.set(workspaceId, { ...v4ReadinessState.get(workspaceId), queryable_generation: event.generation });
@@ -2657,6 +2707,19 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // already follow above) -- a residual pass's own reported completion must
   // survive the NEXT structural scan, not be wiped by it.
   const residualEnabled = process.env["URDIRA_V4_RESIDUAL"] !== undefined && process.env["URDIRA_V4_RESIDUAL"] !== "0";
+  // Frente S-H (Part 1): a true `Reconcile`/`Noop` (R3, `crates/urdira-
+  // indexing-worker/src/v4/scan.rs`) means nothing changed -- no new
+  // generation published, nothing new for semantic/lexical maintenance to
+  // catch up on. Once maintenance has been submitted at least once for this
+  // workspace (`semantic_maintenance_submitted`, below), a further no-op
+  // scan skips resubmitting it entirely -- see the tail of this function for
+  // why this matters beyond a "cheap fast-path lookup": the THREADED path
+  // spawns a real child process per submission, and without this check the
+  // periodic reconciliation sweep's own coalesced-pending retry (`submit
+  // SemanticMaintenance`'s own `semanticMaintenancePending` mechanism)
+  // spawns one every time a no-op sweep tick's own scan happens to land
+  // while an earlier, real pass is still running.
+  const isReconcileNoop = scope.kind === "reconcile" && outcome.reconcile?.mode === "noop";
   v4ReadinessState.set(workspaceId, {
     queryable_generation: outcome.queryable?.generation ?? outcome.generation,
     durable_generation: outcome.generation,
@@ -2665,6 +2728,7 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
     upgrade_completed_generation: priorReadiness?.upgrade_completed_generation,
     upgrade_pending_sites: priorReadiness?.upgrade_pending_sites,
     upgrade_running: residualEnabled ? true : priorReadiness?.upgrade_running,
+    semantic_maintenance_submitted: priorReadiness?.semantic_maintenance_submitted === true || !isReconcileNoop,
   });
   timeline.readiness_updated_at = Date.now();
   debugTiming(`workspace=${workspaceId} readiness_updated_at (durable)`);
@@ -2678,14 +2742,25 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // all in the v4 catalog schema (docs/evidence/2026-09-02-v4-p2-1-schema.md).
   // `submitSemanticMaintenance` now resolves a native-store-backed
   // `SemanticEntityRecordSource` for a v4 workspace (`resolveV4SemanticEntitySource`,
-  // `semantic-v4-wiring.ts`) and feeds it to the SAME reconciler, so this is
-  // submitted unconditionally, exactly like lexical maintenance below it.
+  // `semantic-v4-wiring.ts`) and feeds it to the SAME reconciler.
   // `reconcileSemanticProjection`'s own already-complete fast path means a
   // scan that published nothing new (e.g. a `reconcile` no-op whose
   // `completed_generation` already matches the current one) costs this call
-  // two cheap point lookups, never a re-embed.
+  // two cheap point lookups when it runs in-process -- but Frente S-H found
+  // live that submitting it UNCONDITIONALLY on every scan, combined with
+  // `submitSemanticMaintenance`'s own coalesced-pending retry, spawns a
+  // whole new child process on the THREADED path (the shipped default) for
+  // every no-op periodic-sweep tick that happens to land while an earlier
+  // real pass is still running -- see `isReconcileNoop`/
+  // `semantic_maintenance_submitted` above. Skipped here ONLY once
+  // maintenance has genuinely been submitted at least once already for this
+  // workspace; always still submitted lexical maintenance regardless (a
+  // separate, smaller-blast-radius lever left as a follow-up, not fixed by
+  // this frente -- lexical's own coalesced retry is not spawning a
+  // subprocess for the SAME test-observed failure mode this frente was
+  // asked to fix).
   submitLexicalMaintenance(workspaceId);
-  submitSemanticMaintenance(workspaceId);
+  if (!isReconcileNoop || priorReadiness?.semantic_maintenance_submitted !== true) submitSemanticMaintenance(workspaceId);
 }
 
 function hasPotentialWorkspaceForkDonor(workspace: RegisteredWorkspace, registry: WorkspaceRegistry): boolean {
@@ -3101,6 +3176,49 @@ export class DaemonRuntime {
       // comment -- the in-process path never populates this map either
       // way), or when nothing is currently running for this workspace.
       const semanticThreadRuns = new Map<string, SemanticProcessRun>();
+      /**
+       * Frente S-H (`generic-waddling-hartmanis.md` §4, Part 1) -- fixes Bug
+       * 4 of `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`:
+       * pre-empts an in-flight threaded lexical/semantic maintenance run,
+       * same two calls `scheduleWorkspaceScan` used to make UNCONDITIONALLY
+       * the instant ANY scan was admitted -- including the periodic
+       * reconciliation sweep's own "just double-check nothing changed" scan,
+       * which by definition does not yet know whether anything will turn out
+       * to have changed. `scheduleWorkspaceScan` below now calls this
+       * EAGERLY, at admission, only for a scan that is KNOWN in advance to
+       * publish a real generation (a genuine edit, an explicit
+       * `core:reindex`, a first-ever scan, ...); for the one ambiguous case
+       * -- `activity === "checking_for_updates"`, the periodic sweep's own
+       * signal for "an already-`ready` workspace, unknown whether anything
+       * changed" (`DaemonRuntimeOptions.reconciliation_sweep_interval_ms`'s
+       * doc comment; the ONLY call site that ever passes this activity) --
+       * admission does NOT call this, and this is instead called lazily,
+       * from within the scan's own run body, at the earliest point that
+       * body can confirm a real generation is actually about to publish:
+       * v4's `onQueryableLive` (never invoked by `run_reconcile`'s `Noop`
+       * branch -- `crates/urdira-indexing-worker/src/v4/scan.rs`, R3: a true
+       * no-op never calls `Catalog::apply` and never becomes queryable) and
+       * v3's `on_stage_published` (`workspace-indexing-session.ts`'s own doc
+       * comment: "the expanded agent benchmark measures the source-first
+       * structural readiness boundary" -- fired only once a stage's
+       * `runFullWorkspaceScan` call actually published a real snapshot, not
+       * for a periodic equivalence check that found nothing). A no-op sweep
+       * therefore never touches an unrelated in-flight maintenance pass at
+       * all; a real change still pre-empts it, just at the (slightly later,
+       * but WAL-safe: see `SerializedWriter`'s own busy-retry doc comment
+       * this same file's `WORKSPACE_WRITER_BUSY_MAX_RETRIES` already relies
+       * on for the identical class of contention) moment the scan itself
+       * confirms real work rather than guessing at admission time. Calling
+       * this more than once for the same workspace (the eager call already
+       * fired, then the lazy hook ALSO fires once the scan's own body
+       * confirms real work) is harmless: `.abort()` on an already-aborted or
+       * already-finished run is a no-op, and a workspace with no run
+       * in-flight resolves to `undefined` either way.
+       */
+      const preemptMaintenanceForPublish = (workspaceId: string): void => {
+        lexicalThreadRuns.get(workspaceId)?.abort();
+        semanticThreadRuns.get(workspaceId)?.abort();
+      };
       // Hints (Phase 5's changed-path plumbing, `WorkspaceWatcherManagerOptions.on_reconcile`,
       // `packages/engine/src/watchers.ts`) that arrived for a workspace while
       // its scan was already running: `full: true` means at least one of the
@@ -3321,14 +3439,24 @@ export class DaemonRuntime {
         scanGenerations.set(workspaceId, scanGeneration);
         const requestedUris = changedUris === undefined ? undefined : [...new Set(changedUris)];
         if (authoritativeDeletes.length > 0) activeAuthoritativeDeletePhases.set(workspaceId, new Set(authoritativeDeletes.map((event) => event.normalized_uri)));
-        // Pre-empt a stale in-flight threaded lexical build (see
-        // `lexicalThreadRuns`'s doc comment above) as early as possible --
-        // before this scan is even admitted to the scheduler -- rather than
-        // waiting for it to actually start running.
-        lexicalThreadRuns.get(workspaceId)?.abort();
-        // Same pre-emption, same rationale, for a threaded semantic
-        // maintenance run -- see `semanticThreadRuns`'s doc comment above.
-        semanticThreadRuns.get(workspaceId)?.abort();
+        // Pre-empt a stale in-flight threaded lexical/semantic maintenance
+        // run (see `preemptMaintenanceForPublish`'s own doc comment above)
+        // as early as possible -- before this scan is even admitted to the
+        // scheduler -- rather than waiting for it to actually start running.
+        // Frente S-H: skipped here for `"checking_for_updates"` (the
+        // periodic reconciliation sweep's own signal that this scan does
+        // not yet know whether anything actually changed, the ONLY activity
+        // value this daemon ever schedules that admission cannot already
+        // tell will publish) -- that ambiguous case defers the same call to
+        // `preemptMaintenanceForPublish`'s lazy call sites instead
+        // (`onQueryableLive` in `runV4WorkspaceScan`, `on_stage_published`
+        // below), which fire only once the scan's own run body confirms a
+        // real generation is actually about to publish. Every OTHER
+        // activity value (a genuine edit, `core:reindex`, a first-ever scan,
+        // outdated-format recovery, ...) is by construction always about to
+        // publish, so pre-empting eagerly here is unchanged from before this
+        // fix for all of them.
+        if (activity !== "checking_for_updates") preemptMaintenanceForPublish(workspaceId);
         try {
           scheduler.submit({
             job_id: `workspace-scan:${workspaceId}:${randomUUID()}`,
@@ -3394,6 +3522,7 @@ export class DaemonRuntime {
                       submitLexicalMaintenance,
                       submitSemanticMaintenance,
                       pendingIndexPackPaths,
+                      preemptMaintenanceForPublish,
                     });
                     workspaceWriterBusyRetries.delete(workspaceId);
                     notifyReadinessChanged(workspaceId);
@@ -3554,6 +3683,14 @@ export class DaemonRuntime {
                       // before exposing the new stage; equivalent checks
                       // never enter this callback and stay labeled checking.
                       scanActivities.set(workspaceId, "indexing");
+                      // Frente S-H (Part 1), v3 sibling of `onQueryableLive`'s
+                      // identical call: this callback ONLY fires once a real
+                      // snapshot has published for this stage -- a pure
+                      // equivalence check (no change found) never reaches it
+                      // -- so this is the earliest point a `"checking_for_updates"`
+                      // scan (skipped at admission, see `preemptMaintenanceForPublish`'s
+                      // own doc comment) can confirm real work is happening.
+                      preemptMaintenanceForPublish(workspaceId);
                       if (stage.ordinal < stage.stage_count) registry.markStructuralStagePublished(workspaceId, stageResult.snapshot_id);
                       notifyReadinessChanged(workspaceId);
                     },
@@ -4117,6 +4254,10 @@ export class DaemonRuntime {
             workspace_id: workspaceId,
             pool: "semantic",
             run: async () => {
+              // Frente S-H: one genuine run admission (never fired for a
+              // call coalesced into `semanticMaintenancePending` above) --
+              // see `on_semantic_maintenance_started`'s own doc comment.
+              options.on_semantic_maintenance_started?.(workspaceId);
               let database: WorkspaceDatabase | undefined;
               try {
                 // `semanticThreadEligible` (see its own doc comment above)
