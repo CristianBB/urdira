@@ -109,6 +109,35 @@ export async function ensureWorkspaceSchemaCompatibility(database: SqliteDatabas
   if (!vectorNames.has("document_grain")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN document_grain TEXT");
   if (!vectorNames.has("document_ref")) await database.exec("ALTER TABLE vector_projection_rows ADD COLUMN document_ref TEXT");
   await database.exec("CREATE INDEX IF NOT EXISTS vector_projection_document_ref_idx ON vector_projection_rows(workspace_id, document_grain, document_ref)");
+  // Frente S-G (2026-09-08): `reconcileSemanticProjection`'s own
+  // ARTIFACT-grain "missing rows" query (semantic-reconciler.ts) runs a
+  // `NOT EXISTS` against this table correlated by `(workspace_id,
+  // owner_artifact_id, owner_artifact_version_id)`, filtered further by
+  // `document_grain IS NULL`/`valid_to_generation IS NULL`/`profile_id`/
+  // `executable_binding_id`. Neither pre-existing index on this table leads
+  // with the owner columns, so that correlated subquery could only narrow
+  // to the workspace's ENTIRE open vector-projection set and then scan it
+  // by hand per outer `artifact_versions` row -- confirmed live via
+  // `EXPLAIN QUERY PLAN` at n8n scale (72,922 open entity rows, 20,149
+  // artifact_versions rows): ~1.47 BILLION comparisons, the query did not
+  // complete in 120 seconds against the real corpus. Created HERE (not in
+  // the raw `workspace-v3.sql` schema string, where `document_grain` is a
+  // column this same schema string's own `CREATE TABLE` only added
+  // recently) rather than in `workspace-v3.sql` directly: a pre-existing
+  // (legacy) database opened through this exact function has NOT yet run
+  // the `ALTER TABLE ... ADD COLUMN document_grain` above until this point
+  // in this function's own execution, so an index referencing that column
+  // in the schema string itself (applied earlier, via `initializeSchema`)
+  // fails with "no such column: document_grain" against such a database --
+  // confirmed live by the "pre-migration database open" test in
+  // tests/semantic-maintenance.test.ts. This mirrors
+  // `vector_projection_document_ref_idx`'s own identical placement
+  // reasoning immediately above. The v4 semantic sidecar's OWN identical
+  // copy of this index stays in its raw schema string
+  // (`workspace-v4-semantic.sql`) instead: that sidecar's `document_grain`
+  // column has been part of its base `CREATE TABLE` since its very first
+  // version, so it has no equivalent legacy gap.
+  await database.exec("CREATE INDEX IF NOT EXISTS vector_projection_by_owner_idx ON vector_projection_rows(workspace_id, owner_artifact_id, owner_artifact_version_id, document_grain, valid_to_generation, profile_id, executable_binding_id)");
   // Frente S-B (2026-09-06, R22): per-segment identity columns -- an
   // artifact-grain row (still one vector, R9) keeps `segment_index = 0` and
   // NULL `segment_start`/`segment_end` (nothing to distinguish); an

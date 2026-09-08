@@ -576,14 +576,55 @@ export type EntityEligibility =
   | { readonly eligible: false }
   | { readonly eligible: true; readonly kind: string; readonly label: string; readonly start: number; readonly end: number };
 
-export function evaluateEntityEligibility(recordKind: string, body: Record<string, unknown>, fileText: string, minSpanLength: number): EntityEligibility {
-  if (recordKind === INELIGIBLE_ENTITY_RECORD_KIND) return { eligible: false };
+/**
+ * Root-cause fix (`docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`,
+ * plan `generic-waddling-hartmanis.md` §4, hypothesis (f)): the record
+ * `kind` column (container exclusion), the body's OWN `kind` field
+ * (`INELIGIBLE_ENTITY_BODY_KINDS`, e.g. `"parameter"`), and the span
+ * LENGTH (`end - start`, both already plain numeric fields on `body`) are
+ * every one of `evaluateEntityEligibility`'s checks that need NEITHER the
+ * owning file's decoded text NOR any CAS read at all -- only the
+ * column-0/top-level test actually indexes `fileText`'s own characters.
+ * Measured live at n8n scale: of 366,059 classified `semantic_document_status`
+ * entity rows, 79,769 fail on body `kind` alone (`"unsupported"`) and the
+ * overwhelming majority of the remaining 257,918 `"excluded"` rows fail on
+ * span length alone (`below_min_length`, not position) -- every one of
+ * those previously still paid a full owning-file `content.read` (CAS read)
+ * + UTF-8 decode via `ownerFileState` (`reconcileSemanticProjection`'s
+ * `processMissingEntityRow`) before this eligibility check ever ran, only
+ * to discard the very text it just paid to fetch on the very next line.
+ * With `entityCandidates()`'s own non-owner-sorted keyset pagination (see
+ * `semantic-entity-source-v4.ts`'s doc comment) and only a
+ * `OWNER_FILE_STATE_CACHE_CAP`-sized (64) LRU, that CAS read thrashed
+ * constantly at full-corpus scale instead of amortizing across a file's
+ * many candidate entities -- this is the confirmed dominant cost of the
+ * observed ~0.03 status-rows/second stall. Splitting the checks lets
+ * `processMissingEntityRow` reject a `kind`- or span-doomed candidate
+ * WITHOUT ever touching the owning file, for free (no I/O, no decode,
+ * just two field reads and a subtraction) -- `evaluateEntityEligibility`
+ * itself is unchanged byte-for-byte in return value for every input, it
+ * simply delegates its first three checks here instead of repeating them.
+ */
+export type EntityPreTextEligibility =
+  | { readonly stage: "ineligible" }
+  | { readonly stage: "needs_text"; readonly kind: string; readonly start: number; readonly end: number };
+
+export function evaluateEntityPreTextEligibility(recordKind: string, body: Record<string, unknown>, minSpanLength: number): EntityPreTextEligibility {
+  if (recordKind === INELIGIBLE_ENTITY_RECORD_KIND) return { stage: "ineligible" };
   const kind = typeof body["kind"] === "string" ? body["kind"] as string : undefined;
-  if (kind === undefined || INELIGIBLE_ENTITY_BODY_KINDS.has(kind)) return { eligible: false };
+  if (kind === undefined || INELIGIBLE_ENTITY_BODY_KINDS.has(kind)) return { stage: "ineligible" };
   const start = typeof body["start"] === "number" ? body["start"] : undefined;
   const end = typeof body["end"] === "number" ? body["end"] : undefined;
-  if (start === undefined || end === undefined || !Number.isFinite(start) || !Number.isFinite(end)) return { eligible: false };
-  if (start < 0 || end > fileText.length || end - start < minSpanLength) return { eligible: false };
+  if (start === undefined || end === undefined || !Number.isFinite(start) || !Number.isFinite(end)) return { stage: "ineligible" };
+  if (start < 0 || end - start < minSpanLength) return { stage: "ineligible" };
+  return { stage: "needs_text", kind, start, end };
+}
+
+export function evaluateEntityEligibility(recordKind: string, body: Record<string, unknown>, fileText: string, minSpanLength: number): EntityEligibility {
+  const pre = evaluateEntityPreTextEligibility(recordKind, body, minSpanLength);
+  if (pre.stage === "ineligible") return { eligible: false };
+  const { kind, start, end } = pre;
+  if (end > fileText.length) return { eligible: false };
   let lineStart = start;
   while (lineStart > 0 && fileText[lineStart - 1] !== "\n") lineStart -= 1;
   if (lineStart !== start && (fileText[lineStart] === " " || fileText[lineStart] === "\t")) return { eligible: false };
@@ -819,6 +860,36 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     generation, ...counts, marker_written: markerWritten, ...(aborted === undefined ? {} : { aborted }),
   });
 
+  // Frente S-G (2026-09-08): per-phase timing/counters for the n8n embed
+  // stall investigation (`docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`),
+  // same `URDIRA_DEBUG_TIMING=1` convention `workspace-indexing-session.ts`'s
+  // own scan-phase timing already uses. Gated behind the env var so this
+  // costs nothing (one boolean check per `timedPhase` call) on every
+  // ordinary pass. Accumulates across the WHOLE call (which itself can run
+  // for hours at full n8n scale) and prints a snapshot at most once every
+  // `DEBUG_TIMING_PRINT_INTERVAL_MS`, checked from the entity page loop
+  // (the only loop this pass can spend more than a few seconds inside
+  // between two `await` points at full corpus scale).
+  const debugTiming = process.env["URDIRA_DEBUG_TIMING"] === "1";
+  const phaseTimingsMs: Record<string, number> = {};
+  const phaseCounts: Record<string, number> = {};
+  const timedPhase = async <T>(phase: string, action: () => Promise<T>): Promise<T> => {
+    if (!debugTiming) return action();
+    const startedAt = performance.now();
+    try { return await action(); } finally { phaseTimingsMs[phase] = (phaseTimingsMs[phase] ?? 0) + (performance.now() - startedAt); }
+  };
+  const bumpPhaseCount = (counter: string, by = 1): void => { if (debugTiming) phaseCounts[counter] = (phaseCounts[counter] ?? 0) + by; };
+  const DEBUG_TIMING_PRINT_INTERVAL_MS = 30_000;
+  let lastDebugPrintAt = performance.now();
+  const printDebugTimingIfDue = (): void => {
+    if (!debugTiming) return;
+    const now = performance.now();
+    if (now - lastDebugPrintAt < DEBUG_TIMING_PRINT_INTERVAL_MS) return;
+    lastDebugPrintAt = now;
+    const roundedTimings = Object.fromEntries(Object.entries(phaseTimingsMs).map(([key, value]) => [key, Math.round(value)]));
+    console.error(`[urdira][semantic-timing] workspace=${workspaceId} elapsed_ms=${Math.round(now)} counts=${JSON.stringify(phaseCounts)} timings_ms=${JSON.stringify(roundedTimings)}`);
+  };
+
   // Digest of the entity-eligibility policy this pass runs under: the
   // predicate revision (bumped whenever `evaluateEntityEligibility`'s shape
   // changes what qualifies -- revision 2 is the line-based column-0 test
@@ -903,6 +974,8 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       // immediately, so this step's own peak memory is O(page), not
       // O(corpus).
       await entitySource!.entityCandidates(async (page) => {
+        printDebugTimingIfDue();
+        bumpPhaseCount("container_backfill_pages_enumerated");
         const containers = page.filter((row) => row.record_kind === INELIGIBLE_ENTITY_RECORD_KIND);
         for (const group of chunk(containers, ENTITY_STATUS_BATCH_SIZE)) {
           await sql.transaction(group.map((row) => ({
@@ -1148,9 +1221,10 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
 
   /** Plan 2026-09-06 (Frente S-A): immediate (non-transactional) status upsert -- used wherever there is no companion vector write to be atomic WITH (a permanent skip classification, or a `failed` classification). Reads `generation`/`workspaceId`/`profileId`/`executableBindingId` from the enclosing closure. */
   const writeStatusRow = async (input: { readonly documentGrain: "artifact" | "entity"; readonly documentId: string; readonly artifactId: string; readonly artifactVersionId: string; readonly displayPath: string; readonly status: SemanticDocumentStatus; readonly reasonCodes: readonly string[]; readonly segmentCount?: number }): Promise<void> => {
+    bumpPhaseCount(`status_write_${input.documentGrain}`);
     const command = documentStatusUpsertCommand({ workspaceId, profileId, executableBindingId, generation, updatedAt: nowIso(), ...input });
     if (command.kind !== "run") throw new Error("unreachable: documentStatusUpsertCommand always returns a run command");
-    await sql.run(command.sql, command.params ?? []);
+    await timedPhase("status_write_sql_ms", () => sql.run(command.sql, command.params ?? []));
   };
 
   /**
@@ -1648,6 +1722,10 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // per-item results). Shared verbatim by the artifact and entity insert
   // loops.
   const embedAndCommitBatch = async (pending: readonly PendingEmbedItem[]): Promise<void> => {
+    bumpPhaseCount("embed_batch_segments", pending.length);
+    return timedPhase("embed_and_commit_batch_ms", () => embedAndCommitBatchInner(pending));
+  };
+  const embedAndCommitBatchInner = async (pending: readonly PendingEmbedItem[]): Promise<void> => {
     if (pending.length === 0) return;
     await waitForQueryDrain();
     // Frente S-D (2026-09-07, Lever 3): cache lookup FIRST, for the whole
@@ -1847,15 +1925,17 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const ownerFileState = async (ownerVersionId: string, byteLength: number, contentHash: string): Promise<OwningFileState> => {
     const cached = ownerFileStateCache.get(ownerVersionId);
     if (cached !== undefined) {
+      bumpPhaseCount("entity_owner_file_cache_hit");
       // Refresh recency (Map iteration/insertion order) for the LRU evict below.
       ownerFileStateCache.delete(ownerVersionId);
       ownerFileStateCache.set(ownerVersionId, cached);
       return cached;
     }
+    bumpPhaseCount("entity_owner_file_cas_read");
     let state: OwningFileState;
     if (byteLength > maxDocumentBytes) state = { status: "oversized" };
     else {
-      const bytes = await content.read(contentHash);
+      const bytes = await timedPhase("entity_cas_read_ms", () => content.read(contentHash));
       const text = decodeText(bytes);
       state = text === undefined ? { status: "undecodable" } : { status: "ok", text };
     }
@@ -1874,8 +1954,41 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
     // comment. The owning-file read below is part of "this row's own work"
     // the checkpoint protects, exactly like step 3's `content.read` call.
     if (entityPendingBatch.length === 0 && shouldAbort?.()) { entityLoopAborted = true; return; }
-    const fileState = await ownerFileState(row.owner_artifact_version_id, row.byte_length, row.content_hash);
     const entityDisplayPath = row.display_path ?? row.owner_artifact_id;
+    // v4 storage wiring: `row.body` is already decoded (native-store scan) --
+    // never re-decode it, and never fall into the v3-only `record_value_nodes`
+    // fallback (that table does not exist in the v4 catalog schema at all).
+    // Root-cause fix (Frente S-G, 2026-09-08, plan §4 hypothesis (f)):
+    // decoding `body` never touches the owning file's CAS text (it is either
+    // already inline on the row, or one small `record_value_nodes` SQLite
+    // query keyed by `record_id`) -- doing this BEFORE `ownerFileState`
+    // below lets the pre-text eligibility check reject a `kind`- or
+    // span-doomed candidate without ever paying for the owning file's CAS
+    // read + UTF-8 decode. See `evaluateEntityPreTextEligibility`'s own doc
+    // comment for the measured magnitude of this at n8n scale.
+    const body = row.body !== undefined
+      ? row.body
+      : row.body_payload == null
+        ? decodeEntityRecordBody(hydrateRelationalValue(await sql.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [workspaceId, row.record_id, row.valid_from_generation])))
+        : decodeEntityRecordBody(decodeCanonical(row.body_payload instanceof Uint8Array ? row.body_payload : new Uint8Array(row.body_payload)));
+    const preText = evaluateEntityPreTextEligibility(row.record_kind, body, minEntitySpanLength);
+    if (preText.stage === "ineligible") {
+      bumpPhaseCount("entity_pretext_skipped_no_cas_read");
+      counts.entity_skipped_ineligible += 1;
+      // Same reason-code mapping `evaluateEntityEligibility`'s caller always
+      // used: a body `kind` this reconciler never embeds regardless of
+      // span/position (`INELIGIBLE_ENTITY_BODY_KINDS`, e.g. `"parameter"`)
+      // is `unsupported_kind`; every other pre-text ineligibility reason
+      // (missing/invalid `kind`, or span too short) is `below_min_length`.
+      const bodyKind = typeof body["kind"] === "string" ? body["kind"] as string : undefined;
+      const reasonCode = bodyKind !== undefined && INELIGIBLE_ENTITY_BODY_KINDS.has(bodyKind) ? "unsupported_kind" : "below_min_length";
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: reasonCode === "unsupported_kind" ? "unsupported" : "excluded", reasonCodes: [reasonCode] });
+      return;
+    }
+    // Only a candidate that survived every CAS-free check above (i.e. could
+    // still turn out eligible once the column-0/top-level position test
+    // runs) ever reaches the owning file's CAS read.
+    const fileState = await ownerFileState(row.owner_artifact_version_id, row.byte_length, row.content_hash);
     if (fileState.status === "oversized") {
       counts.entity_skipped_oversized += 1;
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["oversized"] });
@@ -1886,27 +1999,15 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["binary"] });
       return;
     }
-    // v4 storage wiring: `row.body` is already decoded (native-store scan) --
-    // never re-decode it, and never fall into the v3-only `record_value_nodes`
-    // fallback (that table does not exist in the v4 catalog schema at all).
-    const body = row.body !== undefined
-      ? row.body
-      : row.body_payload == null
-        ? decodeEntityRecordBody(hydrateRelationalValue(await sql.all<Record<string, unknown> & RelationalValueRow>("SELECT workspace_id, record_id, valid_from_generation, value_path, parent_path, sequence_ordinal, map_key, value_kind, text_value, integer_value, real_value, bool_value, bytes_value FROM record_value_nodes WHERE workspace_id = ? AND record_id = ? AND valid_from_generation = ? ORDER BY value_path", [workspaceId, row.record_id, row.valid_from_generation])))
-        : decodeEntityRecordBody(decodeCanonical(row.body_payload instanceof Uint8Array ? row.body_payload : new Uint8Array(row.body_payload)));
     const eligibility = evaluateEntityEligibility(row.record_kind, body, fileState.text, minEntitySpanLength);
     if (!eligibility.eligible) {
       counts.entity_skipped_ineligible += 1;
-      // Decided in implementation: a body `kind` this reconciler never
-      // embeds regardless of span/position (`INELIGIBLE_ENTITY_BODY_KINDS`,
-      // e.g. `"parameter"`) is `unsupported_kind`; every other ineligibility
-      // reason `evaluateEntityEligibility` checks (span too short, or not a
-      // top-level/column-0 declaration) is `below_min_length` -- the closest
-      // fit in the fixed vocabulary for "this span/position never
-      // qualifies".
-      const bodyKind = typeof body["kind"] === "string" ? body["kind"] as string : undefined;
-      const reasonCode = bodyKind !== undefined && INELIGIBLE_ENTITY_BODY_KINDS.has(bodyKind) ? "unsupported_kind" : "below_min_length";
-      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: reasonCode === "unsupported_kind" ? "unsupported" : "excluded", reasonCodes: [reasonCode] });
+      // Only the column-0/top-level position test can still fail here (every
+      // `kind`/span-length reason already returned above) -- `below_min_length`
+      // is the closest fit in the fixed vocabulary for "this position never
+      // qualifies", matching this reconciler's pre-existing reason-code
+      // choice for that case.
+      await writeStatusRow({ documentGrain: "entity", documentId: row.record_id, artifactId: row.owner_artifact_id, artifactVersionId: row.owner_artifact_version_id, displayPath: entityDisplayPath, status: "excluded", reasonCodes: ["below_min_length"] });
       return;
     }
     const spanText = fileState.text.slice(eligibility.start, eligibility.end);
@@ -2021,10 +2122,47 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
       [workspaceId, profileId, executableBindingId],
     );
     const openIds = new Set(openRows.map((row) => row.document_ref));
+    // Root-cause fix (Frente S-G, 2026-09-08, plan §4 hypothesis (f), the
+    // primary one): before this fix, `missing` only excluded a candidate
+    // that already had an OPEN `vector_projection_rows` row -- a candidate
+    // already classified `excluded`/`unsupported` in a PRIOR reconcile pass
+    // (permanent, per `evaluateEntityPreTextEligibility`'s own doc comment)
+    // had NO row there (it was never embedded) and so was reprocessed from
+    // scratch -- full body decode, owning-file CAS read, eligibility
+    // check, AND a fresh `semantic_document_status` UPSERT write -- on
+    // EVERY single reconcile call for as long as the workspace exists.
+    // `submitSemanticMaintenance` (`packages/daemon/src/runtime.ts`)
+    // re-triggers this whole function on every scan-batch flush during a
+    // long scan, so at full n8n scale (366,059 already-classified rows
+    // observed) this reprocessed the ENTIRE permanently-ineligible backlog
+    // on every one of those retriggers -- the confirmed dominant
+    // contributor to the observed ~0.03 status-rows/second floor. Loading
+    // already-classified document ids ONCE per call (a single indexed
+    // `document_id`-only scan, no CAS/decode) and skipping them here makes
+    // a repeat pass over an already-fully-classified corpus O(already-
+    // classified count) STRING COMPARISONS instead of O(that count) CAS
+    // reads + SQL writes -- this is the SAME identity/staleness contract
+    // `vector_projection_rows`' own "still visible" check already relies on
+    // (see step 4's stale-close doc comment above): neither this nor the
+    // pre-existing covered-vector path detects a record whose CONTENT
+    // changed while its `record_id` stayed identical and it remained
+    // visible -- both rely on `entitySource.visibleRecordIds`/the orphan
+    // sweep in `syncDocumentStatusBulk` to retire a genuinely-changed
+    // record under a fresh id. This introduces no correctness gap beyond
+    // the one the codebase already accepts for `covered` rows.
+    const alreadyClassifiedRows = await sql.all<{ document_id: string }>(
+      `SELECT document_id FROM semantic_document_status
+        WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND document_grain = 'entity'`,
+      [workspaceId, profileId, executableBindingId],
+    );
+    const alreadyClassifiedIds = new Set(alreadyClassifiedRows.map((row) => row.document_id));
     await entitySource.entityCandidates(async (page) => {
       if (entityLoopAborted) return;
+      printDebugTimingIfDue();
+      bumpPhaseCount("entity_pages_enumerated");
+      bumpPhaseCount("entity_records_seen_in_pages", page.length);
       const missing = page
-        .filter((row) => row.record_kind !== INELIGIBLE_ENTITY_RECORD_KIND && !openIds.has(row.record_id))
+        .filter((row) => row.record_kind !== INELIGIBLE_ENTITY_RECORD_KIND && !openIds.has(row.record_id) && !alreadyClassifiedIds.has(row.record_id))
         .filter((row) => input.shard === undefined || shardIndexFor(row.owner_artifact_id, input.shard.count) === input.shard.index)
         .map((row): EntityInsertRow => ({
           record_id: row.record_id, record_kind: row.record_kind, owner_artifact_id: row.owner_artifact_id,
@@ -2248,7 +2386,8 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   // every slow-path pass; each statement is a `NOT EXISTS`-scoped bulk
   // operation that becomes a near-zero-row no-op once the corpus has been
   // classified once, so this is cheap in the (common) steady state.
-  await syncDocumentStatusBulk();
+  await timedPhase("sync_document_status_bulk_ms", syncDocumentStatusBulk);
+  printDebugTimingIfDue();
 
   // Only publish the completion marker if the workspace's current generation
   // is still exactly what step 1 (generation read) read -- same reasoning as

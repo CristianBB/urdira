@@ -1420,6 +1420,13 @@ describe("decision 17 schema migration (pre-migration database open)", () => {
       // inline index referencing them would fail the open outright
       // (observed live against a real bench workspace).
       await opened.database.exec("DROP INDEX IF EXISTS vector_projection_document_ref_idx");
+      // Frente S-G (2026-09-08): `vector_projection_by_owner_idx` (see
+      // `ensureWorkspaceSchemaCompatibility`'s own doc comment on it,
+      // packages/storage/src/schema.ts) ALSO references `document_grain` --
+      // like `vector_projection_document_ref_idx` above, it must be dropped
+      // before the column itself, or SQLite's own `DROP COLUMN` refuses
+      // ("error in index vector_projection_by_owner_idx after drop column").
+      await opened.database.exec("DROP INDEX IF EXISTS vector_projection_by_owner_idx");
       await opened.database.exec("ALTER TABLE vector_projection_rows DROP COLUMN document_grain");
       await opened.database.exec("ALTER TABLE vector_projection_rows DROP COLUMN document_ref");
       await opened.database.exec("ALTER TABLE semantic_index_state DROP COLUMN document_grains");
@@ -1437,6 +1444,7 @@ describe("decision 17 schema migration (pre-migration database open)", () => {
       expect(markerColumns.some((column) => column.name === "document_grains")).toBe(true);
       const indexes = await reopened.database.all<{ name: string }>("PRAGMA index_list(vector_projection_rows)");
       expect(indexes.some((index) => index.name === "vector_projection_document_ref_idx")).toBe(true);
+      expect(indexes.some((index) => index.name === "vector_projection_by_owner_idx")).toBe(true);
       await reopened.close();
       const reopenedAgain = await storage.openWorkspace("workspace-migration");
       await reopenedAgain.close();
@@ -1643,6 +1651,190 @@ describe("reconcileSemanticProjection entity pass with entity_record_source (v4 
       const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
       expect(second).toEqual({ ...first, closed: 0, inserted: 0, entity_inserted: 0 });
       expect(source.calls).toEqual(callsAfterFirst);
+    });
+  });
+});
+
+// Frente S-G (2026-09-08): regression coverage for
+// `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md` -- the
+// confirmed n8n full-embed stall root causes (plan `generic-waddling-hartmanis.md`
+// §4 hypothesis (f)): (1) a `kind`- or span-doomed entity candidate used to
+// pay a full owning-file CAS read before its eligibility check ever ran;
+// (2) an entity candidate already permanently classified
+// (`excluded`/`unsupported`) in a PRIOR pass was reprocessed from scratch
+// (CAS read + a fresh `semantic_document_status` UPSERT) on EVERY later
+// slow-path pass, forever.
+describe("Frente S-G (2026-09-08): entity eligibility avoids the owning-file CAS read for candidates it can already condemn", () => {
+  it("never calls ownerFileState's CAS read at all for a page whose only NEW candidates are parameter-kind or below-min-length", async () => {
+    // Isolation matters here: `ownerFileState` caches by owning artifact
+    // VERSION for the lifetime of one `reconcileSemanticProjection` call, so
+    // a naive "add ineligible candidates to a file that ALSO has an eligible
+    // one, in the SAME pass" test would pass even WITHOUT this fix -- the
+    // eligible candidate's own CAS read would populate the cache first, and
+    // every ineligible one alongside it would then hit that cache "for
+    // free", proving nothing about whether the fix's pre-text short-circuit
+    // itself ever ran. Splitting this into two passes, with the
+    // pretext-ineligible candidates appearing ONLY in pass 2 on a file whose
+    // ARTIFACT-grain vector is already covered (so step 3 does not touch it
+    // either), gives pass 2 a completely FRESH `ownerFileState` cache (it is
+    // local to each call) with no eligible candidate anywhere to prime it --
+    // the only way pass 2 avoids a CAS read for this file at all is the
+    // pre-text check itself.
+    const workspaceId = "ws-semantic-pretext-cas-skip";
+    const provider = createLocalHashProvider();
+    const text = `export const pretextCasSkipOwnerFile = "${ENTITY_SPAN_PADDING}";\nconst p = 1;\n`;
+    const shortConst = "const p = 1;";
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-1", artifactVersionId: "artv-1", text, validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const meta = await ownerFileMeta(opened, "artv-1");
+      const source = fakeEntitySource([
+        { record_id: "rec-param", record_kind: "jsts:entity_parameter", owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", content_hash: meta.content_hash, byte_length: meta.byte_length, display_path: "art-1", body: { name: "p", kind: "parameter", start: 0, end: 1 } },
+        { record_id: "rec-short", record_kind: "jsts:entity_variable", owner_artifact_id: "art-1", owner_artifact_version_id: "artv-1", content_hash: meta.content_hash, byte_length: meta.byte_length, display_path: "art-1", body: { name: "p", kind: "variable", start: text.indexOf(shortConst), end: text.indexOf(shortConst) + shortConst.length } },
+      ]);
+      // Neither candidate is visible in pass 1 -- only the file's own
+      // artifact-grain document gets embedded (giving it an OPEN vector row
+      // so step 3 skips it entirely in pass 2, unchanged).
+      source.setVisibleIds([]);
+
+      let readsBeforePass2 = 0;
+      const countingReaderPass1: SemanticReconcilerContentReader = { read: async (hash: string): Promise<Uint8Array> => { readsBeforePass2 += 1; return cas.read(hash); } };
+      const first = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: countingReaderPass1, provider, entity_record_source: source });
+      expect(first.entity_inserted).toBe(0);
+      expect(first.entity_skipped_ineligible).toBe(0);
+      expect(first.inserted).toBe(1);
+      expect(first.marker_written).toBe(true);
+      expect(readsBeforePass2).toBeGreaterThan(0);
+
+      source.setVisibleIds(["rec-param", "rec-short"]);
+      await setCurrentGeneration(opened, workspaceId, 2);
+      let readsDuringPass2 = 0;
+      const countingReaderPass2: SemanticReconcilerContentReader = { read: async (hash: string): Promise<Uint8Array> => { readsDuringPass2 += 1; return cas.read(hash); } };
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: countingReaderPass2, provider, entity_record_source: source });
+      expect(second.inserted).toBe(0);
+      expect(second.entity_inserted).toBe(0);
+      expect(second.entity_skipped_ineligible).toBe(2);
+      expect(second.marker_written).toBe(true);
+      // The whole point: a page whose only NEW candidates are `kind:
+      // "parameter"` or below `min_span_length` never reaches
+      // `ownerFileState` at all, so this owning file's CAS bytes are never
+      // read in pass 2 -- ZERO reads, on a completely fresh per-call cache.
+      expect(readsDuringPass2).toBe(0);
+
+      const statusRows = await v4TestStatusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      const paramRow = statusRows.find((row) => row.document_id === "rec-param");
+      expect(paramRow?.status).toBe("unsupported");
+      expect(JSON.parse(paramRow!.reason_codes)).toEqual(["unsupported_kind"]);
+      const shortRow = statusRows.find((row) => row.document_id === "rec-short");
+      expect(shortRow?.status).toBe("excluded");
+      expect(JSON.parse(shortRow!.reason_codes)).toEqual(["below_min_length"]);
+    });
+  });
+});
+
+describe("Frente S-G (2026-09-08): entity-grain semantic_document_status skip on repeat slow-path passes (v4 storage wiring)", () => {
+  it("never re-reads the owning file's CAS bytes, and never rewrites the status row, for an already-classified ineligible entity on a LATER slow-path pass", async () => {
+    const workspaceId = "ws-semantic-v4-status-skip-repeat";
+    const provider = createLocalHashProvider();
+    const methodSource = `render(param) {\n    // ${ENTITY_SPAN_PADDING}\n    return param;\n  }`;
+    const textA = `class Widget {\n  ${methodSource}\n}`;
+    const methodStart = textA.indexOf(methodSource);
+    const eligibleFunc = `export function v4StatusSkipEligibleForTestCoverage() {\n  // ${ENTITY_SPAN_PADDING}\n  return 1;\n}`;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-a", artifactVersionId: "artv-a", text: textA, validFromGeneration: 1, displayPath: "src/a.ts" });
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-b", artifactVersionId: "artv-b", text: eligibleFunc, validFromGeneration: 1, displayPath: "src/b.ts" });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const metaA = await ownerFileMeta(opened, "artv-a");
+      const metaB = await ownerFileMeta(opened, "artv-b");
+
+      const source = fakeEntitySource([
+        { record_id: "rec-method", record_kind: "jsts:entity_callable", owner_artifact_id: "art-a", owner_artifact_version_id: "artv-a", content_hash: metaA.content_hash, byte_length: metaA.byte_length, display_path: "src/a.ts", body: { kind: "method", name: "render", start: methodStart, end: methodStart + methodSource.length, qualified_name: "Widget.render" } },
+        { record_id: "rec-func-b", record_kind: "jsts:entity_callable", owner_artifact_id: "art-b", owner_artifact_version_id: "artv-b", content_hash: metaB.content_hash, byte_length: metaB.byte_length, display_path: "src/b.ts", body: { kind: "function", name: "v4StatusSkipEligibleForTestCoverage", start: eligibleFunc.indexOf("export"), end: eligibleFunc.length } },
+      ]);
+      // Only File A's ineligible (indented, non-top-level) candidate is
+      // visible in pass 1 -- File B's eligible one is revealed only for
+      // pass 2, forcing the SLOW path to run again (an unchanged
+      // generation/candidate-set would instead hit the fast path, per the
+      // "no-op" test above, never reaching the entity loop at all).
+      source.setVisibleIds(["rec-method"]);
+
+      const readCounts = new Map<string, number>();
+      const countingReader: SemanticReconcilerContentReader = { read: async (hash: string): Promise<Uint8Array> => { readCounts.set(hash, (readCounts.get(hash) ?? 0) + 1); return cas.read(hash); } };
+      const statusGenerationOf = async (documentId: string): Promise<number | undefined> => {
+        const row = await opened.database.get<{ generation: number }>(
+          "SELECT generation FROM semantic_document_status WHERE workspace_id = ? AND document_grain = 'entity' AND document_id = ?",
+          [workspaceId, documentId],
+        );
+        return row?.generation;
+      };
+
+      const first = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: countingReader, provider, entity_record_source: source });
+      expect(first.entity_inserted).toBe(0);
+      expect(first.entity_skipped_ineligible).toBe(1);
+      expect(first.marker_written).toBe(true);
+      const readsForAAfterFirst = readCounts.get(metaA.content_hash) ?? 0;
+      expect(readsForAAfterFirst).toBeGreaterThan(0);
+      expect(await statusGenerationOf("rec-method")).toBe(1);
+
+      source.setVisibleIds(["rec-method", "rec-func-b"]);
+      await setCurrentGeneration(opened, workspaceId, 2);
+      const second = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: countingReader, provider, entity_record_source: source });
+      expect(second.entity_inserted).toBe(1);
+      // Root-cause fix: the ALREADY-classified `rec-method` (excluded in
+      // pass 1) must not be reprocessed in pass 2 at all -- neither its
+      // owning file's CAS bytes read again, nor its status row rewritten
+      // (still stamped `generation: 1`, not bumped to 2).
+      expect(second.entity_skipped_ineligible).toBe(0);
+      expect(readCounts.get(metaA.content_hash) ?? 0).toBe(readsForAAfterFirst);
+      expect(await statusGenerationOf("rec-method")).toBe(1);
+    });
+  });
+});
+
+describe("Frente S-G (2026-09-08): syncDocumentStatusBulk's container backfill is chunked, not one unbounded statement", () => {
+  it("classifies 250 container-kind candidates (over the 200-row ENTITY_STATUS_BATCH_SIZE boundary) correctly in one pass, touching CAS zero times", async () => {
+    const workspaceId = "ws-semantic-v4-container-backfill-chunked";
+    const provider = createLocalHashProvider();
+    const CONTAINER_COUNT = 250;
+    // All 250 containers share ONE real owning file/artifact version (its
+    // own content is irrelevant -- a container's classification is
+    // `unsupported_kind`, permanent regardless of file content, per
+    // `INELIGIBLE_ENTITY_RECORD_KIND`'s own doc comment) so this test can
+    // use a real, FK-satisfying owner without seeding 250 distinct files;
+    // the POINT here is the `chunk(containers, ENTITY_STATUS_BATCH_SIZE)`
+    // split at the 200-row boundary, not per-file isolation.
+    const sharedText = `export function containerBackfillSharedOwnerForTestCoverage() { return 1; }`;
+
+    await withWorkspace(workspaceId, async (opened, cas) => {
+      await seedTextVersion(opened, cas, workspaceId, { artifactId: "art-shared", artifactVersionId: "artv-shared", text: sharedText, validFromGeneration: 1 });
+      await setCurrentGeneration(opened, workspaceId, 1);
+      const meta = await ownerFileMeta(opened, "artv-shared");
+      const containers: SemanticEntityCandidateRow[] = Array.from({ length: CONTAINER_COUNT }, (_, index) => ({
+        record_id: `rec-container-${index}`,
+        record_kind: "jsts:entity_container",
+        owner_artifact_id: "art-shared",
+        owner_artifact_version_id: "artv-shared",
+        content_hash: meta.content_hash,
+        byte_length: meta.byte_length,
+        display_path: `src/file-${index}.ts`,
+        body: { kind: "module", name: `file-${index}` },
+      }));
+      const source = fakeEntitySource(containers);
+      const result = await reconcileSemanticProjection({ database: asEngineWorkspaceDatabase(opened), workspace_id: workspaceId, content: cas, provider, entity_record_source: source });
+      expect(result.marker_written).toBe(true);
+      expect(result.entity_skipped_ineligible).toBe(0);
+      expect(result.entity_inserted).toBe(0);
+
+      const statusRows = await v4TestStatusRows(opened, workspaceId, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(statusRows).toHaveLength(CONTAINER_COUNT);
+      expect(statusRows.every((row) => row.status === "unsupported")).toBe(true);
+      expect(statusRows.every((row) => JSON.parse(row.reason_codes)[0] === "unsupported_kind")).toBe(true);
+      // Every one of the 250 candidates got its own row -- the chunk(...,
+      // ENTITY_STATUS_BATCH_SIZE) split (200 + 50) never dropped or
+      // duplicated a row at the boundary.
+      expect(new Set(statusRows.map((row) => row.document_id)).size).toBe(CONTAINER_COUNT);
     });
   });
 });
