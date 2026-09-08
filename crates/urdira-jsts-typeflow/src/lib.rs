@@ -46,6 +46,31 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::symbol::SymbolId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// E-P0l (2026-09-08) coverage-recovery diagnostics: how many times
+/// `collect_members` gave up as "uncertain" specifically because of an
+/// unresolved `extends` ancestor (item A's own guard) versus a known-
+/// subclass-override guess-block (item C's own guard) -- read (and reset)
+/// via `take_demotion_reason_counts`, consulted ONLY by the parity-diff
+/// diagnostic dump scripts (a `REASON_*`-style histogram measuring which
+/// guard costs the most "same" coverage); never consulted by production
+/// resolution logic itself, and never affects any resolution OUTCOME --
+/// purely additive bookkeeping.
+pub static DEMOTED_BY_UNRESOLVED_EXTENDS: AtomicU64 = AtomicU64::new(0);
+pub static DEMOTED_BY_KNOWN_SUBCLASS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot-and-reset the two counters above: `(unresolved_extends,
+/// known_subclass_override)`. Call once per scan/diagnostic run before
+/// reading -- a fresh process already starts both at zero, so this is only
+/// needed to isolate ONE scan's own counts inside a longer-lived process
+/// (a test harness driving several scans in sequence, for instance).
+pub fn take_demotion_reason_counts() -> (u64, u64) {
+    (
+        DEMOTED_BY_UNRESOLVED_EXTENDS.swap(0, Ordering::Relaxed),
+        DEMOTED_BY_KNOWN_SUBCLASS_OVERRIDE.swap(0, Ordering::Relaxed),
+    )
+}
 
 /// E0 identity: `jsts:{kind}:{path}:{start}:{name}`. Mirrors
 /// `urdira-jsts-syntax-worker::semantic_sites::declaration_id` and the
@@ -92,6 +117,25 @@ pub enum RawTypeRef {
     /// createSchemaBuilder>` in the migration DSL's `MigrationContext`
     /// interface.
     ReturnTypeOfFn(ReturnEntityRef),
+    /// G (E-P0l, 2026-09-08): a member's own declared type IS a bare
+    /// `typeof <expr>` type query (`x: typeof console.log`, `x: typeof f`)
+    /// -- as opposed to `ReturnType<typeof f>` (`ReturnTypeOfFn` above),
+    /// which resolves to `f`'s own RETURN type, this resolves to `<expr>`'s
+    /// OWN declaration (the function/variable/import itself): calling a
+    /// member typed this way calls through to whatever `<expr>` actually
+    /// is, exactly the way TypeScript's own checker follows the signature
+    /// through -- found live: `private readonly _fetchFn: typeof fetch`
+    /// called as `this._fetchFn(...)` used to resolve (wrongly) to the
+    /// `_fetchFn` PROPERTY's own declaration instead. `None` inside when
+    /// `<expr>` is not a plain identifier this crate can resolve (a
+    /// qualified name like `console.log`/`globalThis.fetch`, `typeof
+    /// this`, `typeof import(...)`) -- the known-to-be-a-type-query fact
+    /// itself is still preserved (this variant, never silently degrading
+    /// to `Unknown`) so a caller can tell "genuinely a type query, target
+    /// just not known" apart from "not a type query at all" and refuse to
+    /// fall back to guessing the member's own declaration as the call
+    /// target either way -- pending, never a guess.
+    TypeQuery(Option<ReturnEntityRef>),
     /// P1-C: `T["k"]` (a TypeScript indexed-access type with a STRING
     /// LITERAL index only -- a union of keys, a numeric/computed index, or
     /// `keyof T` is `Unknown`, never a guess) -- member `key`'s own declared
@@ -167,6 +211,14 @@ pub enum ResolvedTypeRef {
     /// partially represented, matching the "resolve fully or stay `None`"
     /// contract every other composite `RawTypeRef` wrapper already has.
     Union(Vec<ResolvedTypeRef>),
+    /// G (E-P0l, 2026-09-08): see `RawTypeRef::TypeQuery`'s doc comment.
+    /// `Some(entity_id)` when the type query's own expression resolved to
+    /// a single known declaration; `None` when it is a known type query
+    /// with no resolvable target (a qualified name, `typeof this`, ...) --
+    /// either way, this is NOT the same as the whole member being
+    /// unresolved (`ResolvedTypeRef` itself being absent) -- a caller must
+    /// still refuse to fall back to the member's own declaration.
+    TypeQuery(Option<String>),
 }
 
 /// One member of a class or interface: enough to answer "does this
@@ -1891,8 +1943,24 @@ fn raw_type_ref_of_ts_type(
         // remaining constituent, dedupe, collapse a single survivor).
         TSType::TSUnionType(union) => {
             let mut constituents: Vec<RawTypeRef> = Vec::new();
+            let mut has_real_primitive_constituent = false;
             for member in &union.types {
-                if is_dropped_union_constituent(member) {
+                if is_dropped_nullish_union_constituent(member) {
+                    continue;
+                }
+                if is_real_primitive_union_constituent(member) {
+                    // F (E-P0l, 2026-09-08): a REAL primitive/literal
+                    // constituent (`string | TestId`) is NOT the same as
+                    // `null`/`undefined` -- it has its own member table
+                    // (`String.prototype.toString`, ...) that can
+                    // genuinely collide with the class constituent's same-
+                    // named member. Never drop it as if it were nullish;
+                    // record its presence so the collapse rule below never
+                    // silently promotes the sole remaining entity
+                    // constituent to a confirmed receiver -- see the doc
+                    // comment on `has_real_primitive_constituent`'s use
+                    // below.
+                    has_real_primitive_constituent = true;
                     continue;
                 }
                 let raw = raw_type_ref_of_ts_type(
@@ -1919,33 +1987,72 @@ fn raw_type_ref_of_ts_type(
                 // (`"a" | "b"`, `string | null`) -- nothing left to
                 // represent as a member-lookup receiver.
                 0 => RawTypeRef::Unknown,
-                // A union that collapses to one distinct constituent
-                // (`A | A`, `A | null`) is that constituent, not a union.
-                1 => constituents.into_iter().next().expect("checked len == 1"),
+                // A union that collapses to one distinct entity
+                // constituent (`A | A`, `A | null`) is that constituent,
+                // not a union -- UNLESS a real primitive/literal
+                // constituent was also present (`string | TestId`): F
+                // (E-P0l) -- that case must never collapse to the bare
+                // entity (the primitive's own members are a genuine,
+                // untracked collision risk), so it stays a one-element
+                // `Union`, which never promotes past `Candidates`/`Many`
+                // for a member/call site (see `RawTypeRef::Union`'s own
+                // doc comment) -- pending/possible, never a guess. A pure
+                // class union (`A | B`, no real primitive) is completely
+                // unaffected by this flag.
+                1 if !has_real_primitive_constituent => {
+                    constituents.into_iter().next().expect("checked len == 1")
+                }
                 _ => RawTypeRef::Union(constituents),
             }
         }
+        // G (E-P0l, 2026-09-08): a BARE `typeof <expr>` used directly as a
+        // member's own declared type (as opposed to wrapped inside
+        // `ReturnType<typeof f>`/`InstanceType<typeof C>`, both handled
+        // above) -- see `RawTypeRef::TypeQuery`'s own doc comment. Reuses
+        // `return_entity_ref_of_type_query` (the SAME classification
+        // `ReturnType<typeof f>` uses above) exactly: `Some` only for a
+        // plain identifier this crate can resolve, `None` for anything
+        // else (a qualified name, `typeof this`, `typeof import(...)`) --
+        // never a guess either way.
+        TSType::TSTypeQuery(_) => RawTypeRef::TypeQuery(return_entity_ref_of_type_query(
+            ty,
+            path,
+            scoping,
+            import_specifiers,
+        )),
         _ => RawTypeRef::Unknown,
     }
 }
 
-/// P2-2j: whether `ty` is one of the constituent shapes a union receiver
-/// drops silently rather than treating as a real member-lookup candidate --
-/// `null`/`undefined` (TypeScript's own nullability convention: `A | null`
-/// means "possibly-null A", not a real second branch to look members up on)
-/// and a literal/primitive keyword type (`"a" | "b"`, `string | Foo`) --
-/// neither ever has class/interface members of its own to resolve a call
-/// against. Every OTHER constituent (including `any`/`unknown`/`void`/
-/// `never`/`object`, deliberately NOT dropped here) is classified normally
-/// by `raw_type_ref_of_ts_type`, which -- for anything this crate cannot
-/// classify -- already falls back to `Unknown`, contaminating the whole
-/// union via that function's own `TSUnionType` arm.
-fn is_dropped_union_constituent(ty: &TSType) -> bool {
+/// P2-2j: whether `ty` is one of the NULLISH constituent shapes a union
+/// receiver drops silently and unconditionally -- `null`/`undefined`
+/// (TypeScript's own nullability convention: `A | null` means "possibly-
+/// null A", not a real second branch to look members up on) never have
+/// class/interface members of their own to collide with anything, so
+/// dropping them can never change which member a lookup finds. See
+/// `is_real_primitive_union_constituent` for the DIFFERENT (never fully
+/// silent) treatment a literal/primitive keyword type gets (F, E-P0l).
+fn is_dropped_nullish_union_constituent(ty: &TSType) -> bool {
+    matches!(ty, TSType::TSNullKeyword(_) | TSType::TSUndefinedKeyword(_))
+}
+
+/// F (E-P0l, 2026-09-08): whether `ty` is a literal/primitive keyword type
+/// (`"a" | "b"`, `string`, `number`, `boolean`, `bigint`, `symbol`) inside a
+/// union receiver. Unlike `null`/`undefined` (see `is_dropped_nullish_
+/// union_constituent`), these DO have their own real member table
+/// (`String.prototype.toString`, `Number.prototype.toFixed`, ...) that can
+/// genuinely differ from a sibling class constituent's same-named member --
+/// found live: `joinToString(base: string | TestId, b: string)` calling
+/// `base.toString()`, which this crate used to silently resolve to
+/// `TestId.toString` (wrong -- v3's real checker treats the receiver as
+/// genuinely ambiguous). This function's own callers never resolve the
+/// constituent to anything (this crate has no entity/member model for
+/// built-in primitive prototypes) -- they only use its presence to block
+/// the union-collapse shortcut, never to guess a target.
+fn is_real_primitive_union_constituent(ty: &TSType) -> bool {
     matches!(
         ty,
-        TSType::TSNullKeyword(_)
-            | TSType::TSUndefinedKeyword(_)
-            | TSType::TSLiteralType(_)
+        TSType::TSLiteralType(_)
             | TSType::TSStringKeyword(_)
             | TSType::TSNumberKeyword(_)
             | TSType::TSBooleanKeyword(_)
@@ -2752,6 +2859,40 @@ fn member_entry_of_class_element(
                 import_specifiers,
                 synthetic_interfaces,
             );
+            // G extension (E-P0l, 2026-09-08): NO type annotation AT ALL
+            // (`protected readonly _now = Date.now;`, `static matchQuery =
+            // matchesFuzzy;`) -- a VALUE-COPY initializer -- see `raw_
+            // type_ref_of_value_copy_expression`'s own doc comment. Gated
+            // on `property.type_annotation.is_none()` itself, NOT on
+            // `type_ref` merely being `Unknown` -- found live (adversarial
+            // self-review, same session): `getCalendarDay: (timestamp:
+            // number) => number = getLocalCalendarDay` DOES have an
+            // explicit annotation (a plain function-type signature this
+            // crate does not classify, ALSO `Unknown`), and v3's real
+            // answer there is the PARAMETER'S OWN declaration, never
+            // `getLocalCalendarDay`'s -- an explicit, INDEPENDENT type
+            // shape (even one this crate cannot itself classify) governs
+            // the property's own identity and must never be overridden by
+            // its default value; only a property with NO annotation at
+            // all is inferred AS EXACTLY its initializer's own type,
+            // which is what makes the redirect sound for `_now`/
+            // `matchQuery`.
+            let type_ref = if property.type_annotation.is_none() {
+                property
+                    .value
+                    .as_ref()
+                    .and_then(|value| {
+                        raw_type_ref_of_value_copy_expression(
+                            value,
+                            path,
+                            scoping,
+                            import_specifiers,
+                        )
+                    })
+                    .unwrap_or(type_ref)
+            } else {
+                type_ref
+            };
             Some(MemberEntry {
                 name: shape.name.clone(),
                 is_static: shape.is_static,
@@ -2761,6 +2902,46 @@ fn member_entry_of_class_element(
                 is_async: false,
             })
         }
+        _ => None,
+    }
+}
+
+/// G extension (E-P0l, 2026-09-08): classify a property/parameter's own
+/// VALUE-COPY initializer/default expression (as opposed to an explicit
+/// type annotation, see `RawTypeRef::TypeQuery`'s own doc comment for the
+/// annotation half of this same mechanism) into a `RawTypeRef::TypeQuery`
+/// -- found live: `protected readonly _now = Date.now;` (no annotation at
+/// all, initializer is a qualified member expression) and `static
+/// matchQuery = matchesFuzzy;` (initializer is a plain identifier naming
+/// an imported function). A plain `Identifier` initializer resolves
+/// through the SAME `classify_typeof_target_identifier` closure `typeof f`
+/// itself uses -- `Some` only when it confidently names a known function/
+/// variable/import, `None` (this function's own `None`, meaning "not a
+/// value-copy shape at all") for anything else, so an ordinary field
+/// holding some UNRELATED local's value never gets misclassified. A
+/// `StaticMemberExpression` initializer (`Date.now`, `console.log`,
+/// `globalThis.fetch`) is ALWAYS treated as a value-copy (`TypeQuery(
+/// None)`, never resolved further -- this crate has no member table for
+/// built-in/ambient objects) regardless of whether the object side itself
+/// resolves, since a qualified-member initializer is never plausibly "the
+/// property's own declared behavior" the way a function/arrow-function/
+/// object-literal initializer is. Every OTHER initializer shape (an arrow
+/// function, a function expression, a call expression, a literal, ...) is
+/// `None` here -- the property's own declaration is very likely the
+/// CORRECT call target for those (an arrow function value IS a real
+/// function of its own), so this function must never touch them.
+fn raw_type_ref_of_value_copy_expression(
+    expr: &Expression,
+    path: &str,
+    scoping: &Scoping,
+    import_specifiers: &HashMap<SymbolId, (String, Option<String>)>,
+) -> Option<RawTypeRef> {
+    match expr {
+        Expression::Identifier(ident) => {
+            classify_typeof_target_identifier(ident, path, scoping, import_specifiers)
+                .map(|entity_ref| RawTypeRef::TypeQuery(Some(entity_ref)))
+        }
+        Expression::StaticMemberExpression(_) => Some(RawTypeRef::TypeQuery(None)),
         _ => None,
     }
 }
@@ -2816,6 +2997,41 @@ fn member_entries_of_constructor_parameter_properties(
                 import_specifiers,
                 synthetic_interfaces,
             );
+            // G extension (E-P0l, 2026-09-08): the SAME value-copy-default
+            // fallback `PropertyDefinition` gets, for a parameter property
+            // with NO type annotation AT ALL but a default value that is
+            // itself a value-copy shape. Gated on `param.type_annotation.
+            // is_none()` itself, NOT on `type_ref` merely being `Unknown`
+            // -- see the byte-identical `PropertyDefinition` guard's own
+            // doc comment for why: `getCalendarDay: (timestamp: number) =>
+            // number = getLocalCalendarDay` DOES have an explicit
+            // annotation (a plain function-type signature this crate does
+            // not classify, ALSO `Unknown`) and must NOT redirect through
+            // its default value -- only `spawnRipgrep`/`_fetchFn`-style
+            // ALIASED type annotations (`SpawnRipgrepCmd`/`FetchFn`,
+            // themselves resolving through `typeof <expr>` -- see the
+            // alias-chasing fix in `resolve_type_ref_chasing_aliases`)
+            // legitimately redirect, and those already resolve via the
+            // ANNOTATION alone, never needing this initializer fallback at
+            // all. `param.initializer` is oxc's own name for a parameter's
+            // default value (kept fully separate from `pattern` even when
+            // present, unlike a destructured default).
+            let type_ref = if param.type_annotation.is_none() {
+                param
+                    .initializer
+                    .as_ref()
+                    .and_then(|value| {
+                        raw_type_ref_of_value_copy_expression(
+                            value,
+                            path,
+                            scoping,
+                            import_specifiers,
+                        )
+                    })
+                    .unwrap_or(type_ref)
+            } else {
+                type_ref
+            };
             Some(MemberEntry {
                 name: name.clone(),
                 is_static: false,
@@ -4391,16 +4607,23 @@ impl ProgramIndex {
         if !found.is_empty() {
             return false;
         }
-        if container.has_unresolved_extends {
-            // This container syntactically extends something this crate
-            // could not resolve at all -- same reasoning as the "not a
-            // known container" case above, just one level higher: the real
-            // member may be declared there. Stop here (an unresolvable
-            // `extends` target has no `implements` of its own we could ever
-            // reach anyway) and report uncertain rather than fall through
-            // to THIS container's own `implements` list.
-            return true;
-        }
+        // Item A coverage fix (E-P0l, 2026-09-08): walk every RESOLVED
+        // `extends` ancestor BEFORE giving up on an unresolved one --
+        // `has_unresolved_extends` is set the instant ANY ONE of this
+        // container's own `extends` targets fails to resolve (an interface
+        // can `extends` several bases at once; a class's single `extends`
+        // is all-or-nothing), even when the member genuinely lives on a
+        // DIFFERENT ancestor that DID resolve. `container.extends` (the
+        // RESOLVED subset only) is consulted here regardless of that flag
+        // -- for a class (never partially resolved: `container.extends` is
+        // already empty whenever `has_unresolved_extends` is set) this
+        // loop simply does nothing, byte-identical to before; only an
+        // interface with a MIX of resolved and unresolved bases sees new
+        // behavior, and only when the member is not found on any of the
+        // ones that did resolve. `found` on `entity_id` ITSELF already won
+        // above unconditionally -- unaffected by this reordering either
+        // way (an own declaration must never be shadowed by an unrelated
+        // unresolved ancestor's mere existence).
         let mut uncertain = false;
         for base in &container.extends {
             let base_uncertain = self.collect_members(base, name, is_static, visited, found, false);
@@ -4408,6 +4631,17 @@ impl ProgramIndex {
                 return false;
             }
             uncertain = uncertain || base_uncertain;
+        }
+        if container.has_unresolved_extends {
+            // Some ancestor along this container's OWN extends clause could
+            // not be resolved at all, and none of the ones that DID
+            // resolve (just walked above) declared `name` either -- the
+            // real member might still live on the untracked one. Stop here
+            // (an unresolvable `extends` target has no `implements` of its
+            // own we could ever reach anyway) and report uncertain rather
+            // than fall through to THIS container's own `implements` list.
+            DEMOTED_BY_UNRESOLVED_EXTENDS.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         if uncertain {
             // The `extends` chain came back empty but NOT with full
@@ -4440,6 +4674,7 @@ impl ProgramIndex {
         // does not model, picks the subclass's own declaration instead).
         if allow_implements_fallback && self.has_known_subclass_override(entity_id, name, is_static)
         {
+            DEMOTED_BY_KNOWN_SUBCLASS_OVERRIDE.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if allow_implements_fallback {
@@ -4689,6 +4924,25 @@ fn resolve_type_ref_chasing_aliases(
             })
             .collect::<Option<Vec<_>>>()
             .map(ResolvedTypeRef::Union),
+        // G (E-P0l): NOT the same precedent as `ReturnTypeOfFn`/
+        // `IndexedAccess` right below -- those two genuinely need
+        // `ProgramIndex::build`'s LATER fourth pass (a second index lookup
+        // this alias-chasing pass does not have access to yet), but a
+        // `TypeQuery` resolves FULLY in one step, exactly like `Local`/
+        // `Imported` above -- see `resolve_raw_type_ref`'s own `TypeQuery`
+        // arm doc comment. Found live: `type FetchFn = typeof globalThis.
+        // fetch;` used as a constructor-parameter-property's own type
+        // annotation (`_fetchFn: FetchFn = globalThis.fetch`) -- treating
+        // this arm like `ReturnTypeOfFn` (silently `None`) made `FetchFn`
+        // (a KNOWN alias) "never converge" as far as `dealias_entity`
+        // could tell, discarding the type-query fact entirely and letting
+        // the naive member-name resolution fall through to `_fetchFn`'s
+        // own declaration instead of staying pending.
+        RawTypeRef::TypeQuery(entity_ref) => {
+            Some(ResolvedTypeRef::TypeQuery(entity_ref.as_ref().and_then(
+                |entity_ref| resolve_type_query_entity_ref(entity_ref, owning_path, import_targets),
+            )))
+        }
         RawTypeRef::ReturnTypeOfFn(_) | RawTypeRef::IndexedAccess { .. } => None,
         RawTypeRef::Unknown => None,
     }
@@ -4804,7 +5058,42 @@ fn resolve_raw_type_ref(
         // P1-C: needs `ProgramIndex::build`'s later, fourth pass instead --
         // see `resolve_raw_type_ref_deferred`'s doc comment.
         RawTypeRef::ReturnTypeOfFn(_) | RawTypeRef::IndexedAccess { .. } => None,
+        // G (E-P0l): resolves fully in THIS pass -- unlike `ReturnTypeOfFn`,
+        // it needs no later fixed point (it names `<expr>` itself, never
+        // `<expr>`'s inferred return type, so `function_return_types`
+        // being incomplete this early is irrelevant here).
+        RawTypeRef::TypeQuery(entity_ref) => {
+            Some(ResolvedTypeRef::TypeQuery(entity_ref.as_ref().and_then(
+                |entity_ref| resolve_type_query_entity_ref(entity_ref, owning_path, import_targets),
+            )))
+        }
         RawTypeRef::Unknown => None,
+    }
+}
+
+/// G (E-P0l, 2026-09-08): close a `RawTypeRef::TypeQuery`'s own inner
+/// `ReturnEntityRef` against `import_targets` -- mirrors `RawTypeRef::
+/// Imported`'s own leaf resolution exactly, EXCEPT there is no de-aliasing
+/// step (`dealias_entity`): a type query's target is the referenced
+/// declaration itself, never something `type Alias = ...` could stand in
+/// for.
+fn resolve_type_query_entity_ref(
+    entity_ref: &ReturnEntityRef,
+    owning_path: &str,
+    import_targets: &HashMap<(String, String, String), String>,
+) -> Option<String> {
+    match entity_ref {
+        ReturnEntityRef::Local(id) => Some(id.clone()),
+        ReturnEntityRef::Imported {
+            specifier,
+            imported_name,
+        } => import_targets
+            .get(&(
+                owning_path.to_owned(),
+                specifier.clone(),
+                imported_name.clone().unwrap_or_default(),
+            ))
+            .cloned(),
     }
 }
 
@@ -4845,7 +5134,12 @@ fn contains_deferred(raw: &RawTypeRef) -> bool {
         }
         // P2-2j: a union needs the later pass if ANY constituent does.
         RawTypeRef::Union(items) => items.iter().any(contains_deferred),
-        RawTypeRef::Local(_) | RawTypeRef::Imported { .. } | RawTypeRef::ThisType => false,
+        // G (E-P0l): resolves fully in the first pass (`resolve_raw_type_
+        // ref`) -- see that function's own `TypeQuery` arm doc comment.
+        RawTypeRef::Local(_)
+        | RawTypeRef::Imported { .. }
+        | RawTypeRef::ThisType
+        | RawTypeRef::TypeQuery(_) => false,
         RawTypeRef::Unknown => false,
     }
 }
@@ -4938,6 +5232,19 @@ fn resolve_raw_type_ref_deferred(
             let ResolvedTypeRef::Entity(base_entity) = resolved_base else {
                 return None;
             };
+            // G extension (E-P0l, 2026-09-08): `key` naming one of `base_
+            // entity`'s own CALLABLE members (a method/getter/setter)
+            // means `T['key']` here represents "the SAME callable
+            // identity as that member", not merely "a value of that
+            // member's own declared TYPE" -- see `lookup_member_entity_
+            // if_callable`'s own doc comment. Checked FIRST: falls back to
+            // the existing "type of that member" behavior for a plain
+            // data property (`lookup_member_type_ref` below), unchanged.
+            if let Some(callable_id) =
+                lookup_member_entity_if_callable(containers, &base_entity, key)
+            {
+                return Some(ResolvedTypeRef::TypeQuery(Some(callable_id)));
+            }
             lookup_member_type_ref(containers, &base_entity, key, false)
         }
         // P2-2j: resolve every constituent (through the SAME deferred pass,
@@ -4957,6 +5264,16 @@ fn resolve_raw_type_ref_deferred(
             })
             .collect::<Option<Vec<_>>>()
             .map(ResolvedTypeRef::Union),
+        // G (E-P0l): same first-pass resolution as `resolve_raw_type_ref`'s
+        // own `TypeQuery` arm -- reachable here only when `TypeQuery` is
+        // nested inside a `Union`/`ArrayOf`/... alongside a genuinely
+        // deferred leaf (`ReturnTypeOfFn`/`IndexedAccess`), which routes
+        // the WHOLE composite through this function instead.
+        RawTypeRef::TypeQuery(entity_ref) => {
+            Some(ResolvedTypeRef::TypeQuery(entity_ref.as_ref().and_then(
+                |entity_ref| resolve_type_query_entity_ref(entity_ref, owning_path, import_targets),
+            )))
+        }
         RawTypeRef::Unknown => None,
     }
 }
@@ -4974,6 +5291,87 @@ fn lookup_member_type_ref(
 ) -> Option<ResolvedTypeRef> {
     let mut visited = std::collections::HashSet::new();
     collect_member_type_ref(containers, entity_id, name, is_static, &mut visited, true)
+}
+
+/// G extension (E-P0l, 2026-09-08): whether `target_id` (a `jsts:{kind}:
+/// {path}:{start}:{name}` entity id) names a METHOD/getter/setter/
+/// constructor, as opposed to a plain data property or parameter property
+/// -- byte-identical rule to `urdira_jsts_syntax_worker::SemanticWalker::
+/// narrowed_target_is_a_callable_kind` (duplicated here rather than
+/// shared, same cross-crate-parallel-enum discipline as everywhere else in
+/// this pair of crates).
+fn member_kind_is_callable(target_id: &str) -> bool {
+    target_id
+        .strip_prefix("jsts:")
+        .and_then(|rest| rest.split(':').next())
+        .is_some_and(|kind| matches!(kind, "method" | "getter" | "setter" | "constructor"))
+}
+
+/// G extension (E-P0l, 2026-09-08): `entity_id`'s own entity id for member
+/// `name`, but ONLY when the walk (own body, then `extends`, then --
+/// exactly like `collect_member_type_ref` -- `implements`) finds it
+/// UNIQUELY and that member is itself CALLABLE (`member_kind_is_callable`)
+/// -- used by `IndexedAccess`'s own deferred resolution below: `T['key']`
+/// used as a PROPERTY's declared type, when `key` names one of `T`'s own
+/// methods, means "the SAME callable identity as that method" for
+/// call-target purposes (found live: `_createMessageRequestHandler:
+/// IMcpServerRequestHandlerOptions['createMessageRequestHandler']`,
+/// `IMcpServerRequestHandlerOptions.createMessageRequestHandler` itself a
+/// method signature) -- never a guess: an ambiguous or non-callable match
+/// falls through to `None`, letting the caller fall back to `lookup_
+/// member_type_ref`'s existing "type OF that member" behavior instead.
+fn lookup_member_entity_if_callable(
+    containers: &HashMap<String, ResolvedContainer>,
+    entity_id: &str,
+    name: &str,
+) -> Option<String> {
+    let mut visited = std::collections::HashSet::new();
+    collect_member_entity_if_callable(containers, entity_id, name, false, &mut visited, true)
+}
+
+fn collect_member_entity_if_callable(
+    containers: &HashMap<String, ResolvedContainer>,
+    entity_id: &str,
+    name: &str,
+    is_static: bool,
+    visited: &mut std::collections::HashSet<String>,
+    allow_implements_fallback: bool,
+) -> Option<String> {
+    const MAX_DEPTH: usize = 32;
+    if visited.len() >= MAX_DEPTH || !visited.insert(entity_id.to_owned()) {
+        return None;
+    }
+    let container = containers.get(entity_id)?;
+    let effective_static = is_static && !container.is_interface;
+    let matches: Vec<&ResolvedMember> = container
+        .members
+        .iter()
+        .filter(|member| member.name == name && member.is_static == effective_static)
+        .collect();
+    if matches.len() == 1 {
+        return member_kind_is_callable(&matches[0].entity_id)
+            .then(|| matches[0].entity_id.clone());
+    }
+    if !matches.is_empty() {
+        return None;
+    }
+    for base in &container.extends {
+        if let Some(found) =
+            collect_member_entity_if_callable(containers, base, name, is_static, visited, false)
+        {
+            return Some(found);
+        }
+    }
+    if allow_implements_fallback {
+        for interface in &container.implements {
+            if let Some(found) = collect_member_entity_if_callable(
+                containers, interface, name, false, visited, false,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn collect_member_type_ref(
@@ -6793,6 +7191,56 @@ mod tests {
         assert_eq!(
             index.member_type_ref(&context_id, "schemaBuilder", false),
             Some(ResolvedTypeRef::Entity(builder_id))
+        );
+    }
+
+    /// G extension (E-P0l, 2026-09-08): a `typeof <expr>` type query
+    /// reached through TWO alias hops, the SECOND one crossing a file
+    /// boundary via a named import (`type FetchFunction = GitHubFetch;`
+    /// locally, `export type GitHubFetch = typeof fetchFn;` in another
+    /// file) -- `ProgramIndex::build` alone (given correct `import_
+    /// targets`) resolves this chain correctly; found live against the
+    /// VS Code corpus that the SAME shape (`githubTransport.ts`'s own
+    /// `_fetch: FetchFunction`, chasing into `githubTypes.ts`'s
+    /// `GitHubFetch`) still resolved to `_fetch`'s own declaration in a
+    /// full daemon-driven scan -- isolates the gap to the PRODUCTION
+    /// needed-imports scan (`main.rs`/`v4/typeflow.rs`'s own `collect_
+    /// type_ref_import`) rather than this crate's own alias-chasing
+    /// logic, which this test proves is already sound. Not fixed this
+    /// session (out of safe risk budget to debug live-scan-only state
+    /// further) -- see `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §12.
+    #[test]
+    fn member_type_query_resolves_through_a_two_hop_cross_file_alias_chain() {
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "types.ts".to_owned(),
+            summary_for(
+                "types.ts",
+                "export function fetchFn(url: string) {}\nexport type GitHubFetch = typeof fetchFn;\n",
+            ),
+        );
+        let transport_summary = summary_for(
+            "transport.ts",
+            "import { GitHubFetch } from './types';\ntype FetchFunction = GitHubFetch;\nclass Transport {\n  private readonly _fetch: FetchFunction;\n}\n",
+        );
+        let transport_id = transport_summary.classes[0].entity_id.clone();
+        summaries.insert("transport.ts".to_owned(), transport_summary);
+        let fetchfn_id = summaries["types.ts"].functions[0].entity_id.clone();
+        let github_fetch_alias_id = summaries["types.ts"].type_aliases[0].id.clone();
+        let mut import_targets = HashMap::new();
+        import_targets.insert(
+            (
+                "transport.ts".to_owned(),
+                "./types".to_owned(),
+                "GitHubFetch".to_owned(),
+            ),
+            github_fetch_alias_id,
+        );
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
+        assert_eq!(
+            index.member_type_ref(&transport_id, "_fetch", false),
+            Some(ResolvedTypeRef::TypeQuery(Some(fetchfn_id)))
         );
     }
 

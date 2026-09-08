@@ -71,6 +71,15 @@ const RESOLUTION_EXTENSIONS: [&str; 11] = [
 
 const MAX_EXTENDS_DEPTH: u8 = 10;
 
+// H (E-P0l, 2026-09-08): a declaration/implementation sibling-preference
+// mechanism was attempted here (and in `semantic_sites.rs`'s `resolve_
+// named_binding_via_specifier`) and REMOVED -- see that function's own H
+// doc comment for the full investigation (the found sample, a namespace
+// import's callable-value resolution, never reaches this code path at
+// all; a general version broke 4 other, unrelated samples). Reported as
+// an unfixed residual in `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+// §12, not attempted again this session.
+
 /// Every concrete path `probe_extensions` would test for `base`, in the
 /// same order (the exact path, then each extension appended, then each
 /// extension appended after `/index`) -- the single authoritative

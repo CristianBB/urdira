@@ -8543,6 +8543,14 @@ fn n8n_references_parity_debug_dump() {
         cold_started.elapsed().as_secs_f64(),
         analysis.owners.len()
     );
+    // E-P0l (2026-09-08), Task 2 coverage-recovery diagnostic -- see
+    // `residual.rs`'s own identical block (right after ITS cold scan) for
+    // the full doc comment.
+    let (demoted_unresolved_extends, demoted_known_subclass_override) =
+        urdira_jsts_typeflow::take_demotion_reason_counts();
+    println!("=== cold-scan member-lookup demotion reason histogram ===");
+    println!("  REASON_UNRESOLVED_EXTENDS           {demoted_unresolved_extends:>8}");
+    println!("  REASON_KNOWN_SUBCLASS_OVERRIDE       {demoted_known_subclass_override:>8}");
 
     // Capture every IdentifierRef pending site BEFORE `materialize_cold`
     // consumes `analysis.owners` by value -- see this function's own doc

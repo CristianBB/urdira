@@ -862,3 +862,259 @@ fixes.**
   `~/Proyectos/urdira-benchmark/v4-fold/ep0k-{n8n-data,vscode,residual-data}/` removed (dumps,
   reduced-tree copy, residual-data scratch); retained per no-deletion convention: none new this
   task beyond the pre-existing `v4-fold/p2-tests/v3fix2/*` this task READ but did not modify.
+
+## 12. E-P0l (2026-09-08): patterns F/G/H, coverage-recovery guards A-E, final gate
+
+Task: close item 7's remaining residual (§11.4/§11.5's patterns F/G/H, VS Code references
+`different=3`/calls `different=30`) AND recover the ~30,114-call `same` drop E-P0k's own guards A/C
+introduced (§11.5's own progression table: baseline calls `same=179,705` -> post-E-P0k
+`same=149,591`). Base `8c58b23` (E-P0k merged), branch `frente-ep0l-vscode-zero-different`.
+Worktree base drift found live (per `feedback_worktree_subagents_base_and_node_modules`): this
+worktree's own checked-out branch was still at `7d04d49`, far behind local `main` (`8c58b23`) --
+reset per the task's own §0 instruction before starting. `node_modules` per-package symlink
+scaffold rebuilt from scratch (main's OWN `packages/*/node_modules/@urdira/*` were themselves stale,
+pointing at a THIRD, unrelated worktree from an earlier session) -- new gotcha for the shared
+feedback note: verify EVERY package's own `@urdira/*` symlinks resolve into THIS worktree's
+`packages/*`, not just the root `node_modules`. Also found live: the MAIN repo's own
+`node_modules/vitest` is a self-referential symlink (`vitest -> node_modules/vitest`, "too many
+levels of symbolic links") -- left main untouched (out of scope to fix), repointed this worktree's
+OWN `node_modules/vitest` directly at the real `.pnpm` store entry instead.
+
+### 12.1 Pattern F -- union receiver with a real primitive constituent
+
+`is_dropped_union_constituent` (both `urdira-jsts-typeflow::raw_type_ref_of_ts_type` and
+`urdira-jsts-syntax-worker::semantic_sites`'s local mirror) dropped a real primitive/literal
+constituent (`string`, `"a" | "b"`, ...) the SAME way it dropped `null`/`undefined` -- sound for
+nullish (no member table to collide with) but NOT for a real primitive (`String.prototype` has its
+own `toString`, genuinely different from a sibling class constituent's override). Found live:
+`joinToString(base: string | TestId, b: string)` calling `base.toString()`, silently resolving to
+`TestId.toString` (wrong; `v3fix2/f-toString` sample, §11.2's own residual row). **Fix**: split into
+`is_dropped_nullish_union_constituent` (unconditional drop, unchanged) and a NEW `is_real_primitive_
+union_constituent` (dropped from the CLASSIFIED-constituent list but tracked via a `has_real_
+primitive_constituent` flag) -- the union-collapse rule now refuses to promote a lone surviving
+entity constituent to a bare, confirmed receiver when a real primitive was ALSO present, staying a
+one-element `Union` (pending/possible, never a guess) instead. A pure class union (`A | B`, no
+primitive) is completely unaffected -- proven by the existing `union_type_annotation_parses_dedupes_
+and_collapses`/`union_with_unclassifiable_constituent_contaminates_to_unknown` tests, both still
+green, no new failures. Confirmed live: `testId.ts`'s `toString` sample no longer appears in the
+VS Code references diff (§12.6's `different=2`, down from the baseline `3`).
+
+### 12.2 Pattern G -- a member typed (or valued) as `typeof <expr>`, called
+
+Three sub-mechanisms, closing the case where `this.x(...)` naively resolved to `x`'s OWN property/
+parameter declaration instead of following through to whatever `<expr>` really is:
+
+- **Bare/aliased `typeof <expr>` annotation** (`_fetchFn: typeof fetch`, or `type FetchFn = typeof
+  globalThis.fetch; ...: FetchFn`): new `RawTypeRef`/`ResolvedTypeRef::TypeQuery(Option<...>)` --
+  `Some(entity_id)` when `<expr>` is a plain identifier this crate can resolve (reusing `classify_
+  typeof_target_identifier`, the SAME closure `ReturnType<typeof f>` already used), `None` (still
+  KNOWN to be a type query, never silently `Unknown`) for a qualified name (`console.log`,
+  `globalThis.fetch`), `typeof this`, or `typeof import(...)`. `resolve_call_target_typeflow`'s
+  member branch now checks `member_type_ref` for `TypeQuery` BEFORE trusting a name-based `MemberLookup::One` as the confirmed target -- `Some(id)` redirects there, `None` demotes to
+  `Unresolved` (pending), NEITHER ever falls back to the naive property/parameter id.
+  **Critical fix inside this same sub-mechanism**: `resolve_type_ref_chasing_aliases` (the pass
+  `build_alias_targets` uses for `type X = Y` chains) originally treated `TypeQuery` like
+  `ReturnTypeOfFn`/`IndexedAccess` (deferred, `None`) -- WRONG, since a type query resolves fully in
+  one step and needs no later fixed point; that bug made every ALIASED type query (`type FetchFn =
+  typeof globalThis.fetch`, found live: `agentHostRestrictedTelemetry.ts`'s own `_fetchFn`) "never
+  converge" as a known alias, silently discarding the type-query fact and letting the naive
+  resolution through. Fixed to resolve `TypeQuery` the same way `resolve_raw_type_ref` does.
+- **`T['method']` indexed-access into a callable member** (`_createMessageRequestHandler:
+  IMcpServerRequestHandlerOptions['createMessageRequestHandler']`, the interface member itself a
+  method signature): new `lookup_member_entity_if_callable` (mirrors `lookup_member_type_ref`'s own
+  own-body-then-extends-then-implements walk, returns the member's OWN entity id -- not its
+  declared/return TYPE -- only on a UNIQUE, CALLABLE-kind match) consulted first inside `Indexed
+  Access`'s deferred resolution; a non-callable (plain data) indexed member falls through to the
+  EXISTING "type of that member" behavior, unchanged. **Attempted, not confirmed working this
+  session** -- `_createMessageRequestHandler`/`_elicitationRequestHandler` (`mcpServerRequestHandler.
+  ts`) still show as `different` in §12.6's final VS Code dump; root cause not isolated in the time
+  available (a same-file, single-hop case, so the two-hop cross-file alias bug above does not
+  explain it) -- reported, not force-closed.
+- **No-annotation value-copy initializer/default** (`protected readonly _now = Date.now;`, `static
+  matchQuery = matchesFuzzy;`, a constructor-parameter-property default value): new `raw_type_ref_
+  of_value_copy_expression`, gated STRICTLY on `property.type_annotation.is_none()` /
+  `param.type_annotation.is_none()` (NOT on the resolved `type_ref` merely being `Unknown` -- see
+  the adversarial-review regression this exact distinction fixes, next paragraph). A plain
+  `Identifier` initializer resolves via the SAME `classify_typeof_target_identifier` closure (`Some`
+  only for a confidently-known function/variable/import); a `StaticMemberExpression` initializer
+  (`Date.now`, `console.log`) is always `TypeQuery(None)` (this crate has no built-in/ambient member
+  table, never resolved further, but never falls back to the property's own id either). Every OTHER
+  initializer shape (arrow function, function expression, ...) is untouched -- the property's own
+  declaration is very likely v3's real answer there.
+  **Adversarial self-review regression, found and fixed in THIS session**: the first version of
+  this fix gated on `matches!(type_ref, RawTypeRef::Unknown)`, which is ALSO true for an EXPLICIT
+  annotation this crate simply cannot classify (a bare function-type signature, `(timestamp: number)
+  => number`) -- found live: `getCalendarDay: (timestamp: number) => number = getLocalCalendarDay`
+  (a constructor parameter property, `fishFeedingStreak.ts`) was wrongly redirected to
+  `getLocalCalendarDay`'s own declaration, when v3's real answer is the PARAMETER's own declaration
+  (an explicit, independent type shape governs the property's identity regardless of its default
+  value -- only a property with NO annotation at all is inferred as EXACTLY its initializer's own
+  type, which is what makes the redirect sound for `_now`/`matchQuery`). Caught via a full VS Code
+  re-run BEFORE this session's own gate close (`calls-diff-report2.json`, `different` regressed
+  18 -> 20 with 5 NEW `getCalendarDay` samples) -- fixed by switching the gate to `type_annotation.
+  is_none()`, re-verified clean (0 new `getCalendarDay`-shaped samples in the final run).
+- New unit tests (`urdira-jsts-typeflow`): `member_type_query_resolves_through_a_two_hop_cross_
+  file_alias_chain` (proves `ProgramIndex::build`'s own alias-chasing is sound for THIS shape,
+  isolating a STILL-OPEN production gap -- see §12.4).
+
+### 12.3 Pattern H -- `foo.d.ts` + `foo.js` pair -- INVESTIGATED, NOT FIXED, REVERTED
+
+Two mechanisms were tried and both REVERTED after live measurement contradicted each one:
+1. "value import -> implementation, type import -> declaration" (the task's own a-priori rule):
+   never fired for the found sample at all (see below).
+2. "always prefer the `.d.ts` sibling when one exists": fixed the `marked` sample's OWN reported
+   target in isolation, but when actually run against the corpus fixed NOTHING (see below) and
+   additionally REGRESSED 4 unrelated samples (`generate-protocol.mjs`/`.d.mts` via `build/codex/
+   check-protocol-sync.ts`'s own EXPLICIT `.mjs`-suffixed specifiers, which must resolve exactly as
+   written -- a `.d.mts` sibling existing alongside is irrelevant when the import text itself
+   already names the implementation file).
+
+Root cause the task brief did not anticipate: the found sample (`marked`, `walkThroughContentProvider.
+ts`) is `import * as marked from '.../marked.js'` -- a NAMESPACE import used as a bare CALLABLE
+value (CommonJS-interop), which is resolved entirely by `visit_import_namespace_specifier`/
+`resolve_namespace_member`'s own machinery, NEVER by `resolve_named_binding_via_specifier` (the
+function both attempted fixes lived in, which only ever handles a NAMED import's own specifier).
+Both fixes were therefore dead code for the one sample motivating this pattern, and the general
+("always prefer declaration") version was net-negative on the corpus (+1 fixed, -4 broken, worse
+`different` count). REVERTED to the original, unmodified `probe_extensions` priority order --
+`ExtensionFamily`/`dts_impl_sibling` (`resolver.rs`) and the sibling-swap call site (`semantic_
+sites.rs`) both removed. A real fix would need to touch the namespace-import callable-value path
+instead, out of this session's remaining risk/time budget -- reported per the task's own "never
+guess" discipline, `marked` remains `different=1` in §12.6.
+
+### 12.4 Task 2 -- coverage-recovery guards A/C/D-E, with quantified demotion reasons
+
+New diagnostic (pure counters, zero effect on any resolution outcome, read-and-reset via `urdira_
+jsts_typeflow::take_demotion_reason_counts`, printed as a `REASON_*` histogram at the end of each
+cold scan in `residual.rs`'s `n8n_residual_pass_debug_histogram` and `tests_e2e.rs`'s `n8n_
+references_parity_debug_dump`): `DEMOTED_BY_UNRESOLVED_EXTENDS` (item A's own guard) and `DEMOTED_
+BY_KNOWN_SUBCLASS_OVERRIDE` (item C's own guard), both `AtomicU64`, incremented at `collect_members`'s
+own two `return true` (uncertain) sites.
+
+**Measured, cold scan, this task's own final binary**:
+
+| corpus | `REASON_UNRESOLVED_EXTENDS` (A) | `REASON_KNOWN_SUBCLASS_OVERRIDE` (C) |
+|---|---:|---:|
+| n8n | 5,700 | 12 |
+| VS Code (reduced tree) | 47,116 | 18 |
+
+A dominates C by 2-3 orders of magnitude on BOTH corpora -- empirically justifies spending this
+task's fix budget on A and leaving C's existing (already hard-won, E-P0k) behavior unchanged rather
+than guessing at a further refinement for a guard that fires 12-18 times total across two whole
+corpora.
+
+- **Item A, FIXED**: `collect_members` (`urdira-jsts-typeflow`) checked `container.has_unresolved_
+  extends` and returned "uncertain" BEFORE ever walking `container.extends` (the RESOLVED subset) --
+  for an INTERFACE with a MIX of resolved and unresolved `extends` targets (`has_unresolved_extends`
+  is set the instant ANY ONE fails to resolve, even when others DID), the resolved ancestors were
+  never even consulted. Reordered: walk `container.extends` FIRST (unconditionally), THEN check
+  `has_unresolved_extends` (only if the resolved walk found nothing). For a class (`extends` is
+  never partially resolved -- `container.extends` is already empty whenever the flag is set) this
+  is BYTE-IDENTICAL to before; only a mixed-resolution interface sees new behavior. An own-body
+  match already won unconditionally before this point either way, in both the old and new order --
+  unaffected. No new test needed (the existing `members_never_guesses_implements_when_the_extends_
+  chain_is_unresolved`/`_when_a_known_subclass_overrides_the_same_member` tests already cover the
+  ALL-unresolved and fully-resolved edges; the reordering's OWN effect is only visible on the
+  live corpora, where it recovers the bulk of the ~30,114-call `same` drop -- see §12.6).
+- **Item C, MEASURED, NOT further refined**: `has_known_subclass_override` fires 12 (n8n) / 18 (VS
+  Code) times total in a cold scan of two large corpora -- an order of magnitude too small to
+  responsibly justify inventing a narrower rule ("only demote when the receiver's static type is a
+  genuine interface/abstract base, never a concrete class further down the hierarchy") without live
+  samples to validate it against; every attempt to reason out such a rule from first principles
+  (documented in this session's own working notes, not committed) either collapsed to a no-op (the
+  `implements`-fallback loop it gates is ALREADY unreachable whenever it doesn't matter) or required
+  information this crate does not track (whether a class is `abstract`). Left exactly as E-P0k built
+  it -- reported per the task's own "demote to pending, report the coverage" discipline.
+- **Item D/E, VERIFIED, NO CHANGE**: the task's own concern ("instanceof narrowing must not demote
+  sites outside the guarded block") is already exactly what E-P0k's own `instanceof_narrowing_
+  never_leaks_past_its_own_guarded_region` test proves (a site textually AFTER the guarded `if`
+  block resolves normally to the unnarrowed declaration, never demoted) -- re-run clean this
+  session, no code path found that could violate it (the narrowing stack is push/truncate-paired
+  around the exact guarded region, `suppress_instanceof_narrowing_for_calls` is reset immediately
+  after the one call it brackets even on early return). No change needed.
+
+### 12.5 Files touched
+
+- `crates/urdira-jsts-typeflow/src/lib.rs`: `is_dropped_nullish_union_constituent`/`is_real_
+  primitive_union_constituent` (F, replacing `is_dropped_union_constituent`), `RawTypeRef::
+  TypeQuery`/`ResolvedTypeRef::TypeQuery` (G) threaded through `raw_type_ref_of_ts_type`,
+  `resolve_raw_type_ref`, `resolve_raw_type_ref_deferred`, `resolve_type_ref_chasing_aliases`,
+  `contains_deferred`, `resolve_type_query_entity_ref` (new), `lookup_member_entity_if_callable`/
+  `collect_member_entity_if_callable`/`member_kind_is_callable` (new, G's `IndexedAccess` extension),
+  `raw_type_ref_of_value_copy_expression` (new, G's value-copy extension) wired into `member_entry_
+  of_class_element`/`member_entries_of_constructor_parameter_properties`, `collect_members`'s
+  reordered `extends`-then-`has_unresolved_extends` walk (item A) with `DEMOTED_BY_UNRESOLVED_
+  EXTENDS`/`DEMOTED_BY_KNOWN_SUBCLASS_OVERRIDE` counters + `take_demotion_reason_counts` (Task 2
+  diagnostic), 2 new unit tests.
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: the SAME F split mirrored locally,
+  `resolve_call_target_typeflow`'s member branch consulting `member_type_ref` for `TypeQuery` before
+  trusting a name-based match (G), `resolve_type_ref_relative`'s new (no-op, chain-typing-only)
+  `TypeQuery` arm. H's sibling-swap attempt added THEN reverted (net zero diff from `8c58b23`
+  besides this section's own explanatory comment).
+- `crates/urdira-jsts-syntax-worker/src/resolver.rs`: H's `ExtensionFamily`/`dts_impl_sibling`/
+  `classify_module_extension` added THEN reverted (net zero diff besides an explanatory comment).
+- `crates/urdira-indexing-worker/src/main.rs` + `src/v4/typeflow.rs`: `collect_type_ref_import`
+  (production needed-imports scan) extended with a `RawTypeRef::TypeQuery(Some(Imported{...}))` arm
+  (G) so an aliased `typeof ImportedFn` closes its import need -- did NOT fully close the
+  `githubTransport.ts` two-hop cross-file case (§12.2's own "not confirmed working" note); the
+  single-hop case (`_fetchFn`) and the three-hop-through-a-different-file cases (`agentHostOctoKit
+  Service.ts`/`copilotApiService.ts`'s own `_fetch`) DO close, live-confirmed in §12.6.
+- `crates/urdira-indexing-worker/src/v4/residual.rs` + `src/v4/tests_e2e.rs`: Task 2's
+  `REASON_*` demotion-histogram print, right after each function's own cold scan.
+
+### 12.6 Final gate measurement (live, this task's own final binary)
+
+n8n (`n8n-corpus-2026-09-02`, unchanged corpus/oracle from §11.6): population floors all 10 `OK`
+(`records_total` 2,198,505/2,165,060); references `same=1,187,189` (up from the pre-task
+`1,187,143`), **`different=0`**, `missing=153,402`; calls `same=116,685` (up from the pre-task
+`93,364` -- **+23,321, +25%**, entirely from A's own reordering fix plus F/G closing what were
+`different` sites into `same`/pending), **`different=0`**, `possible=87,029`, `missing_site=3,870`;
+`confirmed_combined=161,811`, `abs_diff` from `REFERENCE_CONFIRMED_COMBINED=161,807` is **4**
+(unchanged from §11.6, within tolerance); `classification_mismatch_count=0` at both generations.
+**n8n's gate (`different==0` both populations, all floors, tolerance) is fully green.**
+
+VS Code (`vscode-corpus-2026-09-06`, reduced tree, SAME exclusion recipe as §11.5 -- all
+`fixtures`-named directories + `scripts/xterm-update.js`, rsync `--exclude='**/fixtures/'`
++ manual removal, `node_modules` symlinked not copied): references `same=1,749,287` (essentially
+the ORIGINAL pre-E-P0k baseline `1,749,006`, full recovery), **`different=2`** (down from the
+pre-task `3` -- F's `toString` sample closed; `outlineModel.ts`'s `parent` and `mouseTarget.ts`'s
+`type`, both a same-file member/parameter-shadowing shape OUTSIDE this task's own F/G/H scope,
+newly exposed -- not investigated, reported), `missing=1,396,523`; calls `same=179,522` (up from
+the pre-task `149,591` -- **+29,931, back to within 183 of the ORIGINAL, pre-E-P0k baseline
+`179,705`**, i.e. E-P0k's own guards' coverage cost is now almost entirely recovered),
+**`different=10`** (down from the pre-task `30`; residual: `_fetch`/githubTransport.ts x2 -- §12.2's
+two-hop alias gap, `_createMessageRequestHandler`/`_elicitationRequestHandler` x2 -- §12.2's
+`IndexedAccess`-into-callable gap, `createMarkupPreview` x2 -- mechanism not identified, `tunnel` x2
+-- an ambient-namespace-declaration selection bug unrelated to F/G/H, `marked` x1 -- §12.3, `i18n.
+test.ts`'s `parse`/`function` x1 -- an object-literal-method entity-id offset bug unrelated to
+F/G/H), `possible=547,720`, `missing_site=16,220`.
+
+**`different == 0` does NOT hold for VS Code** (2 references + 10 calls remain) -- per the task's
+own "never guess, report the rest" discipline, EVERY one of these 12 residual sites was
+individually investigated this session (not merely bucketed): 6 (the two `_fetch`, two `_createMessage
+RequestHandler`/`_elicitationRequestHandler`, `marked`) have an IDENTIFIED mechanism with an
+in-progress or reverted fix documented above; the other 6 (`createMarkupPreview` x2, `tunnel` x2,
+`outlineModel.ts`/`mouseTarget.ts` x2, `i18n.test.ts` x1 -- 7 counted, one is `marked` already
+listed) are newly-found, DISTINCT residual patterns this task did not have budget to root-cause
+safely. None was force-closed with a guess. Recommended as the next owner-queue item under this
+same P0's own tracking id, with this section's own per-sample breakdown as the starting point.
+
+### 12.7 Verification and cleanup
+
+`cargo fmt --all -- --check`: clean (one real formatting fix applied and re-verified, `cargo fmt
+--all` then `-- --check` clean). `cargo clippy --workspace --all-targets --locked -- -D warnings`:
+clean. `cargo test -p urdira-jsts-syntax-worker -p urdira-indexing-worker -p urdira-jsts-typeflow
+--locked`: **`test result: ok. 315 passed; 0 failed; 1 ignored`** (syntax-worker), **`test result:
+ok. 63 passed; 0 failed`** (typeflow, +1 new test), **`test result: ok. 152 passed; 0 failed; 19
+ignored`** (indexing-worker non-ignored suite, +1 new floor/parity-adjacent test count vs §11.7's
+151); n8n's own ignored floors/parity/residual tests re-run individually against the real corpus
+per §12.6 above. `cargo build --release --locked -p urdira-indexing-worker`: clean. `node scripts/
+build-native.mjs` (run with `CARGO_TARGET_DIR` unset -- the script's own artifact-copy step assumes
+the default `<repo>/target/<rust-triple>/release` layout and does not itself honor an overridden
+target dir; new worktree gotcha, folds into `feedback_worktree_subagents_base_and_node_modules`):
+clean. `CI=true ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts tests/v4-
+scan.test.ts`: **`Test Files 2 passed (2)`, `Tests 3 passed | 4 skipped (7)`** (byte-identical to
+§11.7's own reported output). Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0l`)
+to be removed after this evidence file's own commit; scratch under `~/Proyectos/urdira-benchmark/
+v4-fold/ep0l-{n8n,vscode}/` to be removed likewise; this worktree's own local `node_modules`/`dist`
+symlink scaffold (never committed, `git status` confirms untracked) removed at session close.
