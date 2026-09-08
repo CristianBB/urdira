@@ -41,12 +41,13 @@ use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::Comment;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, CallExpression, CatchParameter, ChainElement, Class,
-    ClassType, ComputedMemberExpression, ExportNamedDeclaration, ExportSpecifier, Expression,
-    FormalParameter, FormalParameterRest, Function, FunctionType, IdentifierReference,
-    ImportDeclaration, ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier,
-    ImportOrExportKind, ImportSpecifier, MethodDefinition, MethodDefinitionKind, ModuleExportName,
-    ObjectPattern, ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind,
+    ArrowFunctionExpression, BinaryExpression, BinaryOperator, BindingPattern, CallExpression,
+    CatchParameter, ChainElement, Class, ClassType, ComputedMemberExpression,
+    ExportNamedDeclaration, ExportSpecifier, Expression, FormalParameter, FormalParameterRest,
+    Function, FunctionType, IdentifierReference, IfStatement, ImportDeclaration,
+    ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier, ImportOrExportKind,
+    ImportSpecifier, LogicalExpression, LogicalOperator, MethodDefinition, MethodDefinitionKind,
+    ModuleExportName, ObjectPattern, ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind,
     StaticMemberExpression, TSCallSignatureDeclaration, TSConstructSignatureDeclaration,
     TSConstructorType, TSEnumDeclaration, TSFunctionType, TSInterfaceDeclaration,
     TSMethodSignature, TSMethodSignatureKind, TSModuleDeclaration, TSQualifiedName, TSSignature,
@@ -1447,6 +1448,79 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// a static method/property initializer from an instance one. Empty
     /// (defaults to instance, `false`) outside any member body.
     static_context: Vec<bool>,
+    /// E-P0k (2026-09-08, same-file member/parameter shadowing task):
+    /// whether the method body currently being walked (innermost last)
+    /// declares an EXPLICIT `this: T` parameter (`TSThisParameter` --
+    /// `public static createObservable(this: DomWidgetCtor<TArgs, T>, ...)`
+    /// {}` is the exact shape found live against the VS Code corpus,
+    /// `src/vs/platform/domWidget/browser/domWidget.ts`). TypeScript scopes
+    /// `this` inside such a method to the DECLARED parameter type `T`, not
+    /// the enclosing class -- `type_of_expression`'s `ThisExpression` arm
+    /// always used `class_stack.last()` unconditionally, so `this.
+    /// createObservable(...)` inside that exact static method resolved
+    /// `this` back to `DomWidget` itself (the enclosing class) and picked
+    /// `DomWidget`'s OWN static method instead of `DomWidgetCtor`'s member
+    /// signature -- coincidentally not wrong in that one case (both name
+    /// the same intended shape) but provably UNSOUND in general: `T` can
+    /// name any type, unrelated to the enclosing class, and this crate does
+    /// not attempt to resolve an arbitrary `T` here (a type alias to an
+    /// inline object-literal type, a generic, an imported interface, ...),
+    /// so an explicit `this` parameter simply blocks `class_stack` from
+    /// being used at all (`true` on top of this stack) rather than resolve
+    /// -- `type_of_expression` MUST treat `this` as unknown in that case,
+    /// never fall back to the enclosing class. Empty (defaults to `false`)
+    /// outside any method body; only `visit_method_definition` pushes a
+    /// `true` frame (a plain function/function-expression already fails
+    /// closed for `this` via `class_stack`'s own `None` push in `visit_
+    /// function`, so this stack is not needed there).
+    explicit_this_param_stack: Vec<bool>,
+    /// E-P0k (2026-09-08): a bounded, syntax-local approximation of
+    /// TypeScript's `instanceof` control-flow narrowing -- a stack of
+    /// `(symbol_id, narrowed_class_entity_id)` pairs, pushed on entering the
+    /// LEXICAL region an `instanceof` check is known to guard (an `if
+    /// (x instanceof C)` statement's own consequent, or the right-hand side
+    /// of an `x instanceof C && ...` logical-AND) and popped on leaving it.
+    /// Consulted by `type_of_expression`'s `Identifier` arm BEFORE its
+    /// declared-type lookup -- searched from the END (innermost/most recent
+    /// push wins, matching real lexical nesting) since a symbol can be
+    /// narrowed more than once at different depths.
+    ///
+    /// This is deliberately NOT real control-flow analysis (no dataflow
+    /// merge at join points, no negative narrowing on the ELSE branch, no
+    /// tracking across a `return`/`continue` that would make an `if`'s own
+    /// negative case fall through unguarded to the rest of a block, ...) --
+    /// exactly the two live shapes found in the VS Code corpus and nothing
+    /// more, on this crate's own "never guess past what's proven" discipline
+    /// (see `visit_if_statement`/`visit_logical_expression`'s own doc
+    /// comments for the exact two shapes and the live samples that
+    /// motivated them: `extensions/markdown-language-features/src/
+    /// slugify.ts`'s `other instanceof GithubSlug && ...other.value...`,
+    /// `extensions/references-view/src/types/index.ts`'s `else if (oldInput
+    /// instanceof TypesTreeInput) { ...oldInput.location... }`). Anything
+    /// this narrow tracker cannot prove stays exactly as unnarrowed as
+    /// before this task -- never a false narrowing, only ever a missed one.
+    instanceof_narrowings: Vec<(SymbolId, String)>,
+    /// E-P0k (2026-09-08, adversarial review fix): `instanceof_narrowings`
+    /// is sound for a plain MEMBER READ (`core:references`,
+    /// `resolve_static_member_reference`) but NOT for a CALL's own target
+    /// resolution (`core:call`, `resolve_call_target_typeflow`) -- found
+    /// live against the VS Code corpus: `activePane instanceof MergeEditor
+    /// && activePane.getControl() && ...` (`mergeEditor.ts`) narrows
+    /// `activePane` to `MergeEditor` exactly like the two patterns that
+    /// motivated `instanceof_narrowings` in the first place, but v3's real
+    /// answer for the CALL `activePane.getControl()` is still the
+    /// UNNARROWED declared type's own method (`EditorPane.getControl`,
+    /// `editor.ts`), not `MergeEditor`'s own override -- unlike a plain
+    /// property read, which DOES follow the narrowed type in both of this
+    /// task's own confirmed samples. `Cell`, not a plain `bool`, because
+    /// `resolve_call_target_typeflow`/`type_of_expression` are both `&self`
+    /// (this walker resolves read-only during the main visit; only the
+    /// dedicated stacks like `instanceof_narrowings` itself are `&mut self`
+    /// through a SEPARATE visitor method). Set around the ONE call-target
+    /// entry point that reaches `type_of_expression` for a call's own
+    /// callee object; never touched by a plain member read, so reads keep
+    /// consulting `instanceof_narrowings` exactly as before.
+    suppress_instanceof_narrowing_for_calls: std::cell::Cell<bool>,
     /// Parameter entities, "referenced-only" variant: the nearest enclosing
     /// declaration a `FormalParameter` directly inside it should attribute
     /// `parent_id` to, innermost last -- `None` when that nearest enclosing
@@ -1779,6 +1853,9 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             typeflow_pending_call_shapes: Vec::new(),
             class_stack: Vec::new(),
             static_context: Vec::new(),
+            explicit_this_param_stack: Vec::new(),
+            instanceof_narrowings: Vec::new(),
+            suppress_instanceof_narrowing_for_calls: std::cell::Cell::new(false),
             param_owner_stack: Vec::new(),
             pending_function_owner: None,
             declarator_owns_entity: false,
@@ -2451,6 +2528,74 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         Some(declaration_id(kind, &self.path, target_start, target_name))
     }
 
+    /// E-P0k: `expr` is (possibly through one or more parenthesizations, or
+    /// a chain of `&&`-joined tests) a set of `instanceof` checks -- returns
+    /// one `(symbol_id, class_entity_id)` narrowing per check this crate can
+    /// PROVE (both the left-hand identifier's own binding AND the
+    /// right-hand class name resolve with the same certainty every other
+    /// rule in this file requires). A single `Expression::BinaryExpression`
+    /// with `BinaryOperator::Instanceof`, left a plain `IdentifierReference`
+    /// with a real local binding (never an import, a destructured pattern,
+    /// or anything `resolve_identifier_to_kind`-shaped -- this is about a
+    /// SIMPLE local/parameter identifier, the only shape both live samples
+    /// use), right a plain identifier resolving to exactly one `Class`
+    /// declaration, contributes its own single-entry `Vec`; a
+    /// `LogicalExpression` with `LogicalOperator::And` contributes BOTH
+    /// sides' own narrowings (each already proven independently, and by the
+    /// time control reaches the right-hand side of a `&&`, the left-hand
+    /// side is known true); anything else (an `||`, a negation, a
+    /// non-identifier operand, an ambiguous/unresolved binding) contributes
+    /// nothing -- never a guess.
+    fn extract_instanceof_narrowings(&self, expr: &Expression<'a>) -> Vec<(SymbolId, String)> {
+        match expr {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.extract_instanceof_narrowings(&parenthesized.expression)
+            }
+            Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::And => {
+                let mut narrowings = self.extract_instanceof_narrowings(&logical.left);
+                narrowings.extend(self.extract_instanceof_narrowings(&logical.right));
+                narrowings
+            }
+            Expression::BinaryExpression(binary) => self
+                .instanceof_narrowing_of_binary(binary)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The single-check half of `extract_instanceof_narrowings` -- factored
+    /// out so it can be reused byte-identically regardless of how deep in a
+    /// `&&` chain (or how many parens around) the check appears.
+    fn instanceof_narrowing_of_binary(
+        &self,
+        binary: &BinaryExpression<'a>,
+    ) -> Option<(SymbolId, String)> {
+        if binary.operator != BinaryOperator::Instanceof {
+            return None;
+        }
+        let Expression::Identifier(left) = &binary.left else {
+            return None;
+        };
+        let Expression::Identifier(right) = &binary.right else {
+            return None;
+        };
+        let reference_id = left.reference_id.get()?;
+        let reference = self.scoping.get_reference(reference_id);
+        let symbol_id = reference.symbol_id()?;
+        // Never a destructured binding, an import, or anything with more
+        // than one declaration -- same certainty bar `resolve_identifier_
+        // to_kind` already enforces for every other rule in this file (an
+        // ambiguous/merged binding narrows to nothing, not a guess).
+        if self.scoping.symbol_flags(symbol_id).is_import()
+            || !self.scoping.symbol_redeclarations(symbol_id).is_empty()
+        {
+            return None;
+        }
+        let class_id = self.resolve_identifier_to_kind(right, &[DeclKind::Class])?;
+        Some((symbol_id, class_id))
+    }
+
     /// Resolve a `CallExpression`'s target (E3, T1): only when the callee is
     /// a plain identifier (never a member expression, `this`, `super`, or
     /// any other expression -- `new` never even reaches here, see
@@ -2733,6 +2878,32 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         }
     }
 
+    /// E-P0k (2026-09-08, adversarial review fix): whether `target_id`
+    /// (a `urdira-jsts-typeflow` member entity id, `jsts:{kind}:{path}:
+    /// {start}:{name}`) names a METHOD/getter/setter/constructor, as
+    /// opposed to a plain data property or parameter property. Consulted
+    /// ONLY when the receiver's own type came from an `instanceof`
+    /// narrowing (`rule == "instanceof_narrowed"`) -- found live against
+    /// the VS Code corpus that `instanceof`-narrowing a receiver is sound
+    /// for a PROPERTY read (`other.value`/`oldInput.location`/`base.
+    /// zenModeIgnore`, this task's confirmed samples) but NOT for a METHOD
+    /// (`activePane.getControl`, `mergeEditor.ts`: still resolves, per v3's
+    /// real answer, to the base class's own UNNARROWED method, never the
+    /// narrowed subclass's override) -- this crate does not attempt to
+    /// model WHY v3's real checker draws that exact line (a plausible
+    /// guess: virtual dispatch already makes an overridden method
+    /// correctly polymorphic at the DECLARED type without narrowing, so
+    /// TypeScript's own call/method resolution mechanism differs from its
+    /// plain-property symbol lookup) -- only that it reproducibly does,
+    /// so this crate mirrors the DISTINCTION exactly rather than guess at
+    /// the mechanism.
+    fn narrowed_target_is_a_callable_kind(target_id: &str) -> bool {
+        target_id
+            .strip_prefix("jsts:")
+            .and_then(|rest| rest.split(':').next())
+            .is_some_and(|kind| matches!(kind, "method" | "getter" | "setter" | "constructor"))
+    }
+
     /// The `(entity_id, is_static)` pair a `TypeflowValue` carries, when it
     /// is itself directly a class/interface entity (never an `ArrayOf`/
     /// `PromiseOf` wrapper -- those need an explicit unwrap first, e.g.
@@ -2853,6 +3024,15 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     fn type_of_expression(&self, expr: &Expression<'a>) -> Option<(TypeflowValue, &'static str)> {
         match expr {
             Expression::ThisExpression(_) => {
+                // E-P0k: an explicit `this: T` parameter on the innermost
+                // enclosing method overrides what `this` means for its own
+                // body -- see `explicit_this_param_stack`'s own doc comment.
+                // This crate does not attempt to resolve an arbitrary `T`
+                // here, so `this` is simply unknown in that case, never the
+                // enclosing class.
+                if self.explicit_this_param_stack.last() == Some(&true) {
+                    return None;
+                }
                 let frame = self.class_stack.last()?;
                 Some((
                     TypeflowValue::Entity {
@@ -2887,6 +3067,32 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 let reference_id = ident.reference_id.get()?;
                 let reference = self.scoping.get_reference(reference_id);
                 let symbol_id = reference.symbol_id()?;
+                // E-P0k: an active `instanceof` narrowing (see `instanceof_
+                // narrowings`'s own doc comment) is MORE SPECIFIC than
+                // anything below -- it reflects a proven fact about THIS
+                // exact position, not just the symbol's general declared/
+                // inferred type -- so it is consulted first. Searched from
+                // the end: the innermost (most recently pushed, i.e. most
+                // deeply nested) narrowing for this symbol wins. Suppressed
+                // entirely inside a CALL's own target resolution -- see
+                // `suppress_instanceof_narrowing_for_calls`'s own doc
+                // comment for why a narrowed CALL target is not sound the
+                // same way a narrowed plain read is.
+                if !self.suppress_instanceof_narrowing_for_calls.get()
+                    && let Some((_, narrowed_entity_id)) = self
+                        .instanceof_narrowings
+                        .iter()
+                        .rev()
+                        .find(|(narrowed_symbol, _)| *narrowed_symbol == symbol_id)
+                {
+                    return Some((
+                        TypeflowValue::Entity {
+                            entity_id: narrowed_entity_id.clone(),
+                            is_static: false,
+                        },
+                        "instanceof_narrowed",
+                    ));
+                }
                 if let Some(tagged) = self.local_types.get(&symbol_id).cloned() {
                     return Some(tagged);
                 }
@@ -3347,10 +3553,22 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// own relation kind, exactly like the checker does.
     fn resolve_static_member_reference(&self, expr: &StaticMemberExpression<'a>) -> Option<String> {
         if let Some(index) = self.ctx.typeflow_index
-            && let Some((base_value, _rule)) = self.type_of_expression(&expr.object)
+            && let Some((base_value, rule)) = self.type_of_expression(&expr.object)
             && let Some((base_entity, is_static)) = Self::as_entity(&base_value)
             && let urdira_jsts_typeflow::MemberLookup::One(target) =
                 index.members(&base_entity, expr.property.name.as_str(), is_static)
+            // E-P0k (adversarial review fix): an `instanceof`-narrowed
+            // receiver is sound for a PROPERTY read (this task's two
+            // confirmed samples) but NOT for a METHOD/getter/setter/
+            // constructor -- found live: `activePane.getControl` (a
+            // property-position READ of a method, on the SAME expression a
+            // subsequent CALL also reads) still resolves, per v3's real
+            // answer, to the UNNARROWED declared type's own method
+            // (`EditorPane.getControl`), never `MergeEditor`'s own
+            // override, even though the identical narrowing pattern DOES
+            // apply for a plain data property in every confirmed case. See
+            // `Self::narrowed_target_is_a_callable_kind`'s own doc comment.
+            && !(rule == "instanceof_narrowed" && Self::narrowed_target_is_a_callable_kind(&target))
         {
             return Some(target);
         }
@@ -3574,7 +3792,16 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         let Expression::StaticMemberExpression(member) = &expr.callee else {
             return TypeflowCallResolution::Unresolved;
         };
-        if let Some((base_value, rule)) = self.type_of_expression(&member.object) {
+        // E-P0k: suppress `instanceof_narrowings` for the DURATION of this
+        // one call, exactly around computing the callee's own object type
+        // -- see `suppress_instanceof_narrowing_for_calls`'s own doc
+        // comment. Reset immediately after the call returns (captured into
+        // a local first) rather than held across the `match` below, so an
+        // early return from within it can never leave the flag stuck.
+        self.suppress_instanceof_narrowing_for_calls.set(true);
+        let object_type = self.type_of_expression(&member.object);
+        self.suppress_instanceof_narrowing_for_calls.set(false);
+        if let Some((base_value, rule)) = object_type {
             match &base_value {
                 // P2-2j: a union receiver routes to `members_of_union` --
                 // NEVER to `members`, and NEVER produces `Resolved` (see
@@ -4996,6 +5223,58 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         );
     }
 
+    /// E-P0k: `if (x instanceof C) { ...consequent... }` narrows `x` to `C`
+    /// for the DURATION of the consequent only -- see `instanceof_
+    /// narrowings`'s own doc comment for the exact discipline (bounded,
+    /// syntax-local, never a guess). Reproduces the live shape found in
+    /// `extensions/references-view/src/types/index.ts`: `else if (oldInput
+    /// instanceof TypesTreeInput) { newInput = new TypesTreeInput(oldInput.
+    /// location, ...); }` -- `oldInput.location` used to resolve to
+    /// `SymbolTreeInput`'s own interface member (the UNNARROWED declared
+    /// type) instead of `TypesTreeInput`'s own constructor parameter
+    /// property. Deliberately does NOT narrow anything for the `alternate`
+    /// branch (a real `else` never proves anything an `instanceof` check on
+    /// the `test` failed to -- TypeScript itself only narrows the negative
+    /// case for a DISCRIMINATED shape this crate does not attempt), and
+    /// does not persist past the `if` at all (no narrowing survives into
+    /// whatever follows the whole statement, even along a path that must
+    /// have taken the `if` branch to get there -- again, bounded on
+    /// purpose, matching this whole mechanism's "only ever miss, never
+    /// guess" contract).
+    fn visit_if_statement(&mut self, stmt: &IfStatement<'a>) {
+        self.visit_expression(&stmt.test);
+        let narrowings = self.extract_instanceof_narrowings(&stmt.test);
+        let restore_len = self.instanceof_narrowings.len();
+        self.instanceof_narrowings.extend(narrowings);
+        self.visit_statement(&stmt.consequent);
+        self.instanceof_narrowings.truncate(restore_len);
+        if let Some(alternate) = &stmt.alternate {
+            self.visit_statement(alternate);
+        }
+    }
+
+    /// E-P0k: `x instanceof C && ...right...` narrows `x` to `C` for the
+    /// DURATION of `right` only (never past the whole logical expression,
+    /// never for an `||`) -- see `instanceof_narrowings`'s own doc comment.
+    /// Reproduces the live shape found in `extensions/markdown-language-
+    /// features/src/slugify.ts`: `other instanceof GithubSlug && this.value.
+    /// toLowerCase() === other.value.toLowerCase()` -- the SECOND
+    /// `other.value` used to resolve to `ISlug`'s own interface property
+    /// (the unnarrowed declared type of `other: ISlug`) instead of
+    /// `GithubSlug`'s own constructor parameter property.
+    fn visit_logical_expression(&mut self, expr: &LogicalExpression<'a>) {
+        self.visit_expression(&expr.left);
+        if expr.operator != LogicalOperator::And {
+            self.visit_expression(&expr.right);
+            return;
+        }
+        let narrowings = self.extract_instanceof_narrowings(&expr.left);
+        let restore_len = self.instanceof_narrowings.len();
+        self.instanceof_narrowings.extend(narrowings);
+        self.visit_expression(&expr.right);
+        self.instanceof_narrowings.truncate(restore_len);
+    }
+
     /// Found during E1c's cardinality reconciliation: an import specifier's
     /// LOCAL binding (`local` in `import { imported as local } from "m"`,
     /// or the plain name in `import { name } from "m"`) is, correctly, an
@@ -5987,7 +6266,15 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         // maintained), so `isFoo(x: unknown): x is Foo {}` resolves.
         self.predicate_param_stack
             .push(identifier_pattern_params(&method.value.params.items));
+        // E-P0k: an explicit `this: T` parameter on THIS method's own
+        // `.value` function overrides what `this` means for the rest of its
+        // body -- see `explicit_this_param_stack`'s own doc comment for the
+        // exact live pattern this closes (`domWidget.ts`'s `createObservable
+        // (this: DomWidgetCtor<TArgs, T>, ...)`).
+        self.explicit_this_param_stack
+            .push(method.value.this_param.is_some());
         walk_function(self, &method.value, flags);
+        self.explicit_this_param_stack.pop();
         self.predicate_param_stack.pop();
         self.static_context.pop();
         if pushed {
@@ -12625,6 +12912,311 @@ declare module \"mymod\" {
         assert_eq!(
             semantics.call_rows[0].body.to_value()["target_id"],
             target_id
+        );
+    }
+
+    // E-P0k (2026-09-08, same-file member/parameter shadowing task): see
+    // `docs/evidence/2026-09-07-v4-vscode-campaign.md` §9 item 7 for the
+    // original P0 report (20 `core:references` + 44 `core:call`
+    // `different_target` samples against the VS Code corpus), and this
+    // task's own evidence addendum for the full classification. Two of the
+    // real root causes found live are fixed here; see `ProgramIndex::
+    // collect_members`'s own doc comment (crate `urdira-jsts-typeflow`) for
+    // the third (an unresolved `extends` chain must never fall through to
+    // an `implements` interface's own method SIGNATURE as a guess).
+
+    /// Pattern (b) per this task's own classification -- `this.<member>`
+    /// inside a method that declares an EXPLICIT `this: T` parameter must
+    /// type `this` as `T`, never the enclosing class. Reproduces the exact
+    /// live shape found in `src/vs/platform/domWidget/browser/domWidget.ts`
+    /// (`createObservable`/`instantiateObservable`/`instantiateAppend`/
+    /// `createAppend`, each `public static <name>(this: DomWidgetCtor<...>,
+    /// ...)`  calling `this.createAppend(...)`/etc against ANOTHER static
+    /// method of the SAME class): before this fix, `this.factory()`
+    /// resolved to `Widget`'s own static `factory` (v4's wrong answer,
+    /// `different_target` against v3 in the VS Code sample) purely because
+    /// `class_stack.last()` was consulted unconditionally; now it must stay
+    /// pending (this crate does not attempt to resolve the explicit `this`
+    /// parameter's own declared type, so the correct, honest answer is
+    /// "unknown", never a confident guess at the enclosing class).
+    #[test]
+    fn this_expression_inside_an_explicit_this_parameter_method_never_resolves_to_the_enclosing_class()
+     {
+        let source = "class Widget {\n  static factory(this: unknown): void {}\n  static make(this: unknown): void {\n    this.factory();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let factory_id = "jsts:method:a.ts:24:factory";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().all(|row| row.3 != factory_id),
+            "this.factory() must never resolve to Widget's own static \
+             method through an explicit `this` parameter: rows={rows:?}"
+        );
+        assert!(
+            semantics.typeflow_call_rows.is_empty() && semantics.call_rows.is_empty(),
+            "the call itself must also stay unresolved, not just excluded \
+             from any OTHER target: typeflow_call_rows={:?} call_rows={:?}",
+            semantics.typeflow_call_rows,
+            semantics.call_rows
+        );
+        // Strongest check: the call site was actually REACHED and
+        // deliberately deferred (not merely absent for some unrelated
+        // reason) -- `this.factory()` starts at byte 97 in `source`.
+        assert!(
+            source[97..].starts_with("this.factory"),
+            "test's own assumed call-site offset drifted"
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::Call && site.start_utf16 == 97),
+            "expected a pending call site at offset 97: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    /// Sanity companion: an ORDINARY method (no explicit `this` parameter)
+    /// on the exact same class must be unaffected -- `this.factory()` still
+    /// resolves normally. Guards against `explicit_this_param_stack` ever
+    /// leaking a `true` frame past the ONE method that actually declared an
+    /// explicit `this` parameter.
+    #[test]
+    fn this_expression_still_resolves_normally_without_an_explicit_this_parameter() {
+        let source =
+            "class Widget {\n  factory(): void {}\n  make(): void {\n    this.factory();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let factory_id = "jsts:method:a.ts:17:factory";
+        assert!(
+            semantics
+                .typeflow_call_rows
+                .iter()
+                .any(|row| row.body.to_value()["target_id"] == factory_id),
+            "this.factory() must still resolve normally in an ordinary \
+             method: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    /// Pattern (f) ("otros") per this task's own classification -- a class
+    /// whose real superclass sits several UNRESOLVED `extends` hops away
+    /// (an external/vendored base this crate never indexed) must never fall
+    /// through to an unrelated `implements` interface's own method
+    /// SIGNATURE as a stand-in for the real (untracked) implementation.
+    /// Reproduces the live shape found in `src/vs/workbench/contrib/
+    /// markers/browser/markersView.ts`: `class MarkersTree extends
+    /// WorkbenchObjectTree<...> implements IProblemsWidget` calling
+    /// `this.getSelection()` -- v3's real answer is several `extends` hops
+    /// up in `AbstractTree` (a chain this crate could not fully resolve
+    /// cross-file); v4 used to guess `IProblemsWidget`'s own method
+    /// signature instead (`different_target`). `UnknownBase` here stands in
+    /// for `WorkbenchObjectTree`: an identifier this crate never sees a
+    /// declaration for at all, exactly like an external/vendored base.
+    #[test]
+    fn call_through_this_never_falls_back_to_an_implemented_interface_when_the_extends_chain_is_unresolved()
+     {
+        let source = "interface IProblemsWidget {\n  getSelection(): unknown;\n}\nclass MarkersTree extends UnknownBase implements IProblemsWidget {\n  reveal(): void {\n    this.getSelection();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.typeflow_call_rows.is_empty(),
+            "this.getSelection() must never resolve to IProblemsWidget's \
+             own method signature when MarkersTree's real extends chain \
+             (UnknownBase) could not be resolved at all: {:?}",
+            semantics.typeflow_call_rows
+        );
+    }
+
+    /// Pattern (a) per this task's own classification -- a class `implements`
+    /// an interface without declaring the member itself, but a KNOWN
+    /// subclass overrides it (a constructor parameter property) -- must
+    /// never confidently resolve through the interface. Reproduces the live
+    /// shape found in `src/vs/workbench/browser/layout.ts`:
+    /// `abstract class WorkbenchLayoutStateKey implements
+    /// IWorkbenchLayoutStateKey` (the interface declares `zenModeIgnore`;
+    /// the abstract base does not) with a concrete subclass, `RuntimeState
+    /// Key`, whose OWN constructor parameter property overrides it.
+    #[test]
+    fn member_read_never_guesses_implements_when_a_known_subclass_overrides_the_same_member() {
+        let source = "interface IFace {\n  zenModeIgnore?: boolean;\n}\nabstract class Base implements IFace {\n  other(): void {}\n}\nclass Sub extends Base {\n  constructor(readonly zenModeIgnore?: boolean) {\n    super();\n  }\n}\nfunction use(base: Base) {\n  base.zenModeIgnore;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let interface_member_id = "jsts:property:a.ts:20:zenModeIgnore";
+        assert_eq!(
+            source[20..].get(..13),
+            Some("zenModeIgnore"),
+            "test's own assumed IFace member offset drifted"
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().all(|row| row.3 != interface_member_id),
+            "base.zenModeIgnore must never resolve to IFace's own \
+             signature when Sub's own override exists: rows={rows:?}"
+        );
+    }
+
+    /// E-P0k pattern (b)/(f) -- `instanceof`-narrowed member read. Reproduces
+    /// the live shape found in `extensions/markdown-language-features/src/
+    /// slugify.ts`: `other instanceof GithubSlug && ...other.value...`
+    /// inside `GithubSlug.equals(other: ISlug)` -- `other.value` (the SECOND
+    /// occurrence, guarded by the `instanceof` check) must resolve to
+    /// `GithubSlug`'s own constructor parameter property, never `ISlug`'s
+    /// own (unnarrowed) interface property.
+    #[test]
+    fn instanceof_narrowed_member_read_inside_a_logical_and_resolves_to_the_narrowed_class() {
+        let source = "interface ISlug {\n  readonly value: string;\n  equals(other: ISlug): boolean;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n  equals(other: ISlug): boolean {\n    return other instanceof GithubSlug && this.value === other.value;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let github_slug_value_id = "jsts:parameter:a.ts:145:value";
+        let interface_value_id = "jsts:property:a.ts:29:value";
+        assert_eq!(
+            source[145..].get(..5),
+            Some("value"),
+            "test's own assumed GithubSlug param-property offset drifted"
+        );
+        assert_eq!(
+            source[29..].get(..5),
+            Some("value"),
+            "test's own assumed ISlug interface-property offset drifted"
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == github_slug_value_id),
+            "other.value (narrowed by the preceding instanceof check) must \
+             resolve to GithubSlug's own parameter property: rows={rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.3 != interface_value_id),
+            "other.value must never resolve to ISlug's own (unnarrowed) \
+             interface property once instanceof-narrowed: rows={rows:?}"
+        );
+    }
+
+    /// E-P0k companion: the SAME `instanceof` shape via an `if`/`else if`
+    /// chain rather than a `&&` -- reproduces the live shape found in
+    /// `extensions/references-view/src/types/index.ts`: `else if (oldInput
+    /// instanceof TypesTreeInput) { ...oldInput.location... }`.
+    #[test]
+    fn instanceof_narrowed_member_read_inside_an_if_consequent_resolves_to_the_narrowed_class() {
+        let source = "interface ISlug {\n  readonly value: string;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n}\nfunction use(other: ISlug): string | undefined {\n  if (other instanceof GithubSlug) {\n    return other.value;\n  }\n  return undefined;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let github_slug_value_id = "jsts:parameter:a.ts:112:value";
+        assert_eq!(
+            source[112..].get(..5),
+            Some("value"),
+            "test's own assumed GithubSlug param-property offset drifted"
+        );
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == github_slug_value_id),
+            "other.value inside the instanceof-guarded if-consequent must \
+             resolve to GithubSlug's own parameter property: rows={rows:?}"
+        );
+    }
+
+    /// E-P0k safety companion: the SAME shape, but the member read is
+    /// OUTSIDE the guarded region (after the `if`, or on the `else` side) --
+    /// must NOT be narrowed (this mechanism never proves anything about a
+    /// negative `instanceof` case or anything past the guarded region).
+    #[test]
+    fn instanceof_narrowing_never_leaks_past_its_own_guarded_region() {
+        let source = "interface ISlug {\n  readonly value: string;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n}\nfunction use(other: ISlug): string {\n  if (other instanceof GithubSlug) {\n    // narrowed here only\n  }\n  return other.value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let github_slug_value_id = "jsts:parameter:a.ts:112:value";
+        let interface_value_id = "jsts:property:a.ts:29:value";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().all(|row| row.3 != github_slug_value_id),
+            "other.value AFTER the guarded if-block must never resolve to \
+             GithubSlug's own parameter property: rows={rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.3 == interface_value_id),
+            "other.value AFTER the guarded if-block must still resolve \
+             normally to ISlug's own (unnarrowed) interface property: \
+             rows={rows:?}"
+        );
+    }
+
+    /// E-P0k adversarial-review fix: `instanceof_narrowings` is sound for a
+    /// plain member READ but NOT for a CALL's own target resolution --
+    /// found live against the VS Code corpus (`mergeEditor.ts`):
+    /// `activePane instanceof MergeEditor && activePane.getControl() && ...`
+    /// narrows `activePane` to `MergeEditor` exactly like the read cases
+    /// above, but v3's real answer for the CALL `activePane.getControl()`
+    /// stays the UNNARROWED declared type's own method (`EditorPane.
+    /// getControl`), not `MergeEditor`'s own override. See
+    /// `suppress_instanceof_narrowing_for_calls`'s own doc comment.
+    #[test]
+    fn instanceof_narrowing_never_applies_to_a_calls_own_target_resolution() {
+        let source = "class EditorPane {\n  getControl(): unknown { return undefined; }\n}\nclass MergeEditor extends EditorPane {\n  override getControl(): unknown { return 1; }\n}\nfunction use(activePane: EditorPane) {\n  if (activePane instanceof MergeEditor && activePane.getControl()) {\n    activePane.getControl();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_control_id = "jsts:method:a.ts:21:getControl";
+        let sub_get_control_id = "jsts:method:a.ts:117:getControl";
+        assert_eq!(
+            source[21..].get(..11),
+            Some("getControl("),
+            "test's own assumed EditorPane.getControl offset drifted"
+        );
+        assert_eq!(
+            source[117..].get(..11),
+            Some("getControl("),
+            "test's own assumed MergeEditor.getControl offset drifted"
+        );
+        let call_targets: Vec<String> = semantics
+            .typeflow_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            call_targets
+                .iter()
+                .all(|target| target != sub_get_control_id),
+            "activePane.getControl() must never resolve to MergeEditor's \
+             own override just because activePane was instanceof-narrowed \
+             at the call site: {call_targets:?}"
+        );
+        assert!(
+            call_targets
+                .iter()
+                .any(|target| target == base_get_control_id),
+            "activePane.getControl() must still resolve normally to \
+             EditorPane's own (unnarrowed) declaration: {call_targets:?}"
+        );
+        // The callee's own PROPERTY-position read (`core:references`, in
+        // ADDITION to the separate `core:call` row above -- see `visit_
+        // static_member_expression`'s own doc comment for why v3 emits
+        // both) must ALSO never guess the narrowed subclass's override --
+        // `Self::narrowed_target_is_a_callable_kind` rejects the narrowed
+        // resolution outright here (this position never retries against
+        // the unnarrowed declared type, so it correctly stays PENDING
+        // rather than confidently resolving to EITHER declaration -- a
+        // strictly safer outcome than the pre-fix `different_target`, even
+        // though matching v3's own `EditorPane.getControl` answer exactly
+        // would be nicer; see this test's own module-level doc comment).
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().all(|row| row.3 != sub_get_control_id),
+            "the callee's own property-position read of activePane.\
+             getControl must never resolve to MergeEditor's own override \
+             either: rows={rows:?}"
         );
     }
 }
