@@ -466,11 +466,11 @@ describe("Daemon v4 workspace-scan wiring (URDIRA_V4 default + explicit opt-out/
       const workspaceId = (added.payload as { readonly workspace_id: string }).workspace_id;
 
       const deadline = Date.now() + 20_000;
-      let payload: (IndexStatusWorkspaceView & { readonly last_scan_error_code?: string }) | undefined;
+      let payload: (IndexStatusWorkspaceView & { readonly last_scan_error_code?: string; readonly last_scan_error_at?: string }) | undefined;
       while (Date.now() < deadline) {
         const response = await client.call("core:index_status", { workspace_ids: [workspaceId] });
         expect(response.outcome).toBe("success");
-        const workspaces = (response.payload as { readonly workspaces: readonly (IndexStatusWorkspaceView & { readonly last_scan_error_code?: string })[] }).workspaces;
+        const workspaces = (response.payload as { readonly workspaces: readonly (IndexStatusWorkspaceView & { readonly last_scan_error_code?: string; readonly last_scan_error_at?: string })[] }).workspaces;
         payload = workspaces[0];
         if (payload?.last_scan_error_code !== undefined) break;
         await sleep(50);
