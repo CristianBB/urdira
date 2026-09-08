@@ -3356,6 +3356,75 @@ describe("SqliteCanonicalQuerySnapshotPort warm-records LRU accounting", () => {
       expect(reads).toBeGreaterThan(readsAfterFirst);
     });
   });
+
+  it("Frente S-H: caches the fully-decoded semantic_vectors result per generation -- a second call for the SAME generation skips the SQL reads entirely, a generation bump invalidates it, and evictWarmRecords()/approxWarmBytes() cover it", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-1", versionId: "artv-1", path: "src/one.ts", byteLength: 64, validFromGeneration: 1 });
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-2", versionId: "artv-2", path: "src/two.ts", byteLength: 64, validFromGeneration: 1 });
+      await putSemanticVector(opened, provider, { artifactId: "art-1", versionId: "artv-1", text: "function residentCacheOne() {}" });
+      await putSemanticVector(opened, provider, { artifactId: "art-2", versionId: "artv-2", text: "function residentCacheTwo() {}" });
+
+      let sqlReads = 0;
+      const db = opened.database;
+      // A `Proxy` (not a `{ ...db, all: ... }` spread) forwards every OTHER
+      // method by delegating straight through to `db` -- `SqliteWorkerAdapter`
+      // (`packages/storage/src/sqlite.ts`) implements `SqliteDatabase` with
+      // prototype methods, so a spread would silently drop `get`/`run`/... .
+      const countingDb = new Proxy(db, {
+        get(target, property, receiver) {
+          if (property === "all") {
+            return (sql: string, params?: readonly unknown[]) => {
+              if (sql.includes("FROM vector_projection_rows")) sqlReads += 1;
+              return target.all(sql, params as never);
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const port = new SqliteCanonicalQuerySnapshotPort(countingDb, cas);
+
+      const first = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(first).toHaveLength(2);
+      expect(sqlReads).toBe(1);
+      expect(port.approxWarmBytes()).toBeGreaterThan(0);
+
+      // Same generation: a second call returns the LITERAL SAME array (object
+      // identity, not just a deep-equal rebuild) and never re-queries
+      // `vector_projection_rows` at all.
+      const second = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(second).toBe(first);
+      expect(sqlReads).toBe(1);
+      // Every row's `vector_payload` is a VIEW into one shared contiguous
+      // backing buffer, not N independent allocations.
+      expect(first[0]!.vector_payload.buffer).toBe(first[1]!.vector_payload.buffer);
+
+      // A real generation bump (a new vector published under generation 2)
+      // is NOT masked by the cache: the next call re-queries and returns the
+      // union of both generations' still-visible vectors, not the stale
+      // generation-1 answer.
+      await db.run("UPDATE workspace_current_state SET current_generation = 2 WHERE workspace_id = ?", [workspace.workspace_id]);
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-3", versionId: "artv-3", path: "src/three.ts", byteLength: 64, validFromGeneration: 2 });
+      await putSemanticVector(opened, provider, { artifactId: "art-3", versionId: "artv-3", text: "function residentCacheThree() {}", validFromGeneration: 2 });
+      const afterBump = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(afterBump).toHaveLength(3);
+      expect(sqlReads).toBe(2);
+      expect(afterBump).not.toBe(first);
+
+      // evictWarmRecords() drops it (folded into the SAME warm-bytes budget
+      // as recordsCache/shardBytesCache) -- the next call for the SAME
+      // (now-current) generation rebuilds it from scratch, byte-identical.
+      const warmBytesBeforeEvict = port.approxWarmBytes();
+      expect(warmBytesBeforeEvict).toBeGreaterThan(0);
+      port.evictWarmRecords();
+      expect(port.approxWarmBytes()).toBe(0);
+      const afterEvict = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(afterEvict).toEqual(afterBump);
+      expect(sqlReads).toBe(3);
+    });
+  });
 });
 
 // --- RecordBodyInterner: cross-workspace decoded-body sharing --------------

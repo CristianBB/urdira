@@ -667,6 +667,33 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * budget knob -- one daemon-wide memory ceiling, not two to tune.
    */
   private readonly shardBytesCache = new Map<string, Uint8Array>();
+  /**
+   * Frente S-H (`generic-waddling-hartmanis.md` §4, Part 2, lever 1): the
+   * fully-decoded result of `semantic_vectors` for one `(workspace_id,
+   * profile_id, executable_binding_id)` triple, keyed by that triple and
+   * tagged with the `generation` it was built for. `semantic_vectors` below
+   * checks this FIRST -- a hit for the CURRENT generation skips the
+   * `vector_projection_rows` SELECT, the `vector_shards` lookup, AND every
+   * `packed.slice(...)` allocation entirely, returning the exact same array
+   * of `SemanticVectorRow` objects a fresh build would have produced (each
+   * row's `vector_payload` is a zero-copy `Uint8Array` VIEW into one single
+   * contiguous backing `ArrayBuffer` built once per cache-miss -- see the
+   * build loop below -- not `N` separate slice allocations, so a corpus at
+   * n8n's own measured scale (93,060 vectors x 384 dims x 4 bytes =~143MB,
+   * `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md` Part 3)
+   * pays that ~143MB copy ONCE per generation instead of once per query).
+   * Invalidation is implicit: a `generation` mismatch (the workspace
+   * published a new structural OR semantic generation since this entry was
+   * built) is treated exactly like a miss and the entry is rebuilt and
+   * overwritten -- there is no separate "invalidate" call, mirroring
+   * `recordsCache`'s own generation-tagged-entry convention immediately
+   * above. Folded into the SAME `approxWarmBytes()`/`evictWarmRecords()`
+   * budget loop as `recordsCache`/`shardBytesCache` (see `approxWarmBytes`'s
+   * own doc comment) rather than a second, independent MB knob -- one
+   * daemon-wide memory ceiling, not two to tune, per this frente's own
+   * amendment to decision 06.
+   */
+  private readonly residentVectorCache = new Map<string, { readonly generation: number; readonly vectors: readonly SemanticVectorRow[]; readonly bytes: number }>();
 
   /**
    * `interner` (optional -- omitted, this port behaves exactly as before
@@ -964,6 +991,9 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     // existing `URDIRA_WARM_RECORDS_BUDGET_MB` eviction loop bounds both
     // caches together under one ceiling.
     for (const bytes of this.shardBytesCache.values()) total += bytes.byteLength;
+    // Frente S-H: `residentVectorCache`'s own doc comment -- folded into the
+    // SAME total, one ceiling for every warm cache this port holds.
+    for (const cached of this.residentVectorCache.values()) total += cached.bytes;
     return total;
   }
 
@@ -995,6 +1025,8 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     this.capabilityCache.clear();
     this.textCache.clear();
     this.shardBytesCache.clear();
+    // Frente S-H: `residentVectorCache`'s own doc comment.
+    this.residentVectorCache.clear();
   }
 
   async records(scope: QueryScope): Promise<readonly CanonicalQueryRecord[]> {
@@ -1372,6 +1404,12 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (content === undefined) return [];
     const generation = await this.currentGeneration(scope);
     if (generation === undefined) return [];
+    // Frente S-H (Part 2, lever 1): `residentVectorCache`'s own doc comment
+    // -- a hit for the CURRENT generation skips everything below (the SQL
+    // reads, the shard lookups, and every per-vector slice allocation).
+    const residentKey = `${scope.workspace_id}:${profileId}:${executableBindingId}`;
+    const residentCached = this.residentVectorCache.get(residentKey);
+    if (residentCached !== undefined && residentCached.generation === generation) return residentCached.vectors;
     const rows = await this.database.all<{ projection_record_id: string; owner_artifact_id: string; owner_artifact_version_id: string; shard_id: string; shard_offset: number; byte_length: number; dimensions: number; element_type: string; normalization: string; distance_metric: string; document_grain: string | null; document_ref: string | null; segment_index: number | null; segment_start: number | null; segment_end: number | null }>(
       `SELECT projection_record_id, owner_artifact_id, owner_artifact_version_id, shard_id, shard_offset, byte_length, dimensions, element_type, normalization, distance_metric, document_grain, document_ref, segment_index, segment_start, segment_end
          FROM vector_projection_rows
@@ -1380,7 +1418,10 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
         ORDER BY projection_record_id`,
       [scope.workspace_id, profileId, executableBindingId, generation, generation],
     );
-    if (rows.length === 0) return [];
+    if (rows.length === 0) {
+      this.residentVectorCache.set(residentKey, { generation, vectors: [], bytes: 0 });
+      return [];
+    }
     const shardIds = [...new Set(rows.map((row) => row.shard_id))];
     // SQLite's variable ceiling is a runtime property (and can be as low as
     // 999). A semantic result may reference many packed shards, so never
@@ -1421,10 +1462,25 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
         this.shardBytesCache.set(shard.content_hash, bytes);
       } catch { /* unreadable shard -> its rows are dropped below, same "best effort" discipline artifact_text's CAS-read catch uses */ }
     });
+    // Frente S-H (Part 2, lever 1): every surviving row's bytes land in ONE
+    // contiguous backing `ArrayBuffer` (a real "Float32Array contiguo" per
+    // the plan's own wording -- `element_type` is `float32_le` for every
+    // row decision 17's provider ever writes), built exactly once per
+    // cache-miss; each row's own `vector_payload` below is a zero-copy
+    // `Uint8Array` VIEW into that one buffer (`new Uint8Array(buffer, offset,
+    // length)`), never its own separate backing allocation the way
+    // `packed.slice(...)` used to allocate per row, per query.
+    const survivingRows = rows.filter((row) => shardBytes.has(row.shard_id));
+    let totalBytes = 0;
+    for (const row of survivingRows) totalBytes += row.byte_length;
+    const backing = new ArrayBuffer(totalBytes);
     const result: SemanticVectorRow[] = [];
-    for (const row of rows) {
-      const packed = shardBytes.get(row.shard_id);
-      if (packed === undefined) continue;
+    let cursor = 0;
+    for (const row of survivingRows) {
+      const packed = shardBytes.get(row.shard_id)!;
+      const view = new Uint8Array(backing, cursor, row.byte_length);
+      view.set(packed.subarray(row.shard_offset, row.shard_offset + row.byte_length));
+      cursor += row.byte_length;
       // `document_grain === "entity"` (with a non-null `document_ref`) is
       // the only combination this pair of columns ever takes besides a bare
       // NULL `document_grain` (see the schema columns' own comment) -- any
@@ -1443,12 +1499,13 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       const hasSegmentSpan = row.segment_start !== null && row.segment_end !== null;
       result.push({
         projection_record_id: row.projection_record_id, owner_artifact_id: row.owner_artifact_id, owner_artifact_version_id: row.owner_artifact_version_id,
-        vector_payload: packed.slice(row.shard_offset, row.shard_offset + row.byte_length), dimensions: row.dimensions, element_type: row.element_type,
+        vector_payload: view, dimensions: row.dimensions, element_type: row.element_type,
         normalization: row.normalization, distance_metric: row.distance_metric, segment_index: row.segment_index ?? 0,
         ...(isEntity ? { document_grain: "entity" as const, document_ref: row.document_ref as string } : {}),
         ...(hasSegmentSpan ? { segment_start: row.segment_start as number, segment_end: row.segment_end as number } : {}),
       });
     }
+    this.residentVectorCache.set(residentKey, { generation, vectors: result, bytes: totalBytes });
     return result;
   }
 
