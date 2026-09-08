@@ -18,6 +18,7 @@ export {
   SqliteCanonicalQuerySnapshotPort,
   type CanonicalQueryRecord,
   type CanonicalQuerySnapshotPort,
+  type ComparisonParticipantResolver,
   type IndexedGraphEdge,
 } from "./canonical-query-data-port.js";
 export { decodeRow as decodeCanonicalQueryRecordRow, type RecordRow as CanonicalQueryRecordRow } from "./query-record-decode.js";

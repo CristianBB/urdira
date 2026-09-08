@@ -2,7 +2,7 @@ import { chmod, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, join, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, countFilesUpToBudget, KQUEUE_FILE_WATCH_BUDGET, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, countFilesUpToBudget, KQUEUE_FILE_WATCH_BUDGET, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type CanonicalQuerySnapshotPort, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
 import { sweepWorkspaceDataDir, type OrphanReport } from "./orphan-sweep.js";
@@ -1595,10 +1595,35 @@ function createCursorSigningSecret(): string {
   return randomBytes(32).toString("hex");
 }
 
-/** Extracts the single-workspace target from a `QueryScope` in a `core:query`/`core:query_continue` request payload. Comparison scopes are not yet resolvable to one workspace database (see final report). */
+/**
+ * Extracts the ONE workspace this `core:query`/`core:query_continue`
+ * request's admission/scheduling/readiness gates below key off.
+ *
+ * Frente Q-4 (2026-09-08): a `comparison` scope has no single workspace of
+ * its own, but every admission gate below (structural-stage requirement,
+ * freshness wait, job scheduling, warm-LRU touch) is written against
+ * exactly one. Rather than rebuild that machinery symmetrically for N
+ * participants, this admits a comparison request against its "target"
+ * participant (or, absent that exact role, its first participant --
+ * decision 03's own "General multi-workspace discovery uses caller order
+ * and participant ordinal" for non-"base"/"target" roles): that participant
+ * gets the FULL existing single-workspace freshness/structural-readiness
+ * wait, exactly like any other query against it. Every OTHER participant's
+ * readiness is instead probed inside `CanonicalRecordQueryDataPort.
+ * executeCompare` itself (typed `core:coverage_incomplete`/
+ * `core:workspace_not_found` per participant, not a symmetric admission
+ * wait) -- a documented, asymmetric scope decision, not an oversight; see
+ * `docs/evidence/2026-09-08-v4-identity-lookup-and-compare.md`.
+ */
 function singleWorkspaceScopeId(payload: unknown): string | undefined {
   const scope = requestRecord(requestRecord(payload)["scope"]);
-  return scope["scope_type"] === "single_workspace" && typeof scope["workspace_id"] === "string" && scope["workspace_id"].length > 0 ? scope["workspace_id"] : undefined;
+  if (scope["scope_type"] === "single_workspace" && typeof scope["workspace_id"] === "string" && scope["workspace_id"].length > 0) return scope["workspace_id"];
+  if (scope["scope_type"] === "comparison" && Array.isArray(scope["participants"])) {
+    const participants = scope["participants"].map((participant) => requestRecord(participant));
+    const primary = participants.find((participant) => participant["role"] === "target") ?? participants[0];
+    if (primary !== undefined && typeof primary["workspace_id"] === "string" && primary["workspace_id"].length > 0) return primary["workspace_id"];
+  }
+  return undefined;
 }
 
 function queryUsesSourceBinding(payload: unknown): boolean {
@@ -1823,7 +1848,19 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   const snapshotPort = structuralStoreKind === "native" && existsSync(structuralStoreDir)
     ? NativeCanonicalQuerySnapshotPort.open(database.database, structuralStoreDir, sqliteSnapshotPort, interner)
     : sqliteSnapshotPort;
-  const dataPort = new CanonicalRecordQueryDataPort(snapshotPort, semanticProvider === undefined ? undefined : { semantic: semanticProvider });
+  // Frente Q-4 (2026-09-08): `core:compare`'s comparison scope needs each
+  // participant workspace's OWN snapshot port -- this closure recurses back
+  // into the SAME `acquireWorkspaceQueryEngine`/`cache` this workspace's own
+  // engine was just built from, so a comparison participant is served from
+  // exactly the same cache, connection lifecycle, and warm-LRU accounting
+  // as a direct `core:query` against that workspace. Never invoked at
+  // construction time (only lazily, inside an actual `core:compare` call,
+  // long after this workspace's own entry is already in `cache`), so there
+  // is no self-recursion hazard resolving a workspace against its own
+  // not-yet-cached entry.
+  const comparisonParticipantResolver = (participantWorkspaceId: string): Promise<CanonicalQuerySnapshotPort> =>
+    acquireWorkspaceQueryEngine(participantWorkspaceId, registry, storage, cursorCache, cache, interner, lru, semanticProvider).then((entry) => entry.snapshot_port);
+  const dataPort = new CanonicalRecordQueryDataPort(snapshotPort, { ...(semanticProvider === undefined ? {} : { semantic: semanticProvider }), comparison_participants: comparisonParticipantResolver });
   // Query instrumentation is deliberately opt-in because canonical byte
   // accounting and event-loop histograms add measurable work. The existing
   // --debug-timing switch enables one bounded lifetime aggregator per cached

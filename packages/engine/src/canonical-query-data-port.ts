@@ -1,5 +1,5 @@
 import { canonicalBytes, digestBytes, digestCanonicalArray } from "@urdira/canonical";
-import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryScope, type SemanticAffectedArtifactPage, type SemanticAffectedArtifactView, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
+import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryParticipant, type QueryScope, type SemanticAffectedArtifactPage, type SemanticAffectedArtifactView, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
 import type { RelationalValueRow } from "@urdira/storage";
 import type { SqliteDatabase } from "@urdira/storage";
 import { mapWithConcurrency } from "./concurrency.js";
@@ -1913,6 +1913,170 @@ function relationClassification(record: CanonicalQueryRecord): "confirmed" | "po
   return record.body["classification"] === "possible" ? "possible" : "confirmed";
 }
 
+/**
+ * Frente Q-4 (2026-09-08): `core:compare`'s diff/item helpers. Cross-
+ * workspace correlation uses `identity_key` -- decision 03's "Workspaces,
+ * comparisons, and freshness" section names this exact concept ("portable
+ * symbol keys, exact paths, content digests") as the only thing decision 25
+ * ever documents as stable across two DIFFERENT workspace snapshots;
+ * `record_id`/`identity_id` are per-workspace/per-generation digests with
+ * no cross-workspace meaning (they are not even guaranteed stable across
+ * two generations of the SAME workspace). A record with no `identity_key`
+ * (diagnostics, artifact-subject rows) never participates in a comparison
+ * pair -- `recordsForComparisonParticipant` already filters those out
+ * before this runs.
+ */
+interface ComparisonPair {
+  readonly base: CanonicalQueryRecord;
+  readonly target: CanonicalQueryRecord;
+}
+
+interface ComparisonDiff {
+  readonly added: readonly CanonicalQueryRecord[];
+  readonly removed: readonly CanonicalQueryRecord[];
+  readonly changed: readonly ComparisonPair[];
+  readonly moved: readonly ComparisonPair[];
+  readonly correlated: readonly ComparisonPair[];
+  readonly possibleCorrelated: readonly ComparisonPair[];
+}
+
+/** Content identity, deliberately excluding location (`owner_artifact_id`/`primary_source_span`) so a pure rename/move is never misclassified as `changed`. */
+function comparisonContentDigest(record: CanonicalQueryRecord): string {
+  return digestOf({ kind: record.kind, universal_kind: record.universal_kind, category: record.category, body: record.body, facets: record.facets ?? [] });
+}
+
+function comparisonLocationKey(record: CanonicalQueryRecord): string {
+  return `${record.owner_artifact_id} ${record.owner_artifact_version_id} ${JSON.stringify(record.primary_source_span ?? null)}`;
+}
+
+function sortComparisonRecords(records: readonly CanonicalQueryRecord[]): readonly CanonicalQueryRecord[] {
+  return [...records].sort((left, right) => (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id));
+}
+
+function sortComparisonPairs(pairs: readonly ComparisonPair[]): readonly ComparisonPair[] {
+  return [...pairs].sort((left, right) => (left.target.identity_key ?? left.target.record_id).localeCompare(right.target.identity_key ?? right.target.record_id));
+}
+
+/**
+ * Set-diffs two already-fetched (per-participant) record sets by
+ * `identity_key`. `correlationPolicy === "include_possible"` additionally
+ * looks for an EXACT content-digest match between an otherwise-`added` and
+ * an otherwise-`removed` record (a rename: `identity_key` changed but the
+ * record's own content did not) and reports it as a `possible`-tier
+ * correlation -- it never removes the pair from `added`/`removed`
+ * themselves (those two streams are a strict `identity_key` set
+ * difference, unconditionally; decision 03: "any selected set can be
+ * paginated without consuming another set").
+ */
+function diffComparisonRecordSets(baseRecords: readonly CanonicalQueryRecord[], targetRecords: readonly CanonicalQueryRecord[], correlationPolicy: "strict" | "include_possible"): ComparisonDiff {
+  const baseByIdentity = new Map<string, CanonicalQueryRecord>();
+  for (const record of baseRecords) { const key = record.identity_key; if (key !== undefined && !baseByIdentity.has(key)) baseByIdentity.set(key, record); }
+  const targetByIdentity = new Map<string, CanonicalQueryRecord>();
+  for (const record of targetRecords) { const key = record.identity_key; if (key !== undefined && !targetByIdentity.has(key)) targetByIdentity.set(key, record); }
+
+  const added: CanonicalQueryRecord[] = [];
+  const removed: CanonicalQueryRecord[] = [];
+  const changed: ComparisonPair[] = [];
+  const moved: ComparisonPair[] = [];
+  const correlated: ComparisonPair[] = [];
+
+  for (const [key, targetRecord] of targetByIdentity) {
+    const baseRecord = baseByIdentity.get(key);
+    if (baseRecord === undefined) { added.push(targetRecord); continue; }
+    correlated.push({ base: baseRecord, target: targetRecord });
+    if (comparisonContentDigest(baseRecord) !== comparisonContentDigest(targetRecord)) { changed.push({ base: baseRecord, target: targetRecord }); continue; }
+    if (comparisonLocationKey(baseRecord) !== comparisonLocationKey(targetRecord)) moved.push({ base: baseRecord, target: targetRecord });
+  }
+  for (const [key, baseRecord] of baseByIdentity) if (!targetByIdentity.has(key)) removed.push(baseRecord);
+
+  const possibleCorrelated: ComparisonPair[] = [];
+  if (correlationPolicy === "include_possible" && added.length > 0 && removed.length > 0) {
+    const removedByDigest = new Map<string, CanonicalQueryRecord[]>();
+    for (const record of removed) {
+      const digest = comparisonContentDigest(record);
+      const bucket = removedByDigest.get(digest);
+      if (bucket === undefined) removedByDigest.set(digest, [record]); else bucket.push(record);
+    }
+    const matchedRemoved = new Set<string>();
+    for (const targetRecord of added) {
+      const bucket = removedByDigest.get(comparisonContentDigest(targetRecord));
+      if (bucket === undefined) continue;
+      const baseRecord = bucket.find((candidate) => !matchedRemoved.has(candidate.record_id));
+      if (baseRecord === undefined) continue;
+      matchedRemoved.add(baseRecord.record_id);
+      possibleCorrelated.push({ base: baseRecord, target: targetRecord });
+    }
+  }
+
+  return {
+    added: sortComparisonRecords(added),
+    removed: sortComparisonRecords(removed),
+    changed: sortComparisonPairs(changed),
+    moved: sortComparisonPairs(moved),
+    correlated: sortComparisonPairs(correlated),
+    possibleCorrelated: sortComparisonPairs(possibleCorrelated),
+  };
+}
+
+/**
+ * `added`/`removed` items: the flat `recordValue()` shape (so the
+ * pre-existing, generic MCP renderer -- `describeBundle`, keyed off a
+ * top-level `subject_type`/`name`/`kind`/`path` -- already renders these
+ * usefully with zero renderer changes) plus the registry-documented
+ * `participant` field (`operationStreamFields["core:compare"].added` /
+ * `.removed`, `packages/contracts/src/registries.ts`) naming which
+ * participant role the subject belongs to.
+ */
+function compareParticipantItem(record: CanonicalQueryRecord, participantRole: string): QueryStreamItem {
+  const value = { ...recordValue(record, "confirmed"), participant: participantRole };
+  return { value, stable_sort_key: `confirmed\0${record.identity_key ?? record.record_id}` };
+}
+
+/** `changed`/`moved`/`correlated` items: same flat, renderer-friendly base
+ * (the TARGET record's own shape) plus the registry-documented single
+ * named field (`change`/`move`/`correlation`) carrying the before/after (or
+ * correlation) detail a flat subject alone cannot express. */
+function compareChangeItem(pair: ComparisonPair): QueryStreamItem {
+  const value = { ...recordValue(pair.target, "confirmed"), change: { identity_key: pair.target.identity_key, before: recordValue(pair.base, "confirmed"), after: recordValue(pair.target, "confirmed") } };
+  return { value, stable_sort_key: `confirmed\0${pair.target.identity_key ?? pair.target.record_id}` };
+}
+
+function compareMoveItem(pair: ComparisonPair): QueryStreamItem {
+  const value = {
+    ...recordValue(pair.target, "confirmed"),
+    move: {
+      identity_key: pair.target.identity_key,
+      before: { artifact_id: pair.base.owner_artifact_id, artifact_version_id: pair.base.owner_artifact_version_id, source_span: pair.base.primary_source_span },
+      after: { artifact_id: pair.target.owner_artifact_id, artifact_version_id: pair.target.owner_artifact_version_id, source_span: pair.target.primary_source_span },
+    },
+  };
+  return { value, stable_sort_key: `confirmed\0${pair.target.identity_key ?? pair.target.record_id}` };
+}
+
+function compareCorrelationItem(pair: ComparisonPair, classification: "confirmed" | "possible", correlationClass: "identity_key" | "content_digest"): QueryStreamItem {
+  const value = { ...recordValue(pair.target, classification), correlation: { correlation_class: correlationClass, base_record_id: pair.base.record_id, target_record_id: pair.target.record_id } };
+  return { value, stable_sort_key: `${classification}\0${pair.target.identity_key ?? pair.target.record_id}` };
+}
+
+/**
+ * Preserves an already-typed error's own `code`/`details` (duck-typed:
+ * both `EngineError`/`EngineErrorWithDetails` here and the daemon's own
+ * `DaemonError` -- a different class, a different package, never imported
+ * here -- carry exactly these two fields) instead of masking it behind a
+ * generic fallback code. Falls back to `fallbackCode`/`fallbackDetails`
+ * only for a genuinely untyped failure (a thrown string, a raw `TypeError`
+ * from somewhere unexpected, a rejected promise with no `code`).
+ */
+function rewrapComparisonParticipantError(error: unknown, fallbackCode: string, fallbackMessage: string, fallbackDetails: Readonly<Record<string, unknown>>): EngineErrorWithDetails {
+  const candidate = error as { readonly code?: unknown; readonly details?: unknown };
+  if (typeof candidate?.code === "string" && candidate.code.length > 0) {
+    const details = candidate.details !== null && typeof candidate.details === "object" ? candidate.details as Record<string, unknown> : fallbackDetails;
+    return new EngineErrorWithDetails(candidate.code, fallbackMessage, details);
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  return new EngineErrorWithDetails(fallbackCode, `${fallbackMessage} (${detail})`, fallbackDetails);
+}
+
 function strings(value: unknown): readonly string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
@@ -2913,6 +3077,27 @@ function semanticCandidateItem(record: CanonicalQueryRecord, rank: number, snipp
 }
 
 /**
+ * Frente Q-4 (2026-09-08): resolves ONE comparison participant's own
+ * `workspace_id` to ITS OWN `CanonicalQuerySnapshotPort` -- the seam
+ * `core:compare`'s executor (`CanonicalRecordQueryDataPort.executeCompare`)
+ * needs to evaluate "each side with its own port/snapshot" (every
+ * `CanonicalQuerySnapshotPort` instance, native or SQLite, is bound to
+ * exactly one workspace's database/store; nothing in this engine package
+ * can reach a DIFFERENT workspace's data on its own). The daemon wires this
+ * to the SAME per-workspace query-engine cache every other query already
+ * uses (`packages/daemon/src/runtime.ts`'s `acquireWorkspaceQueryEngine`),
+ * so a comparison participant gets exactly the same cached
+ * connection/generation/capability state a direct `core:query` against
+ * that workspace would. Rejects (throws) for an unknown/removed workspace
+ * or one whose engine cannot be constructed -- `executeCompare` maps that
+ * into a typed `core:workspace_not_found`/`core:coverage_incomplete` error,
+ * never a raw `TypeError`.
+ */
+export interface ComparisonParticipantResolver {
+  (workspace_id: string): Promise<CanonicalQuerySnapshotPort>;
+}
+
+/**
  * Language-neutral evaluator over one immutable canonical record snapshot.
  * It never invokes plugin code; JavaScript/TypeScript records participate only
  * through their registered universal kinds and validated relation endpoints.
@@ -2923,7 +3108,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * decoded records (which would duplicate the corpus in the join cache). */
   private readonly relationIndexCache = new Map<string, { readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }>();
 
-  constructor(private readonly snapshots: CanonicalQuerySnapshotPort, private readonly options: { readonly semantic?: ResolvedSemanticProvider } = {}) {}
+  constructor(private readonly snapshots: CanonicalQuerySnapshotPort, private readonly options: { readonly semantic?: ResolvedSemanticProvider; readonly comparison_participants?: ComparisonParticipantResolver } = {}) {}
 
   private async resolveIndexedGraphSelectors(scope: QueryScope, selectorValues: unknown): Promise<readonly CanonicalQueryRecord[] | undefined> {
     const selectors = Array.isArray(selectorValues) ? selectorValues : [];
@@ -4467,10 +4652,164 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     );
   }
 
+  /**
+   * Frente Q-4 (2026-09-08): `core:compare` implementation. See the
+   * `ComparisonParticipantResolver` doc comment above for why "each side
+   * evaluated with its own port/snapshot" needs a resolver at all, and
+   * `docs/evidence/2026-09-08-v4-identity-lookup-and-compare.md` for the
+   * full design writeup (reproduction, alternatives considered, the
+   * `identity_key`-as-correlation-key rationale, and the exact stream item
+   * shapes).
+   *
+   * Scope decision (documented, not a silent gap): supports exactly two
+   * participants. The registered `core:compare_workspaces` recipe's own
+   * guard already requires exact `base`/`target` roles
+   * (`core:comparison_roles_base_target`, recipe-executor.ts) and decision
+   * 03's "Workspaces, comparisons, and freshness" section only assigns
+   * role semantics to that exact pair ("General multi-workspace discovery
+   * uses caller order and participant ordinal" for anything else -- so a
+   * direct `core:compare` call with two participants that carry NEITHER
+   * role falls back to caller order). A request with more than two
+   * participants, or with exactly one of "base"/"target" present, gets a
+   * typed `core:participant_role_invalid` rather than a guessed N-way
+   * semantics this decision never specifies.
+   */
+  private async executeCompare(operation: OperationInvocation): Promise<OperationEvaluation> {
+    const scope = operation.scope;
+    if (scope.scope_type !== "comparison") throw new EngineErrorWithDetails("core:invalid_query_scope", "core:compare requires a comparison scope.", { recipe_id: operation.operation_id, required_scope_kind: "comparison", required_roles: [], provided_scope_kind: scope.scope_type, provided_roles: [] });
+    if (scope.participants.length !== 2) {
+      throw new EngineErrorWithDetails("core:participant_role_invalid", `core:compare requires exactly two participants (base/target); received ${scope.participants.length}.`, { operation: operation.operation_id, provided_roles: scope.participants.map((participant) => participant.role), required_roles: ["base", "target"] });
+    }
+    const explicitBase = scope.participants.find((participant) => participant.role === "base");
+    const explicitTarget = scope.participants.find((participant) => participant.role === "target");
+    let baseParticipant: QueryParticipant;
+    let targetParticipant: QueryParticipant;
+    if (explicitBase !== undefined && explicitTarget !== undefined) { baseParticipant = explicitBase; targetParticipant = explicitTarget; }
+    else if (explicitBase === undefined && explicitTarget === undefined) { [baseParticipant, targetParticipant] = scope.participants as [QueryParticipant, QueryParticipant]; }
+    else throw new EngineErrorWithDetails("core:participant_role_invalid", `core:compare received one of "base"/"target" without the other; provide both roles or neither.`, { operation: operation.operation_id, provided_roles: scope.participants.map((participant) => participant.role), required_roles: ["base", "target"] });
+
+    const args = object(operation.arguments);
+    const requestedKinds = new Set(strings(args["comparison_kinds"]));
+    const correlationPolicy = args["correlation_policy"] === "include_possible" ? "include_possible" : "strict";
+    const selection = Array.isArray(args["selection"]) && args["selection"].length > 0 ? args["selection"] : undefined;
+
+    const [base, target] = await Promise.all([this.resolveComparisonParticipant(baseParticipant), this.resolveComparisonParticipant(targetParticipant)]);
+    const [baseRecords, targetRecords] = await Promise.all([
+      this.recordsForComparisonParticipant(base.port, base.scope, selection),
+      this.recordsForComparisonParticipant(target.port, target.scope, selection),
+    ]);
+    const diff = diffComparisonRecordSets(baseRecords, targetRecords, correlationPolicy);
+
+    const streams: Record<string, QueryStreamItem[]> = {};
+    if (requestedKinds.has("added")) streams["added"] = diff.added.map((record) => compareParticipantItem(record, targetParticipant.role));
+    if (requestedKinds.has("removed")) streams["removed"] = diff.removed.map((record) => compareParticipantItem(record, baseParticipant.role));
+    if (requestedKinds.has("changed")) streams["changed"] = diff.changed.map((pair) => compareChangeItem(pair));
+    if (requestedKinds.has("moved")) streams["moved"] = diff.moved.map((pair) => compareMoveItem(pair));
+    if (requestedKinds.has("correlated")) {
+      streams["correlated"] = [
+        ...diff.correlated.map((pair) => compareCorrelationItem(pair, "confirmed", "identity_key")),
+        ...(correlationPolicy === "include_possible" ? diff.possibleCorrelated.map((pair) => compareCorrelationItem(pair, "possible", "content_digest")) : []),
+      ];
+    }
+
+    const capabilityStates = [...(await base.port.capability_states?.(base.scope) ?? []), ...(await target.port.capability_states?.(target.scope) ?? [])];
+    return result(streams, capabilityStates);
+  }
+
+  /**
+   * Resolves one comparison participant to its own snapshot port (via
+   * `options.comparison_participants`, see that resolver's own doc
+   * comment) and probes its readiness with the SAME `capability_states`
+   * every other operation already reads -- never a full admission/
+   * freshness wait (that machinery is keyed to ONE "primary" workspace at
+   * the daemon's RPC layer, `packages/daemon/src/runtime.ts`'s
+   * `singleWorkspaceScopeId`; only the primary participant gets that
+   * symmetric wait today, a documented scope decision, not an oversight --
+   * see the evidence doc). Any failure -- unknown/removed workspace,
+   * resolver absent, or a capability state that reports `unsupported` --
+   * surfaces as a typed error (reusing the failing dependency's own
+   * `code`/`details` when it already carries one, e.g. the daemon's own
+   * `core:workspace_not_found`), never a raw `TypeError` or an
+   * unhandled rejection.
+   */
+  private async resolveComparisonParticipant(participant: QueryParticipant): Promise<{ readonly port: CanonicalQuerySnapshotPort; readonly scope: SingleWorkspaceScope }> {
+    const scope: SingleWorkspaceScope = { scope_type: "single_workspace", workspace_id: participant.workspace_id, ...(participant.snapshot_id === undefined ? {} : { snapshot_id: participant.snapshot_id }) };
+    if (this.options.comparison_participants === undefined) {
+      throw new EngineErrorWithDetails(
+        "core:required_capability_unsupported",
+        `core:compare has no comparison-participant resolver wired for this query engine; workspace "${participant.workspace_id}" (role "${participant.role}") cannot be reached from here.`,
+        { capability: "core:comparison_participants", workspace_snapshot_binding_ids: [participant.workspace_id], reason_codes: ["no_participant_resolver"] },
+      );
+    }
+    let port: CanonicalQuerySnapshotPort;
+    try {
+      port = await this.options.comparison_participants(participant.workspace_id);
+    } catch (error) {
+      throw rewrapComparisonParticipantError(error, "core:workspace_not_found", `Comparison participant workspace "${participant.workspace_id}" (role "${participant.role}") is not available.`, { workspace_id: participant.workspace_id });
+    }
+    try {
+      const states = await port.capability_states?.(scope) ?? [];
+      if (states.some((state) => state.status === "unsupported")) {
+        throw new EngineErrorWithDetails(
+          "core:coverage_incomplete",
+          `Comparison participant workspace "${participant.workspace_id}" (role "${participant.role}") has an unsupported structural capability.`,
+          { capabilities: states.map((state) => state.capability), workspace_snapshot_binding_ids: [participant.workspace_id], statuses: states.map((state) => state.status), waited_ms: 0, required_frontier: "structural", blocking_stage: "compare", blocking_operation: "core:compare", retryable: false },
+        );
+      }
+    } catch (error) {
+      throw rewrapComparisonParticipantError(error, "core:coverage_incomplete", `Comparison participant workspace "${participant.workspace_id}" (role "${participant.role}") is not ready.`, { capabilities: [], workspace_snapshot_binding_ids: [participant.workspace_id], statuses: ["unknown"], waited_ms: 0, required_frontier: "structural", blocking_stage: "compare", blocking_operation: "core:compare", retryable: true });
+    }
+    return { port, scope };
+  }
+
+  /**
+   * Fetches one comparison participant's own entity/relation records,
+   * bounded exactly like every other non-pushdown operation
+   * (`FULL_CORPUS_FALLBACK_RECORD_CAP`) -- `core:compare` gets no special
+   * exemption from that guard just because it evaluates two sides instead
+   * of one. A non-empty `selection` resolves through the SAME indexed
+   * selector resolution `tryBuildContextPushdown`/`tryGraphPushdown` already
+   * use (`resolveIndexedGraphSelectors`, called here on a throwaway sibling
+   * port bound to THIS participant so its private helper methods run
+   * against the participant's own snapshot, not `this.snapshots`);
+   * declining to resolve is a typed `core:execution_resource_limit`, never
+   * a silent full-corpus scan.
+   */
+  private async recordsForComparisonParticipant(port: CanonicalQuerySnapshotPort, scope: SingleWorkspaceScope, selection: readonly unknown[] | undefined): Promise<readonly CanonicalQueryRecord[]> {
+    const structural = (records: readonly CanonicalQueryRecord[]): readonly CanonicalQueryRecord[] => records.filter((record) => record.category === "entity" || record.category === "relation");
+    if (selection !== undefined) {
+      const sibling = new CanonicalRecordQueryDataPort(port, this.options);
+      const resolved = await sibling.resolveIndexedGraphSelectors(scope, selection);
+      if (resolved !== undefined) return structural(resolved);
+      throw new EngineErrorWithDetails(
+        "core:execution_resource_limit",
+        `core:compare's "selection" could not be resolved to an indexed lookup for workspace "${scope.workspace_id}"; narrow it to record_id/entity_id/relation_id or symbol selectors.`,
+        { limit_kind: "comparison_selection_unresolvable", configured_limit: 0, observed_or_required: selection.length },
+      );
+    }
+    const visibleCount = await port.visible_record_count?.(scope);
+    if (visibleCount !== undefined && visibleCount > FULL_CORPUS_FALLBACK_RECORD_CAP) {
+      throw new EngineErrorWithDetails(
+        "core:execution_resource_limit",
+        `core:compare with no "selection" would require decoding all ${visibleCount} visible records for workspace "${scope.workspace_id}" (over the ${FULL_CORPUS_FALLBACK_RECORD_CAP}-record cap) -- narrow with "selection".`,
+        { limit_kind: "full_corpus_decode_record_count", configured_limit: FULL_CORPUS_FALLBACK_RECORD_CAP, observed_or_required: visibleCount },
+      );
+    }
+    const records = port.records_for_query !== undefined ? await port.records_for_query(scope) : await port.records(scope);
+    return structural(records);
+  }
+
   async execute(operation: OperationInvocation): Promise<OperationEvaluation> {
     this.rejectNonSubjectPipelineOperation(operation);
     const boundArguments = await materializeHandleBindings(operation.arguments, operation.input_handles);
     const boundOperation: OperationInvocation = boundArguments === operation.arguments ? operation : { ...operation, arguments: boundArguments };
+    // Frente Q-4 (2026-09-08): `core:compare`'s ONLY legal scope
+    // (registries.ts: `scopes: ["comparison"]`) is `comparison` -- every
+    // pushdown/fallback method below (`has_warm_records` first of all,
+    // called unconditionally a few lines down regardless of operation_id)
+    // throws a raw `TypeError` for a non-`single_workspace` scope, so this
+    // must be handled before any of them ever sees the scope.
+    if (boundOperation.operation_id === "core:compare") return this.executeCompare(boundOperation);
     const pushedSearchText = await this.trySearchTextPushdown(boundOperation);
     if (pushedSearchText !== undefined) return pushedSearchText;
     const pushedContext = await this.tryBuildContextPushdown(boundOperation);

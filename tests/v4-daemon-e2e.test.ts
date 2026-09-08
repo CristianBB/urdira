@@ -1169,4 +1169,118 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       await rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 60_000);
+
+  /**
+   * Frente Q-4 (2026-09-08): `core:compare` over the REAL daemon `core:query`
+   * IPC path, two genuinely distinct registered v4 workspaces under ONE
+   * `DaemonRuntime` -- proves `runtime.ts`'s own wiring, not just the engine
+   * unit tests in `tests/phase-canonical-query-data-port.test.ts`: (a)
+   * `singleWorkspaceScopeId`'s new comparison-scope branch admits the
+   * request against its "target" participant (freshness/structural-stage
+   * gates, job scheduling) instead of rejecting outright with
+   * `core:ipc_request_invalid` as it did before this frente; (b)
+   * `acquireWorkspaceQueryEngine`'s `comparison_participants` resolver
+   * reaches the OTHER (base) participant's own cached query engine from
+   * inside the target's; (c) `CanonicalRecordQueryDataPort.executeCompare`
+   * diffs the two real, independently-scanned, real-native-structural-store
+   * workspaces by `identity_key`. Two tiny, deliberately near-identical
+   * inline fixtures (base: `greet`/`farewell`; target: `greet` unchanged,
+   * `farewell`'s body edited, `sayHello` added) -- small enough that both
+   * scans complete well inside this test's own timeout.
+   */
+  it("core:compare diffs two real, independently-scanned v4 workspaces over the daemon core:query IPC path", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-compare-data-"));
+    const baseWorkspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-compare-base-"));
+    const targetWorkspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-compare-target-"));
+    await writeFile(
+      join(baseWorkspaceRoot, "greetings.ts"),
+      "export function greet(name: string): string {\n  return `hello ${name}`;\n}\n\nexport function farewell(name: string): string {\n  return `bye ${name}`;\n}\n",
+      "utf8",
+    );
+    await writeFile(
+      join(targetWorkspaceRoot, "greetings.ts"),
+      "export function greet(name: string): string {\n  return `hello ${name}`;\n}\n\nexport function farewell(name: string): string {\n  return `goodbye ${name}`;\n}\n\nexport function sayHello(name: string): string {\n  return greet(name);\n}\n",
+      "utf8",
+    );
+    const originalV4Flag = process.env["URDIRA_V4"];
+    let runtime: DaemonRuntime | undefined;
+    const sessions = new Map<string, IndexingCoreProcessTransport>();
+    try {
+      process.env["URDIRA_V4"] = "1";
+      delete process.env["URDIRA_V4_RESIDUAL"];
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-daemon-e2e-compare",
+        workspace_registry: asDaemonWorkspaceRegistry(new WorkspaceRegistry()),
+        resolve_plugin_provider: async () => { throw new Error("resolve_plugin_provider must not be called for a v4 workspace."); },
+        resolve_workspace_scan_transport: async (workspace) => {
+          let transport = sessions.get(workspace.workspace_id);
+          if (transport === undefined) {
+            transport = createIndexingCoreProcessTransport({ command: workerPath!, request_timeout_ms: 120_000 });
+            sessions.set(workspace.workspace_id, transport);
+          }
+          return transport;
+        },
+        semantic_index: false,
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, DAEMON_CLIENT_OPTIONS);
+
+      const baseAdded = await client.call("core:workspace_add", { args: [baseWorkspaceRoot], confirmed: true });
+      expect(baseAdded.outcome).toBe("success");
+      const baseWorkspaceId = (baseAdded.payload as { readonly workspace_id: string }).workspace_id;
+      const targetAdded = await client.call("core:workspace_add", { args: [targetWorkspaceRoot], confirmed: true });
+      expect(targetAdded.outcome).toBe("success");
+      const targetWorkspaceId = (targetAdded.payload as { readonly workspace_id: string }).workspace_id;
+      await pollUntilStructuralReady(client, baseWorkspaceId);
+      await pollUntilStructuralReady(client, targetWorkspaceId);
+
+      const compareOptions = {
+        freshness: "current",
+        wait_timeout_ms: 0,
+        coverage_requirement: "accept_reported",
+        evidence: { evidence: "summary", evidence_chain_depth: 1 },
+        diagnostics: { diagnostics: "relevant", diagnostic_detail: true },
+        snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 },
+        registry: { registry: "used", include_payload_schemas: false },
+        response_budget: { max_items: 1_000, max_characters: 4_000_000 },
+      };
+      const response = await client.call("core:query", {
+        api_version: 3,
+        scope: { scope_type: "comparison", participants: [{ workspace_id: baseWorkspaceId, role: "base" }, { workspace_id: targetWorkspaceId, role: "target" }] },
+        expression: { expression_type: "operation", operation: "core:compare", arguments: { comparison_kinds: ["added", "removed", "changed", "correlated"] } },
+        options: compareOptions,
+      });
+      expect(response.outcome).toBe("success");
+      const streams = (response.payload as { readonly streams: Readonly<Record<string, StreamPage>> }).streams;
+      const identityKeysOf = (streamName: string): readonly string[] => (streams[streamName]?.items ?? []).map((item) => (item.value as Record<string, unknown>)["identity_key"] as string);
+
+      // `greet` is byte-identical on both sides -- correlated, never changed/added/removed.
+      expect(identityKeysOf("correlated")).toEqual(expect.arrayContaining([expect.stringMatching(/greet$/)]));
+      expect(identityKeysOf("changed").some((key) => key.endsWith(":greet"))).toBe(false);
+      // `farewell`'s body was edited -- present on both sides (correlated) AND changed.
+      expect(identityKeysOf("changed").some((key) => key.endsWith(":farewell"))).toBe(true);
+      expect(identityKeysOf("correlated").some((key) => key.endsWith(":farewell"))).toBe(true);
+      // `sayHello` only exists in the target workspace -- added, never removed/changed.
+      expect(identityKeysOf("added").some((key) => key.endsWith(":sayHello"))).toBe(true);
+      expect(identityKeysOf("removed").some((key) => key.endsWith(":sayHello"))).toBe(false);
+      // Editing `farewell`'s body (`"bye"` -> `"goodbye"`, 3 bytes longer)
+      // shifts the byte offsets of everything after it in the SAME file --
+      // `jsts:contains`/`jsts:references` relation identity_keys encode an
+      // exact source span, so the shifted-position relation rows genuinely
+      // disappear (removed) and reappear at their new offset (added): a
+      // real, correct consequence of position-encoded identity_key, not a
+      // bug in this diff. Only relation rows are expected here -- the
+      // FUNCTION entities themselves keep stable identity_keys (name-based,
+      // unaffected by a later sibling's body length).
+      for (const key of identityKeysOf("removed")) expect(key.startsWith("jsts:contains:") || key.startsWith("jsts:references:")).toBe(true);
+    } finally {
+      if (originalV4Flag === undefined) delete process.env["URDIRA_V4"]; else process.env["URDIRA_V4"] = originalV4Flag;
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(baseWorkspaceRoot, { recursive: true, force: true });
+      await rm(targetWorkspaceRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

@@ -559,3 +559,121 @@ analogous internal one, `StoreReader::subject_index`, not reachable via any
 N-API method a `records_by_ids`-shaped caller can use) -- comparable in
 scope to this amendment's own `by_kind_universal` addition, not a quick
 follow-up.
+
+## 2026-09-08 Q-4 amendment: identity-by-index, and `core:compare` implemented
+
+`docs/evidence/2026-09-08-v4-identity-lookup-and-compare.md` closes the two
+items the Q1/Q-3 amendments above left open: the `identity_key`/`identity_id`
+scan gap `records_by_ids`'s `otherIds` fallback paid on every
+`analyze_impact`/`find_related_tests` call, and `core:compare`'s complete
+absence of an execution path (every port rejected a `comparison` scope with
+a raw `TypeError` before ever reaching `records_for_query`).
+
+**Identity index.** Two NEW indexes, additive, no `HEADER_FORMAT`/`Manifest.
+format` change: `StoreInner::identity_id_index` (`crates/urdira-structural-
+store/src/reader.rs`, an in-memory `HashMap<[u8;32], Vec<(segment_index,
+ordinal)>>` built once per store load/reopen -- the exact same pattern
+`dep_owner_index`/`subject_index` already establish) answers an
+`identity_id` (TS `entity_id`/`relation_id`/`diagnostic_id`) lookup, and a
+new visibility-filtered `StoreReader::by_identity_key` reuses the EXISTING
+on-disk `by_identity` range (keyed by `identity_key_digest`) that
+`by_identity_last` (writer.rs's diffing primitive, deliberately not
+visibility-filtered) already indexed -- `by_identity_key` is simply the
+missing "safe for a live query" sibling of that same range. `identity_id`
+and `identity_key_digest` are two DIFFERENT digests of related data (one
+wraps the identity_key text in a domain-separated UCE object
+`urdira_native_core::uce_text_digest_bytes`, made `pub` for this reason;
+the other, for the v3-conversion path's own writer, is a plain
+`Sha256::digest` with no domain separation -- a pre-existing inconsistency,
+not introduced here), so neither can be derived from the other and each
+needs its own index. New N-API surface:
+`records_by_identity_keys`/`records_by_identity_ids`
+(`crates/urdira-native-node/src/structural_store_napi.rs`) /
+`recordsByIdentityKeys`/`recordsByIdentityIds`
+(`native-structural-store-binding.ts`), consumed by
+`NativeCanonicalQuerySnapshotPort.records_by_ids`'s `otherIds` resolution,
+which now tries `recordsByIdentityIds` then `recordsByIdentityKeys` for
+whatever remains unresolved -- both O(k) indexed lookups, never a corpus
+scan, regardless of which form(s) a caller's ids turn out to be.
+`OTHER_IDS_SCAN_ROW_BUDGET` (the Q1/Q-2 bound on the WORST CASE of a scan
+that no longer happens) is removed; `OTHER_IDS_COUNT_CAP` (a sanity bound
+on batch size, unrelated to scanning) stays. Proven scan-free directly (a
+spy on the native handle's `iterVisibleBatch`, `scanAll`'s only FFI call,
+asserting zero calls while every id form -- `record_id`, v3-sidecar
+`identity_id` text, native-pipeline `identity_id`, `identity_key` text, and
+an unresolvable id -- resolves), not just measured faster:
+`tests/native-query-snapshot-port.test.ts`, plus a native-store conversion
+of `tests/query-pushdown-catalog.test.ts`'s own `core:analyze_impact`
+fixture (the exact selector shape this decision's Q-3 amendment diagnosed)
+with the same spy.
+
+**`core:compare`.** Implemented at the query-engine layer
+(`CanonicalRecordQueryDataPort.executeCompare`/`resolveComparisonParticipant`/
+`recordsForComparisonParticipant`/`diffComparisonRecordSets`,
+`canonical-query-data-port.ts`) -- dispatched before any pushdown/fallback
+attempt (all of which dereference `scope.workspace_id` and throw for a
+`comparison` scope). Each of the (exactly two, `base`/`target` by role or
+caller order -- decision 03's own "General multi-workspace discovery uses
+caller order and participant ordinal") participants is resolved to its OWN
+`CanonicalQuerySnapshotPort` via a new `ComparisonParticipantResolver`
+dependency, wired by the daemon (`packages/daemon/src/runtime.ts`'s
+`acquireWorkspaceQueryEngine`) to the SAME per-workspace query-engine cache
+every other query already uses -- a comparison participant is served from
+exactly the connection/generation/capability-state a direct `core:query`
+against that workspace would use, including a genuinely DIFFERENT
+registered workspace (the realistic "before/after" shape this system
+supports today: two distinct workspaces, e.g. a fork/donor pair -- decision
+01 §6170's "same workspace twice, distinct snapshot_id" shape is
+architecturally described but requires historical-generation retention
+neither port implements, an existing, unrelated "Pinned historical-snapshot
+queries are not supported" contract this frente did not touch; it now
+surfaces as the existing typed `core:snapshot_expired`/`core:snapshot_not_
+found`, never a raw `TypeError`). Each side's record set is fetched through
+the SAME bounded convention every other non-pushdown operation already
+uses (`selection`-narrowed via `resolveIndexedGraphSelectors` when given,
+else the `FULL_CORPUS_FALLBACK_RECORD_CAP`-guarded generic fetch) --
+`core:compare` gets no special exemption from that guard.
+
+Diffing correlates by `identity_key` -- decision 03's "Workspaces,
+comparisons, and freshness" section's own "portable symbol keys" language,
+the only identity form decision 25 and its Q1 amendment already document as
+NOT workspace/generation-local (unlike `record_id`/`identity_id`, which are
+content-and-location digests with no cross-workspace meaning). `added`/
+`removed` are an unconditional `identity_key` set difference; `changed` is
+a content-digest difference (excluding location, so a pure move never
+counts as `changed`); `moved` is a location difference at unchanged
+content; `correlated` is every identity_key present on both sides,
+`confirmed` tier via exact `identity_key` match, plus (`correlation_policy:
+"include_possible"`) a `possible` tier via exact content-digest match
+between an otherwise-`added` and an otherwise-`removed` record (a rename:
+`identity_key` changed, content did not) -- `include_possible` never
+removes members from `added`/`removed` themselves. A participant that
+cannot be reached (unregistered/removed workspace) or is not ready (an
+`unsupported` capability state) surfaces a typed `core:workspace_not_found`/
+`core:coverage_incomplete` (reusing the failing dependency's own code when
+it already carries one), never a raw `TypeError` or an unhandled
+rejection. `moved`/`correlated`'s exact wire shape (`change`/`move`/
+`correlation`-named fields, per `registries.ts`'s own `operationStreamFields`
+metadata, layered on top of the SAME flat `recordValue()` shape every other
+operation's `ResultSubject` already uses, so the existing generic MCP
+renderer needs no change for `added`/`removed`/the base subject of
+`changed`/`moved`/`correlated`) was not specified anywhere else in the
+contract or an existing decision -- decided here, in implementation, per
+this frente's own criterion (a)/(c) (correct, tested, documented; never a
+silent gap), not returned as a question.
+
+Daemon reachability (`packages/daemon/src/runtime.ts`): `singleWorkspaceScopeId`
+(the function every `core:query`/`core:query_continue` admission gate keys
+off) gains a `comparison`-scope branch -- admits the request against its
+`target` participant (or first participant, absent that role), which gets
+the FULL existing freshness/structural-readiness wait; every OTHER
+participant's readiness is instead probed inside `executeCompare` itself
+(a documented, asymmetric scope decision -- see the evidence doc -- not a
+symmetric N-participant admission-wait system this frente did not build).
+Before this amendment, ANY comparison-scoped `core:query` request was
+rejected outright at this exact point with `core:ipc_request_invalid`,
+never reaching the engine at all.
+
+See the evidence doc for the full before/after latency table (both
+corpora), the `core:compare` diff design's worked example, and literal
+test/verification counts.
