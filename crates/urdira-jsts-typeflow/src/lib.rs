@@ -59,16 +59,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// purely additive bookkeeping.
 pub static DEMOTED_BY_UNRESOLVED_EXTENDS: AtomicU64 = AtomicU64::new(0);
 pub static DEMOTED_BY_KNOWN_SUBCLASS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+/// E-P0o (2026-09-08): how many times `semantic_sites.rs`'s own caller
+/// demoted a `members()` `One` (an OWN declaration on the receiver's
+/// entity) to a genuine ambiguity because `ProgramIndex::sibling_extends_
+/// overrides` found at least one OTHER known `extends`-descendant
+/// container that ALSO redeclares the same member name -- the `getModel`/
+/// `_getViewModel`/`cellAt`/`getSelection` VS Code residual (`docs/
+/// evidence/2026-09-07-v4-vscode-campaign.md` §14.7). Incremented from
+/// `urdira-jsts-syntax-worker`, not this crate (only that crate sees the
+/// receiver-typing `rule` needed to decide "reliable" vs not) -- exported
+/// `pub` for that reason, unlike the two counters above which this crate
+/// increments itself.
+pub static DEMOTED_BY_SIBLING_DECLARATION: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot-and-reset the two counters above: `(unresolved_extends,
-/// known_subclass_override)`. Call once per scan/diagnostic run before
-/// reading -- a fresh process already starts both at zero, so this is only
-/// needed to isolate ONE scan's own counts inside a longer-lived process
-/// (a test harness driving several scans in sequence, for instance).
-pub fn take_demotion_reason_counts() -> (u64, u64) {
+/// Snapshot-and-reset the three counters above: `(unresolved_extends,
+/// known_subclass_override, sibling_declaration)`. Call once per scan/
+/// diagnostic run before reading -- a fresh process already starts all
+/// three at zero, so this is only needed to isolate ONE scan's own counts
+/// inside a longer-lived process (a test harness driving several scans in
+/// sequence, for instance).
+pub fn take_demotion_reason_counts() -> (u64, u64, u64) {
     (
         DEMOTED_BY_UNRESOLVED_EXTENDS.swap(0, Ordering::Relaxed),
         DEMOTED_BY_KNOWN_SUBCLASS_OVERRIDE.swap(0, Ordering::Relaxed),
+        DEMOTED_BY_SIBLING_DECLARATION.swap(0, Ordering::Relaxed),
     )
 }
 
@@ -4729,17 +4743,139 @@ impl ProgramIndex {
     /// came back confidently empty) -- correctness over the extra
     /// bookkeeping a hot-path index would need.
     fn has_known_subclass_override(&self, ancestor_id: &str, name: &str, is_static: bool) -> bool {
-        self.containers.iter().any(|(other_id, other_container)| {
-            if other_id == ancestor_id {
-                return false;
+        !self
+            .sibling_extends_overrides(ancestor_id, name, is_static)
+            .is_empty()
+    }
+
+    /// `entity_id`'s own OWN `members` list only (never `extends`/
+    /// `implements`) -- the member entity id(s) `entity_id` declares
+    /// DIRECTLY at the given static/instance disposition. Used by
+    /// `semantic_sites.rs` to tell apart a `members()` `One` outcome that
+    /// came from `entity_id`'s own declaration (eligible for the E-P0o
+    /// sibling-declaration check below) from one that came from an
+    /// INHERITED ancestor declaration.
+    ///
+    /// E-P0o (2026-09-08) adversarial finding: an INHERITED match is NOT
+    /// treated the same way, even though it looks structurally identical --
+    /// live VS Code counter-example (`editor: ICodeEditor` in `coreCommands.
+    /// ts`, guarded by `if (!editor.hasModel()) return;`): `ICodeEditor`
+    /// itself does not declare `getModel` (own list here would be empty,
+    /// the match comes from its OWN ancestor `IEditor`), and a FURTHER
+    /// descendant, `IActiveCodeEditor extends ICodeEditor`, redeclares it --
+    /// but v3's real answer is REACHED THROUGH a `hasModel(): this is
+    /// IActiveCodeEditor` user-defined type-predicate guard genuinely
+    /// narrowing `editor` to `IActiveCodeEditor` for the rest of the
+    /// function, a control-flow fact this crate does not model (the same
+    /// general class of gap as `instanceof` narrowing, just a different
+    /// syntax) -- NOT an unresolvable ambiguity between two equally
+    /// plausible candidates the way the own-declaration shape is. Reusing
+    /// the sibling-candidate mechanism for this shape would misrepresent a
+    /// DETERMINISTIC-but-unmodeled fact as a genuine ambiguity, and a
+    /// regression-tested counter-example on the OWN-declaration side
+    /// (`instanceof_narrowing_never_applies_to_a_calls_own_target_
+    /// resolution`: `EditorPane` DOES declare `getControl` itself, `MergeEditor
+    /// extends EditorPane` overrides it, and v3's own proven answer for a
+    /// CALL is still `EditorPane`'s own declaration, unconditionally) proves
+    /// the inherited and direct cases are NOT interchangeable -- own-
+    /// declaration wins unconditionally for a call/read whose receiver type
+    /// itself declares the member (matches TypeScript's real declared-type
+    /// resolution: a type that itself declares a member is used exactly as
+    /// declared, regardless of what unrelated subtypes might also declare),
+    /// while an INHERITED match leaves open exactly this kind of unmodeled
+    /// narrowing. So the E-P0o sibling check below is gated on THIS
+    /// function being non-empty -- see `resolve_static_member_reference`'s
+    /// own call site. The inherited-match residual this leaves (~281 VS
+    /// Code sites at this task's own measurement, `docs/evidence/2026-09-07-
+    /// v4-vscode-campaign.md` §15) is reported, not guessed at.
+    pub fn own_member_ids(&self, entity_id: &str, name: &str, is_static: bool) -> Vec<String> {
+        let Some(container) = self.containers.get(entity_id) else {
+            return Vec::new();
+        };
+        let effective_static = is_static && !container.is_interface;
+        container
+            .members
+            .iter()
+            .filter(|member| member.name == name && member.is_static == effective_static)
+            .map(|member| member.entity_id.clone())
+            .collect()
+    }
+
+    /// E-P0o (2026-09-08, sibling-declaration ambiguity -- 76% of VS Code's
+    /// remaining `different`-target residual, `docs/evidence/2026-09-07-v4-
+    /// vscode-campaign.md` §14.7): every OTHER known container that is a
+    /// transitive `extends` DESCENDANT of `entity_id` (never `implements` --
+    /// same "real subclassing, not interface conformance" restriction as
+    /// `extends_chain_reaches`'s own doc comment) and ALSO declares its OWN
+    /// `name` member at the given static/instance disposition -- the exact
+    /// relationship `has_known_subclass_override` already tested as a bare
+    /// bool (now implemented in terms of this function), generalized to the
+    /// full candidate id list.
+    ///
+    /// Live pattern this closes: `src/vs/editor/browser/editorBrowser.ts`
+    /// declares `getModel()` on `IEditor` itself (`ITextModel | null`), AND
+    /// on two SIBLING descendants in the SAME file, `ICodeEditor extends
+    /// IEditor` (`ITextModel`) and `IDiffEditor extends IEditor`
+    /// (`IDiffEditorModel | null`) -- each its own, DIFFERENT redeclaration,
+    /// narrowing the base's own signature. `IEditor` DOES declare `getModel`
+    /// itself, so `members(IEditor, "getModel", false)` returns a confident-
+    /// looking `One(IEditor::getModel)` (`collect_members`'s own-members
+    /// loop matches immediately, before ever walking `extends`) -- but v3's
+    /// real per-call-site, receiver-type-based resolution answers with
+    /// `ICodeEditor`'s own narrower declaration at every sampled importer,
+    /// never `IEditor`'s. This crate has no receiver-type-narrowing of its
+    /// own (see this crate's own module doc, "deliberately narrow"), so it
+    /// cannot KNOW which of the three declarations is real at any given call
+    /// site -- guessing `IEditor`'s own declaration merely because it is the
+    /// entity `type_of_expression` happened to resolve is the exact class of
+    /// unsound guess this crate's "never guess" discipline forbids elsewhere
+    /// (`has_known_subclass_override`'s own doc comment, `members_of_union`'s
+    /// own doc comment, ...). This function surfaces the full candidate set
+    /// so the caller (which alone knows whether the receiver's OWN typing
+    /// `rule` already pins it to `entity_id` specifically -- an explicit
+    /// annotation, `this`, ... -- see `semantic_sites.rs`'s `rule_pins_
+    /// receiver_uniquely`) can decide confirmed vs. ambiguous.
+    ///
+    /// The caller (`semantic_sites.rs`) only ever consults this for
+    /// `entity_id` when `own_member_ids(entity_id, name, is_static)` is
+    /// NON-empty -- i.e. `members(entity_id, ...)` matched `entity_id`'s OWN
+    /// direct declaration, never an inherited one -- see that function's own
+    /// doc comment for the live counter-example (`ICodeEditor`/
+    /// `IActiveCodeEditor`) proving an INHERITED match is a genuinely
+    /// different (unmodeled control-flow narrowing, not a same-file
+    /// ambiguity) shape this mechanism must not also claim.
+    ///
+    /// A linear scan over every container this index knows about, same
+    /// performance tradeoff `has_known_subclass_override` already made for
+    /// the identical reason (this crate's own incremental add/remove/replace
+    /// machinery would otherwise need a FOURTH index kept consistent, for a
+    /// check only ever consulted at a genuinely rare fork in member
+    /// resolution). `None` (an empty vec, never a guess) when no such
+    /// sibling exists -- the ordinary, overwhelmingly common case.
+    pub fn sibling_extends_overrides(
+        &self,
+        entity_id: &str,
+        name: &str,
+        is_static: bool,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for (other_id, other_container) in &self.containers {
+            if other_id == entity_id {
+                continue;
+            }
+            if !self.extends_chain_reaches(other_id, entity_id) {
+                continue;
             }
             let effective_static = is_static && !other_container.is_interface;
-            let declares_own = other_container
-                .members
-                .iter()
-                .any(|member| member.name == name && member.is_static == effective_static);
-            declares_own && self.extends_chain_reaches(other_id, ancestor_id)
-        })
+            for member in &other_container.members {
+                if member.name == name && member.is_static == effective_static {
+                    ids.push(member.entity_id.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// Whether walking `start_id`'s own `extends` chain (never `implements`

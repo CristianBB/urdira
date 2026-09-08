@@ -180,6 +180,21 @@ pub struct OwnerSemantics {
     /// outcome into the same plain-pending path `Unresolved` already takes,
     /// deliberately -- see `visit_call_expression`'s own doc comment).
     pub candidate_call_rows: Vec<ProposedRecord>,
+    /// E-P0o (2026-09-08): the `core:references` sibling of `candidate_call_
+    /// rows` -- one per-candidate `possible` `core:references` row for a
+    /// PLAIN member read (never a call callee) whose typeflow receiver
+    /// resolved to a single entity that declares the member directly, but a
+    /// sibling `extends`-descendant container ALSO redeclares it (see
+    /// `CandidateReferenceRow`'s own doc comment for the exact `getModel`-
+    /// shaped VS Code pattern this closes, `docs/evidence/2026-09-07-v4-
+    /// vscode-campaign.md` §14.7/§15). The SAME site also still contributes
+    /// its ordinary no-target entry to `pending_sites` (with the candidate
+    /// reason), so a later residual tsgo pass can still upgrade it to one
+    /// CONFIRMED `reference_rows` entry. **Never** produces a `classification:
+    /// "confirmed"` row -- same zero-wrong-target discipline as `candidate_
+    /// call_rows`. Empty whenever this owner had no such ambiguous member
+    /// read.
+    pub candidate_reference_rows: Vec<ProposedRecord>,
     /// Parameter entities, "every declaration" variant (2026-09-06, owner-
     /// approved fidelity fix superseding the 2026-09-04 "referenced-only"
     /// cut): one `jsts:entity_parameter` `ProposedRecord` per identifier-
@@ -393,6 +408,7 @@ pub struct PendingSiteProposal {
 /// | 7 | `heritage_deferred_to_e3` | this crate, `PendingHeritageSite` |
 /// | 8 | `heritage_target_uncertain` | this crate, `PendingHeritageSite` |
 /// | 9 | `heritage_clause_partially_pending` | this crate, `PendingHeritageSite` |
+/// | 10 | `sibling_declaration_ambiguous` | this crate, `PendingCallSite`/`CandidateCallRow`/`CandidateReferenceRow` (E-P0o) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingReasonCode {
@@ -406,6 +422,7 @@ pub enum PendingReasonCode {
     HeritageDeferredToE3 = 7,
     HeritageTargetUncertain = 8,
     HeritageClausePartiallyPending = 9,
+    SiblingDeclarationAmbiguous = 10,
 }
 
 impl PendingReasonCode {
@@ -420,6 +437,7 @@ impl PendingReasonCode {
             REASON_HERITAGE_DEFERRED => Self::HeritageDeferredToE3,
             REASON_HERITAGE_TARGET_UNCERTAIN => Self::HeritageTargetUncertain,
             REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING => Self::HeritageClausePartiallyPending,
+            REASON_SIBLING_DECLARATION_AMBIGUOUS => Self::SiblingDeclarationAmbiguous,
             _ => Self::Unspecified,
         };
         code as u8
@@ -436,6 +454,7 @@ impl PendingReasonCode {
             7 => REASON_HERITAGE_DEFERRED,
             8 => REASON_HERITAGE_TARGET_UNCERTAIN,
             9 => REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING,
+            10 => REASON_SIBLING_DECLARATION_AMBIGUOUS,
             _ => "unspecified",
         }
     }
@@ -709,6 +728,23 @@ const REASON_OVERLOAD_AMBIGUOUS: &str = "overload_ambiguous";
 /// even one constituent lacks the member entirely (that stays plain
 /// pending with no candidates -- `MemberLookup::None`, never a guess).
 const REASON_UNION_AMBIGUOUS: &str = "union_ambiguous";
+/// E-P0o (2026-09-08): the receiver resolved to a SINGLE known entity
+/// (`ProgramIndex::members` returned `One`, own declaration OR inherited --
+/// distinct from `REASON_OVERLOAD_AMBIGUOUS`, which is about that SAME
+/// container declaring the name more than once itself), but the receiver's
+/// own typing `rule` does not pin it to that entity uniquely (see `rule_
+/// pins_receiver_uniquely`'s own doc comment) AND at least one OTHER known
+/// container that is a transitive `extends` descendant of the resolved
+/// entity ALSO redeclares the same member name (`ProgramIndex::sibling_
+/// extends_overrides` non-empty) -- the `getModel`/`_getViewModel`/`cellAt`/
+/// `getSelection` VS Code residual, `docs/
+/// evidence/2026-09-07-v4-vscode-campaign.md` §14.7/§15. Used for BOTH a
+/// plain member reference (`resolve_static_member_reference`'s `Candidates`
+/// outcome, `CandidateReferenceRow`) and a call target (`resolve_call_
+/// target_typeflow`'s `TypeflowCallResolution::Candidates`, `CandidateCallRow`)
+/// -- same reason string either way, decision 28's sibling-candidate rule
+/// is one mechanism regardless of site kind.
+const REASON_SIBLING_DECLARATION_AMBIGUOUS: &str = "sibling_declaration_ambiguous";
 /// A2 (pending.sites migration): fallback reason for a `PendingSiteProposal`
 /// built from a [`PendingHeritageSite`] whose own `reason` field cannot be
 /// recovered for some future reason -- not reached by any code path today
@@ -1219,6 +1255,42 @@ struct CandidateCallRow {
     reason: &'static str,
 }
 
+/// E-P0o (2026-09-08): the `core:references` sibling of `CandidateCallRow`
+/// -- one per-candidate `possible` `core:references` row for a PLAIN member
+/// read (`obj.m`, never a call callee -- see `resolve_call_target_typeflow`'s
+/// own `CandidateCallRow`/`TypeflowCallResolution::Candidates` for the call
+/// case) whose typeflow receiver resolved to a single known entity that
+/// declares the member directly, but a sibling `extends`-descendant
+/// container ALSO redeclares it (`ProgramIndex::sibling_extends_overrides`,
+/// `REASON_SIBLING_DECLARATION_AMBIGUOUS`) -- there is no overload/union
+/// equivalent for a plain reference the way `Many`/`UnionCandidates` exist
+/// for a call target, since `resolve_static_member_reference`'s own `One`
+/// match already only ever sees a single container's own resolved member
+/// (an overloaded/union-typed member read stays plain pending today,
+/// unchanged by this task). The site ALSO stays `checker_pending` (`push_
+/// site`, same reason) so a later residual tsgo pass can still upgrade it
+/// to one CONFIRMED row -- same two-row contract `CandidateCallRow`'s own
+/// doc comment describes. Turned into a `possible` (never `confirmed`)
+/// `core:references` row by `candidate_reference_record` in `finish`.
+struct CandidateReferenceRow {
+    start: u32,
+    end: u32,
+    source_id: String,
+    target_id: String,
+    reason: &'static str,
+}
+
+/// Outcome of `SemanticWalker::resolve_static_member_reference`. Mirrors
+/// `TypeflowCallResolution` for a plain (non-call) member read -- `Candidates`
+/// is E-P0o's sibling-declaration ambiguity (see `CandidateReferenceRow`'s
+/// own doc comment); deliberately never a `Resolved` for that outcome, same
+/// zero-wrong-target discipline as the call case.
+enum StaticMemberResolution {
+    Resolved(String),
+    Candidates(Vec<String>),
+    Unresolved,
+}
+
 /// Outcome of `SemanticWalker::resolve_call_target_typeflow`. `Candidates`
 /// is P2-2j: the receiver resolved, but the member lookup itself was
 /// genuinely ambiguous (an overload set on one container, or a union of
@@ -1467,6 +1539,11 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// mode (`visit_call_expression`'s `Candidates` arm is only reached
     /// outside that mode).
     candidate_call_rows: Vec<CandidateCallRow>,
+    /// E-P0o (2026-09-08): the `core:references` sibling of `candidate_call_
+    /// rows`, for a plain member read rather than a call. See
+    /// `CandidateReferenceRow`'s and `OwnerSemantics::candidate_reference_
+    /// rows`'s own doc comments.
+    candidate_reference_rows: Vec<CandidateReferenceRow>,
     /// `URDIRA_JSTS_TYPEFLOW_ORACLE=1` only. See `OwnerSemantics::
     /// typeflow_oracle_hits`'s doc comment.
     typeflow_oracle_hits: Vec<TypeflowOracleHit>,
@@ -1888,6 +1965,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             pending_call_sites: Vec::new(),
             pending_heritage_sites: Vec::new(),
             candidate_call_rows: Vec::new(),
+            candidate_reference_rows: Vec::new(),
             typeflow_oracle_hits: Vec::new(),
             typeflow_pending_call_shapes: Vec::new(),
             class_stack: Vec::new(),
@@ -3020,6 +3098,65 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .is_some_and(|kind| matches!(kind, "method" | "getter" | "setter" | "constructor"))
     }
 
+    /// E-P0o (2026-09-08, sibling-declaration ambiguity, decision 28): does
+    /// `rule` (`type_of_expression`'s own second return value, tagging HOW
+    /// the receiver's type was derived) already pin the receiver to ITS
+    /// resolved entity uniquely enough that `ProgramIndex::sibling_extends_
+    /// overrides` never needs consulting at all? ONLY consulted, per its own
+    /// call site's own gate, when the match came from the entity's OWN
+    /// direct declaration (`ProgramIndex::own_member_ids` non-empty), never
+    /// an inherited one -- see that function's own doc comment for the live
+    /// `ICodeEditor`/`IActiveCodeEditor` counter-example proving an
+    /// inherited match is a structurally DIFFERENT shape (unmodeled control-
+    /// flow narrowing, not a same-file ambiguity) this mechanism must not
+    /// also claim, and for why `instanceof_narrowing_never_applies_to_a_
+    /// calls_own_target_resolution`'s own adversarial regression guard
+    /// (`EditorPane` DOES declare `getControl` itself, `MergeEditor extends
+    /// EditorPane` overrides it, v3's own proven CALL answer is still
+    /// `EditorPane`'s own declaration unconditionally) requires the direct-
+    /// declaration case to stay confirmed even in the PRESENCE of a known
+    /// sibling override, whenever `rule` here is reliable.
+    ///
+    /// The task's own three named "reliable" shapes -- "a parameter
+    /// annotated with a concrete interface", "`this` in a concrete class",
+    /// "a variable with a resolved annotation" -- collapse to exactly TWO
+    /// rule strings here: `"this"` (`class_stack`'s own frame is always the
+    /// syntactically enclosing, necessarily concrete, class -- never
+    /// inferred or propagated) and `"member_declared_type"` (`record_local_
+    /// type`'s explicit-annotation branch, used identically for a
+    /// parameter's own annotation and a local variable's own annotation --
+    /// see that function's doc comment: the untyped-initializer fallback
+    /// only ever runs when NO annotation exists at all). Three more are
+    /// reliable for the SAME reason (a literal, unambiguous name/proof,
+    /// never a guess) even though the task's own examples do not name them
+    /// individually: `"super"` (`super.m` bypasses any subclass override by
+    /// JS's own runtime semantics -- there is no "which sibling" question at
+    /// all), `"instanceof_narrowed"` (a PROVEN control-flow fact about this
+    /// exact position, not an inferred/propagated type -- see `narrowed_
+    /// target_is_a_callable_kind`'s own doc comment for the one place this
+    /// crate already treats it as authoritative), `"member_class_static"`
+    /// and `"member_new_expression"` (`ClassName.member`/`new ClassName()`
+    /// name one concrete declaration directly, by literal syntax, exactly
+    /// like an explicit annotation does). Every OTHER rule (`"member_
+    /// declared_type_chain"`, `"call_return_type"`, `"object_shape_static"`,
+    /// `"array_element"`, `"record_element"`, `"await"`, `"parenthesized"`,
+    /// `"non_null"`, `"as_expression"`, `"type_assertion"`, `"inline_type_
+    /// literal_member"`, ...) is some form of INFERENCE or PROPAGATION
+    /// through a chain this crate does not itself narrow the way TypeScript's
+    /// real checker does -- not reliable enough to trust `members()`'s own-
+    /// declaration match over a known sibling override.
+    fn rule_pins_receiver_uniquely(rule: &str) -> bool {
+        matches!(
+            rule,
+            "this"
+                | "super"
+                | "instanceof_narrowed"
+                | "member_declared_type"
+                | "member_class_static"
+                | "member_new_expression"
+        )
+    }
+
     /// The `(entity_id, is_static)` pair a `TypeflowValue` carries, when it
     /// is itself directly a class/interface entity (never an `ArrayOf`/
     /// `PromiseOf` wrapper -- those need an explicit unwrap first, e.g.
@@ -3694,7 +3831,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// member-read resolution independently visit the SAME
     /// `StaticMemberExpression` node (the callee) and each publish their
     /// own relation kind, exactly like the checker does.
-    fn resolve_static_member_reference(&self, expr: &StaticMemberExpression<'a>) -> Option<String> {
+    fn resolve_static_member_reference(
+        &self,
+        expr: &StaticMemberExpression<'a>,
+    ) -> StaticMemberResolution {
         if let Some(index) = self.ctx.typeflow_index
             && let Some((base_value, rule)) = self.type_of_expression(&expr.object)
             && let Some((base_entity, is_static)) = Self::as_entity(&base_value)
@@ -3713,7 +3853,37 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // `Self::narrowed_target_is_a_callable_kind`'s own doc comment.
             && !(rule == "instanceof_narrowed" && Self::narrowed_target_is_a_callable_kind(&target))
         {
-            return Some(target);
+            // E-P0o (2026-09-08, sibling-declaration ambiguity): `target`
+            // came from `base_entity`'s OWN direct declaration only when
+            // `own_member_ids` is non-empty (an INHERITED match is a
+            // structurally different, unmodeled-narrowing shape -- see
+            // `ProgramIndex::own_member_ids`'s own doc comment for the live
+            // `ICodeEditor`/`IActiveCodeEditor` counter-example and why it
+            // is NOT treated the same way here). Only consulted when `rule`
+            // does not already pin the receiver to `base_entity` uniquely
+            // (`rule_pins_receiver_uniquely`) -- a reliably-typed receiver's
+            // own resolution stands, matching decision 28's "confirmation
+            // stays when the receptor is typed uniquely" carve-out.
+            if !Self::rule_pins_receiver_uniquely(rule)
+                && !index
+                    .own_member_ids(&base_entity, expr.property.name.as_str(), is_static)
+                    .is_empty()
+            {
+                let mut candidates = index.sibling_extends_overrides(
+                    &base_entity,
+                    expr.property.name.as_str(),
+                    is_static,
+                );
+                if !candidates.is_empty() {
+                    urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    candidates.push(target);
+                    candidates.sort();
+                    candidates.dedup();
+                    return StaticMemberResolution::Candidates(candidates);
+                }
+            }
+            return StaticMemberResolution::Resolved(target);
         }
         // 2026-09-05 A5 references-parity task, Paso 1 fix Form 1: a
         // namespace-import-bound identifier read as a plain VALUE (not a
@@ -3733,7 +3903,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         if let Some(target_id) =
             self.resolve_namespace_member(&expr.object, expr.property.name.as_str())
         {
-            return Some(target_id);
+            return StaticMemberResolution::Resolved(target_id);
         }
         // D.5 (2026-09-05, adversarial review): `Ns.Member` in VALUE
         // position where `Ns` is a LOCAL namespace or one imported BY
@@ -3750,10 +3920,13 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         // seeing only its own outermost segment, mirroring `visit_ts_
         // qualified_name`'s own one-level-per-call contract.
         let Expression::Identifier(root) = &expr.object else {
-            return None;
+            return StaticMemberResolution::Unresolved;
         };
         let segment = expr.property.name.as_str().to_owned();
-        self.resolve_qualified_namespace_path(root, &[segment])
+        match self.resolve_qualified_namespace_path(root, &[segment]) {
+            Some(target_id) => StaticMemberResolution::Resolved(target_id),
+            None => StaticMemberResolution::Unresolved,
+        }
     }
 
     /// D.4 (2026-09-05, references-parity task, diagnosis only -- no
@@ -4049,6 +4222,40 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                                     )
                                 {
                                     return TypeflowCallResolution::Unresolved;
+                                }
+                                // E-P0o (2026-09-08, sibling-declaration
+                                // ambiguity): same check, same rationale
+                                // (own declaration only, see `ProgramIndex::
+                                // own_member_ids`'s own doc comment), as
+                                // `resolve_static_member_reference`'s own --
+                                // see that function's own doc comment and
+                                // `rule_pins_receiver_uniquely`'s doc comment
+                                // for the exact "reliable rule" allow-list.
+                                if !Self::rule_pins_receiver_uniquely(rule)
+                                    && !index
+                                        .own_member_ids(
+                                            &base_entity,
+                                            member.property.name.as_str(),
+                                            is_static,
+                                        )
+                                        .is_empty()
+                                {
+                                    let mut candidates = index.sibling_extends_overrides(
+                                        &base_entity,
+                                        member.property.name.as_str(),
+                                        is_static,
+                                    );
+                                    if !candidates.is_empty() {
+                                        urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        candidates.push(target);
+                                        candidates.sort();
+                                        candidates.dedup();
+                                        return TypeflowCallResolution::Candidates {
+                                            targets: candidates,
+                                            reason: REASON_SIBLING_DECLARATION_AMBIGUOUS,
+                                        };
+                                    }
                                 }
                                 return TypeflowCallResolution::Resolved(target, rule);
                             }
@@ -4539,6 +4746,16 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 &right.target_id,
             ))
         });
+        // E-P0o: same deterministic-order rationale as `candidate_call_rows`
+        // above.
+        self.candidate_reference_rows.sort_by(|left, right| {
+            (left.start, left.end, &left.source_id, &left.target_id).cmp(&(
+                right.start,
+                right.end,
+                &right.source_id,
+                &right.target_id,
+            ))
+        });
         let sites_digest = compute_sites_digest(&self.sites);
         let pending_sites = self
             .sites
@@ -4629,6 +4846,14 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .candidate_call_rows
             .iter()
             .map(|row| candidate_call_record(&self.path, row, &self.line_index))
+            .collect();
+        // E-P0o: one `possible` `core:references` row PER CANDIDATE (own
+        // `target_id` each), in sorted order -- see `CandidateReferenceRow`'s
+        // and `OwnerSemantics::candidate_reference_rows`'s own doc comments.
+        let candidate_reference_rows = self
+            .candidate_reference_rows
+            .iter()
+            .map(|row| candidate_reference_record(&self.path, row, &self.line_index))
             .collect();
         // Parameter entities, "every declaration" variant (2026-09-06
         // fidelity fix, supersedes the 2026-09-04 "referenced-only" cut):
@@ -4765,6 +4990,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             typeflow_heritage_rows,
             pending_site_rows,
             candidate_call_rows,
+            candidate_reference_rows,
             parameter_entity_rows,
             parameter_contains_rows,
             external_entity_rows,
@@ -5240,6 +5466,75 @@ fn candidate_call_record(
         category: "relation",
         kind: "jsts:relation_call".to_owned(),
         universal_kind: "core:call".to_owned(),
+        facets_list: facets_list_from_value(&facets),
+        facets: canonical_json(&facets),
+        schema_version: 1,
+        source_span: canonical_span(path, row.start, row.end),
+        span_start_line: line_index.line_of(row.start),
+        span_end_line: line_index.line_of(row.end),
+        identity_key,
+        body: RecordBody::Encoded(body),
+        source_id: Some(row.source_id.clone()),
+        target_id: Some(row.target_id.clone()),
+        evidence_references: canonical_evidence(path, row.start, row.end),
+    }
+}
+
+/// `core:references` proposed record, `classification: "possible"`, carrying
+/// a REAL `target_id` -- E-P0o, the `core:references` sibling of `candidate_
+/// call_record` for a PLAIN member read rather than a call. See
+/// `CandidateReferenceRow`'s and `OwnerSemantics::candidate_reference_rows`'s
+/// own doc comments for the exact contract this closes. The identity recipe
+/// matches `reference_proposed_record`'s CONFIRMED recipe exactly (`jsts:
+/// references:{path}:{start}:{end}:{source_id}:{target_id}`) -- two
+/// different candidates for the SAME site get two DIFFERENT identities,
+/// same rationale as `candidate_call_record`'s own doc comment. `facets`
+/// gain `"core:indirect"` even though a `target_id` is present, same v3
+/// possible-classification convention `candidate_call_record` already
+/// follows.
+fn candidate_reference_record(
+    path: &str,
+    row: &CandidateReferenceRow,
+    line_index: &LineIndex,
+) -> ProposedRecord {
+    let identity_key = format!(
+        "jsts:references:{path}:{}:{}:{}:{}",
+        row.start, row.end, row.source_id, row.target_id
+    );
+    // A3b: strict lexicographic key order (`classification`, `end`, `path`,
+    // `reason`, `source_id`, `start`, `target_id`), same as `candidate_call_
+    // record`.
+    let mut encoder = urdira_native_core::BodyEncoder::new();
+    encoder
+        .begin_object(7)
+        .expect("candidate reference body field count is fixed");
+    encoder
+        .key("classification")
+        .expect("relation body key order");
+    encoder.string("possible").expect("string never fails");
+    encoder.key("end").expect("relation body key order");
+    encoder
+        .uint(u64::from(row.end))
+        .expect("row.end is a finite u32");
+    encoder.key("path").expect("relation body key order");
+    encoder.string(path).expect("string never fails");
+    encoder.key("reason").expect("relation body key order");
+    encoder.string(row.reason).expect("string never fails");
+    encoder.key("source_id").expect("relation body key order");
+    encoder.string(&row.source_id).expect("string never fails");
+    encoder.key("start").expect("relation body key order");
+    encoder
+        .uint(u64::from(row.start))
+        .expect("row.start is a finite u32");
+    encoder.key("target_id").expect("relation body key order");
+    encoder.string(&row.target_id).expect("string never fails");
+    let body = encoder.finish();
+    let facets = serde_json::json!(["core:reference_relation", "core:indirect"]);
+    ProposedRecord {
+        proposal_record_key: proposal_record_key(&identity_key),
+        category: "relation",
+        kind: "jsts:relation_references".to_owned(),
+        universal_kind: "core:references".to_owned(),
         facets_list: facets_list_from_value(&facets),
         facets: canonical_json(&facets),
         schema_version: 1,
@@ -5869,25 +6164,29 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         // identifier-kind site in this file: a JSDoc-typed file's own
         // typeflow index input is unreliable, so it stays pending too).
         let resolved = if self.jsdoc_typed_file {
-            None
+            StaticMemberResolution::Unresolved
         } else {
             self.resolve_static_member_reference(expr)
         };
         // External package/symbol entities task (item 2): when typeflow
-        // could not resolve this member read (`resolved` is `None`), try
-        // ONE more thing before falling back to the pending site -- is the
-        // receiver a plain identifier bound by an EXTERNAL `import * as ns`
-        // (`_.get` in `import * as _ from "lodash"; _.get(...)`)? A static
-        // property name only (`expr.property` is always a plain
+        // could not resolve this member read (`resolved` is `Unresolved`),
+        // try ONE more thing before falling back to the pending site -- is
+        // the receiver a plain identifier bound by an EXTERNAL `import * as
+        // ns` (`_.get` in `import * as _ from "lodash"; _.get(...)`)? A
+        // static property name only (`expr.property` is always a plain
         // `IdentifierName` for a `StaticMemberExpression` -- a computed
         // access `ns[expr]` is a different AST node, `ComputedMemberExpression`,
         // not reachable here at all). Emits the symbol entity when found
-        // (see `emit_external_use`'s own doc comment).
-        let external = if resolved.is_some() || self.jsdoc_typed_file {
-            None
-        } else {
-            self.resolve_external_namespace_member(&expr.object, expr.property.name.as_str())
-        };
+        // (see `emit_external_use`'s own doc comment). E-P0o: a `Candidates`
+        // outcome already found REAL candidates through typeflow -- never
+        // attempted here either, same "resolved is Some" precedent as
+        // before this task.
+        let external =
+            if matches!(resolved, StaticMemberResolution::Unresolved) && !self.jsdoc_typed_file {
+                self.resolve_external_namespace_member(&expr.object, expr.property.name.as_str())
+            } else {
+                None
+            };
         if let Some(NamespaceMemberResolution::External(canonical, _)) = &external {
             self.emit_external_use(
                 canonical,
@@ -5901,8 +6200,14 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         let external_target_id = external.map(|resolution| match resolution {
             NamespaceMemberResolution::External(_, target_id) => target_id,
         });
-        match resolved.or(external_target_id) {
-            Some(target_id) => {
+        let resolved = match (resolved, external_target_id) {
+            (StaticMemberResolution::Unresolved, Some(target_id)) => {
+                StaticMemberResolution::Resolved(target_id)
+            }
+            (resolved, _) => resolved,
+        };
+        match resolved {
+            StaticMemberResolution::Resolved(target_id) => {
                 self.push_site(
                     SiteKind::IdentifierRef,
                     start,
@@ -5933,7 +6238,33 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     });
                 }
             }
-            None => {
+            // E-P0o: the site stays PENDING (with the sibling-declaration
+            // reason -- exactly like an `Unresolved` site, just a different
+            // reason) AND gets one `CandidateReferenceRow` per candidate,
+            // mirroring `visit_call_expression`'s own `Candidates` arm --
+            // see `CandidateReferenceRow`'s own doc comment.
+            StaticMemberResolution::Candidates(targets) => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::CheckerPending,
+                    Some(REASON_SIBLING_DECLARATION_AMBIGUOUS),
+                );
+                let source_id = self.current_owner();
+                for target_id in targets {
+                    if source_id != target_id {
+                        self.candidate_reference_rows.push(CandidateReferenceRow {
+                            start,
+                            end,
+                            source_id: source_id.clone(),
+                            target_id,
+                            reason: REASON_SIBLING_DECLARATION_AMBIGUOUS,
+                        });
+                    }
+                }
+            }
+            StaticMemberResolution::Unresolved => {
                 let reason = if self.jsdoc_typed_file {
                     REASON_JSDOC_TYPED_FILE
                 } else {
@@ -11071,6 +11402,213 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
                 .iter()
                 .any(|site| site.site_kind == SiteKind::Call
                     && site.reason.as_deref() == Some(REASON_CALL_DEFERRED))
+        );
+    }
+
+    // --- E-P0o (2026-09-08): sibling-declaration ambiguity (`getModel`
+    // shape, `docs/evidence/2026-09-07-v4-vscode-campaign.md` §14.7/§15) --
+
+    /// Minimal reproduction of the live `IEditor`/`ICodeEditor` shape: `IBase`
+    /// declares `getModel` DIRECTLY on itself, and a sibling `extends`
+    /// descendant in the SAME file, `IDerived`, redeclares it with a
+    /// different signature. The receiver (`this.base`) is typed through a
+    /// property's own declared-type CHAIN (`member_declared_type_chain`),
+    /// never an explicit annotation naming `IBase` specifically -- exactly
+    /// the "receptor tipado por... interfaz base común" shape decision 28's
+    /// sibling-candidate rule targets. A plain member READ (never a call),
+    /// so this exercises `resolve_static_member_reference`'s own `Candidates`
+    /// arm and `CandidateReferenceRow`, not the call-target path.
+    #[test]
+    fn sibling_declaration_ambiguous_member_read_produces_candidate_reference_rows_never_a_confirmed_one()
+     {
+        let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IDerived extends IBase {\n  getModel(): string;\n}\nclass Host {\n  base: IBase;\n  read() {\n    this.base.getModel;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:20:getModel";
+        let derived_get_model_id = "jsts:method:a.ts:80:getModel";
+        assert_eq!(
+            source[20..].get(..8),
+            Some("getModel"),
+            "test's own assumed IBase::getModel offset drifted"
+        );
+        assert_eq!(
+            source[80..].get(..8),
+            Some("getModel"),
+            "test's own assumed IDerived::getModel offset drifted"
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != base_get_model_id && row.3 != derived_get_model_id),
+            "this.base.getModel must NEVER confirm to either sibling \
+             declaration -- decision 28 forbids guessing between them: \
+             rows={:?}",
+            resolved(&semantics)
+        );
+        assert_eq!(
+            semantics.candidate_reference_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.candidate_reference_rows
+        );
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            assert_eq!(row.body.to_value()["classification"], "possible");
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([
+                base_get_model_id.to_owned(),
+                derived_get_model_id.to_owned()
+            ]),
+            "both sibling declarations must be present as candidates"
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::IdentifierRef
+                    && site.reason.as_deref() == Some(REASON_SIBLING_DECLARATION_AMBIGUOUS))
+        );
+    }
+
+    /// Same `IBase`/`IDerived` shape as above, but as a CALL target
+    /// (`this.base.getModel()`) rather than a plain read -- exercises
+    /// `resolve_call_target_typeflow`'s own sibling-declaration check and
+    /// `TypeflowCallResolution::Candidates`/`CandidateCallRow`, mirroring
+    /// `typeflow_overloaded_member_produces_candidate_rows_via_this_and_a_
+    /// typed_local`'s own test shape for the pre-existing overload/union
+    /// mechanisms.
+    #[test]
+    fn sibling_declaration_ambiguous_call_target_produces_candidate_call_rows_never_a_confirmed_one()
+     {
+        let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IDerived extends IBase {\n  getModel(): string;\n}\nclass Host {\n  base: IBase;\n  read() {\n    this.base.getModel();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.typeflow_call_rows.is_empty(),
+            "this.base.getModel() must never confirm to either sibling \
+             declaration: rows={:?}",
+            semantics.typeflow_call_rows
+        );
+        assert_eq!(
+            semantics.candidate_call_rows.len(),
+            2,
+            "rows: {:?}",
+            semantics.candidate_call_rows
+        );
+        for row in &semantics.candidate_call_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            assert_eq!(row.body.to_value()["classification"], "possible");
+        }
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::Call
+                    && site.reason.as_deref() == Some(REASON_SIBLING_DECLARATION_AMBIGUOUS))
+        );
+    }
+
+    /// Control: when the receiver is instead a PARAMETER explicitly
+    /// annotated with the NARROWER sibling interface directly (`host:
+    /// IDerived`, `member_declared_type` -- one of `rule_pins_receiver_
+    /// uniquely`'s reliable rules), the read must stay CONFIRMED to that
+    /// interface's own declaration, unaffected by the sibling relationship
+    /// -- decision 28's "confirmation stays when the receptor is typed
+    /// uniquely" carve-out.
+    #[test]
+    fn explicitly_annotated_parameter_of_the_narrower_sibling_interface_still_confirms() {
+        let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IDerived extends IBase {\n  getModel(): string;\n}\nfunction use(host: IDerived) {\n  host.getModel;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let derived_get_model_id = "jsts:method:a.ts:80:getModel";
+        assert_eq!(
+            source[80..].get(..8),
+            Some("getModel"),
+            "test's own assumed IDerived::getModel offset drifted"
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == derived_get_model_id),
+            "host.getModel must confirm to IDerived's own declaration when \
+             the parameter is explicitly annotated with IDerived directly: \
+             rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics.candidate_reference_rows.is_empty(),
+            "an explicitly, uniquely typed receiver must never produce a \
+             sibling candidate row: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+    }
+
+    /// Live VS Code counter-example, investigated and DELIBERATELY NOT
+    /// generalized to (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §15,
+    /// `ProgramIndex::own_member_ids`'s own doc comment): an EXPLICITLY
+    /// annotated parameter (`mid: IMid`, `member_declared_type`) whose
+    /// entity does NOT itself declare the member (the match comes from its
+    /// OWN ancestor, `IBase`, via ordinary inheritance) while a FURTHER
+    /// descendant of `IMid` (`INarrow extends IMid`) redeclares it --
+    /// reproduces `ICodeEditor` (declares no `getModel` of its own, inherits
+    /// `IEditor`'s) vs. `IActiveCodeEditor extends ICodeEditor` (redeclares
+    /// it narrower, reached in the real corpus through a `hasModel(): this
+    /// is IActiveCodeEditor` user-defined type-predicate guard this crate
+    /// does not model). An EARLIER version of this fix generalized the
+    /// sibling check to this inherited shape too, but that broke the
+    /// adversarial regression guard `instanceof_narrowing_never_applies_to_
+    /// a_calls_own_target_resolution` (own-declaration + a known override
+    /// must stay CONFIRMED for a call, proven live) -- the two shapes are
+    /// NOT interchangeable, so this crate deliberately leaves the inherited
+    /// shape CONFIRMED (to the ancestor's own declaration) rather than
+    /// mis-representing an unmodeled control-flow-narrowing fact as a
+    /// same-file candidate ambiguity. This is the residual E-P0o's own §15
+    /// reports rather than guesses at.
+    #[test]
+    fn sibling_declaration_via_an_inherited_match_stays_confirmed_not_generalized_to() {
+        let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IMid extends IBase {\n  other(): void;\n}\ninterface INarrow extends IMid {\n  getModel(): string;\n}\nfunction use(mid: IMid) {\n  mid.getModel;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:20:getModel";
+        assert_eq!(
+            source[20..].get(..8),
+            Some("getModel"),
+            "test's own assumed IBase::getModel offset drifted"
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == base_get_model_id),
+            "mid.getModel must stay confirmed to IMid's own inherited \
+             (IBase) declaration -- the inherited shape is deliberately NOT \
+             covered by the sibling-declaration check, see this test's own \
+             doc comment: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics.candidate_reference_rows.is_empty(),
+            "the inherited shape must never produce a sibling candidate \
+             row: rows={:?}",
+            semantics.candidate_reference_rows
         );
     }
 

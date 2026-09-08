@@ -1101,6 +1101,13 @@ pub fn run_scoped(
             // regardless (see below), independent of whether any candidate
             // ROW gets published.
             owner.records.extend(semantics.candidate_call_rows);
+            // E-P0o (2026-09-08): the `core:references` sibling of
+            // `candidate_call_rows` above -- see `OwnerSemantics::
+            // candidate_reference_rows`'s own doc comment. Gated behind the
+            // SAME measurement-only escape hatch as the call-side rows
+            // (never on by default): a plain member reference site still
+            // contributes its ordinary `pending_sites` entry regardless.
+            owner.records.extend(semantics.candidate_reference_rows);
         }
         // Parameter entities, "every declaration" variant (2026-09-06,
         // owner-approved fidelity fix superseding the 2026-09-04

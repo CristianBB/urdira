@@ -353,3 +353,35 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   regression floor in `scripts/v4-population-floors.json`/`crates/urdira-indexing-worker/src/v4/
   tests_e2e.rs`'s `n8n_population_floors` starts at `74,021` (`0.99 x` the OLD figure) and is
   expected to only move up once F.3's measurement lands.
+
+## Amendment 2026-09-08 (Frente E-P0o, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §15)
+
+- **Sibling-candidate rule (own-declaration shape only) — new candidate-ambiguity mechanism,
+  same discipline as the 2026-09-06 union/overload amendment above.** When a member lookup
+  (`obj.m`/`this.m`/`x.m()`) resolves the receiver to a single known entity that declares `m`
+  DIRECTLY on itself (`urdira_jsts_typeflow::ProgramIndex::own_member_ids` non-empty), but (a) the
+  receiver's own typing was NOT reached through one of the "reliable" rules (`semantic_sites.rs`'s
+  `rule_pins_receiver_uniquely`: `this`, `super`, a proven `instanceof` narrowing, an explicit
+  `: T` annotation, `ClassName.member`, or `new ClassName()`) and (b) at least one OTHER known
+  container that is a transitive `extends` DESCENDANT of the resolved entity ALSO redeclares `m`
+  (`ProgramIndex::sibling_extends_overrides` non-empty) — the site must stay `possible`, with ONE
+  candidate row per declaration (own's + every known sibling's), NEVER `confirmed` to either.
+  Reason `sibling_declaration_ambiguous` (`PendingReasonCode` code 10). Mirrors the union/overload
+  mechanism exactly, extended to a plain (non-call) member reference for the first time
+  (`CandidateReferenceRow`/`candidate_reference_record`, `core:references` classification
+  `possible`) — previously `core:references` had no `possible` bucket at all.
+- **Explicitly NOT generalized to an INHERITED match** (the receiver's resolved entity does NOT
+  declare `m` itself; the match comes from walking that entity's OWN `extends` chain up to an
+  ancestor). A live VS Code counter-example (`editor: ICodeEditor` in `coreCommands.ts`, guarded by
+  `if (!editor.hasModel()) return;` — `hasModel(): this is IActiveCodeEditor` narrows `editor` to a
+  DESCENDANT of `ICodeEditor` this crate does not model) proves the inherited shape is a distinct,
+  unmodeled CONTROL-FLOW-NARROWING gap (the same general class as `instanceof`, just a different
+  syntax), not a same-file candidate ambiguity — labeling it `possible` would misrepresent a
+  deterministic-but-unknown fact as a genuine ambiguity. A regression-tested adversarial guard
+  (`instanceof_narrowing_never_applies_to_a_calls_own_target_resolution`, E-P0k) additionally
+  proves the own-declaration and inherited shapes are NOT interchangeable: own-declaration wins
+  UNCONDITIONALLY for a call/read whose receiver type itself declares the member, even in the
+  presence of a known descendant override — matching TypeScript's real declared-type resolution.
+  This residual (~281 VS Code references, ~153 VS Code calls at this task's own measurement,
+  down from 461/317 pre-fix) is reported, not guessed at — implementing real type-predicate
+  narrowing (`x is T`) is a genuinely separate typeflow feature, out of this decision's scope.
