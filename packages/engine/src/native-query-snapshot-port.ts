@@ -366,16 +366,35 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   /**
    * Decomposes a `RecordColumnSelector` (whose `categories`/`universal_kinds`/`kinds`
    * arrays are each independently optional and multi-valued) into a bounded
-   * set of exact `(universal_kind, category, kind)` triples the native
-   * store's `by_kind` range index can answer directly. Each combo is
-   * capped at `limit` (sorted by `record_id` within the combo, exactly
-   * like the store's own `by_kind`); merging combos and re-sorting/
-   * re-slicing to `limit` globally is still correct because a record in
-   * the true global top-`limit` can never rank outside the top-`limit` of
-   * its OWN combo's sorted range.
+   * set of `(universal_kind, category[, kind])` combos the native store's
+   * `by_kind` range index can answer directly. Each combo is capped at
+   * `limit` (sorted by `record_id` within the combo, exactly like the
+   * store's own `by_kind`); merging combos and re-sorting/re-slicing to
+   * `limit` globally is still correct because a record in the true global
+   * top-`limit` can never rank outside the top-`limit` of its OWN combo's
+   * sorted range.
+   *
+   * Frente Q-3 (2026-09-08): when `selector.kinds` is omitted/empty (the
+   * caller wants "any kind" -- e.g. `core:inspect_architecture`'s pushdown
+   * asking for every `core:container`/`core:type` entity, regardless of the
+   * producer-specific `kind` string), this used to default `kinds` to
+   * `dicts.kinds` -- EVERY kind string in the WHOLE store, across every
+   * category and universal_kind, not scoped to what was actually asked for
+   * (the engine layer has no registry mapping a universal_kind to its own
+   * kind strings; that mapping is plugin-local). That inflated `comboCount`
+   * past `SELECTOR_COMBO_CAP` for realistic selectors and silently fell
+   * back to the full-corpus `scanAll` branch below -- measured live on n8n
+   * (2,198,601 records): 26.4-30.1s for two `inspect_architecture` calls,
+   * exactly the "full scan disguised as a bounded call" this cap exists to
+   * make rare. Now answered via `recordsByKindUniversal` (the native
+   * `(universal_kind, category)` prefix range -- `by_kind`'s rows are
+   * sorted by the full `(universal_kind_id, category, kind_id)` triple, so
+   * every kind under one `(universal_kind, category)` is contiguous) --
+   * one native call per `(category, universal_kind)` pair, no `kinds`
+   * dimension in the combo count at all.
    *
    * This method's return type has no `undefined`/"decline" signal (unlike
-   * e.g. `graph_edges_by_subject_ids`), so when the expansion would be
+   * e.g. `graph_edges_by_subject_ids`), so when the expansion would still be
    * unbounded (`SELECTOR_COMBO_CAP`) this falls back to one full
    * visible-corpus scan filtered in JS rather than ever answering
    * incorrectly -- slower, never wrong.
@@ -387,27 +406,39 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     const dicts = this.handle.dictionaries();
     const categories = selector.categories !== undefined && selector.categories.length > 0 ? selector.categories : (["entity", "relation", "fact", "evidence", "diagnostic"] as const);
     const universalKinds = selector.universal_kinds !== undefined && selector.universal_kinds.length > 0 ? selector.universal_kinds : dicts.universalKinds;
-    const kinds = selector.kinds !== undefined && selector.kinds.length > 0 ? selector.kinds : dicts.kinds;
-    const comboCount = categories.length * universalKinds.length * kinds.length;
+    const explicitKinds = selector.kinds !== undefined && selector.kinds.length > 0 ? selector.kinds : undefined;
     const found = new Map<string, CanonicalQueryRecord>();
-    if (comboCount > 0 && comboCount <= SELECTOR_COMBO_CAP) {
-      for (const category of categories) {
-        for (const universalKind of universalKinds) {
-          for (const kind of kinds) {
-            for (const row of this.handle.recordsByKindExact(universalKind, category, kind, generation, limit)) found.set(row.recordId, this.decode(row, scope.workspace_id));
+    if (explicitKinds === undefined) {
+      const comboCount = categories.length * universalKinds.length;
+      if (comboCount > 0 && comboCount <= SELECTOR_COMBO_CAP) {
+        for (const category of categories) {
+          for (const universalKind of universalKinds) {
+            for (const row of this.handle.recordsByKindUniversal(universalKind, category, generation, limit)) found.set(row.recordId, this.decode(row, scope.workspace_id));
           }
         }
+        return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id)).slice(0, limit);
       }
     } else {
-      const categorySet = selector.categories !== undefined && selector.categories.length > 0 ? new Set(selector.categories) : undefined;
-      const universalKindSet = selector.universal_kinds !== undefined && selector.universal_kinds.length > 0 ? new Set(selector.universal_kinds) : undefined;
-      const kindSet = selector.kinds !== undefined && selector.kinds.length > 0 ? new Set(selector.kinds) : undefined;
-      for (const row of this.scanAll(generation)) {
-        if (categorySet !== undefined && !categorySet.has(row.category)) continue;
-        if (universalKindSet !== undefined && !universalKindSet.has(row.universalKind)) continue;
-        if (kindSet !== undefined && !kindSet.has(row.kind)) continue;
-        found.set(row.recordId, this.decode(row, scope.workspace_id));
+      const comboCount = categories.length * universalKinds.length * explicitKinds.length;
+      if (comboCount > 0 && comboCount <= SELECTOR_COMBO_CAP) {
+        for (const category of categories) {
+          for (const universalKind of universalKinds) {
+            for (const kind of explicitKinds) {
+              for (const row of this.handle.recordsByKindExact(universalKind, category, kind, generation, limit)) found.set(row.recordId, this.decode(row, scope.workspace_id));
+            }
+          }
+        }
+        return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id)).slice(0, limit);
       }
+    }
+    const categorySet = selector.categories !== undefined && selector.categories.length > 0 ? new Set(selector.categories) : undefined;
+    const universalKindSet = selector.universal_kinds !== undefined && selector.universal_kinds.length > 0 ? new Set(selector.universal_kinds) : undefined;
+    const kindSet = explicitKinds !== undefined ? new Set(explicitKinds) : undefined;
+    for (const row of this.scanAll(generation)) {
+      if (categorySet !== undefined && !categorySet.has(row.category)) continue;
+      if (universalKindSet !== undefined && !universalKindSet.has(row.universalKind)) continue;
+      if (kindSet !== undefined && !kindSet.has(row.kind)) continue;
+      found.set(row.recordId, this.decode(row, scope.workspace_id));
     }
     return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id)).slice(0, limit);
   }

@@ -1075,6 +1075,42 @@ impl NativeStructuralStoreHandle {
         Ok(views.iter().map(|v| self.to_output(v, &dicts)).collect())
     }
 
+    /// Every `kind` under one `(universal_kind, category)` -- see
+    /// `by_kind_universal_range`'s own doc comment (`segment_io.rs`) and
+    /// `StoreReader::by_kind_universal` (`reader.rs`) for why this exists:
+    /// the engine layer (`NativeCanonicalQuerySnapshotPort.records_by_
+    /// selector`, TS side) has no registry mapping a universal_kind to its
+    /// own producer-specific `kind` strings to enumerate, and enumerating
+    /// via the FULL kind dictionary (every kind string in the whole store)
+    /// blew `SELECTOR_COMBO_CAP` and silently fell back to a full-corpus
+    /// scan for `core:inspect_architecture`'s pushdown -- measured live on
+    /// n8n (2,198,601 records) at 26.4-30.1s for two such calls.
+    #[napi]
+    pub fn records_by_kind_universal(
+        &self,
+        universal_kind: String,
+        category: String,
+        generation: u32,
+        limit: u32,
+    ) -> Result<Vec<NativeOutputRecordRow>> {
+        let dicts = self.reader.dictionaries();
+        let Some(universal_kind_id) = dicts
+            .universal_kinds
+            .iter()
+            .position(|k| k == &universal_kind)
+        else {
+            return Ok(Vec::new());
+        };
+        let category_byte = category_to_byte(&category)?;
+        let views = self.reader.by_kind_universal(
+            universal_kind_id as u16,
+            category_byte,
+            generation as u64,
+            limit as usize,
+        );
+        Ok(views.iter().map(|v| self.to_output(v, &dicts)).collect())
+    }
+
     /// Ordinal directly into the store's `artifacts` dictionary (see
     /// `dictionaries()`); TS resolves the ordinal by scanning the small
     /// returned dictionary rather than this crate exposing a text-keyed

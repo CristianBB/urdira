@@ -1802,6 +1802,38 @@ pub fn by_kind_ordinal_at(arr: &[u8], i: usize) -> u32 {
     u32le(arr, i * BY_KIND_STRIDE + 5)
 }
 
+/// Frente Q-3 (2026-09-08): `by_kind`'s rows are sorted by the exact
+/// `(universal_kind_id, category, kind_id)` triple, so every row sharing
+/// one `(universal_kind_id, category)` prefix -- regardless of `kind_id` --
+/// is CONTIGUOUS in this array. `core:inspect_architecture`'s pushdown
+/// (`tryInspectArchitecturePushdown`, `packages/engine/src/canonical-query-
+/// data-port.ts`) wants "every entity of universal_kind X", not one exact
+/// `kind`, and the language-neutral engine layer has no registry mapping a
+/// universal_kind to its own producer-specific `kind` strings to enumerate
+/// (that mapping is plugin-local, e.g. `packages/plugin-javascript-
+/// typescript/src/registry-contribution.ts`'s `recordKind` calls) -- so
+/// `NativeCanonicalQuerySnapshotPort.records_by_selector`'s existing
+/// "kinds omitted" default (`dicts.kinds`, EVERY kind string in the WHOLE
+/// store, not scoped to the requested universal_kind) blew its own
+/// `SELECTOR_COMBO_CAP` and silently fell back to a full-corpus
+/// `scanAll` -- measured live on n8n (2,198,601 records): 26.4-30.1s for
+/// two such calls (`core:container`/`core:type`), the exact "full scan
+/// disguised as a bounded call" shape `records_by_selector`'s own decline-
+/// to-scan fallback was supposed to make rare, not routine. This prefix
+/// range lets the TS port answer "any kind" directly from the index
+/// instead, in one O(log n + result size) lookup per segment.
+pub fn by_kind_universal_range(arr: &[u8], universal_kind_id: u16, category: u8) -> (usize, usize) {
+    let n = arr.len() / BY_KIND_STRIDE;
+    let key_of = |i: usize| -> (u16, u8) {
+        let rec = &arr[i * BY_KIND_STRIDE..(i + 1) * BY_KIND_STRIDE];
+        (u16le(rec, 0), rec[2])
+    };
+    let target = (universal_kind_id, category);
+    let lo = lower_bound(n, |i| key_of(i).cmp(&target));
+    let hi = upper_bound(n, |i| key_of(i).cmp(&target));
+    (lo, hi)
+}
+
 /// F4 4.3: range over an `entities.index` array `(owner_artifact u32,
 /// span_start u32, ordinal u32)` sorted by `(owner_artifact, span_start)`.
 /// Returns `[lo, hi)` row indices -- ordinarily 0 or 1 wide (an owner's

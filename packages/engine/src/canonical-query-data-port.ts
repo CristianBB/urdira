@@ -521,6 +521,33 @@ const SEARCH_TEXT_PUSHDOWN_OFFSET_CAP = 2000;
 // been observed to OOM a full JS decode of `CanonicalQueryRecord[]` plus
 // its identity maps.
 const FULL_CORPUS_FALLBACK_RECORD_CAP = 200_000;
+// Frente Q-3 (2026-09-08): caps for the new `analyze_impact`/`find_related_
+// tests`/`inspect_architecture` pushdowns (`tryAnalyzeImpactPushdown`,
+// `tryFindRelatedTestsPushdown`, `relatedTestsPushdown`, `relationClosure`,
+// `tryInspectArchitecturePushdown`). Every one of these bounds ONE closure/
+// selector answer (the caller set for a single symbol, the containment
+// chain above one subject, the covering-test set, the container/type
+// inventory), never the corpus itself -- so, like `FIND_RECORDS_PUSHDOWN_
+// LIMIT` above, raising them if a real workspace's fan-out ever exceeds them
+// does not reintroduce an O(corpus) cost; it only widens one bounded
+// traversal. Chosen generously above realistic fan-out (a symbol's direct
+// callers, a containment chain's depth, one workspace's container/type
+// count) and far below corpus scale (~2.2M/~4.5M records at n8n/VS Code).
+const IMPACT_CALLER_MAX_NODES = 20_000;
+const CONTAINMENT_ANCESTOR_MAX_DEPTH = 64;
+const CONTAINMENT_ANCESTOR_MAX_NODES = 4_096;
+const RELATED_TESTS_MAX_NODES = 20_000;
+// Deliberately much smaller than the other caps above: unlike a BFS closure
+// or a caller-narrowed selector, `inspect_architecture` truncates (see
+// `tryInspectArchitecturePushdown`'s own doc comment) rather than declining,
+// so this cap directly bounds how many full records get JSON-decoded on
+// every call -- measured live (n8n): decoding ~29,500 records (the prior
+// 50,000 cap) cost 21-27s wall while the native lookup underneath it cost
+// 117-154ms, entirely JS-side decode of records a real caller's own
+// response_budget was always going to truncate away. 500 keeps decode cost
+// well under a second while still covering a realistic "orientation"-sized
+// entry_points/public_surfaces answer.
+const INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT = 500;
 // Exact-scan cap for `trySemanticSearch`'s semantic AND lexical lanes alike
 // (see the pinned spec's "v1 grain" decision: exact scan, no ANN). Structural
 // filters (`paths`/`subject_types`) are applied BEFORE this cap, same
@@ -2965,6 +2992,190 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return [...records.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
   }
 
+  /**
+   * Frente Q-3 (2026-09-08): bounded, single-relation-kind BFS over the same
+   * native-indexed primitives `indexedGraphRecords` uses (`graph_edges_by_
+   * subject_ids`, backed by `adj_in`/`adj_out` -- a per-subject binary-
+   * search range lookup, `crates/urdira-structural-store/src/reader.rs`'s
+   * `StoreReader::adjacency`, NOT a corpus scan -- and `records_by_ids`),
+   * generalized to filter edges to exactly one `relation_kind` per call
+   * instead of every relation kind touching the frontier. Backs `core:
+   * analyze_impact`'s caller closure and `core:find_related_tests`'/
+   * `relatedTestsPushdown`'s containment-ancestor and covering-test walks --
+   * every one of them, in the pre-Q-3 in-memory fallback, filtered `maps.
+   * relations` by exactly one `universal_kind` per step (`relationEndpoints`/
+   * `ancestors`/`relatedTests` above). Declines (`undefined`) when the port
+   * lacks either capability, exactly like `indexedGraphRecords`.
+   *
+   * `maxNodes` bounds the CUMULATIVE count of newly-discovered records
+   * across every depth (checked once per depth, not mid-batch) -- once at or
+   * past it, the BFS stops and returns what it already found rather than
+   * ever scanning the full corpus for more. This is a legitimate, honestly-
+   * labeled partial answer only if a real request's fan-out exceeds the
+   * (generous) cap; every differential test in this frente's own test file
+   * stays far under it.
+   *
+   * Unlike `ancestors()`'s single-chain climb (which takes only the FIRST
+   * matching parent per step, via `Array.prototype.find`), this explores
+   * EVERY matching edge at each depth (a proper BFS frontier) -- a strict
+   * superset when a subject has more than one same-kind inbound/outbound
+   * edge (e.g. two distinct "core:contains" parents), which the old single-
+   * chain walk would silently under-count. Real containment in this
+   * codebase's producers is tree-shaped in practice (confirmed by every
+   * existing fixture and this frente's own differential tests matching
+   * exactly), so this is documented as an intentional generalization, not a
+   * regression risk against real workspaces.
+   */
+  private async relationClosure(scope: QueryScope, rootRecords: readonly CanonicalQueryRecord[], relationKind: string, direction: "inbound" | "outbound", maxDepth: number, maxNodes: number): Promise<readonly CanonicalQueryRecord[] | undefined> {
+    if (this.snapshots.graph_edges_by_subject_ids === undefined || this.snapshots.records_by_ids === undefined) return undefined;
+    const discovered = new Map<string, CanonicalQueryRecord>();
+    const seen = new Set(rootRecords.map((record) => record.record_id));
+    let frontier = rootRecords;
+    for (let depth = 0; depth < maxDepth && frontier.length > 0 && discovered.size < maxNodes; depth += 1) {
+      const frontierAliases = new Set(frontier.flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)));
+      const rows = await this.snapshots.graph_edges_by_subject_ids(scope, [...frontierAliases], direction);
+      if (rows === undefined) return undefined;
+      const endpointIds = new Set<string>();
+      for (const edge of rows) {
+        if (edge.relation_kind !== relationKind) continue;
+        if (direction === "outbound" && frontierAliases.has(edge.source_subject_id)) endpointIds.add(edge.target_subject_id);
+        if (direction === "inbound" && frontierAliases.has(edge.target_subject_id)) endpointIds.add(edge.source_subject_id);
+      }
+      if (endpointIds.size === 0) break;
+      const hydrated = await this.snapshots.records_by_ids(scope, [...endpointIds]);
+      const next: CanonicalQueryRecord[] = [];
+      for (const record of hydrated) {
+        if (seen.has(record.record_id)) continue;
+        seen.add(record.record_id);
+        discovered.set(record.record_id, record);
+        next.push(record);
+        if (discovered.size >= maxNodes) break;
+      }
+      frontier = next;
+    }
+    return [...discovered.values()];
+  }
+
+  /**
+   * Shared `core:analyze_impact`/`core:find_related_tests` pushdown: the
+   * covering-test set for `subjects`, mirroring the in-memory `relatedTests`
+   * function's exact semantics (`covered = subjects` union each subject's
+   * container-ancestor chain; `tests` = every "core:covers" relation whose
+   * target is in `covered`, deduped by `record_id`) but resolved through
+   * `relationClosure` instead of a full-corpus `maps.relations` filter.
+   */
+  private async relatedTestsPushdown(scope: QueryScope, subjects: readonly CanonicalQueryRecord[]): Promise<readonly CanonicalQueryRecord[] | undefined> {
+    const covered = new Map<string, CanonicalQueryRecord>();
+    for (const subject of subjects) covered.set(subject.record_id, subject);
+    for (const subject of subjects) {
+      const ancestorRecords = await this.relationClosure(scope, [subject], "core:contains", "inbound", CONTAINMENT_ANCESTOR_MAX_DEPTH, CONTAINMENT_ANCESTOR_MAX_NODES);
+      if (ancestorRecords === undefined) return undefined;
+      for (const ancestor of ancestorRecords) covered.set(ancestor.record_id, ancestor);
+    }
+    const coveredRecords = [...covered.values()];
+    if (coveredRecords.length === 0) return [];
+    const tests = await this.relationClosure(scope, coveredRecords, "core:covers", "inbound", 1, RELATED_TESTS_MAX_NODES);
+    if (tests === undefined) return undefined;
+    return [...new Map(tests.map((record) => [record.record_id, record])).values()];
+  }
+
+  /**
+   * `core:analyze_impact` pushdown (Frente Q-3, 2026-09-08). Matches the
+   * in-memory fallback's exact `will_break`/`tests_to_run` semantics
+   * (direct -- depth-1 -- "core:call" callers of `target`; tests covering
+   * the target or any of its direct callers) without ever decoding the
+   * corpus: `target` resolves through `resolveIndexedGraphSelectors` (the
+   * same indexed point-lookup `tryGraphPushdown` uses), the caller set
+   * through one bounded `relationClosure` call, and the test set through
+   * `relatedTestsPushdown`. `must_update`/`may_be_affected`/`uncertain_
+   * dynamic_usage` stay `[]`, matching the pre-Q-3 fallback exactly (no
+   * confidence-graded transitive classification exists yet on either path
+   * -- flagged in this frente's own evidence doc as the next, larger,
+   * capability gap, same as Q-2's own catalog sweep flagged it).
+   */
+  private async tryAnalyzeImpactPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
+    if (operation.operation_id !== "core:analyze_impact") return undefined;
+    const args = object(operation.arguments);
+    const targets = await this.resolveIndexedGraphSelectors(operation.scope, args["target"] === undefined ? [] : [args["target"]]);
+    if (targets === undefined) return undefined;
+    const target = targets[0];
+    const callerRecords = target === undefined ? [] : await this.relationClosure(operation.scope, [target], "core:call", "inbound", 1, IMPACT_CALLER_MAX_NODES);
+    if (callerRecords === undefined) return undefined;
+    const tests = target === undefined ? [] : await this.relatedTestsPushdown(operation.scope, [target, ...callerRecords]);
+    if (tests === undefined) return undefined;
+    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    return result({ will_break: callerRecords.map((record) => item(record)), must_update: [], may_be_affected: [], tests_to_run: tests.map((record) => item(record)), uncertain_dynamic_usage: [] }, capabilityStates);
+  }
+
+  /**
+   * `core:find_related_tests` pushdown (Frente Q-3, 2026-09-08). Matches the
+   * in-memory fallback's exact `tests` stream (`relatedTests(subjects,
+   * maps)`) via `relatedTestsPushdown`; `fixtures`/`mocks`/`helpers` stay
+   * `[]`, matching the pre-Q-3 fallback exactly (it never populated them
+   * either).
+   */
+  private async tryFindRelatedTestsPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
+    if (operation.operation_id !== "core:find_related_tests") return undefined;
+    const args = object(operation.arguments);
+    const subjects = await this.resolveIndexedGraphSelectors(operation.scope, args["subjects"]);
+    if (subjects === undefined) return undefined;
+    const tests = await this.relatedTestsPushdown(operation.scope, subjects);
+    if (tests === undefined) return undefined;
+    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    return result({ tests: tests.map((record) => item(record)), fixtures: [], mocks: [], helpers: [] }, capabilityStates);
+  }
+
+  /**
+   * `core:inspect_architecture` pushdown (Frente Q-3, 2026-09-08). Matches
+   * the in-memory fallback's `entry_points`/`public_surfaces`/`layers`
+   * semantics (every `core:container` entity; every `core:type` entity whose
+   * `name` does not start with `_`; `layers` always `[]`) via `records_by_
+   * selector` (the same native `by_kind` pushdown `core:find_records` uses),
+   * restricted to `categories: ["entity"]` since both source kinds are
+   * always entities (mirrors the fallback's own implicit restriction to
+   * `maps.entities`). `boundaries`/`cycles`/`extension_points` are never
+   * populated by the pre-Q-3 fallback either (a pre-existing capability gap,
+   * not a v4-scale regression -- out of this frente's scale-pushdown
+   * mandate, see the evidence doc) and stay absent here for exact parity.
+   * `scope`/`views`/`max_relation_depth`/`filter` are accepted arguments the
+   * fallback also never applies -- unchanged here, same reason.
+   *
+   * UNLIKE every other pushdown in this file, this one truncates instead of
+   * declining above its cap. `core:find_records`'s own pushdown (`tryPushdown`)
+   * fetches `limit + 1` and declines (falls back to the full in-memory path)
+   * the moment that is exceeded, because a `find_records` selector is
+   * caller-narrowed and an incomplete answer would silently misrepresent a
+   * SPECIFIC request. `inspect_architecture` has no such narrowing selector
+   * at all (its own fallback returns literally "every container"/"every
+   * type", unconditionally) -- for a real large workspace that set can be
+   * tens of thousands of records (measured live on n8n: 15,231 `core:
+   * container` + 14,276 `core:type` entities), and declining would only
+   * route to the SAME generic fallback, which the `visible_record_count`
+   * guard then rejects outright above `FULL_CORPUS_FALLBACK_RECORD_CAP` --
+   * turning an "overview" operation that could legitimately return its
+   * first N results into a hard failure. `INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT`
+   * is deliberately small (an architecture overview's `entry_points`/`public_
+   * surfaces` are for orientation, not exhaustive enumeration -- realistic
+   * `response_budget.max_items` values are in this same range) rather than
+   * "as large as the pushdown can still afford": fetching-then-discarding
+   * tens of thousands of fully hydrated `CanonicalQueryRecord`s (each paying
+   * a JSON-body decode) before a downstream response-budget trim is real,
+   * measured cost, not merely a theoretical one -- 21-27s for one
+   * `inspect_architecture` call at n8n scale with the prior (50,000) cap,
+   * confirmed by a direct native-only harness that isolated the native
+   * lookup itself at 117-154ms for the SAME rows -- so the cost was entirely
+   * this port's own JS-side decode of records the caller was always going to
+   * truncate away, not the native store.
+   */
+  private async tryInspectArchitecturePushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
+    if (operation.operation_id !== "core:inspect_architecture" || this.snapshots.records_by_selector === undefined) return undefined;
+    const containers = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:container"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT);
+    const types = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:type"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT);
+    const publicSurfaces = types.filter((record) => !String(record.body["name"] ?? "").startsWith("_"));
+    const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+    return result({ entry_points: containers.map((record) => item(record)), public_surfaces: publicSurfaces.map((record) => item(record)), layers: [] }, capabilityStates);
+  }
+
   private async evaluateGraphOperation(operation: OperationInvocation, records: readonly CanonicalQueryRecord[], maps: IdentityMaps, capabilityStates: readonly SnapshotCapabilityStateEntry[]): Promise<OperationEvaluation | undefined> {
     const args = object(operation.arguments);
     const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
@@ -3466,6 +3677,12 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const args = object(operation.arguments);
     const graph = await this.tryGraphPushdown(operation);
     if (graph !== undefined) return graph;
+    const analyzeImpact = await this.tryAnalyzeImpactPushdown(operation);
+    if (analyzeImpact !== undefined) return analyzeImpact;
+    const relatedTestsPushed = await this.tryFindRelatedTestsPushdown(operation);
+    if (relatedTestsPushed !== undefined) return relatedTestsPushed;
+    const architecture = await this.tryInspectArchitecturePushdown(operation);
+    if (architecture !== undefined) return architecture;
     if (operation.operation_id === "core:resolve_symbol" && this.snapshots.records_by_name !== undefined) {
       const reference = String(args["reference"] ?? "");
       // A record's plain `name` never contains "." for any known producer,
@@ -4272,13 +4489,30 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
       return result({ artifacts: artifacts.map((record) => item(record)) }, capabilityStates);
     }
+    // Frente Q-3 (2026-09-08): `core:discover_definitions` matches against
+    // the REGISTRY definition inventory (`discoverDefinitions` below), never
+    // against workspace records -- it needs zero corpus reads. Pre-Q-3 it
+    // still fell all the way through the generic `records_for_query`
+    // fallback below (and, before Q-2's guard existed, would have OOM'd a
+    // large corpus for an operation that never even looks at the result),
+    // then discarded every decoded record unused. Answered here, before the
+    // `visible_record_count` guard, so it is never even guard-rejected for a
+    // large corpus -- it was never corpus-dependent in the first place.
+    if (boundOperation.operation_id === "core:discover_definitions") {
+      const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
+      return result(discoverDefinitions(object(boundOperation.arguments)), capabilityStates);
+    }
     // Frente Q-2 (2026-09-08, item 4 sweep finding): refuse an unbounded
     // full-corpus decode BEFORE attempting it, for whichever operation
-    // reaches this point with no dedicated pushdown (today: analyze_impact,
-    // find_related_tests, inspect_architecture, compare, discover_definitions
-    // -- see the evidence doc's catalog sweep). `visible_record_count` is a
-    // cheap, no-decode count; a port that omits it (no known OOM history)
-    // is never newly restricted by this check.
+    // reaches this point with no dedicated pushdown (today: `core:compare`
+    // -- see this frente's own evidence doc: it is unimplemented and, being
+    // "comparison"-scoped, never even reaches this guard through the normal
+    // single-workspace path anyway -- and any future operation added without
+    // one; `analyze_impact`/`find_related_tests`/`inspect_architecture` are
+    // pushed down above, `discover_definitions` is answered above without
+    // touching the corpus at all). `visible_record_count` is a cheap,
+    // no-decode count; a port that omits it (no known OOM history) is never
+    // newly restricted by this check.
     const visibleCount = await this.snapshots.visible_record_count?.(boundOperation.scope);
     if (visibleCount !== undefined && visibleCount > FULL_CORPUS_FALLBACK_RECORD_CAP) {
       throw new EngineErrorWithDetails(

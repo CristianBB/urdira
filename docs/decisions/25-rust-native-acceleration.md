@@ -516,3 +516,46 @@ found live but left unfixed (`core:search_text`'s lexical pushdown declining
 even when `search_text_ready` reports true; `core:get_outline`'s
 multi-second variance traced to native-store mmap page-fault warm-up, not
 an algorithmic full scan).
+
+## 2026-09-08 Q-3 amendment: full-catalog pushdown, and one new index
+
+`docs/evidence/2026-09-08-v4-full-pushdown-catalog.md` closes the last
+operations reachable only through `CanonicalRecordQueryDataPort.execute()`'s
+generic `records_for_query` fallback -- guarded since Q2
+(`core:execution_resource_limit` above `FULL_CORPUS_FALLBACK_RECORD_CAP =
+200,000`), but genuinely non-functional at n8n (2,198,601 records) / VS Code
+(~4.5M records) scale, not merely slow. Operation -> index matrix (additive
+to the table above):
+
+| operation | index used | new in Q-3? |
+|---|---|---|
+| `core:analyze_impact` | `adj_in`/`adj_out` (`graph_edges_by_subject_ids`) filtered to one relation kind (`core:call`) via a new `relationClosure` helper, bounded BFS depth 1 for direct callers | yes (`tryAnalyzeImpactPushdown`) |
+| `core:find_related_tests` | same `relationClosure` helper, `core:contains` inbound (containment ancestors, bounded depth 64) then `core:covers` inbound (covering tests, depth 1) | yes (`tryFindRelatedTestsPushdown`, shared `relatedTestsPushdown`) |
+| `core:inspect_architecture` | `by_kind`, via a **new** `(universal_kind, category)`-only prefix range (`by_kind_universal_range`/`StoreReader::by_kind_universal`/`records_by_kind_universal` N-API/`recordsByKindUniversal` TS) -- `by_kind`'s existing exact-triple range could not answer "every kind" without enumerating a kind dictionary the engine layer has no registry mapping to scope by universal_kind | yes (`tryInspectArchitecturePushdown`; the new index also improves `core:find_records`'s existing pushdown for the same "kinds omitted" selector shape) |
+| `core:discover_definitions` | none needed (registry inventory, not corpus records) -- moved earlier in `execute()` so it never reaches the guard at all | fix, not a new index |
+| `core:compare` | none -- `scope_type: "comparison"` is a different, unimplemented execution path (every port rejects it with a `TypeError` before `records_for_query`); broken independent of scale, left unfixed (out of this amendment's pushdown-boundary scope) | not addressed |
+
+New native surface, mirroring `by_kind`/`records_by_kind_exact`'s own
+shape exactly: `by_kind_universal_range` (`crates/urdira-structural-store/
+src/segment_io.rs`), `StoreReader::by_kind_universal` (`reader.rs`),
+`#[napi] records_by_kind_universal` (`crates/urdira-native-node/src/
+structural_store_napi.rs`), `NativeStructuralStoreHandle.
+recordsByKindUniversal` (`packages/engine/src/native-structural-store-
+binding.ts`), consumed by `NativeCanonicalQuerySnapshotPort.records_by_
+selector`'s "kinds omitted" branch (`native-query-snapshot-port.ts`).
+
+Diagnosed, precisely, but **not fixed** in this amendment (flagged as the
+clear next priority): `analyze_impact`/`find_related_tests` resolve their
+`entity_id`-shaped target/subject selector through `records_by_ids`'s
+`otherIds` linear-scan fallback -- the exact mechanism this decision's own
+Q1 amendment above already documents ("identity_id/identity_key forms...
+have no dedicated native index"), here hit on every call by these two
+operations' primary intended call shape rather than only a caller-error edge
+case. Costs ~2.5-3.7s per call (n8n/VS Code) despite the underlying BFS
+itself costing low tens of milliseconds once resolved -- confirmed via a
+native-only harness isolating the two costs. A real fix needs a
+`identity_key -> record_id` index exposed to TS (the store already has an
+analogous internal one, `StoreReader::subject_index`, not reachable via any
+N-API method a `records_by_ids`-shaped caller can use) -- comparable in
+scope to this amendment's own `by_kind_universal` addition, not a quick
+follow-up.
