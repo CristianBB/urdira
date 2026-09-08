@@ -1774,6 +1774,43 @@ impl StoreReader {
         candidates.into_iter().skip(start).take(limit).collect()
     }
 
+    /// Frente Q-3 (2026-09-08): sibling of `by_kind` for "every kind under
+    /// this `(universal_kind, category)`" instead of one exact `kind` --
+    /// see `by_kind_universal_range`'s own doc comment (`segment_io.rs`)
+    /// for why the engine layer needs this rather than enumerating kinds
+    /// itself. Same per-segment range-then-merge-then-sort shape as
+    /// `by_kind`, minus `kind_id`/`after_key` (this store's only caller,
+    /// `core:inspect_architecture`'s pushdown, has no pagination need --
+    /// its own `INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT` already bounds the
+    /// result and declines pushdown outright above it).
+    pub fn by_kind_universal(
+        &self,
+        universal_kind_id: u16,
+        category: u8,
+        generation: u64,
+        limit: usize,
+    ) -> Vec<RecordView> {
+        let inner = self.snapshot();
+        let mut candidates: Vec<RecordView> = Vec::new();
+        for seg in &inner.segments {
+            let data = &seg.by_kind[HEADER_LEN..];
+            let (lo, hi) = by_kind_universal_range(data, universal_kind_id, category);
+            for i in lo..hi {
+                let ord = by_kind_ordinal_at(data, i) as usize;
+                let view = RecordView {
+                    segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
+                    ordinal: ord,
+                };
+                if view.is_visible(generation) {
+                    candidates.push(view);
+                }
+            }
+        }
+        candidates.sort_by_key(|v| v.record_id());
+        candidates.into_iter().take(limit).collect()
+    }
+
     pub fn by_identity_last(&self, identity_key_digest: &[u8; 32]) -> Option<RecordView> {
         let inner = self.snapshot();
         let mut best: Option<RecordView> = None;

@@ -197,6 +197,15 @@ export declare class NativeStructuralStoreHandle {
   recordsByIds(keysHex: readonly string[], generation: number): readonly NativeOutputRecordRow[];
   recordsByName(name: string, generation: number): readonly NativeOutputRecordRow[];
   recordsByKindExact(universalKind: string, category: string, kind: string, generation: number, limit: number, afterKeyHex?: string): readonly NativeOutputRecordRow[];
+  /** Frente Q-3 (2026-09-08): every `kind` under one `(universal_kind,
+   * category)` -- see `by_kind_universal_range`'s doc comment (`crates/
+   * urdira-structural-store/src/segment_io.rs`) for why this exists
+   * alongside `recordsByKindExact`: the engine layer has no registry
+   * mapping a universal_kind to its own producer-specific `kind` strings
+   * to enumerate, and enumerating via the full kind dictionary blew
+   * `records_by_selector`'s own combo cap and fell back to a full-corpus
+   * scan for `core:inspect_architecture`'s pushdown. */
+  recordsByKindUniversal(universalKind: string, category: string, generation: number, limit: number): readonly NativeOutputRecordRow[];
   recordsByOwnerOrdinal(ownerArtifactOrdinal: number, generation: number): readonly NativeOutputRecordRow[];
   adjacency(subjectIds: readonly string[], direction: "outbound" | "inbound", generation: number): readonly NativeOutputEdgeRow[];
   changedBetween(g1: number, g2: number): readonly NativeChangedEntry[];

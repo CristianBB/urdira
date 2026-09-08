@@ -537,7 +537,17 @@ const IMPACT_CALLER_MAX_NODES = 20_000;
 const CONTAINMENT_ANCESTOR_MAX_DEPTH = 64;
 const CONTAINMENT_ANCESTOR_MAX_NODES = 4_096;
 const RELATED_TESTS_MAX_NODES = 20_000;
-const INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT = 50_000;
+// Deliberately much smaller than the other caps above: unlike a BFS closure
+// or a caller-narrowed selector, `inspect_architecture` truncates (see
+// `tryInspectArchitecturePushdown`'s own doc comment) rather than declining,
+// so this cap directly bounds how many full records get JSON-decoded on
+// every call -- measured live (n8n): decoding ~29,500 records (the prior
+// 50,000 cap) cost 21-27s wall while the native lookup underneath it cost
+// 117-154ms, entirely JS-side decode of records a real caller's own
+// response_budget was always going to truncate away. 500 keeps decode cost
+// well under a second while still covering a realistic "orientation"-sized
+// entry_points/public_surfaces answer.
+const INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT = 500;
 // Exact-scan cap for `trySemanticSearch`'s semantic AND lexical lanes alike
 // (see the pinned spec's "v1 grain" decision: exact scan, no ANN). Structural
 // filters (`paths`/`subject_types`) are applied BEFORE this cap, same
@@ -3060,7 +3070,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
 
   /**
    * `core:inspect_architecture` pushdown (Frente Q-3, 2026-09-08). Matches
-   * the in-memory fallback's exact `entry_points`/`public_surfaces`/`layers`
+   * the in-memory fallback's `entry_points`/`public_surfaces`/`layers`
    * semantics (every `core:container` entity; every `core:type` entity whose
    * `name` does not start with `_`; `layers` always `[]`) via `records_by_
    * selector` (the same native `by_kind` pushdown `core:find_records` uses),
@@ -3072,13 +3082,38 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * mandate, see the evidence doc) and stay absent here for exact parity.
    * `scope`/`views`/`max_relation_depth`/`filter` are accepted arguments the
    * fallback also never applies -- unchanged here, same reason.
+   *
+   * UNLIKE every other pushdown in this file, this one truncates instead of
+   * declining above its cap. `core:find_records`'s own pushdown (`tryPushdown`)
+   * fetches `limit + 1` and declines (falls back to the full in-memory path)
+   * the moment that is exceeded, because a `find_records` selector is
+   * caller-narrowed and an incomplete answer would silently misrepresent a
+   * SPECIFIC request. `inspect_architecture` has no such narrowing selector
+   * at all (its own fallback returns literally "every container"/"every
+   * type", unconditionally) -- for a real large workspace that set can be
+   * tens of thousands of records (measured live on n8n: 15,231 `core:
+   * container` + 14,276 `core:type` entities), and declining would only
+   * route to the SAME generic fallback, which the `visible_record_count`
+   * guard then rejects outright above `FULL_CORPUS_FALLBACK_RECORD_CAP` --
+   * turning an "overview" operation that could legitimately return its
+   * first N results into a hard failure. `INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT`
+   * is deliberately small (an architecture overview's `entry_points`/`public_
+   * surfaces` are for orientation, not exhaustive enumeration -- realistic
+   * `response_budget.max_items` values are in this same range) rather than
+   * "as large as the pushdown can still afford": fetching-then-discarding
+   * tens of thousands of fully hydrated `CanonicalQueryRecord`s (each paying
+   * a JSON-body decode) before a downstream response-budget trim is real,
+   * measured cost, not merely a theoretical one -- 21-27s for one
+   * `inspect_architecture` call at n8n scale with the prior (50,000) cap,
+   * confirmed by a direct native-only harness that isolated the native
+   * lookup itself at 117-154ms for the SAME rows -- so the cost was entirely
+   * this port's own JS-side decode of records the caller was always going to
+   * truncate away, not the native store.
    */
   private async tryInspectArchitecturePushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
     if (operation.operation_id !== "core:inspect_architecture" || this.snapshots.records_by_selector === undefined) return undefined;
-    const containers = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:container"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT + 1);
-    if (containers.length > INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT) return undefined;
-    const types = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:type"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT + 1);
-    if (types.length > INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT) return undefined;
+    const containers = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:container"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT);
+    const types = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:type"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT);
     const publicSurfaces = types.filter((record) => !String(record.body["name"] ?? "").startsWith("_"));
     const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
     return result({ entry_points: containers.map((record) => item(record)), public_surfaces: publicSurfaces.map((record) => item(record)), layers: [] }, capabilityStates);
