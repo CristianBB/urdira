@@ -101,7 +101,41 @@ export function itemId(item: QueryStreamItem): string {
   return "unknown";
 }
 
-/** Converts one upstream `ResultSubject`-shaped stream item into a `SubjectSelector` for a downstream operation argument -- every emitted `ResultSubject` carries `record_id` (see `recordValue` in `canonical-query-data-port.ts`), and `record` selectors are accepted by every subject-resolving operation regardless of the underlying record's category. */
+/**
+ * Converts one upstream `ResultSubject`-shaped stream item into a
+ * `SubjectSelector` for a downstream operation argument -- every emitted
+ * `ResultSubject` carries `record_id` (see `recordValue` in
+ * `canonical-query-data-port.ts`), and `record` selectors are accepted by
+ * every subject-resolving operation regardless of the underlying record's
+ * category.
+ *
+ * Q1 fix (2026-09-08, `docs/evidence/2026-09-08-v4-vscode-query-latency.md`):
+ * this used to populate the selector's `record_id` field with `itemId(item)`,
+ * which prefers `entity_id`/`relation_id`/`diagnostic_id` (the record's
+ * logical/proposal identity, e.g. `entity:<hex>`) over the record's own
+ * storage-identity `record_id` (e.g. `record:<sha256-hex>`) whenever both are
+ * present -- which is true of nearly every entity/relation/diagnostic record.
+ * The mislabeled value was harmless against `SqliteCanonicalQuerySnapshotPort`/
+ * the full in-memory path, whose `by_any_id` map indexes a record under ALL
+ * three identity forms regardless of which one lands in the `record_id`
+ * field. But `NativeCanonicalQuerySnapshotPort.records_by_ids`
+ * (`native-query-snapshot-port.ts`) can only serve a `record:<64-hex>`-shaped
+ * id from its indexed hex lookup; anything else falls into its documented
+ * `otherIds` fallback, `scanAll(generation)` -- a full linear decode of every
+ * visible record in the native structural store. Every pipeline stage
+ * binding that flows an upstream result into a downstream `SubjectSelector`
+ * (the documented `resolve_symbol -> find_references` pattern in particular,
+ * `packages/mcp/src/index.ts`'s `PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES`)
+ * goes through this function, so this single mislabeling turned the
+ * documented, recommended usage pattern into an unconditional full-corpus
+ * scan on every v4 workspace -- measured at ~110-160s on VS Code's
+ * ~4.5M-record store (cold and warm alike, since the native port caches no
+ * decoded corpus to warm). The field is literally named `record_id`, so it
+ * must carry the record's own `record_id`, never a different identity
+ * mislabeled under that name; `itemId(item)` remains correct for its OTHER
+ * use (grouping/log identity, where the semantic identity is the right
+ * choice), so only this call site changes.
+ */
 export function toSubjectSelector(item: QueryStreamItem): Record<string, unknown> {
   const value = item.value as Record<string, unknown> | undefined;
   const body = value !== undefined && isRecord(value["body"]) ? value["body"] : undefined;
@@ -110,7 +144,8 @@ export function toSubjectSelector(item: QueryStreamItem): Record<string, unknown
   if (value?.["universal_kind"] === "core:artifact" && body !== undefined && typeof body["artifact_id"] === "string" && typeof body["artifact_version_id"] === "string") {
     return { subject_type: "artifact", artifact_id: body["artifact_id"], artifact_version_id: body["artifact_version_id"], ...sourceSpanBinding };
   }
-  return { subject_type: "record", record_id: itemId(item), ...sourceSpanBinding };
+  const recordId = typeof value?.["record_id"] === "string" ? value["record_id"] : itemId(item);
+  return { subject_type: "record", record_id: recordId, ...sourceSpanBinding };
 }
 
 /**

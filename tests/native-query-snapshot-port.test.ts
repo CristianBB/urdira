@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { QueryScope } from "@urdira/contracts";
 import { createDurableStorage } from "../packages/storage/src/index.js";
+import { toSubjectSelector } from "../packages/engine/src/recipe-executor.js";
 import {
   CanonicalRecordQueryDataPort,
   NativeCanonicalQuerySnapshotPort,
@@ -26,6 +27,7 @@ import {
   convertV3WorkspaceToNativeStore,
   loadNativeStructuralStoreAddon,
   type CanonicalQueryRecord,
+  type QueryStreamItem,
 } from "../packages/engine/src/index.js";
 
 let addonAvailable = true;
@@ -554,5 +556,106 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       const nativeFound = await nativePort.execute(findRecords);
       expect(nativeFound.streams["records"]).toEqual(sqliteFound.streams["records"]);
     });
+  });
+
+  // Q1 (2026-09-08, docs/evidence/2026-09-08-v4-vscode-query-latency.md):
+  // regression coverage for the P0 this frente fixed -- `core:resolve_symbol
+  // -> core:find_references` chained through a pipeline `bindings: {target:
+  // {stage_id, output}}` (packages/mcp/src/index.ts's own documented
+  // `PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES`) used to make `toSubjectSelector`
+  // (recipe-executor.ts) label a resolved declaration's `identity_id` under
+  // the downstream selector's `record_id` field. Against
+  // `NativeCanonicalQuerySnapshotPort`, a `record_id` field that is not a
+  // `record:<64-hex>` value falls into `records_by_ids`'s `otherIds`
+  // fallback, `scanAll(generation)` -- a full linear decode of the entire
+  // visible corpus (measured at 78.8% of ~110-160s wall time on VS Code's
+  // ~4.5M-record store; reproduced live on n8n's own 2.2M-record store too,
+  // timing out a 30s deadline pre-fix). This test pins BOTH the exact
+  // selector-construction fix and the resulting pushdown behavior: the
+  // native port's own full-corpus entry points are wired to throw, so the
+  // test fails loudly if find_references ever falls back to them again.
+  it("core:resolve_symbol -> core:find_references through a stage_output binding never triggers the native port's full-corpus fallback", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+
+      // Resolve exactly as `core:resolve_symbol`'s own pushdown/in-memory
+      // paths do -- `otherFunc` is unambiguous in the fixture (one
+      // declaration), matching the real MCP example's own precondition
+      // ("resolution may return multiple declarations" is out of scope
+      // here; ambiguity is `core:selector_ambiguous`, a separate path).
+      const nativePort = new CanonicalRecordQueryDataPort(native);
+      const resolved = await nativePort.execute({
+        operation_id: "core:resolve_symbol", operation_version: 3, result_streams: ["declarations", "candidates"],
+        arguments: { reference: "otherFunc", resolution_scope: "workspace" }, scope,
+      });
+      const declarations = (resolved.streams["declarations"] ?? []) as readonly QueryStreamItem[];
+      expect(declarations).toHaveLength(1);
+      const declarationItem = declarations[0]!;
+
+      // Pin the exact bug: the resolved item's `value` carries BOTH the
+      // logical `entity_id` (`identity:2222...`, from `insertIdentityAssignment`)
+      // and the storage `record_id` (`record:bbbb...`). `toSubjectSelector`
+      // must select the LATTER for its `record_id` field -- the field is
+      // literally named `record_id`, and only a `record:<64-hex>` value is
+      // servable through the native port's indexed `records_by_ids` path.
+      const declarationValue = declarationItem.value as Record<string, unknown>;
+      expect(declarationValue["entity_id"]).toBe("identity:" + "2".repeat(64));
+      expect(declarationValue["record_id"]).toBe("record:" + "b".repeat(64));
+      const targetSelector = toSubjectSelector(declarationItem);
+      expect(targetSelector["record_id"]).toBe("record:" + "b".repeat(64));
+
+      // Wire every full-corpus entry point to throw -- if find_references
+      // regresses to the pre-fix behavior (or any other v4 pushdown path
+      // regresses to a full scan), this test fails with that thrown error
+      // rather than silently passing on a slow path.
+      Object.assign(native, {
+        records_for_query: async () => { throw new Error("find_references pushdown performed a full record scan (records_for_query)"); },
+        records_for_query_batches: async function* () { throw new Error("find_references pushdown performed a batched full record scan (records_for_query_batches)"); },
+        records: async () => { throw new Error("find_references pushdown populated the warm record cache (records)"); },
+      });
+
+      const referencesResult = await nativePort.execute({
+        operation_id: "core:find_references", operation_version: 3, result_streams: ["references", "owners"],
+        arguments: { target: targetSelector, include_declarations: false }, scope,
+      });
+      const references = (referencesResult.streams["references"] ?? []) as readonly QueryStreamItem[];
+      const owners = (referencesResult.streams["owners"] ?? []) as readonly QueryStreamItem[];
+      expect(references).toHaveLength(1);
+      expect(owners).toHaveLength(1);
+      expect((owners[0]!.value as Record<string, unknown>)["record_id"]).toBe("record:" + "a".repeat(64));
+
+      // The native port's own warm-record accounting stays at zero
+      // regardless -- confirms `DEFAULT_WARM_RECORDS_BUDGET_MB`'s eviction
+      // loop (packages/daemon/src/runtime.ts) never applies to this path;
+      // it was never the fallback's actual trigger (see the evidence doc).
+      expect(native.approxWarmBytes()).toBe(0);
+      expect(await native.has_warm_records!()).toBe(false);
+    });
+  });
+
+  // Companion unit coverage for `toSubjectSelector` itself (recipe-executor.ts):
+  // the field-priority bug was reachable from ANY category
+  // (entity/relation/diagnostic) whose `ResultSubject` carries both a
+  // logical id and its own `record_id` -- not only the entity case the
+  // fixture above exercises end-to-end.
+  it("toSubjectSelector prefers the record's own record_id over entity_id/relation_id/diagnostic_id", () => {
+    const entityItem = { value: { subject_type: "entity", record_id: "record:" + "1".repeat(64), entity_id: "identity:" + "e".repeat(64) }, stable_sort_key: "k1" };
+    expect(toSubjectSelector(entityItem)["record_id"]).toBe("record:" + "1".repeat(64));
+
+    const relationItem = { value: { subject_type: "relation", record_id: "record:" + "2".repeat(64), relation_id: "identity:" + "f".repeat(64) }, stable_sort_key: "k2" };
+    expect(toSubjectSelector(relationItem)["record_id"]).toBe("record:" + "2".repeat(64));
+
+    const diagnosticItem = { value: { subject_type: "diagnostic", record_id: "record:" + "3".repeat(64), diagnostic_id: "identity:" + "a".repeat(64) }, stable_sort_key: "k3" };
+    expect(toSubjectSelector(diagnosticItem)["record_id"]).toBe("record:" + "3".repeat(64));
+
+    // No `record_id` at all (a shape `recordValue` never actually produces,
+    // but `toSubjectSelector`'s own doc comment only guarantees behavior
+    // for real `ResultSubject` values) still falls back to `itemId`'s prior
+    // priority order rather than throwing or returning `undefined`.
+    const bareItem = { value: { subject_type: "entity", entity_id: "identity:" + "9".repeat(64) }, stable_sort_key: "k4" };
+    expect(toSubjectSelector(bareItem)["record_id"]).toBe("identity:" + "9".repeat(64));
   });
 });
