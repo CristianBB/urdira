@@ -266,13 +266,29 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     // `identity_id`/`identity_key` forms (the other two shapes a
     // `SubjectSelector` may carry) have no dedicated native index -- see
     // the evidence doc's documented gap -- so they're resolved with one
-    // full visible-corpus scan, done ONCE for every such id in this call
-    // rather than once per id.
+    // visible-corpus scan, done ONCE for every such id in this call rather
+    // than once per id. Q1 hardening (2026-09-08,
+    // `docs/evidence/2026-09-08-v4-vscode-query-latency.md`): the primary
+    // fix (`toSubjectSelector` in `recipe-executor.ts`) stops the documented
+    // pipeline-binding pattern from ever reaching this branch, but a caller
+    // MAY still legitimately pass an `entity_id`/`relation_id` selector
+    // directly (e.g. copying `resolve_symbol`'s own `declarations[].
+    // entity_id` field by hand, exactly as `packages/mcp/src/index.ts`'s own
+    // binding-hazard comment warns against but does not forbid). `identity_id`/
+    // `identity_key` values are unique per generation (they ARE the record's
+    // identity), so once every requested id has been found there is nothing
+    // left to discover -- stop scanning instead of always paying the full
+    // corpus cost, which turns this fallback from "always O(corpus)" into
+    // "O(corpus) worst case, O(offset of the last match) common case" with
+    // no format or index change.
     if (otherIds.size > 0) {
+      let remaining = otherIds.size;
       for (const row of this.scanAll(generation)) {
         if (found.has(row.recordId)) continue;
         if ((row.identityId !== undefined && otherIds.has(row.identityId)) || (row.identityKey !== undefined && otherIds.has(row.identityKey))) {
           found.set(row.recordId, this.decode(row, scope.workspace_id));
+          remaining -= 1;
+          if (remaining <= 0) break;
         }
       }
     }

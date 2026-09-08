@@ -462,3 +462,57 @@ current artifact/version frontier from its leased SQLite connection and the
 JSTS engine derives verified CAS paths inside Rust. The private array fields
 remain available only to differential/oracle tests; they are not part of the
 production composition path.
+
+## 2026-09-08 Q1 amendment: a query-plan-layer bug, not a pushdown-boundary gap
+
+`docs/evidence/2026-09-08-v4-vscode-query-latency.md` traces a P0 (`core:
+resolve_symbol -> core:find_references` measured at 116-160s on VS Code's
+~4.5M-record native structural store, cold and warm alike; reproduced on
+n8n's own 2.2M-record store too, exceeding a 30s deadline pre-fix). The
+"Query and storage boundary" section above already commits `NativeCanonical
+QuerySnapshotPort` to indexed pushdown for graph traversal
+(`records_by_ids`/`records_by_name`/`graph_edges_by_subject_ids`/
+`container_records_by_artifact_references`, `native-query-snapshot-port.ts`),
+and that commitment held: every pushdown method was correctly implemented
+and indexed. The defect was one layer higher, in the language-neutral query
+engine shared by every port (`packages/engine/src/recipe-executor.ts`'s
+`toSubjectSelector`), which mislabeled a resolved declaration's logical
+`entity_id` under a downstream `SubjectSelector`'s `record_id` field
+whenever a pipeline stage bound one operation's output into another's
+argument (`bindings: {target: {stage_id, output}}` -- the documented
+`core:resolve_symbol -> core:find_references` pattern in `packages/mcp/
+src/index.ts`'s own `PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES`). Against
+`SqliteCanonicalQuerySnapshotPort`, this was invisible: that port's
+in-memory `by_any_id` map indexes every record under all three identity
+forms (`record_id`/`identity_id`/`identity_key`), so a selector carrying
+either form under the `record_id` field resolved identically. Against the
+native port's own indexed `records_by_ids` (this decision's own
+"Structural methods ... read the native store directly" contract), a
+`record_id` field must actually decode as `record:<64-hex>` to hit the
+`by_identity`-backed lookup; anything else -- including a mislabeled
+`identity_id` -- falls into the documented `otherIds` fallback, one linear
+decode of the entire visible generation (`scanAll`), repeated on every such
+call with no corpus cache to warm.
+
+Fix: `toSubjectSelector` now uses the record's own `record_id` field
+directly (falling back to the prior priority order only when a `ResultSubject`
+somehow lacks one) -- the selector field is literally named `record_id`, so
+it must carry that value, never a different identity mislabeled under it.
+Hardening, defense in depth for a caller that legitimately supplies an
+`entity_id`/`relation_id` selector by hand: `NativeCanonicalQuerySnapshotPort
+.records_by_ids`'s `otherIds` fallback now stops scanning once every
+requested id has been found, rather than always walking the complete
+generation.
+
+This amendment does not change the pushdown boundary, the native store
+format, or which methods are indexed -- it corrects the query-plan-layer
+selector construction that fed those already-correct pushdown methods a
+wrong identity. `find_references` p50: VS Code ~416ms cold / ~260-270ms
+warm (was 116-160s, cold=warm); n8n (heavily-referenced symbol, 50 capped
+references/29 owners) ~2.1-2.7s cold / ~540-640ms warm (was >30s, timed
+out pre-fix). See the evidence doc for the full before/after table, the
+CPU profile pinning `scanAll` at 78.8% of wall time, and two P1/P2 gaps
+found live but left unfixed (`core:search_text`'s lexical pushdown declining
+even when `search_text_ready` reports true; `core:get_outline`'s
+multi-second variance traced to native-store mmap page-fault warm-up, not
+an algorithmic full scan).
