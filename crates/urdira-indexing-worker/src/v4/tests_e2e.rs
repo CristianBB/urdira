@@ -8787,26 +8787,35 @@ fn n8n_incremental_create_delete_roots_match_oracle() {
 /// all -- `core:references` sites are never sent to tsgo, see this module's
 /// sibling diagnostic `n8n_references_parity_debug_dump`'s doc comment).
 ///
-/// Unlike `dump_call_bodies`, this function does NOT need the `core:
-/// indirect`-facet carve-out (no `core:references` row is ever a per-
-/// candidate overload/union row -- that mechanism is `core:call`-only, see
-/// `semantic_sites.rs`'s `candidate_call_record`), and does NOT synthesize
-/// any "possible, no target" entries: `OwnerSemantics::reference_rows` (this
-/// crate's module doc, point 1) only ever holds identifier references Rust
-/// resolved "lexically, with zero doubt" -- there is no persisted `core:
-/// references` row, and no `pending.sites` row either (`PENDING_SITE_KIND_*`
-/// only has `Call`/`Inherits`/`Implements`), for anything Rust could not
-/// resolve. `confirmed_flag` is therefore expected to be `true` for every
-/// row this function ever dumps -- carried through anyway, rather than
-/// hard-coded, so the wire format stays byte-compatible with `dump_call_
-/// bodies` and a future genuine inconsistency (mirroring the real one that
-/// motivated the flag on the call side) would still be visible to the diff
-/// script rather than silently assumed away.
+/// E-P0o (2026-09-08) UPDATE: this function USED to need no `core:indirect`-
+/// facet carve-out at all (no `core:references` row was ever a per-candidate
+/// row -- that mechanism was `core:call`-only). That is no longer true:
+/// `semantic_sites.rs`'s `CandidateReferenceRow`/`candidate_reference_record`
+/// (E-P0o, the sibling-declaration-ambiguity fix, `docs/evidence/2026-09-07-
+/// v4-vscode-campaign.md` §14.7/§15) now publishes a `classification:
+/// "possible"` `core:references` row -- carrying a REAL `target_id` (so
+/// `target_subject().is_some()` is `true` for it) AND the `core:indirect`
+/// facet bit (same v3 possible-classification convention `candidate_call_
+/// record` already used) -- for a plain member read whose typeflow receiver
+/// resolved to a single entity that declares the member directly, but a
+/// sibling `extends`-descendant container also redeclares it. Without this
+/// carve-out, EVERY candidate row of such a site would misreport as
+/// `confirmed` here, and the parity script would then see two (or more)
+/// DIFFERENT "confirmed" targets at the exact same `(path, start, end)` --
+/// exactly the wrong-target class of bug this whole mechanism exists to
+/// prevent, just relocated to this diagnostic dump instead of the real
+/// resolution path. Mirrors `dump_call_bodies_cold_only`'s own identical
+/// fix for `core:call` byte for byte.
 fn dump_reference_bodies(structural_root: &Path, generation: u64, out_path: &Path) {
     use urdira_structural_store::row::CATEGORY_RELATION;
 
     let store = StoreReader::open(structural_root).expect("store reopens for reference body dump");
     let dicts = store.dictionaries();
+    let indirect_bit = dicts
+        .facet_names
+        .iter()
+        .position(|name| name == "core:indirect")
+        .expect("FACET_ORDER (materialize.rs) always registers core:indirect");
     let mut rows: Vec<(bool, Vec<u8>)> = Vec::new();
     for view in store.iter_visible(generation) {
         if view.category() != CATEGORY_RELATION {
@@ -8820,7 +8829,8 @@ fn dump_reference_bodies(structural_root: &Path, generation: u64, out_path: &Pat
         if universal_kind != "core:references" {
             continue;
         }
-        let confirmed = view.target_subject().is_some();
+        let confirmed =
+            view.target_subject().is_some() && (view.facets() & (1u64 << indirect_bit)) == 0;
         rows.push((confirmed, view.body().to_vec()));
     }
 
@@ -8943,11 +8953,12 @@ fn n8n_references_parity_debug_dump() {
     // E-P0l (2026-09-08), Task 2 coverage-recovery diagnostic -- see
     // `residual.rs`'s own identical block (right after ITS cold scan) for
     // the full doc comment.
-    let (demoted_unresolved_extends, demoted_known_subclass_override) =
+    let (demoted_unresolved_extends, demoted_known_subclass_override, demoted_sibling_declaration) =
         urdira_jsts_typeflow::take_demotion_reason_counts();
     println!("=== cold-scan member-lookup demotion reason histogram ===");
     println!("  REASON_UNRESOLVED_EXTENDS           {demoted_unresolved_extends:>8}");
     println!("  REASON_KNOWN_SUBCLASS_OVERRIDE       {demoted_known_subclass_override:>8}");
+    println!("  REASON_SIBLING_DECLARATION           {demoted_sibling_declaration:>8}");
 
     // Capture every IdentifierRef pending site BEFORE `materialize_cold`
     // consumes `analysis.owners` by value -- see this function's own doc

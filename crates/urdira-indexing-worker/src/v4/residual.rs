@@ -5612,11 +5612,15 @@ mod tests {
         // counts`'s own doc comment. Printed as a `REASON_*`-shaped
         // histogram line, consulted only by a human/script reading this
         // diagnostic's stderr -- never affects any resolution outcome.
-        let (demoted_unresolved_extends, demoted_known_subclass_override) =
-            urdira_jsts_typeflow::take_demotion_reason_counts();
+        let (
+            demoted_unresolved_extends,
+            demoted_known_subclass_override,
+            demoted_sibling_declaration,
+        ) = urdira_jsts_typeflow::take_demotion_reason_counts();
         println!("=== cold-scan member-lookup demotion reason histogram ===");
         println!("  REASON_UNRESOLVED_EXTENDS           {demoted_unresolved_extends:>8}");
         println!("  REASON_KNOWN_SUBCLASS_OVERRIDE       {demoted_known_subclass_override:>8}");
+        println!("  REASON_SIBLING_DECLARATION           {demoted_sibling_declaration:>8}");
         print_confirmed_possible_histogram("COLD", &structural_root, base_generation);
         let cold_mismatches =
             print_classification_mismatch_count("COLD", &structural_root, base_generation);
@@ -6243,7 +6247,29 @@ mod tests {
         // both VS Code and n8n parity for this same build, see the evidence
         // doc's own §14) -- not a regression to chase down. The +-4
         // tolerance itself is unchanged; only the live target moved.
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_912;
+        // Refreshed AGAIN 2026-09-08 (E-P0o, `docs/evidence/2026-09-07-v4-
+        // vscode-campaign.md` §15): `semantic_sites.rs`'s new sibling-
+        // declaration-ambiguity check (`rule_pins_receiver_uniquely`/
+        // `ProgramIndex::sibling_extends_overrides`, decision 28) demotes a
+        // member call/reference whose receiver's own resolved entity
+        // declares the member directly, but a known `extends`-descendant
+        // container in the same index ALSO redeclares it, from a confident-
+        // looking (but occasionally WRONG, see the VS Code `getModel`
+        // residual this closes) confirmed target to a `possible` candidate
+        // pair -- n8n's own corpus has 95 such sites (small relative to VS
+        // Code's ~20K, but real), some of which the residual tsgo pass can
+        // still independently confirm and some of which it cannot --
+        // `confirmed_combined` drops by 9 (161,912 -> **161,903**, this
+        // session's own measurement, `URDIRA_V4_RESIDUAL_BUDGET_MS=15000`).
+        // This is the SAME "intended, safety-improving direction" every
+        // prior refresh above documents (fewer confirmed sites, never a
+        // wrong one) -- `different == 0` still holds in n8n's own
+        // references/calls parity for this same build (see the evidence
+        // doc's own §15); VS Code's own residual `different` count also
+        // dropped (461->281 references, 317->153 calls) rather than grew.
+        // Not a regression to chase down. The +-4 tolerance itself is
+        // unchanged; only the live target moved.
+        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_903;
         const CONFIRMED_COMBINED_TOLERANCE: u64 = 4;
         let confirmed_combined_diff =
             final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);

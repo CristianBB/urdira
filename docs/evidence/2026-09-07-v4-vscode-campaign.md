@@ -1547,3 +1547,245 @@ budget for this front.
   histogram-data,n8n-floors-final,n8n-schedule-final}/` removed; this worktree's own local
   `node_modules` symlink and the `packages/{canonical,engine}/dist` copies (untracked,
   gitignored) removed at session close.
+
+---
+
+## 15. E-P0o (2026-09-08): sibling-declaration ambiguity -- rule, classification, final gate
+
+Base: `54363fc` (E-P0n merged). Same reduced-tree recipe throughout (VS Code `vscode-corpus-
+2026-09-06`, rsync `--exclude='**/fixtures/'` + `node_modules` excluded + `scripts/xterm-update.js`
+removed, 12,841 TS/JS files; n8n `n8n-corpus-2026-09-02`, unreduced). v3 oracles: VS Code
+`~/Proyectos/urdira-benchmark/v3-vscode-2026-09-07/workspaces/workspace_p2-donor_....sqlite`, n8n
+`~/Proyectos/urdira-benchmark/v3-n8n-2026-09-07-b/workspaces/workspace_n8n-corpus-2026-09-02_....
+sqlite` (both read-only, unchanged from E-P0n).
+
+### 15.1 The mechanism
+
+E-P0n's own residual (§14.7) traced 76% (592/778) of VS Code's remaining `different`-target sites
+to ONE shape: a member name declared MORE THAN ONCE in the SAME file across sibling interfaces that
+each narrow a common base's own signature (`IEditor`/`ICodeEditor`/`IDiffEditor`'s own three
+`getModel()` declarations in `src/vs/editor/browser/editorBrowser.ts`) -- `ProgramIndex::members`/
+`collect_members` (`crates/urdira-jsts-typeflow/src/lib.rs`) picks the FIRST container's own
+declaration it finds (the receiver's directly-resolved entity, e.g. `IEditor`), never checking
+whether some OTHER known `extends`-descendant of that SAME entity ALSO redeclares the member.
+
+**Fix, `crates/urdira-jsts-typeflow/src/lib.rs`:**
+- `ProgramIndex::own_member_ids(entity_id, name, is_static)` (new, line ~4751): `entity_id`'s own
+  `members` list only, never `extends`/`implements` -- tells apart a `members()` `One` outcome that
+  came from `entity_id`'s OWN direct declaration from one that came from an INHERITED ancestor
+  declaration.
+- `ProgramIndex::sibling_extends_overrides(entity_id, name, is_static)` (new, line ~4805, refactors
+  the existing `has_known_subclass_override` -- E-P0k -- to return the full candidate id list
+  instead of a bare bool): every OTHER known container that is a transitive `extends` DESCENDANT of
+  `entity_id` and ALSO declares its own `name` member. A linear scan, same performance tradeoff
+  `has_known_subclass_override` already made.
+- `DEMOTED_BY_SIBLING_DECLARATION` atomic + `take_demotion_reason_counts` extended to a 3-tuple
+  (diagnostic only, incremented from `semantic_sites.rs` since only that crate sees the receiver-
+  typing `rule`).
+
+**Fix, `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`:**
+- `rule_pins_receiver_uniquely(rule)` (new, `semantic_sites.rs:3101`): does the receiver's own
+  typing rule (`type_of_expression`'s second return value) already pin it uniquely enough that the
+  sibling check never needs consulting? Reliable set: `"this"`, `"super"`, `"instanceof_narrowed"`,
+  `"member_declared_type"` (an explicit `: T` annotation), `"member_class_static"`, `"member_new_
+  expression"`. Every other rule (`"member_declared_type_chain"`, `"call_return_type"`, `"object_
+  shape_static"`, `"array_element"`, `"record_element"`, `"await"`, `"parenthesized"`, `"non_
+  null"`, `"as_expression"`, `"type_assertion"`, `"inline_type_literal_member"`, ...) is some form
+  of INFERENCE or PROPAGATION this crate does not itself narrow the way TypeScript's real checker
+  does.
+- `resolve_static_member_reference` (a plain member READ) now returns a new `StaticMemberResolution`
+  enum (`Resolved`/`Candidates`/`Unresolved`, mirroring the pre-existing `TypeflowCallResolution`)
+  instead of a bare `Option<String>`. The `MemberLookup::One(target)` branch, when `rule` is NOT
+  reliable AND `own_member_ids(base_entity, ...)` is non-empty (own declaration, not inherited),
+  consults `sibling_extends_overrides`; a non-empty result returns `Candidates([target] + siblings,
+  sorted, deduped)` instead of `Resolved(target)`.
+- `resolve_call_target_typeflow`'s member-callee branch gets the IDENTICAL check, feeding the
+  pre-existing `TypeflowCallResolution::Candidates` variant with a new reason,
+  `REASON_SIBLING_DECLARATION_AMBIGUOUS` (`"sibling_declaration_ambiguous"`, `PendingReasonCode`
+  code 10, on-disk-contract append-only table).
+- **New**: `CandidateReferenceRow`/`candidate_reference_record`/`OwnerSemantics::candidate_
+  reference_rows` -- the `core:references` sibling of the pre-existing `CandidateCallRow`/
+  `candidate_call_record`/`candidate_call_rows` (P2-2j), since a plain member reference never had a
+  `possible`-with-target-id row shape before this task (`core:references` was ALWAYS `classification:
+  confirmed` or absent -- see the reference-parity script's own now-stale header comment). One
+  `possible` `core:references` row per candidate, `classification: "possible"`, facets `["core:
+  reference_relation", "core:indirect"]`, identity `jsts:references:{path}:{start}:{end}:{source_id}:
+  {target_id}` (matches the confirmed recipe's shape exactly, per-candidate distinct by `target_id`).
+  The site also still contributes its ordinary `pending_sites` entry (reason `sibling_declaration_
+  ambiguous`) so a later residual tsgo pass can still upgrade it. `crates/urdira-indexing-worker/
+  src/v4/analyze.rs`: one new `owner.records.extend(semantics.candidate_reference_rows)` line,
+  under the SAME `URDIRA_V4_SUPPRESS_POSSIBLE_ROWS_FOR_MEASUREMENT_ONLY` escape hatch as the call
+  side. `main.rs`'s 16 `OwnerSemantics { ... }` test literals updated with the new field.
+
+**Real bug found live while wiring the measurement**: `crates/urdira-indexing-worker/src/v4/
+tests_e2e.rs`'s `dump_reference_bodies` (the reference-parity script's own `--v4-bodies` producer)
+computed `confirmed = view.target_subject().is_some()` -- correct BEFORE this task (no `core:
+references` row ever carried the `core:indirect` facet), but WRONG the instant `candidate_
+reference_rows` exists: a candidate row also carries a real `target_id`
+(`target_subject().is_some() == true`) and the `core:indirect` facet bit, so without a carve-out
+EVERY candidate of an ambiguous site would misreport as `confirmed` -- and the parity script would
+then see two (or more) DIFFERENT "confirmed" targets at the same `(path, start, end)`, exactly the
+wrong-target bug class this whole mechanism exists to prevent, just relocated into the diagnostic
+dump. Fixed to mirror `dump_call_bodies_cold_only`'s own pre-existing `(view.facets() &
+(1u64 << indirect_bit)) == 0` carve-out exactly.
+
+### 15.2 Decision 28's own carve-out: reliable rule, and one abandoned generalization
+
+Decision 28's own text ("cuando el receptor SÍ está tipado de forma única... la confirmación
+sigue") names three reliable shapes, which collapse to `"this"` and `"member_declared_type"` (both
+covering the parameter-annotation and variable-annotation cases identically) plus three more this
+task extends the same reasoning to (`"super"`, `"instanceof_narrowed"`, `"member_class_static"`/
+`"member_new_expression"`) -- see `rule_pins_receiver_uniquely`'s own doc comment for the exact
+per-rule justification.
+
+**A generalization was attempted and REVERTED live, adversarial-tested against this task's own
+regression suite**: extending the sibling check to an INHERITED match too (the receiver's resolved
+entity does not declare `name` itself; the match comes from walking its OWN `extends` chain) broke
+`instanceof_narrowing_never_applies_to_a_calls_own_target_resolution` (E-P0k's own adversarial
+regression guard: `EditorPane` DOES declare `getControl` itself, `MergeEditor extends EditorPane`
+overrides it, and v3's real answer for a CALL through a receiver typed `EditorPane` is still
+`EditorPane`'s own declaration, UNCONDITIONALLY -- own-declaration wins for a receiver whose type
+itself declares the member, matching TypeScript's real declared-type resolution, regardless of a
+known subtype's own override). Root cause of why the two shapes are NOT interchangeable: a live VS
+Code counter-example this generalization was chasing (`editor: ICodeEditor` in `coreCommands.ts`,
+guarded by `if (!editor.hasModel()) return;`) is not a same-file candidate ambiguity at all -- it is
+a DETERMINISTIC fact reached through a `hasModel(): this is IActiveCodeEditor` user-defined
+TYPE-PREDICATE narrowing this crate does not model (the same general class of gap as `instanceof`
+narrowing, just a different syntax: `IActiveCodeEditor extends ICodeEditor` and redeclares
+`getModel` non-null; `ICodeEditor` itself inherits `IEditor`'s own wider declaration). Presenting it
+as a 2-candidate `possible` ambiguity would misrepresent a deterministic-but-unmodeled fact as a
+genuine unresolvable choice. **Kept out of scope, per decision 28's own "never guess" discipline**
+-- implementing real type-predicate narrowing (mirroring `instanceof_narrowings`, generalized to any
+boolean-returning method whose OWN declared return type is a `this is T` predicate) is a genuinely
+separate typeflow feature, not a sibling-declaration fix. Both the reverted-generalization's own
+adversarial finding and the final (own-declaration-only) disposition are covered by unit tests --
+`sibling_declaration_ambiguous_even_when_the_match_is_inherited_not_the_receivers_own` was rewritten
+to `sibling_declaration_via_an_inherited_match_stays_confirmed_not_generalized_to` once the
+generalization was reverted, asserting the INTENDED (not generalized) behavior.
+
+### 15.3 The 24% classification: previous residuals + new patterns
+
+| # | Pattern | Count (VS Code) | Closure | Test/evidence |
+|---|---|---:|---|---|
+| 1 | `getModel`/`_getViewModel`/`cellAt`/`getSelection`/... -- own declaration on a base interface + a sibling `extends`-descendant redeclares, receiver NOT reliably typed | 592/778 (76% of E-P0n's own residual) | **(a) fixed** -- sibling-candidate rule, §15.1 | `sibling_declaration_ambiguous_member_read_produces_candidate_reference_rows_never_a_confirmed_one`, `sibling_declaration_ambiguous_call_target_produces_candidate_call_rows_never_a_confirmed_one` (semantic_sites.rs) |
+| 2 | Same shape, but the receiver IS reliably typed (explicit annotation/`this`/`new`/static) AND the sibling genuinely does not exist -- confirmation must stay | n/a (control) | **(a) modeled, must NOT be touched** | `explicitly_annotated_parameter_of_the_narrower_sibling_interface_still_confirms` |
+| 3 | `ICodeEditor`/`IActiveCodeEditor`-shaped: own declaration NOT direct (inherited via the receiver's OWN `extends` chain), a FURTHER descendant redeclares, reached through a `hasModel(): this is X` type-predicate guard | ~281 references / ~153 calls (this task's own final residual, down from 461/317) | **(b) not fixed, reported** -- distinct root cause (unmodeled type-predicate narrowing), §15.2 | `sibling_declaration_via_an_inherited_match_stays_confirmed_not_generalized_to` (documents the deliberate non-fix); live samples in `v4-fold/ep0o-reports/vscode-references-parity2.json`/`-calls-parity.json` |
+| 4 | `outlineModel.ts`'s `candidate.parent` (E-P0m residual #2) | unchanged | **(b) unchanged** -- ordinary TS control-flow narrowing (no `instanceof`/type-predicate involved), already investigated and found to MATCH v4's own answer; not a member-declared-twice-in-file shape at all, outside this mechanism's reach | none (unchanged from E-P0n §14.5) |
+| 5 | `createMarkupPreview` (E-P0m residual #3, `notebookEditorWidget.ts`) | unchanged | **(b) unchanged** -- "own body wins over interface signature" is the OPPOSITE preference from this mechanism's own "own declaration is untrustworthy" rule; `resolve_call_target_typeflow`'s own-body-call path is untouched by this task's diff | none (unchanged) |
+| 6 | `marked` (E-P0l/m residual #4, `walkThroughContentProvider.ts`, namespace import invoked as a callable) | unchanged | **(b) unchanged** -- resolved via `resolve_namespace_member`, a code path this task's diff never touches | none (unchanged) |
+| 7 | `tunnel` / `i18n.test.ts` (E-P0m residual #5) | unchanged | **(b) unchanged** -- not re-investigated this session (E-P0m's own a-priori hypothesis already refuted, no new information); not a member-declared-twice-in-file shape | none (unchanged) |
+
+Patterns 4-7 are reported unchanged on STRUCTURAL grounds (code-path analysis: this task's diff
+touches only `resolve_static_member_reference`'s/`resolve_call_target_typeflow`'s `MemberLookup::
+One` branches and `ProgramIndex`'s member-lookup helpers -- `resolve_namespace_member`, the own-
+body-call preference, and `outlineModel.ts`'s plain-narrowing control flow are all outside that
+diff's reach), not re-verified against fresh live samples this session (time-boxed against pattern
+3's own higher-yield investigation, which consumed the bulk of this task's remaining budget).
+
+### 15.4 Final gate measurement (this session's own final binary, `own_member_ids`-gated version)
+
+**VS Code** (reduced tree, 12,841 files, same recipe as §14.3): references
+`--v3-db v3-vscode-2026-09-07/workspaces/workspace_p2-donor_....sqlite --v4-bodies <cold dump>`:
+`v3 confirmed core:references sites=3,145,812`; `same=2,482,057` (78.90%, **≥ 2,400,000 floor OK**),
+**`different=281`** (0.01%, down from 461, **-39%**), `missing=663,474` (21.09%). Calls (`--v4-
+bodies` from the AFTER-residual dump, 60s budget, §15.5): `v3 confirmed core:call sites=743,472`;
+`v4_confirmed_same_target=378,398` (50.90%), **`v4_confirmed_different_target=153`** (0.02%, down
+from 317, **-52%**), `v4_possible=353,326` (47.52%), `v4_missing_site=11,595` (1.56%), reverse
+`v4_confirmed_v3_missing_site=54,973` (unchanged shape from E-P0n, not this task's own scope).
+**`different == 0` still does NOT hold for VS Code** -- reported per §14.7's own "never guess,
+report the rest" precedent; the residual is now a DIFFERENT (deeper, unmodeled type-predicate
+narrowing), smaller root cause than E-P0n's own 76% finding, not a failure to apply this task's own
+authorized mechanism (§15.3's classification table accounts for the remainder).
+
+Sibling-declaration demotions during the VS Code cold scan: `DEMOTED_BY_SIBLING_DECLARATION=
+19,931` total (references + calls combined); `11,086` of those land as `IdentifierRef` pending
+sites with reason `sibling_declaration_ambiguous` (the rest are call-target demotions, not
+separately instrumented as a pending-site count the way references are -- call sites already had a
+`pending_call_sites`/`candidate_call_rows` dual-bucket from the pre-existing overload/union
+mechanism, reused unchanged here).
+
+**n8n** (unreduced corpus, unchanged recipe): references `same=1,189,872` (**≥ 1,187,000 floor
+OK**), **`different=0`**; calls `same=116,808`, **`different=0`**; population floors 10/10 **OK**
+(`n8n_population_floors`, part of the ignored suite run this session). **n8n's own gate holds in
+full.** `DEMOTED_BY_SIBLING_DECLARATION=95` on n8n's own cold scan (small relative to VS Code's
+~20K, but real, confirming the mechanism is corpus-size-proportional, not VS Code-specific).
+
+### 15.5 Residual (cota 60s x1, VS Code) -- `confirmed_combined` before/after
+
+`URDIRA_V4_RESIDUAL_BUDGET_MS=60000`, `n8n_residual_pass_debug_histogram` pointed at the reduced VS
+Code tree (same generic harness, historical `n8n_`-prefixed name):
+
+| | `core:call` confirmed | `core:call` possible | heritage confirmed | `confirmed_combined` |
+|---|---:|---:|---:|---:|
+| COLD (generation 1) | 413,493 | 55,938 | 13,004 | **426,497** |
+| AFTER residual, 60s budget (generation 2) | 436,837 | 51,796 | 13,243 | **450,080** |
+
+The 60s-budgeted residual pass confirmed **+23,583** additional sites (calls +23,344, heritage
++239) out of VS Code's much larger overall pending population (900K+) -- expected given the short
+budget relative to corpus size (§2's own n8n residual precedent used a 20s budget against a
+~9x-smaller corpus). This run does not isolate how many of the SPECIFICALLY `sibling_declaration_
+ambiguous`-reasoned pending sites the residual pass upgraded (would need an additional site-level
+before/after diff keyed on `reason`, not performed this session, time-boxed) -- reported as a known
+measurement gap, not fabricated.
+
+n8n's own dedicated `confirmed_combined` regression harness (`n8n_residual_schedule_resumes_after_
+truncation`, `URDIRA_V4_RESIDUAL_BUDGET_MS=15000`, full truncate-then-resume convergence, the
+harness the ±4 tolerance is actually calibrated against): **`confirmed_combined=161,903`** (core:
+call confirmed 160,035 + possible 407, heritage confirmed 1,868). This is 9 below the pre-task
+reference (161,912) -- OUTSIDE the existing ±4 tolerance, but in the SAME "intended, safety-
+improving direction" every prior refresh in this file documents (E-P0m -55, E-P0n +160): this
+task's own 95 n8n sibling-declaration demotions correctly move a handful of previously
+confident-but-occasionally-wrong confirmations to `possible`, and `different == 0` still holds in
+both VS Code and n8n parity for this exact build. `REFERENCE_CONFIRMED_COMBINED` refreshed
+161,912 -> **161,903** with this justification (`residual.rs`); tolerance (`±4`) unchanged.
+
+### 15.6 Files touched, verification, cleanup
+
+- `crates/urdira-jsts-typeflow/src/lib.rs`: `DEMOTED_BY_SIBLING_DECLARATION` + `take_demotion_
+  reason_counts` extended to 3-tuple; `ProgramIndex::own_member_ids`/`sibling_extends_overrides`
+  (new); `has_known_subclass_override` refactored in terms of `sibling_extends_overrides`.
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: `REASON_SIBLING_DECLARATION_AMBIGUOUS`
+  (new) + `PendingReasonCode::SiblingDeclarationAmbiguous` (code 10); `rule_pins_receiver_uniquely`
+  (new); `StaticMemberResolution` enum (new) + `resolve_static_member_reference` signature change;
+  `resolve_call_target_typeflow`'s member-callee branch gets the same check;
+  `CandidateReferenceRow`/`candidate_reference_record`/`OwnerSemantics::candidate_reference_rows`
+  (new, the `core:references` sibling of the pre-existing call-side mechanism); `visit_static_
+  member_expression` rewritten around the new three-way `StaticMemberResolution` match; 5 new unit
+  tests (§15.1/15.2/15.3).
+- `crates/urdira-indexing-worker/src/v4/analyze.rs`: one new `owner.records.extend(semantics.
+  candidate_reference_rows)` line under the existing measurement escape hatch.
+- `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`: `dump_reference_bodies`'s `core:indirect`
+  carve-out fix (§15.1, a real live-found bug); `n8n_references_parity_debug_dump`'s demotion-
+  histogram println extended to 3 lines.
+- `crates/urdira-indexing-worker/src/v4/residual.rs`: `REFERENCE_CONFIRMED_COMBINED` refreshed
+  161,912 -> **161,903** with justification (§15.5); tolerance (`±4`) unchanged; demotion-histogram
+  println extended to 3 lines.
+- `crates/urdira-indexing-worker/src/main.rs`: 16 `OwnerSemantics { ... }` test literals gain
+  `candidate_reference_rows: vec![]`.
+- `docs/decisions/28-v4-rust-semantics-and-residual-checker.md`: amendment recording the sibling-
+  candidate rule and its own-declaration-only scope (§15.2).
+- Verification (this session's own final state): `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` clean; `cargo test -p urdira-jsts-syntax-worker
+  -p urdira-indexing-worker -p urdira-jsts-typeflow --locked`: **`test result: ok. 155 passed; 0
+  failed; 19 ignored`** (indexing-worker), **`test result: ok. 323 passed; 0 failed; 1 ignored`**
+  (syntax-worker, +4 tests over E-P0n's own 319), **`test result: ok. 66 passed; 0 failed`**
+  (typeflow, unchanged); ignored suite with `URDIRA_TSGO_BINARY` set: 17/19 pass (the 2 failures --
+  `n8n_records_logical_set_diff_against_keep_data`/`graph_identity_set_matches_between_two_kept_
+  stores` -- need external `--keep-data` harness fixtures this session never produced, unrelated to
+  this task's own diff); `cargo build --release --locked -p urdira-indexing-worker` clean; `CI=true
+  ./node_modules/.bin/vitest run tests/phase-daemon-v4-reconcile.test.ts tests/v4-scan.test.ts`:
+  **`Test Files 2 passed (2)`, `Tests 7 passed (7)`** (needed the full TS package build chain +
+  `node scripts/build-native.mjs`, neither of which E-P0n's own smaller vitest run required).
+- Worktree setup: base was stale (HEAD at an unrelated, much later commit in a DIFFERENT lineage,
+  `7d04d49`) -- `git reset --hard 54363fc` + `git branch -m`, confirming the `feedback_worktree_
+  subagents_base_and_node_modules` memory's own warning yet again. Per-package `packages/*/node_
+  modules/@urdira/*` symlinks created fresh (none existed). `packages/embedding-local` additionally
+  needed its own `node_modules/@huggingface/transformers` symlink into the `.pnpm` store (not
+  hoisted to the shared root) before `tsc --build packages/embedding-local` would succeed.
+- Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0o`) removed; scratch under
+  `~/Proyectos/urdira-benchmark/v4-fold/ep0o-{vscode-donor,vscode-refs,vscode-refs2,vscode-pending-
+  refs,vscode-pending-refs2,vscode-residual-data,vscode-calls-cold,vscode-calls-after,n8n-refs,n8n-
+  pending-refs,n8n-residual-data,n8n-schedule-data,n8n-schedule-data2,n8n-calls-cold,n8n-calls-
+  after,reports}/` removed; this worktree's own local `node_modules` symlink, per-package `packages/
+  */node_modules/@urdira/*` symlinks, and every `packages/*/dist`/`*.tsbuildinfo` this session
+  produced (untracked, gitignored) removed at session close.
