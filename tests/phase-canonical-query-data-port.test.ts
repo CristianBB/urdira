@@ -2926,6 +2926,48 @@ describe("CanonicalRecordQueryDataPort semantic_document_status real counts + co
     });
   });
 
+  it("Frente S-G (2026-09-08): reconcileSemanticProjection's own artifact-grain 'missing rows' NOT EXISTS subquery is one indexed SEARCH per outer row, not a rescan of the whole vector space", async () => {
+    // Root cause confirmed live at n8n scale
+    // (docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md, Bug
+    // 5): `vector_projection_visible_idx` leads with `(workspace_id,
+    // profile_id, executable_binding_id, ...)`, NOT the owner columns this
+    // correlated subquery actually filters by -- so SQLite could only use
+    // it to narrow to the workspace's ENTIRE open vector-projection set
+    // (72,922 rows at n8n scale) and then scan that whole set by hand for
+    // every one of the ~20k outer `artifact_versions` rows (confirmed:
+    // ~1.47 BILLION comparisons, the query did not complete in 120 seconds
+    // against the real corpus). `vector_projection_by_owner_idx` fixes
+    // this by leading with the exact correlated columns instead.
+    await withSemanticWorkspace(async (opened) => {
+      const rows = await opened.database.all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT artifact_versions.artifact_id AS artifact_id, artifact_versions.artifact_version_id AS artifact_version_id
+           FROM artifact_versions
+           JOIN source_artifacts ON source_artifacts.workspace_id = artifact_versions.workspace_id AND source_artifacts.artifact_id = artifact_versions.artifact_id
+          WHERE artifact_versions.workspace_id = ? AND artifact_versions.encoding <> 'binary'
+            AND artifact_versions.valid_from_generation <= ?
+            AND (artifact_versions.valid_to_generation IS NULL OR artifact_versions.valid_to_generation > ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM vector_projection_rows
+               WHERE vector_projection_rows.workspace_id = artifact_versions.workspace_id
+                 AND vector_projection_rows.owner_artifact_id = artifact_versions.artifact_id
+                 AND vector_projection_rows.owner_artifact_version_id = artifact_versions.artifact_version_id
+                 AND vector_projection_rows.valid_to_generation IS NULL
+                 AND vector_projection_rows.document_grain IS NULL
+                 AND vector_projection_rows.profile_id = ? AND vector_projection_rows.executable_binding_id = ?
+            )`,
+        [workspace.workspace_id, 1, 1, "profile-x", "binding-x"],
+      );
+      expect(rows.length).toBeGreaterThan(0);
+      // Positive assertion: the correlated subquery's own row in the plan
+      // names the new index, as a SEARCH (never a SCAN of the whole table).
+      const correlatedRow = rows.find((row) => /vector_projection_rows/u.test(row.detail));
+      expect(correlatedRow).toBeDefined();
+      expect(correlatedRow!.detail).toMatch(/SEARCH .*USING (COVERING )?INDEX vector_projection_by_owner_idx/u);
+      for (const row of rows) expect(row.detail).not.toMatch(/\bSCAN vector_projection_rows\b/u);
+    });
+  });
+
   it("Frente S-F: buildSemanticCoverageView reads the materialized semantic_coverage_summary row instead of recomputing live, when one exists", async () => {
     await withSemanticWorkspace(async (opened, cas) => {
       const provider = createLocalHashProvider();

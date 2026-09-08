@@ -60,6 +60,38 @@ CREATE TABLE IF NOT EXISTS vector_projection_rows (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS vector_projection_lookup_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, projection_record_id);
 CREATE INDEX IF NOT EXISTS vector_projection_visible_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, valid_from_generation, valid_to_generation, projection_record_id);
+-- Frente S-G (2026-09-08): `reconcileSemanticProjection`'s own ARTIFACT-grain
+-- "missing rows" query (semantic-reconciler.ts) runs a `NOT EXISTS` against
+-- this table correlated by `(workspace_id, owner_artifact_id,
+-- owner_artifact_version_id)`, filtered further by `document_grain IS NULL`
+-- (artifact rows only), `valid_to_generation IS NULL` (open rows only), and
+-- `profile_id`/`executable_binding_id`. Neither index above leads with the
+-- owner columns -- `vector_projection_visible_idx` leads with
+-- `(workspace_id, profile_id, executable_binding_id, ...)`, so the
+-- correlated subquery could only narrow to EVERY open row for the whole
+-- vector space (all of it, once entity-grain embedding has run) and then
+-- scan that entire set by hand for each of the ~20k outer artifact_versions
+-- rows. Confirmed live via `EXPLAIN QUERY PLAN` at n8n scale (72,922 open
+-- entity rows, 20,149 artifact_versions rows): `SEARCH vpr USING INDEX
+-- vector_projection_visible_idx (workspace_id=?)` -- a correlated scalar
+-- subquery re-scanning up to 72,922 rows per outer row, ~1.47 BILLION
+-- comparisons total, the reconciler's OWN full artifact pass never observed
+-- completing within any prior frente's own measurement (S-C through S-F)
+-- because entity-grain work always dominated or crashed first -- this cost
+-- was real but had never been reached before. This new index leads with the
+-- exact correlated columns instead, turning that same subquery into one
+-- indexed point lookup per outer row (`SEARCH ... USING INDEX
+-- vector_projection_by_owner_idx (workspace_id=? AND owner_artifact_id=? AND
+-- owner_artifact_version_id=? AND document_grain=?)`, confirmed via
+-- `EXPLAIN QUERY PLAN` -- no more full-vector-space rescans). Safe to create
+-- here (unlike the v3 catalog's own identical copy, moved to
+-- `ensureWorkspaceSchemaCompatibility` in packages/storage/src/schema.ts):
+-- this sidecar's `vector_projection_rows.document_grain` column has been
+-- part of the base `CREATE TABLE` since this file's very first version
+-- (decision 17 was designed into v4 from P2-1 onward) -- there is no legacy
+-- v4 sidecar predating it the way v3's catalog has one predating its own
+-- later `ALTER TABLE ... ADD COLUMN document_grain` migration.
+CREATE INDEX IF NOT EXISTS vector_projection_by_owner_idx ON vector_projection_rows(workspace_id, owner_artifact_id, owner_artifact_version_id, document_grain, valid_to_generation, profile_id, executable_binding_id);
 -- Marks the last generation for which the async post-ready semantic
 -- maintenance job (embedding + vector-row upkeep) fully caught up with
 -- artifact_versions under the CURRENT embedding provider. Unlike

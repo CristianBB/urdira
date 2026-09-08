@@ -34,7 +34,7 @@ use urdira_structural_store::row::{
 };
 use urdira_structural_store::{
     PENDING_SITE_KIND_CALL, PENDING_SITE_KIND_IMPLEMENTS, PENDING_SITE_KIND_INHERITS, RecordView,
-    StoreReader, to_prefixed_hex,
+    StoreReader, VisibleIter, to_prefixed_hex,
 };
 
 fn napi_err(message: impl Into<String>) -> Error {
@@ -745,6 +745,24 @@ pub struct NativeStructuralStoreHandle {
     reader: StoreReader,
     dir: PathBuf,
     sidecar: TextSidecar,
+    /// Frente S-G (2026-09-08, root-cause fix for the n8n full-embed stall,
+    /// `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`):
+    /// a single resumable cursor slot for [`Self::iter_visible_batch`]'s
+    /// sequential-drain fast path. `(generation, last_served_key_hex, iter)`
+    /// -- `iter` is already positioned to yield the record AFTER
+    /// `last_served_key_hex` (or the very first visible record, when
+    /// `last_served_key_hex` is `None`) at exactly `generation`.
+    /// `records_for_query_batches` (`native-query-snapshot-port.ts`) is the
+    /// ONLY real caller, and it always drains one handle sequentially,
+    /// page after page, passing each page's own last key back as the next
+    /// call's `after_key_hex` -- exactly the pattern this slot recognizes.
+    /// Any call that does NOT match (a different generation, a
+    /// non-sequential/concurrent access pattern, or simply no cursor
+    /// cached yet) transparently falls back to the ORIGINAL correct-but-
+    /// O(n)-per-batch re-scan-and-skip below -- this is a pure speed
+    /// optimization for the common case, never a correctness requirement,
+    /// so a cache miss can never produce a wrong answer, only a slower one.
+    visible_cursor: Option<(u64, Option<String>, VisibleIter)>,
 }
 
 fn artifact_text(dicts: &Dictionaries, ordinal: u32) -> (String, String) {
@@ -812,6 +830,7 @@ impl NativeStructuralStoreHandle {
             reader,
             dir: path,
             sidecar,
+            visible_cursor: None,
         })
     }
 
@@ -820,6 +839,15 @@ impl NativeStructuralStoreHandle {
         let changed = self.reader.reopen_if_changed().map_err(store_err)?;
         if changed {
             self.sidecar = load_sidecar(&self.dir)?;
+            // The cached cursor's own `Arc<StoreInner>` snapshot would stay
+            // perfectly valid to keep draining (it owns its generation's
+            // segments independently of `self.reader`'s own reopen), but a
+            // reopen means a NEWER generation just became current -- keeping
+            // an old-generation cursor alive only pins its snapshot's memory
+            // for a stream essentially nothing will resume. Pure hygiene,
+            // never a correctness requirement (see `visible_cursor`'s own
+            // doc comment).
+            self.visible_cursor = None;
         }
         Ok(changed)
     }
@@ -1177,40 +1205,46 @@ impl NativeStructuralStoreHandle {
             .min(u32::MAX as u64) as u32
     }
 
-    /// See module doc: this re-runs the k-way merge from the start and
-    /// skips forward past `after_key_hex` on every call -- O(n) per batch,
-    /// not O(1). Fine at fixture/gold-manifest scale (what this converter
-    /// targets today); a corpus-scale caller needs a real resumable
-    /// cursor added to `StoreReader` itself, out of scope here (documented
-    /// as a follow-up in the evidence doc).
+    /// Frente S-G (2026-09-08) root-cause fix, confirmed the dominant
+    /// contributor to the n8n full-embed stall
+    /// (`docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`):
+    /// this USED TO unconditionally re-run the k-way merge from the start
+    /// and skip forward past `after_key_hex` on every single call -- O(n)
+    /// per batch, so draining the WHOLE visible corpus via repeated calls
+    /// (`records_for_query_batches`'s own sequential loop,
+    /// `native-query-snapshot-port.ts`) cost O(n^2 / batch_size) total,
+    /// independent of worker/shard count (every shard pays its OWN full
+    /// O(n^2) enumeration). `visible_cursor` (see its own doc comment)
+    /// now recognizes the SEQUENTIAL-DRAIN pattern that is this method's
+    /// only real production call shape -- `after_key_hex` equal to the
+    /// PREVIOUS call's own last-returned key, same `generation` -- and
+    /// resumes the SAME live `VisibleIter` instead of re-scanning, making
+    /// a full sequential drain O(n) total. Any call that does not match
+    /// that pattern (first call, a different generation, a retried or
+    /// non-sequential `after_key_hex`) falls back to the ORIGINAL
+    /// re-scan-and-skip behavior below, byte-for-byte -- so this can only
+    /// ever be a latency win, never a correctness change: the returned
+    /// `rows`/`next_cursor` for a given `(generation, after_key_hex,
+    /// batch_size)` are identical whichever path served them.
     #[napi]
     pub fn iter_visible_batch(
-        &self,
+        &mut self,
         generation: u32,
         batch_size: u32,
         after_key_hex: Option<String>,
     ) -> Result<NativeVisibleBatch> {
+        let (views, next_cursor) = drain_visible_batch(
+            &self.reader,
+            &mut self.visible_cursor,
+            generation as u64,
+            batch_size,
+            after_key_hex,
+        );
         let dicts = self.reader.dictionaries();
-        let after_key = after_key_hex.as_deref().and_then(parse_hex32);
-        let mut rows = Vec::with_capacity(batch_size as usize);
-        let mut next_cursor = None;
-        let mut skipping = after_key.is_some();
-        for view in self.reader.iter_visible(generation as u64) {
-            if skipping {
-                if view.record_id() == after_key.unwrap() {
-                    skipping = false;
-                }
-                continue;
-            }
-            if rows.len() as u32 >= batch_size {
-                break;
-            }
-            next_cursor = Some(hex_encode(&view.record_id()));
-            rows.push(self.to_output(&view, &dicts));
-        }
-        if rows.len() < batch_size as usize {
-            next_cursor = None;
-        }
+        let rows = views
+            .iter()
+            .map(|view| self.to_output(view, &dicts))
+            .collect();
         Ok(NativeVisibleBatch { rows, next_cursor })
     }
 
@@ -1457,6 +1491,73 @@ impl NativeStructuralStoreHandle {
             generation as u64,
         ))
     }
+}
+
+/// Frente S-G (2026-09-08) root-cause fix: the cursor-reuse core of
+/// [`NativeStructuralStoreHandle::iter_visible_batch`], factored out as a
+/// plain function (same `napi::Result`-avoidance rationale as
+/// `pending_site_rows_for_owner`'s own doc comment below -- this lets a
+/// `#[cfg(test)]` unit test exercise it directly, without a `#[napi]`
+/// method's `Result<T>` requiring host glue to link). Takes the SAME
+/// `(generation, last_served_key_hex, iterator)` cursor slot the napi
+/// method stores on `self`, so the two are byte-for-byte the same logic --
+/// this is not a reimplementation the method wraps, it IS the method's own
+/// body. See `NativeStructuralStoreHandle::visible_cursor`'s own doc
+/// comment for the full O(n^2)-per-drain problem this closes and why a
+/// cache MISS can only ever be slower, never wrong.
+fn drain_visible_batch(
+    reader: &StoreReader,
+    cursor_slot: &mut Option<(u64, Option<String>, VisibleIter)>,
+    generation: u64,
+    batch_size: u32,
+    after_key_hex: Option<String>,
+) -> (Vec<RecordView>, Option<String>) {
+    let cached = cursor_slot.take();
+    let mut iter = match cached {
+        Some((cached_gen, cached_after, cached_iter))
+            if cached_gen == generation && cached_after == after_key_hex =>
+        {
+            cached_iter
+        }
+        _ => {
+            // Fallback: the ORIGINAL correct-but-O(n)-per-batch shape -- a
+            // fresh k-way merge, skipped forward to `after_key_hex`. Taken
+            // on the first call, a generation change, or any non-sequential
+            // access pattern -- always correct, only ever slower than the
+            // cache hit above.
+            let after_key = after_key_hex.as_deref().and_then(parse_hex32);
+            let mut fresh = reader.iter_visible(generation);
+            if let Some(target) = after_key {
+                for view in fresh.by_ref() {
+                    if view.record_id() == target {
+                        break;
+                    }
+                }
+            }
+            fresh
+        }
+    };
+    let mut rows = Vec::with_capacity(batch_size as usize);
+    let mut last_key_hex = after_key_hex;
+    for _ in 0..batch_size {
+        match iter.next() {
+            Some(view) => {
+                last_key_hex = Some(hex_encode(&view.record_id()));
+                rows.push(view);
+            }
+            None => break,
+        }
+    }
+    let exhausted = rows.len() < batch_size as usize;
+    let next_cursor = if exhausted {
+        None
+    } else {
+        last_key_hex.clone()
+    };
+    if !exhausted {
+        *cursor_slot = Some((generation, last_key_hex, iter));
+    }
+    (rows, next_cursor)
 }
 
 /// The row-mapping logic `pending_sites_by_owner` exposes over napi,
@@ -1710,5 +1811,213 @@ mod pending_sites_by_owner_tests {
         assert_eq!(other[0].reason, "heritage_target_uncertain");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Frente S-G (2026-09-08): coverage for `drain_visible_batch`'s cursor-
+/// reuse fast path AND its fallback -- the fix for the confirmed n8n
+/// full-embed stall root cause (a full O(n) re-scan-and-skip on EVERY
+/// page, `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`).
+/// Same `napi::Result`-avoidance rationale as `pending_sites_by_owner_tests`
+/// (this crate has no `[lib]` target) -- built directly against
+/// `urdira_structural_store`'s own public write API and `StoreReader::open`,
+/// never `NativeStructuralStoreHandle`.
+#[cfg(test)]
+mod drain_visible_batch_tests {
+    use super::{Dictionaries, NONE_U16, NONE_U32, VisibleIter, drain_visible_batch};
+    use sha2::{Digest, Sha256};
+    use urdira_structural_store::{CATEGORY_ENTITY, RecordRow, SegmentWriter, StoreReader};
+
+    fn digest_of(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "urdira-native-node-visible-batch-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_record(identity_key: &[u8], generation: u32) -> RecordRow {
+        let record_id = digest_of(identity_key);
+        let record_digest = digest_of(b"body");
+        let identity_key_digest = digest_of(identity_key);
+        RecordRow {
+            record_id,
+            owner_artifact: 0,
+            owner_version: 0,
+            valid_from: generation,
+            valid_to: 0,
+            category: CATEGORY_ENTITY,
+            kind_id: 0,
+            universal_kind_id: 0,
+            facets: 0,
+            span_artifact_version: 0,
+            span_start_byte: 0,
+            span_end_byte: 0,
+            span_start_line: NONE_U32,
+            span_end_line: NONE_U32,
+            identity_type: 0,
+            assignment_kind: 0,
+            name_id: 0,
+            identity_key: identity_key.to_vec(),
+            record_digest,
+            body_digest: record_digest,
+            identity_id: identity_key_digest,
+            identity_key_digest,
+            previous_record_id: [0u8; 32],
+            source_subject: None,
+            target_subject: None,
+            relation_kind_id: NONE_U16,
+            body: b"{}".to_vec(),
+        }
+    }
+
+    /// Builds a 5-record store and drains it two rows at a time via
+    /// `drain_visible_batch`, always passing the PREVIOUS call's own
+    /// `next_cursor` back in -- exactly `records_for_query_batches`'s own
+    /// real sequential-drain call shape. Every record must be returned,
+    /// in ascending key order, with no duplicates -- correct whichever
+    /// internal path (cache hit or fallback) actually served each call.
+    #[test]
+    fn sequential_drain_with_chained_cursor_returns_every_record_once_in_order() {
+        let dir = tmp_dir("sequential");
+        let generation: u32 = 1;
+        let records: Vec<RecordRow> = (0..5)
+            .map(|index| make_record(format!("entity-{index}").as_bytes(), generation))
+            .collect();
+        let dicts = Dictionaries {
+            kinds: vec!["jsts:entity_declaration".to_string()],
+            universal_kinds: vec!["core:declaration".to_string()],
+            relation_kinds: Vec::new(),
+            names: Vec::new(),
+            subjects: Vec::new(),
+            artifacts: vec![("artifact:a".to_string(), "artifact-version:a".to_string())],
+            facet_names: Vec::new(),
+            subject_text: Vec::new(),
+            artifact_paths: Vec::new(),
+            entity_kinds: Vec::new(),
+        };
+        SegmentWriter::new()
+            .write_base_with_pending(&dir, &records, &[], &dicts, generation as u64, &[])
+            .expect("write_base_with_pending");
+        let reader = StoreReader::open(&dir).expect("open");
+
+        let mut cursor: Option<(u64, Option<String>, VisibleIter)> = None;
+        let mut after_key: Option<String> = None;
+        let mut collected: Vec<[u8; 32]> = Vec::new();
+        loop {
+            let (views, next_cursor) = drain_visible_batch(
+                &reader,
+                &mut cursor,
+                generation as u64,
+                2,
+                after_key.clone(),
+            );
+            if views.is_empty() {
+                break;
+            }
+            collected.extend(views.iter().map(|view| view.record_id()));
+            if next_cursor.is_none() {
+                break;
+            }
+            after_key = next_cursor;
+        }
+
+        assert_eq!(collected.len(), 5, "every record returned exactly once");
+        let mut expected: Vec<[u8; 32]> = records.iter().map(|row| row.record_id).collect();
+        expected.sort();
+        let mut actual = collected.clone();
+        actual.sort();
+        assert_eq!(actual, expected, "same record set, order-independent check");
+        // Ascending key order (the k-way merge's own documented contract),
+        // preserved across the cache-hit AND fallback paths alike.
+        let mut sorted_collected = collected.clone();
+        sorted_collected.sort();
+        assert_eq!(
+            collected, sorted_collected,
+            "records arrive in ascending key order"
+        );
+    }
+
+    /// A call whose `after_key_hex` does NOT match the cached cursor's own
+    /// position (a different generation here) must fall back to a fresh
+    /// scan rather than silently resuming from the wrong place or
+    /// returning a cache-stale answer -- the whole safety property that
+    /// makes the cache-hit fast path a pure optimization, never a
+    /// correctness requirement.
+    #[test]
+    fn a_cursor_mismatch_falls_back_to_a_correct_fresh_scan_instead_of_reusing_the_wrong_state() {
+        let dir = tmp_dir("mismatch");
+        let generation: u32 = 1;
+        let records: Vec<RecordRow> = (0..3)
+            .map(|index| make_record(format!("entity-{index}").as_bytes(), generation))
+            .collect();
+        let dicts = Dictionaries {
+            kinds: vec!["jsts:entity_declaration".to_string()],
+            universal_kinds: vec!["core:declaration".to_string()],
+            relation_kinds: Vec::new(),
+            names: Vec::new(),
+            subjects: Vec::new(),
+            artifacts: vec![("artifact:a".to_string(), "artifact-version:a".to_string())],
+            facet_names: Vec::new(),
+            subject_text: Vec::new(),
+            artifact_paths: Vec::new(),
+            entity_kinds: Vec::new(),
+        };
+        SegmentWriter::new()
+            .write_base_with_pending(&dir, &records, &[], &dicts, generation as u64, &[])
+            .expect("write_base_with_pending");
+        let reader = StoreReader::open(&dir).expect("open");
+
+        let mut cursor: Option<(u64, Option<String>, VisibleIter)> = None;
+        // Prime the cache with a partial drain (1 of 3 rows) at generation 1.
+        let (first_views, first_cursor) =
+            drain_visible_batch(&reader, &mut cursor, generation as u64, 1, None);
+        assert_eq!(first_views.len(), 1);
+        assert!(cursor.is_some(), "a non-exhausted drain caches its cursor");
+
+        // A call whose `after_key_hex` does NOT match the cached cursor's
+        // own last-served key (a genuinely bogus key here, standing in for
+        // "some other, non-sequential caller") is a cache MISS -- the
+        // cached iterator, already positioned past record 1, must be
+        // DISCARDED rather than reused for this different request. No
+        // record's key is all-zero, so the ORIGINAL "skip forward to
+        // after_key_hex" semantics (preserved byte-for-byte in the
+        // fallback branch: a key that is never found means "skip
+        // everything") correctly yield ZERO rows here -- the SAME answer
+        // the pre-fix implementation always gave for a never-matching
+        // `after_key_hex`, never a wrong resume from the stale cached
+        // position and never a panic.
+        let bogus_after = Some(format!("{:064x}", 0u8));
+        let (mismatched_views, _) =
+            drain_visible_batch(&reader, &mut cursor, generation as u64, 10, bogus_after);
+        assert_eq!(
+            mismatched_views.len(),
+            0,
+            "cache miss falls back to the ORIGINAL skip-to-after_key semantics, not a reuse of the stale cached position"
+        );
+
+        // The mismatched call above exhausted its own fresh scan, clearing
+        // the cache slot entirely -- continuing the ORIGINAL sequential
+        // chain from `first_cursor` afterward still returns the correct
+        // remaining rows: the earlier mismatch left no corrupted or stale
+        // state behind for a later, properly-chained call to trip over.
+        let (resumed_views, resumed_cursor) =
+            drain_visible_batch(&reader, &mut cursor, generation as u64, 10, first_cursor);
+        assert_eq!(
+            resumed_views.len(),
+            2,
+            "the original chain still yields the correct remaining rows"
+        );
+        assert!(resumed_cursor.is_none());
     }
 }

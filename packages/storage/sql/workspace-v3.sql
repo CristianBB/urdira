@@ -486,6 +486,18 @@ CREATE TABLE IF NOT EXISTS vector_projection_rows (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS vector_projection_lookup_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, projection_record_id);
 CREATE INDEX IF NOT EXISTS vector_projection_visible_idx ON vector_projection_rows(workspace_id, profile_id, executable_binding_id, valid_from_generation, valid_to_generation, projection_record_id);
+-- Frente S-G (2026-09-08): `vector_projection_by_owner_idx` (the fix for
+-- `reconcileSemanticProjection`'s artifact-grain "missing rows" query,
+-- confirmed live at n8n scale via EXPLAIN QUERY PLAN -- see
+-- `ensureWorkspaceSchemaCompatibility`'s own doc comment on this index in
+-- packages/storage/src/schema.ts for the full evidence) is created THERE,
+-- not here: `document_grain` is only guaranteed present on a pre-existing
+-- (legacy) `vector_projection_rows` table AFTER that function's own
+-- `ALTER TABLE ... ADD COLUMN document_grain` migration step runs, which
+-- happens strictly AFTER this schema string's own `CREATE INDEX` statements
+-- (confirmed live: creating the index here broke
+-- `ensureWorkspaceSchemaCompatibility`'s own pre-migration-database-open
+-- test with "no such column: document_grain").
 -- Plan 2026-09-06 (Frente S-A): per-document semantic materialization status
 -- -- byte-for-byte identical to the v4 semantic sidecar's own copy
 -- (packages/storage/sql/workspace-v4-semantic.sql), added here too so
