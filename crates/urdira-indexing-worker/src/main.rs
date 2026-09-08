@@ -2507,6 +2507,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             dependency_graph: summary
                                                 .as_ref()
                                                 .map(|s| s.dependency_graph.clone()),
+                                            incomplete_fact_paths: summary.as_ref().and_then(|s| {
+                                                if s.incomplete_fact_paths.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(s.incomplete_fact_paths.clone())
+                                                }
+                                            }),
                                             analysis_token: summary.map(|s| s.analysis_token),
                                         }
                                     }
@@ -2558,6 +2565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             affected_paths: None,
                                             changed_paths: None,
                                             dependency_graph: None,
+                                            incomplete_fact_paths: None,
                                             analysis_token: None,
                                         },
                                         Err(error) => IndexingEvent::Error {
@@ -2606,6 +2614,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 affected_paths: None,
                                 changed_paths: None,
                                 dependency_graph: None,
+                                incomplete_fact_paths: None,
                                 analysis_token: None,
                             },
                             Err(error) => IndexingEvent::Error {
@@ -2728,6 +2737,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 affected_paths: None,
                                 changed_paths: None,
                                 dependency_graph: None,
+                                incomplete_fact_paths: None,
                                 analysis_token: None,
                             })
                         })();
@@ -3460,6 +3470,11 @@ struct JstsGenerationSummary {
     group_count: u64,
     owner_count: u64,
     row_count: u64,
+    /// Paths whose own facts page came back incomplete (`!parsed` or
+    /// carrying non-empty oxc diagnostics) this generation -- see
+    /// `incomplete_fact_paths`'s own doc comment inside `run_jsts_generation`
+    /// (2026-09-08 P0 fix). Empty on every generation unaffected by this.
+    incomplete_fact_paths: Vec<String>,
 }
 
 /// Upper bound on facts-lane analysis worker threads, and the bound used for
@@ -3964,6 +3979,7 @@ fn run_jsts_generation(
             group_count: 0,
             owner_count: 0,
             row_count: 0,
+            incomplete_fact_paths: Vec::new(),
         });
     }
     // Keep only one physical group resident. The previous implementation
@@ -3979,6 +3995,20 @@ fn run_jsts_generation(
     let mut direct_files_by_path = HashMap::<String, BTreeMap<String, ()>>::new();
     let mut imports_complete_by_path = HashMap::<String, bool>::new();
     let mut next_sequence_by_path = HashMap::<String, u64>::new();
+    // 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md §4.1):
+    // paths whose own facts page came back `!parsed` or carrying non-empty
+    // oxc diagnostics. These used to abort the ENTIRE generation the instant
+    // ANY single file hit this -- VS Code's own monorepo has 6 distinct such
+    // files (5 intentionally-malformed test fixtures, plus one legitimate
+    // CommonJS build script, `scripts/xterm-update.js`, using a bare
+    // top-level `return`, valid under Node's module-wrapper semantics but
+    // rejected by a raw ECMAScript script/module parse). v4's own pipeline
+    // (`crates/urdira-indexing-worker/src/v4/analyze.rs`'s `facts_for_paths`
+    // call) never imposed this check at all and scanned the exact same
+    // corpus three times over without issue (see the evidence doc's §1).
+    // Tracked here so the caller can report which paths were skipped instead
+    // of the generation silently losing them.
+    let mut incomplete_fact_paths = Vec::<String>::new();
     let mut pending = affected_paths
         .iter()
         .cloned()
@@ -4093,7 +4123,40 @@ fn run_jsts_generation(
                 }
             };
             if !parsed || !diagnostics.is_empty() {
-                return Err(CoreError(format!("JS/TS facts are incomplete for {path}")));
+                // Skip publishing THIS file's own structural records for this
+                // generation instead of failing the whole candidate -- see
+                // `incomplete_fact_paths`'s own doc comment above for why.
+                // The rest of the corpus (every other page in this same
+                // batch, and every other batch) is unaffected: this `continue`
+                // only stops draining pages for `path` itself, it never
+                // touches `pending`/`observations` for any other path.
+                eprintln!(
+                    "[urdira-indexing-worker] JS/TS facts incomplete for {path} (parsed={parsed}, {} diagnostic(s)); skipping this file's structural records for this generation, continuing the scan",
+                    diagnostics.len()
+                );
+                incomplete_fact_paths.push(path.clone());
+                direct_files_by_path.remove(&path);
+                imports_complete_by_path.remove(&path);
+                next_sequence_by_path.remove(&path);
+                // Marked `"complete": false` in the dependency graph (the
+                // existing field already means "this file's own facts are
+                // not fully trustworthy", previously only used for an
+                // unresolved relative import specifier) plus a dedicated
+                // `"incomplete_facts": true` flag so a future reader can
+                // distinguish the two reasons. `isValidSyntaxDependencyGraph`
+                // (`packages/plugin-javascript-typescript/src/worker.ts`)
+                // only requires `direct_files`/`complete` to exist with the
+                // right types -- an extra key round-trips through its gzip
+                // cache untouched.
+                dependency_graph.insert(
+                    path,
+                    serde_json::json!({
+                        "direct_files": Vec::<String>::new(),
+                        "complete": false,
+                        "incomplete_facts": true,
+                    }),
+                );
+                continue;
             }
             let file = files_by_path.get(&path).ok_or_else(|| {
                 CoreError(format!(
@@ -4242,6 +4305,7 @@ fn run_jsts_generation(
         group_count,
         owner_count,
         row_count,
+        incomplete_fact_paths,
     })
 }
 
@@ -8115,6 +8179,87 @@ mod tests {
         assert_eq!(summary.group_count, 1);
         assert_eq!(core.recovered_group_count().expect("receipt count"), 1);
         let _ = std::fs::remove_file(source_path);
+    }
+
+    /// 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md
+    /// §4.1): one file with genuinely broken syntax (oxc diagnostics
+    /// non-empty) used to fail the WHOLE generation via `CoreError("JS/TS
+    /// facts are incomplete for ...")`, losing every other file's records
+    /// too. Two files here, one broken (`bad.ts`) and one valid
+    /// (`good.ts`): the generation must still succeed, must publish the
+    /// valid file's own record, and must report `bad.ts` in
+    /// `incomplete_fact_paths` instead of aborting.
+    #[test]
+    fn run_jsts_generation_skips_a_file_with_incomplete_facts_instead_of_aborting() {
+        let request = test_request();
+        let digest_of = |bytes: &[u8]| -> String {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(bytes);
+            format!(
+                "sha256:{}",
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        };
+        let good_source = b"export const answer = 42;\n";
+        let bad_source = b"const x = ;\n";
+        let good_path = std::env::temp_dir().join(format!(
+            "urdira-indexing-worker-good-{}.ts",
+            std::process::id()
+        ));
+        let bad_path = std::env::temp_dir().join(format!(
+            "urdira-indexing-worker-bad-{}.ts",
+            std::process::id()
+        ));
+        std::fs::write(&good_path, good_source).expect("good source");
+        std::fs::write(&bad_path, bad_source).expect("bad source");
+        let mut core = IndexingCore::open(":memory:", &request).expect("core");
+        let mut syntax = SyntaxWorkerState::default();
+        let mut engine = JavascriptTypescriptEngine::new("1", "sha256:engine");
+        let input = serde_json::from_value::<JstsGenerationInput>(serde_json::json!({
+            "project_key": "project:worker-test-incomplete-facts",
+            "configuration_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "root_names": ["good.ts", "bad.ts"],
+            "files": [
+                {
+                    "path": "good.ts",
+                    "artifact_id": "artifact:good",
+                    "artifact_version_id": "version:good",
+                    "content_digest": digest_of(good_source),
+                    "source_blob_path": good_path,
+                    "byte_length": good_source.len()
+                },
+                {
+                    "path": "bad.ts",
+                    "artifact_id": "artifact:bad",
+                    "artifact_version_id": "version:bad",
+                    "content_digest": digest_of(bad_source),
+                    "source_blob_path": bad_path,
+                    "byte_length": bad_source.len()
+                }
+            ],
+            "budgets": {"max_output_bytes": 16 * 1024 * 1024, "max_files": 2, "max_source_bytes": good_source.len() + bad_source.len()}
+        }))
+        .expect("engine input");
+        let summary =
+            run_jsts_generation(&mut syntax, &mut core, &mut engine, &request, &input, true)
+                .expect("generation must succeed despite one file's incomplete facts");
+        assert_eq!(summary.incomplete_fact_paths, vec!["bad.ts".to_string()]);
+        assert!(
+            summary.owner_count >= 1,
+            "the valid file's own record must still be published"
+        );
+        let graph = summary
+            .dependency_graph
+            .as_object()
+            .expect("dependency graph object");
+        let bad_entry = graph.get("bad.ts").expect("bad.ts entry present");
+        assert_eq!(bad_entry.get("incomplete_facts"), Some(&Value::Bool(true)));
+        let _ = std::fs::remove_file(good_path);
+        let _ = std::fs::remove_file(bad_path);
     }
 
     #[test]

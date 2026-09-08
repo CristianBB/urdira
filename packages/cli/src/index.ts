@@ -60,7 +60,7 @@ export const CLI_COMMAND_CATALOG: readonly CliCommandDescriptor[] = [
   descriptor("workspace-list", "List workspaces", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-show", "Show workspace", "workspace", "read_only", "none", [arg("workspace", "Workspace identifier")], ["json", "debug-timing"]), descriptor("workspace-add", "Add workspace", "workspace", "administrative", "proposal", [arg("path", "Workspace directory")], ["path", "payload", "proposal-id", "index-pack", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-configure", "Configure workspace", "workspace", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-remove", "Remove workspace", "workspace", "administrative", "destructive", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-purge", "Purge workspace", "workspace", "administrative", "destructive", [arg("workspace", "Removed workspace identifier")], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-orphans", "List orphaned workspace data", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-orphans-purge", "Purge orphaned workspace data", "workspace", "administrative", "destructive", [], ["all", "dry-run", "confirm", "json", "debug-timing"]),
   descriptor("codebase-list", "List codebases", "codebase", "read_only", "none", [], ["json", "debug-timing"]), descriptor("codebase-create", "Create codebase", "codebase", "administrative", "proposal", [arg("display_name", "Project display name")], ["vcs-identity", "dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-rename", "Rename project", "codebase", "administrative", "proposal", [arg("codebase", "Codebase identifier"), arg("display_name", "New project display name")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-assign", "Assign workspace", "codebase", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("codebase", "Codebase identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-unassign", "Unassign workspace", "codebase", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-remove", "Remove codebase", "codebase", "administrative", "destructive", [arg("codebase", "Codebase identifier")], ["dry-run", "confirm", "json", "debug-timing"]),
   descriptor("start", "Start daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("stop", "Stop daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("restart", "Restart daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("mcp", "MCP service", "service", "service_active", "none"), descriptor("web", "Web service", "service", "service_active", "none"),
-  descriptor("config-set", "Set configuration", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "value", "payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("repair", "Repair", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("gc", "Collect garbage", "maintenance", "administrative", "proposal", [], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("reindex", "Reindex", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "dry-run", "confirm", "json", "debug-timing"]), descriptor("index-pack-export", "Export index pack", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("out", "Output file", false)], ["workspace", "out", "require-git-clean", "dry-run", "confirm", "json", "debug-timing"]),
+  descriptor("config-set", "Set configuration", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "value", "payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("repair", "Repair", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("gc", "Collect garbage", "maintenance", "administrative", "proposal", [], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("reindex", "Reindex", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "dry-run", "confirm", "json", "debug-timing"]), descriptor("index-pack-export", "Export index pack", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("out", "Output file", false)], ["workspace", "out", "require-git-clean", "timeout", "dry-run", "confirm", "json", "debug-timing"]),
   descriptor("agent-status", "Agent status", "agent", "read_only", "none", [], ["client", "workspace", "json", "debug-timing"], { client: ["all", ...AGENT_CLIENTS] }), descriptor("agent-install", "Install agent integration", "agent", "administrative", "proposal", [], ["client", "workspace", "scope", "dry-run", "confirm", "json", "debug-timing"], { client: ["all", ...AGENT_CLIENTS], scope: ["user"] }), descriptor("agent-uninstall", "Uninstall agent integration", "agent", "administrative", "proposal", [], ["client", "workspace", "scope", "dry-run", "confirm", "json", "debug-timing"], { client: ["all", ...AGENT_CLIENTS], scope: ["user"] }), descriptor("agent-hook", "Agent hook", "agent", "read_only", "none", [], ["client", "payload", "json", "debug-timing"], { client: AGENT_CLIENTS }),
 ] as const;
 
@@ -73,7 +73,7 @@ export interface CliDaemonClient { readonly call: (call: string, payload: unknow
 export interface CliDependencies { readonly client: CliDaemonClient; readonly preview_admin?: (command: CliCommand) => Promise<unknown>; readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>; readonly prompt?: (question: string) => Promise<string | boolean>; readonly read_stdin?: () => Promise<string>; readonly home_directory?: string; }
 export interface CliResult { readonly exit_code: number; readonly data: unknown; readonly stdout: string; }
 
-const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "workspace-root", "path", "value", "vcs-identity", "engine-build-id", "client", "scope", "index-pack", "out", "require-git-clean", "all"]);
+const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "workspace-root", "path", "value", "vcs-identity", "engine-build-id", "client", "scope", "index-pack", "out", "require-git-clean", "all", "timeout"]);
 // --debug-timing is a process/runtime diagnostic switch, not part of any
 // request payload. It is therefore accepted uniformly on read-only commands
 // as well as lifecycle/admin commands; the app entrypoint consumes it before
@@ -199,6 +199,32 @@ function formatOrphanTable(groups: unknown): string {
   const widths = headers.map((header, column) => Math.max(header.length, ...tableRows.map((row) => row[column]!.length)));
   const renderRow = (cells: readonly string[]): string => cells.map((cell, column) => padColumn(cell, widths[column]!)).join("  ").trimEnd();
   return [renderRow(headers), ...tableRows.map(renderRow)].join("\n");
+}
+
+/**
+ * Non-`--json` rendering for `workspace-show`; `undefined` when the payload
+ * has no recognizable `workspace` object (the caller falls back to the raw
+ * JSON payload, which already carries `status`/`last_scan_error`/
+ * `last_scan_error_at` verbatim -- `workspaceAdministrativeView`,
+ * `packages/daemon/src/runtime.ts`, spreads the raw `RegisteredWorkspace`).
+ * This is purely a human-terminal summary line for a failed scan
+ * (2026-09-08 P0 fix, `docs/evidence/2026-09-07-v4-vscode-campaign.md` §4.0):
+ * a workspace stuck reporting `status: "indexing"` forever after a scan
+ * failure used to be silent in this exact command's own text output.
+ */
+function formatWorkspaceShowResult(resultPayload: unknown): string | undefined {
+  const record = isPlainRecord(resultPayload) ? resultPayload : {};
+  const workspace = isPlainRecord(record["workspace"]) ? record["workspace"] : undefined;
+  if (workspace === undefined) return undefined;
+  const id = typeof workspace["workspace_id"] === "string" ? workspace["workspace_id"] : "?";
+  const root = typeof workspace["display_root"] === "string" ? workspace["display_root"] : undefined;
+  const status = typeof workspace["status"] === "string" ? workspace["status"] : "unknown";
+  const lines = [`workspace: ${id}${root !== undefined ? ` (${root})` : ""}`, `status: ${status}`];
+  if (typeof workspace["last_scan_error"] === "string") {
+    const at = typeof workspace["last_scan_error_at"] === "string" ? ` at ${workspace["last_scan_error_at"]}` : "";
+    lines.push(`last_scan_error: ${workspace["last_scan_error"]}${at}`);
+  }
+  return [lines.join("\n"), JSON.stringify(workspace)].join("\n");
 }
 
 /** Non-`--json` rendering for `workspace-orphans`/`workspace-orphans-purge`; `undefined` for every other command (the caller falls back to the raw JSON payload). */
@@ -421,6 +447,7 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
   // `CliResult.data` sees), only `stdout`.
   const rendered = command.name === "index" && !command.options.json && data.outcome === "success" ? formatIndexStatusTable(resultPayload)
     : command.name === "workspace-orphans" && !command.options.json && data.outcome === "success" ? formatOrphanCommandResult("workspace-orphans", resultPayload) ?? resultPayload
-      : resultPayload;
+      : command.name === "workspace-show" && !command.options.json && data.outcome === "success" ? formatWorkspaceShowResult(resultPayload) ?? resultPayload
+        : resultPayload;
   return { exit_code: data.outcome === "success" ? 0 : 1, data: resultPayload, stdout: output(rendered, command.options.json) };
 }

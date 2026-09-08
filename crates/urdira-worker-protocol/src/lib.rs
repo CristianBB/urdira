@@ -410,6 +410,13 @@ pub enum IndexingEvent {
         dependency_graph: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         analysis_token: Option<String>,
+        /// Paths this generation could not extract complete facts for
+        /// (`!parsed` or non-empty oxc diagnostics) -- skipped rather than
+        /// failing the whole generation (2026-09-08 P0 fix,
+        /// `docs/evidence/2026-09-07-v4-vscode-campaign.md` §4.1). Absent or
+        /// empty on every generation unaffected by this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incomplete_fact_paths: Option<Vec<String>>,
     },
     SemanticResult {
         request_id: String,

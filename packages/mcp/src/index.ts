@@ -1462,7 +1462,16 @@ function renderIndexStatusText(page: JsonRecord): string {
           && typeof reconcile["metadata_refreshed"] === "number" && reconcile["metadata_refreshed"] > 0
           ? `, refreshed=${reconcile["metadata_refreshed"]}`
           : "";
-        lines.push(`  last_scan: ${label}${reconcileSummary}${metadataRefreshed}${changedPaths}${wallMs}`);
+        // P-1 (2026-09-08): set only when this reconcile followed a
+        // `core:index_pack_export` pack import -- `import_wall_ms` isolates
+        // the import's own cost (stat + native copy/verify + atomic rename)
+        // from `wall_ms` above (this reconcile scan's own cost), previously
+        // only approximable as `ready_elapsed_ms - reconcile_wall`.
+        const indexPackImport = isRecord(lastScan["import"]) ? lastScan["import"] as JsonRecord : undefined;
+        const importSummary = indexPackImport !== undefined && typeof indexPackImport["import_wall_ms"] === "number"
+          ? `, import=${indexPackImport["imported"] === true ? "ok" : "failed"} (${typeof indexPackImport["pack_bytes"] === "number" ? `${indexPackImport["pack_bytes"]} bytes, ` : ""}import_wall_ms=${indexPackImport["import_wall_ms"]})`
+          : "";
+        lines.push(`  last_scan: ${label}${reconcileSummary}${metadataRefreshed}${changedPaths}${wallMs}${importSummary}`);
       }
       if (!lexicalCurrent) lines.push("  hint: search_text will report partial until lexical catches up");
       if (!semanticCurrent) lines.push("  hint: search_semantic is unavailable until semantic indexing catches up");

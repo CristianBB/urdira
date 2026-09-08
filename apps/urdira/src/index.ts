@@ -97,6 +97,25 @@ export const URDIRA_ENGINE_BUILD_ID = `urdira-core-${URDIRA_VERSION}`;
 const DAEMON_HEALTH_PROBE_TIMEOUT_MS = 2_000;
 const CLI_ADMIN_REQUEST_TIMEOUT_MS = 300_000;
 const DAEMON_SHUTDOWN_TIMEOUT_MS = 300_000;
+/**
+ * `core:index_pack_export`'s own default deadline (2026-09-08 P0 fix,
+ * `docs/evidence/2026-09-07-v4-vscode-campaign.md` §6.0/§9 item 3): a plain
+ * CLI call used to get the transport's hardcoded ~30s default (`core:
+ * index_pack_export` was never in the `longRunning` list below at all), so a
+ * VS Code-scale export (measured 63.5s clean, 109s under load) aborted with
+ * `core:ipc_timeout` before it could finish -- confirmed live, worked around
+ * only at the measurement-script level (a direct `DaemonClient` call
+ * bypassing the CLI's own timeout policy). Fix: `core:index_pack_export`
+ * blocks for as long as it takes by default (24h, the same ceiling
+ * `admin_request_timeout_ms` itself is validated against below), UNLESS the
+ * caller passes `--timeout <seconds>` on the `index-pack-export` command
+ * itself, in which case that value is used instead -- "sin límite de tiempo
+ * salvo --timeout". Progress frames (`context.reportProgress`,
+ * `packages/daemon/src/runtime.ts`'s handler) stream over the same
+ * connection while the export runs so a caller watching `on_progress` is
+ * not left staring at a silent terminal for a multi-minute export.
+ */
+const INDEX_PACK_EXPORT_DEFAULT_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const debugTimingEnabled = (): boolean => process.env["URDIRA_DEBUG_TIMING"] === "1";
 
 function urdiraHelpLegacy(): string {
@@ -2762,9 +2781,19 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
       if (call === "core:workspace_add") options.on_progress?.({ phase: "workspace_registration", completed: 0, message: "registering the workspace and starting observation" });
       if (call === "core:daemon_stop") options.on_progress?.({ phase: "daemon_stop", completed: 0, message: "requesting graceful daemon shutdown" });
       if (call === "core:daemon_restart") options.on_progress?.({ phase: "daemon_restart", completed: 0, message: "requesting graceful daemon replacement" });
-      const longRunning = call === "core:workspace_preview" || call === "core:workspace_add" || call === "core:workspace_configure" || call === "core:configuration_set" || call === "core:reindex" || call === "core:daemon_stop" || call === "core:daemon_restart";
+      if (call === "core:index_pack_export") options.on_progress?.({ phase: "index_pack_export", completed: 0, message: "exporting index pack" });
+      const longRunning = call === "core:workspace_preview" || call === "core:workspace_add" || call === "core:workspace_configure" || call === "core:configuration_set" || call === "core:reindex" || call === "core:daemon_stop" || call === "core:daemon_restart" || call === "core:index_pack_export";
+      // `core:index_pack_export` gets its own deadline, independent of
+      // `adminRequestTimeoutMs` -- see `INDEX_PACK_EXPORT_DEFAULT_TIMEOUT_MS`'s
+      // own doc comment. `values.timeout` (seconds) comes straight from the
+      // CLI's own `--timeout` option on `index-pack-export` (`packages/cli/
+      // src/index.ts`'s descriptor); a scripted `--payload` caller can set
+      // the same `values.timeout` field directly.
+      const payloadValues = payload !== null && typeof payload === "object" ? (payload as { readonly values?: Record<string, unknown> }).values : undefined;
+      const requestedTimeoutSeconds = call === "core:index_pack_export" && typeof payloadValues?.["timeout"] === "string" && /^[0-9]+$/.test(payloadValues["timeout"]) ? Number(payloadValues["timeout"]) : undefined;
+      const callTimeoutMs = call === "core:index_pack_export" ? (requestedTimeoutSeconds !== undefined ? requestedTimeoutSeconds * 1_000 : INDEX_PACK_EXPORT_DEFAULT_TIMEOUT_MS) : adminRequestTimeoutMs;
       return rawClient.call(call, payload, {
-        ...(longRunning ? { deadline_at: new Date(Date.now() + adminRequestTimeoutMs).toISOString() } : {}),
+        ...(longRunning ? { deadline_at: new Date(Date.now() + callTimeoutMs).toISOString() } : {}),
         ...(options.on_progress === undefined ? {} : { on_progress: options.on_progress }),
       });
     } };

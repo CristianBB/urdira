@@ -707,6 +707,31 @@ const INDEX_PACK_EXPORT_MAX_ATTEMPTS = 3;
  * flight, `false` if the deadline (or the caller's abort signal) was hit
  * first while a scan was still running.
  */
+/**
+ * Best-effort, recursive directory size for `core:index_pack_export`'s own
+ * progress denominator ONLY (2026-09-08 P0 fix) -- never awaited on the
+ * export's own critical path in a way that could fail it: every I/O error
+ * (a vanished file mid-walk, a permission error) is swallowed and simply
+ * excluded from the running total, exactly like `orphan-sweep.ts`'s own
+ * `directorySizeBytes` (not reused directly: that one is module-private and
+ * this call site does not need its orphan-sweep-specific framing).
+ */
+async function directorySizeBytesForProgressEstimate(directoryPath: string): Promise<number> {
+  let entries;
+  try {
+    entries = await readdir(directoryPath, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const entry of entries) {
+    const fullPath = join(directoryPath, entry.name);
+    if (entry.isDirectory()) { total += await directorySizeBytesForProgressEstimate(fullPath); continue; }
+    try { total += (await stat(fullPath)).size; } catch { /* vanished mid-walk: best-effort, never fatal. */ }
+  }
+  return total;
+}
+
 async function waitForScanSettled(workspaceId: string, scanInFlight: ReadonlySet<string>, signal: AbortSignal, deadlineMs: number): Promise<boolean> {
   while (scanInFlight.has(workspaceId)) {
     if (signal.aborted) return false;
@@ -1373,6 +1398,10 @@ function v4StatusFields(
         ...(scanTimeline === undefined ? {} : { timeline: relativeTimeline(scanTimeline) }),
         // Frente E: set only for `kind === "reconcile"`.
         ...(lastScanSummary.reconcile === undefined ? {} : { reconcile: lastScanSummary.reconcile }),
+        // P-1 (2026-09-08): set only when this reconcile followed a
+        // `core:index_pack_export` pack import -- see `V4LastScanSummary
+        // .import`'s own doc comment.
+        ...(lastScanSummary.import === undefined ? {} : { import: lastScanSummary.import }),
       },
     } : {}),
     // Folds the lane arithmetic above into one answer per operation family:
@@ -2190,6 +2219,19 @@ interface V4LastScanSummary {
   readonly timings: ScanTimings;
   /** Frente E: set only when `kind === "reconcile"`. */
   readonly reconcile?: ReconcileSummary;
+  /**
+   * P-1 (2026-09-08): set only when this scan followed a `core:index_pack_export`
+   * pack import (`importedFromIndexPack`) -- covers the whole
+   * `importPendingV4IndexPack` call (stat + native copy/verify + atomic
+   * rename), which the `reconcile` scan that ALWAYS follows a successful
+   * import (see `docs/decisions/23-index-pack.md`'s "Reconcile follow-up,
+   * not full" section) does not otherwise capture at all. `imported: false`
+   * still reports `import_wall_ms` for a failed/rolled-back import attempt
+   * (root verification failure, or a thrown error) -- the corpus falls
+   * through to an ordinary `full` scan in that case, but the import attempt
+   * itself still cost real wall time worth surfacing.
+   */
+  readonly import?: { readonly imported: boolean; readonly import_wall_ms: number; readonly pack_bytes?: number };
 }
 const v4LastScanSummaries = new Map<string, V4LastScanSummary>();
 
@@ -2277,7 +2319,15 @@ interface RunV4WorkspaceScanInput {
  * multi-path rollback for a failure mode local same-filesystem `rename(2)`
  * calls essentially never hit in practice.
  */
-async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: string, workspaceId: string): Promise<boolean> {
+interface V4IndexPackImportOutcome {
+  readonly imported: boolean;
+  /** Wall time for this whole function (stat + import + verify + atomic rename), regardless of outcome. */
+  readonly import_wall_ms: number;
+  /** `undefined` when the pack file itself could not be stat'd (already gone, or never a real path). */
+  readonly pack_bytes?: number;
+}
+
+async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: string, workspaceId: string): Promise<V4IndexPackImportOutcome> {
   // Adversarial-review fix (plan §7.1, R15/R17 cross-check): the staging
   // suffix MUST be appended onto each REAL final path, not derived by
   // running `structuralStoreDirFor`/`sidecarScanDirFor` on the already-
@@ -2317,6 +2367,15 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
   // relying on a real filesystem fault. Never read outside a test process
   // (an operator's env would need to set this by name on purpose).
   const failAfterRename = process.env["URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME"];
+  // P-1 (2026-09-08): `import_wall_ms` measures this whole function --
+  // stat, the native `importV4IndexPack` copy/verify call, and the atomic
+  // rename swap -- so it is directly comparable to `reconcile_wall(noop)`
+  // in the R20 formula (docs/decisions/23-index-pack.md, `docs/evidence/
+  // 2026-09-07-v4-vscode-campaign.md` §6.2/§9 item 4, which previously had
+  // to approximate this as `ready_elapsed_ms - reconcile_wall` because no
+  // product-exposed metric isolated it).
+  const importStartedAt = Date.now();
+  const packBytes = await stat(packPath).then((info) => info.size).catch(() => undefined);
   try {
     const imported = await importV4IndexPack({
       packPath,
@@ -2328,7 +2387,7 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
     if (!imported.roots_verified) {
       console.error(`[urdira] v4 index pack import for ${workspaceId} failed root verification (${imported.root_mismatches.join("; ")}); falling back to a full scan`);
       await cleanupStaging();
-      return false;
+      return { imported: false, import_wall_ms: Date.now() - importStartedAt, ...(packBytes === undefined ? {} : { pack_bytes: packBytes }) };
     }
     await rename(stagingStructuralRoot, paths.structural_root);
     if (failAfterRename === "structural") throw new Error("URDIRA_V4_INDEX_PACK_IMPORT_FAIL_AFTER_RENAME=structural (test-injected failure)");
@@ -2340,7 +2399,7 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
     // never paired with a WAL that describes a different schema/page count.
     for (const suffix of ["-wal", "-shm", "-journal"]) await rm(`${paths.database_path}${suffix}`, { force: true }).catch(() => undefined);
     await rename(stagingDatabasePath, paths.database_path);
-    return true;
+    return { imported: true, import_wall_ms: Date.now() - importStartedAt, ...(packBytes === undefined ? {} : { pack_bytes: packBytes }) };
   } catch (error) {
     // NOTE (self-healing, verified live by
     // `tests/phase-daemon-v4-index-pack.test.ts`'s fault-injection tests):
@@ -2363,7 +2422,7 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
     // MANIFEST/generation mismatch a query could observe.
     console.error(`[urdira] v4 index pack import for ${workspaceId} threw, falling back to a full scan:`, error);
     await cleanupStaging();
-    return false;
+    return { imported: false, import_wall_ms: Date.now() - importStartedAt, ...(packBytes === undefined ? {} : { pack_bytes: packBytes }) };
   }
 }
 
@@ -2420,10 +2479,12 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // donor's tree and this workspace's own -- a `full` scan here would
   // needlessly redo the donor's own work from scratch.
   let importedFromIndexPack = false;
+  let indexPackImportOutcome: V4IndexPackImportOutcome | undefined;
   const pendingPackPath = isFirstScan ? pendingIndexPackPaths?.get(workspaceId) : undefined;
   if (pendingPackPath !== undefined) {
     pendingIndexPackPaths?.delete(workspaceId);
-    importedFromIndexPack = await importPendingV4IndexPack(paths, pendingPackPath, workspaceId);
+    indexPackImportOutcome = await importPendingV4IndexPack(paths, pendingPackPath, workspaceId);
+    importedFromIndexPack = indexPackImportOutcome.imported;
   }
   // `requestedUris === undefined` is `mergeScanRequestIntoBuffer`'s own
   // "unsafe/lost-coverage" signal (an explicit reindex, or a coalesced
@@ -2582,7 +2643,7 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
       // assigning `undefined` -- `outcome.reconcile` is absent only if the
       // worker predates Frente E, an older-binary edge case worth keeping
       // distinguishable from "reconcile ran and reported nothing".
-      ? { kind: "reconcile", timings: outcome.timings, ...(outcome.reconcile === undefined ? {} : { reconcile: outcome.reconcile }) }
+      ? { kind: "reconcile", timings: outcome.timings, ...(outcome.reconcile === undefined ? {} : { reconcile: outcome.reconcile }), ...(indexPackImportOutcome === undefined ? {} : { import: indexPackImportOutcome }) }
       : { kind: "full", timings: outcome.timings });
   const priorReadiness = v4ReadinessState.get(workspaceId);
   // P1-D-c: the residual pass is gated behind the SAME env var
@@ -3635,9 +3696,13 @@ export class DaemonRuntime {
                   } else {
                     workspaceWriterBusyRetries.delete(workspaceId);
                   }
-                  // A first-ever scan failure leaves the workspace "indexing" with
-                  // no visible failure state, so the error must at least reach
-                  // stderr or the failure is completely undiagnosable.
+                  // A scan failure must always leave a visible failure state --
+                  // see `WorkspaceRegistry#recordScanFailure`'s own doc comment
+                  // (2026-09-08 P0 fix) for the "first-ever scan, no snapshot at
+                  // all" case it now handles directly (re-pins straight to
+                  // "degraded" itself). The error must at least reach stderr too,
+                  // or the failure is completely undiagnosable from the daemon
+                  // process alone.
                   console.error(`[urdira] workspace scan failed for ${workspaceId}:`, error);
                   // Record the failure BEFORE re-pinning to "degraded" below:
                   // `markReady(..., "degraded")` preserves whatever
@@ -3650,8 +3715,20 @@ export class DaemonRuntime {
                   // `freshness_status: "current"` forever even though it is
                   // serving `priorSnapshotId` on repeat.
                   try { registry.recordScanFailure(workspaceId, scanFailureErrorCode(error)); } catch { /* superseded by a concurrent scan or lifecycle change */ }
-                  if (priorSnapshotId !== undefined) {
-                    try { registry.markReady(workspaceId, priorSnapshotId, "degraded"); } catch { /* superseded by a concurrent scan or lifecycle change */ }
+                  // Re-pin to "degraded" against the FRESHEST known snapshot, not
+                  // just `priorSnapshotId` (captured before this scan started).
+                  // A first-ever scan (`priorSnapshotId === undefined`) that got
+                  // far enough to publish an intermediate structural stage
+                  // (`markStructuralStagePublished`) before failing later already
+                  // has a newer usable snapshot than `priorSnapshotId` -- re-read
+                  // the workspace's own `current_snapshot_id` after `recordScan
+                  // Failure` above so that case is re-pinned too, instead of
+                  // silently relying on `recordScanFailure`'s own "no snapshot at
+                  // all" fallback (which only covers the case where NEITHER a
+                  // prior generation NOR an intermediate stage exists).
+                  const latestSnapshotId = priorSnapshotId ?? registry.get(workspaceId)?.current_snapshot_id;
+                  if (latestSnapshotId !== undefined) {
+                    try { registry.markReady(workspaceId, latestSnapshotId, "degraded"); } catch { /* superseded by a concurrent scan or lifecycle change */ }
                   }
                   notifyReadinessChanged(workspaceId);
                 } finally {
@@ -4551,6 +4628,28 @@ export class DaemonRuntime {
             throw new DaemonError("core:workspace_lifecycle", "Workspace has a scan in progress; index pack export requires no scan in flight.");
           }
           const requireGitClean = values["require-git-clean"] === "true";
+          // 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md
+          // §6.0/§9 item 3): a large export used to run silently for its
+          // whole duration with no progress signal at all -- a caller
+          // watching `on_progress` (the CLI's own terminal rendering) saw
+          // nothing until the RPC either finished or hit a timeout. `out
+          // Path`'s own growing file size, sampled on an interval and pushed
+          // through `context.reportProgress` (the same streamed-frame
+          // mechanism `core:workspace_preview`'s file-discovery progress
+          // already uses), gives a real, live signal without needing to wait
+          // for `exportV4IndexPack`/`exportIndexPack` to report their own
+          // internal progress -- both write their single output file
+          // incrementally regardless of format (v4's gzip container, v3's
+          // tagged-NDJSON stream). Cleared unconditionally in `finally`
+          // below so a thrown/cancelled export never leaves a dangling timer.
+          const exportStartedAt = Date.now();
+          let exportProgressBytesTotal: number | undefined;
+          const exportProgressInterval = setInterval(() => {
+            stat(outPath).then((info) => {
+              context.reportProgress({ phase: "index_pack_export", completed: info.size, ...(exportProgressBytesTotal === undefined ? {} : { total: exportProgressBytesTotal }), message: `writing index pack (${info.size} bytes so far)` });
+            }).catch(() => undefined);
+          }, 1_000);
+          try {
           // v4 (native structural store) branches to a completely different
           // export container (`exportV4IndexPack`, a single gzip file of
           // `workspace.sqlite` + `structural/` + `sidecar/`) than v3's
@@ -4562,6 +4661,16 @@ export class DaemonRuntime {
           const structuralStoreKind = await readStructuralStore(structuralStoreDatabase.database).finally(() => structuralStoreDatabase.close().catch(() => undefined));
           if (structuralStoreKind === "native") {
             const databasePath = indexingStorage.defaultWorkspaceDatabasePath(workspace.workspace_id);
+            // Best-effort progress denominator only (never blocks the export
+            // itself, and a stale/wrong estimate only affects the reported
+            // percentage, never correctness): the uncompressed container is
+            // roughly `structural/` + the sqlite catalog's own on-disk size
+            // (§6.4 of the evidence doc above measured the compressed pack at
+            // ~44% of this sum on a real 3.6GB VS Code-scale store).
+            exportProgressBytesTotal = await Promise.all([
+              directorySizeBytesForProgressEstimate(structuralStoreDirFor(databasePath)),
+              stat(databasePath).then((info) => info.size).catch(() => 0),
+            ]).then(([structuralBytes, databaseBytes]) => structuralBytes + databaseBytes).catch(() => undefined);
             // `exportV4IndexPack` (inside the worker thread) independently
             // guards against a concurrent scan publishing a NEW generation
             // while the export's own file walk is in flight -- it re-reads
@@ -4595,7 +4704,12 @@ export class DaemonRuntime {
                 await waitForScanSettled(workspace.workspace_id, scanInFlight, context.signal, retryDeadlineMs);
               }
             }
-            return { workspace_id: workspace.workspace_id, out_path: resultV4.pack_path, generation: resultV4.manifest.generation, bytes: (await stat(resultV4.pack_path)).size, roots: resultV4.manifest.roots };
+            // `pack_path` alongside the pre-existing `out_path` (kept for
+            // backward compatibility with any existing caller reading it):
+            // the design this task's plan called for names the field
+            // `pack_path` (`{pack_path, bytes, generation, roots,
+            // export_wall_ms}`).
+            return { workspace_id: workspace.workspace_id, out_path: resultV4.pack_path, pack_path: resultV4.pack_path, generation: resultV4.manifest.generation, bytes: (await stat(resultV4.pack_path)).size, roots: resultV4.manifest.roots, export_wall_ms: Date.now() - exportStartedAt };
           }
           // The export runs in its own worker thread with its own storage
           // handle: its bulk row reads are synchronous by design (see
@@ -4607,7 +4721,10 @@ export class DaemonRuntime {
             out_path: outPath,
             ...(requireGitClean ? { require_git_clean: true, canonical_root: workspace.canonical_root } : {}),
           });
-          return { workspace_id: workspace.workspace_id, out_path: result.out_path, pack_id: result.manifest.pack_id, manifest_digest: result.manifest.manifest_digest, row_counts: result.manifest.row_counts };
+          return { workspace_id: workspace.workspace_id, out_path: result.out_path, pack_path: result.out_path, pack_id: result.manifest.pack_id, manifest_digest: result.manifest.manifest_digest, row_counts: result.manifest.row_counts, export_wall_ms: Date.now() - exportStartedAt };
+          } finally {
+            clearInterval(exportProgressInterval);
+          }
         }
         if (options.workspace_registry && request.call === "core:workspace_remove") {
           const rootOrId = workspaceRootFromRequest(request.payload);

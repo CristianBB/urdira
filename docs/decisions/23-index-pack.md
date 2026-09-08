@@ -284,3 +284,87 @@ still reaches `ready` via `reconcile` and correctly resolves the new local
 symbol (absent from the donor's own snapshot), proving the `cold` fallback
 never silently serves stale donor data; and a corrupt pack falls back to a
 `full` scan and still reaches `ready`.
+
+## Amendment 2026-09-08 (Frente D-1: export RPC timeout, and `import_wall_ms`)
+
+Live evidence (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §6.0/§9 item 3): `core:index_pack
+_export` on a 3.6GB VS Code-scale store measured 63.5s (clean) to 109s (under concurrent load) --
+but `apps/urdira/src/index.ts`'s `longRunning` deadline list (the set of admin RPC calls that get
+`adminRequestTimeoutMs`, default 300s, instead of the IPC transport's own hardcoded 30s default)
+never included `core:index_pack_export`. A plain CLI-driven export therefore aborted at exactly
+30,002ms with `core:ipc_timeout` on anything past that floor, confirmed live; the campaign had to
+call `DaemonClient` directly with an explicit long `deadline_at`, bypassing the CLI's own timeout
+policy, to measure the export at all.
+
+**Considered and rejected: a detached `{operation_id, status: "running"}` + separate poll RPC**
+(the shape this task's own plan text described first). Rejected for THIS pass in favor of the
+mechanism below -- both give a caller an effectively unbounded wait with live progress, but the
+poll-RPC shape additionally survives the CLI process itself being killed mid-export (a genuinely
+separate, larger feature: the export would need to keep running fully detached from any particular
+RPC connection, and a NEW caller would need to be able to discover and re-attach to an
+already-running export by id). That is flagged below as a real follow-up, not implemented here --
+this pass closes the P0 (a legitimate export aborting on a hardcoded internal deadline) without
+introducing a new stateful server-side operation registry needing its own lifecycle/TTL/cleanup
+policy on top of the one `WorkspaceRegistry.beginReconciliation`'s `reconciliation_operation_id`
+already has for a different purpose (correlating a scan, never for fetching a RESULT by id -- there
+is no existing "poll a result by operation_id" RPC anywhere in this codebase to reuse verbatim, per
+research findings in this pass's own report).
+
+**Mechanism actually shipped.** Two independent, additive changes:
+
+1. **The deadline is caller-controlled, not a fixed short default.** `core:index_pack_export` is
+   now in `runUrdira`'s own per-call deadline computation (`apps/urdira/src/index.ts`): by default it
+   gets `INDEX_PACK_EXPORT_DEFAULT_TIMEOUT_MS` (24 hours -- the same ceiling `admin_request_timeout
+   _ms` itself is validated against elsewhere in this same function), so "sin límite de tiempo" holds
+   in practice. A new CLI option, `index-pack-export --timeout <seconds>` (`packages/cli/src/
+   index.ts`'s descriptor + `OPTION_NAMES`), overrides that default when the caller wants a real
+   bound -- read straight out of the same `values.timeout` field the daemon RPC handler's own
+   `payload.values` already carries every other free-form option in (`--require-git-clean`, `--out`),
+   no new payload shape needed. Compatibility: `core:index_pack_export`'s response shape is
+   unchanged for a caller that finishes inside any deadline, short or long -- this is purely a
+   deadline-computation change on the CLI-transport side, not a protocol change.
+2. **Real progress, not silence.** `packages/daemon/src/runtime.ts`'s `core:index_pack_export`
+   handler now starts a 1-second `setInterval` (cleared unconditionally in a `finally`) that `stat`s
+   the growing output file and calls `context.reportProgress({phase: "index_pack_export", completed:
+   <bytes written>, total: <best-effort estimate>, message})` -- the SAME streamed-IPC-frame
+   mechanism `core:workspace_preview`'s file-discovery progress already uses (`LocalIpcServer`'s
+   `reportProgress`/`IpcProgress`, `packages/daemon/src/protocol.ts`), so no new wire format was
+   needed either. `total` is a one-time, best-effort estimate (`structural/` directory size via a new
+   local `directorySizeBytesForProgressEstimate` recursive walk, plus the sqlite catalog's own file
+   size) computed once before the v4 export call starts; every I/O error during that estimate is
+   swallowed (`total` is simply omitted, never fatal to the export itself) -- §6.4 of the evidence doc
+   measured the compressed pack at ~44% of this exact sum on a real 3.6GB VS Code-scale store, so the
+   estimate is directionally useful even though the final pack is smaller (gzip).
+
+**Result shape** (`{pack_path, bytes, generation, roots, export_wall_ms}`, the design's own naming):
+`pack_path` was added as a new field on both the v4 and v3 (legacy NDJSON) export result branches,
+alongside the pre-existing `out_path` (kept, not removed, for backward compatibility -- any existing
+caller reading `out_path` keeps working unchanged). `export_wall_ms` (`Date.now()` around the whole
+handler body, both branches) is new on both branches too.
+
+**`import_wall_ms`.** A separate, previously-reported gap (§9 item 4 of the same evidence doc): no
+product-exposed metric isolated a pack import's own cost (`importPendingV4IndexPack`'s stat +
+native copy/verify + atomic rename) from the `reconcile` scan that always follows it (see "Reconcile
+follow-up, not full (R17)" above) -- the campaign could only approximate it as `ready_elapsed_ms -
+reconcile_wall`. `importPendingV4IndexPack` now returns `{imported, import_wall_ms, pack_bytes?}`
+(measuring its own whole function body, regardless of success/failure/rollback) instead of a bare
+`boolean`; `runV4WorkspaceScan` threads this into a new `V4LastScanSummary.import` field, set only
+when the scan followed a pack import, surfaced as `last_scan.import` in `core:index_status`'s v4
+status fields (`v4StatusFields`, `packages/daemon/src/runtime.ts`) and rendered as one extra clause
+on the MCP `urdira_index_status` renderer's existing `last_scan:` line
+(`import=ok|failed (<pack_bytes> bytes, import_wall_ms=<ms>)`).
+
+**Verification.** `tests/app-runtime.test.ts` (new test) uses a fake `LocalIpcServer` (no real
+export work) to observe the exact `deadline_at` `runUrdira` sends for `core:index_pack_export` --
+confirms the ~24h default, confirms `--timeout 5` overrides it to ~5s, and confirms an
+`index_pack_export` progress phase is forwarded to `on_progress`. `tests/phase-daemon-v4-index-pack
+.test.ts` (extended) asserts `pack_path`/`export_wall_ms` on a real export against the real worker
+binary, and asserts `last_scan.import.{imported, import_wall_ms, pack_bytes}` after a real pack
+import reaches `ready`.
+
+**Follow-up not implemented in this pass** (flagged, per the "considered and rejected" note above):
+a genuinely detached export that survives the initiating CLI process being killed, discoverable by a
+NEW caller via an `operation_id`. Today's mechanism (an effectively unbounded deadline plus live
+progress on the SAME connection) closes the P0 this task authorized fixing; a detached/resumable
+export is a materially larger feature (a server-side operation registry with its own
+lifecycle/cleanup policy) that was out of this task's own time budget.
