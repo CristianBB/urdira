@@ -8981,25 +8981,38 @@ fn n8n_population_floors() {
         eprintln!("[n8n_population_floors] wrote population TSV -> {dump_path}");
     }
 
-    for (kind, floor) in kind_checks {
-        let count = count_of(kind);
+    // `URDIRA_V4_POPULATION_FLOORS=skip`: the floors above are n8n-
+    // calibrated (R5); pointing `URDIRA_V4_N8N_CORPUS` at a different
+    // corpus (e.g. VS Code, plan `generic-waddling-hartmanis.md` §7.2 P-2)
+    // still needs this test's cold scan + TSV dump (`URDIRA_V4_POPULATION_
+    // DUMP`) for `scripts/v4-population-parity.mjs`, but the n8n floors
+    // themselves are meaningless there -- skip only the assertions, never
+    // the dump.
+    if std::env::var("URDIRA_V4_POPULATION_FLOORS").as_deref() == Ok("skip") {
+        eprintln!(
+            "[n8n_population_floors] URDIRA_V4_POPULATION_FLOORS=skip -- floor assertions skipped (dump still written above)"
+        );
+    } else {
+        for (kind, floor) in kind_checks {
+            let count = count_of(kind);
+            assert!(
+                count >= floor,
+                "{kind} population regressed below its floor: {count} < {floor}"
+            );
+        }
         assert!(
-            count >= floor,
-            "{kind} population regressed below its floor: {count} < {floor}"
+            external_module_count >= FLOOR_EXTERNAL_MODULE,
+            "external_module population regressed below its floor: {external_module_count} < {FLOOR_EXTERNAL_MODULE}"
+        );
+        assert!(
+            external_symbol_count >= FLOOR_EXTERNAL_SYMBOL,
+            "external_symbol population regressed below its floor: {external_symbol_count} < {FLOOR_EXTERNAL_SYMBOL}"
+        );
+        assert!(
+            total_records >= FLOOR_RECORDS_TOTAL,
+            "total record count regressed below its floor: {total_records} < {FLOOR_RECORDS_TOTAL}"
         );
     }
-    assert!(
-        external_module_count >= FLOOR_EXTERNAL_MODULE,
-        "external_module population regressed below its floor: {external_module_count} < {FLOOR_EXTERNAL_MODULE}"
-    );
-    assert!(
-        external_symbol_count >= FLOOR_EXTERNAL_SYMBOL,
-        "external_symbol population regressed below its floor: {external_symbol_count} < {FLOOR_EXTERNAL_SYMBOL}"
-    );
-    assert!(
-        total_records >= FLOOR_RECORDS_TOTAL,
-        "total record count regressed below its floor: {total_records} < {FLOOR_RECORDS_TOTAL}"
-    );
 
     let _ = std::fs::remove_dir_all(&scratch_root);
 }

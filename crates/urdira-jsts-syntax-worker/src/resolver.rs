@@ -1926,6 +1926,28 @@ fn is_standard_global_name(name: &str) -> bool {
         "clearInterval",
         "performance",
         "crypto",
+        // VS Code campaign (2026-09-07/08, P-2, plan `generic-waddling-
+        // hartmanis.md` §0 R19): `src/typings/editContext.d.ts` augments
+        // the standard `HTMLElement` interface (`interface HTMLElement {
+        // ... }`, TS declaration merging with `lib.dom.d.ts`'s own
+        // declaration) -- every one of the 7,029 `v4_different_target`
+        // references-parity rows on this corpus (100% of a 50-row random
+        // sample) was this exact collision, v3 resolving to `lib.dom.d.ts`
+        // and v4 to the workspace augmentation file. Found live through
+        // this function's own documented recipe.
+        "HTMLElement",
+        // Same recipe, second pass on the same corpus (the `HTMLElement`
+        // fix alone dropped `v4_different_target` from 7,029 to 195 --
+        // these four names, found in a fresh 50-row sample of the
+        // remainder, account for the bulk of what was left):
+        // `extensions/types/lib.textEncoder.d.ts` re-declares `TextEncoder`/
+        // `TextDecoder` (v3 -> `lib.dom.d.ts`); `src/typings/base-common.
+        // d.ts` re-declares `ErrorConstructor` (v3 -> `lib.es5.d.ts`) and
+        // `IdleDeadline` (v3 -> `lib.dom.d.ts`).
+        "TextEncoder",
+        "TextDecoder",
+        "ErrorConstructor",
+        "IdleDeadline",
     ];
     NAMES.contains(&name)
 }
