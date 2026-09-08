@@ -63,7 +63,7 @@ fn barrel_fixture_root() -> PathBuf {
         .join("tests/fixtures/codebases/typescript/barrel-method-call")
 }
 
-/// Frente E-P0g: a TWO-HOP barrel chain (`consumer.test.ts` -> `impl.ts`
+/// Frente E-P0g: a TWO-HOP barrel chain (`consumer.spec.ts` -> `impl.ts`
 /// [imports a re-exported TYPE, edited in the SAME batch] -> `pkgroot.ts`
 /// [a package-root barrel] -> `eventbus/barrel.ts` [a NESTED barrel,
 /// RENAMED] -> `eventbus/iface.ts` [the real declaring interface]) --
@@ -5142,9 +5142,9 @@ fn method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation() {
 /// the SAME mixed batch as an unrelated content edit to the file that
 /// imports THROUGH it via a package-root barrel (`impl.ts`, edited) --
 /// `delta.rs::run`'s own structural/content generation split (`has_
-/// structural && has_content`) -- must still close `consumer.test.ts`'s
+/// structural && has_content`) -- must still close `consumer.spec.ts`'s
 /// (never itself touched) stale property reference reached through the
-/// WHOLE chain (`consumer.test.ts` -> `impl.ts` -> `pkgroot.ts` -> the
+/// WHOLE chain (`consumer.spec.ts` -> `impl.ts` -> `pkgroot.ts` -> the
 /// renamed `eventbus/barrel.ts` -> `eventbus/iface.ts`).
 #[test]
 fn nested_barrel_rename_in_a_mixed_batch_closes_a_transitive_property_reference() {
