@@ -1,6 +1,6 @@
 # Frente E-P0j: v4 entity records publish the declaration's span, not the identifier's
 
-Plan `resilient-knitting-twilight.md` §0/§3/§4/§5. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `resilient-knitting-twilight.md` §0/§3/§4/§5. Repo `~/Proyectos/urdira`,
 main `9b49e82` at task start (worktree found on an unrelated, decoy history at
 `7d04d49` — reset per Paso 0). Worked in worktree
 `.claude/worktrees/agent-a5fa18e700243a639`, branch `frente-ep0j-declaration-spans`.

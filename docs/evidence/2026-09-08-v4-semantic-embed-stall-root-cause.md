@@ -1,6 +1,6 @@
 # Frente S-G: n8n full-embed stall -- root cause(s), fix, and re-measurement
 
-Plan `resilient-knitting-twilight.md` §0/§4. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `resilient-knitting-twilight.md` §0/§4. Repo `~/Proyectos/urdira`,
 main `9b20fbb` at task start (S-A..S-F merged). Worked in worktree
 `.claude/worktrees/agent-aebe6d0370ad4b702`, branch `frente-sg-embed-stall`.
 Input: `docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md` (S-F's

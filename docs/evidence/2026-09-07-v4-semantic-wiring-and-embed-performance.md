@@ -1,6 +1,6 @@
 # Frente S-C: v4 semantic wiring, embed-performance profile, and query-latency batching
 
-Plan `resilient-knitting-twilight.md` §0/§4. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `resilient-knitting-twilight.md` §0/§4. Repo `~/Proyectos/urdira`,
 main `8ff1981` at task start. Worked in worktree
 `.claude/worktrees/agent-af1bcdb8bd013415a`, branch `frente-sc-semantic-v4-perf`.
 Machine: Apple Silicon, 10 physical/10 logical cores (`sysctl hw.physicalcpu

@@ -1,6 +1,6 @@
 # Frente S-D: semantic embed performance (n8n) and query latency
 
-Plan `resilient-knitting-twilight.md` §0/§4. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `resilient-knitting-twilight.md` §0/§4. Repo `~/Proyectos/urdira`,
 main `9b49e82` at task start (Frente S-C merged: v4 semantic wiring, entity
 record source, parallel snapshot reads in `search_semantic`). Worked in
 worktree `.claude/worktrees/agent-a6008f80a86d81632`, branch

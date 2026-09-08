@@ -1,7 +1,7 @@
 # Frente S-F: semantic query latency (materialized coverage + covering
 # index + bounded entity scan + shard cache) and full n8n embed measurement
 
-Plan `resilient-knitting-twilight.md` §0/§4. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `resilient-knitting-twilight.md` §0/§4. Repo `~/Proyectos/urdira`,
 main `28dea00` at task start (S-A..S-E merged). Worked in worktree
 `.claude/worktrees/agent-ae08d05bf30d025e9`, branch `frente-sf-semantic-latency`.
 Input: `docs/evidence/2026-09-07-v4-semantic-close.md` (S-E's own final

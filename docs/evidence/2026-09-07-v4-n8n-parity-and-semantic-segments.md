@@ -1,7 +1,7 @@
 # v4 n8n parity (F.3 §4c, previously BLOCKED) + S.7 semantic segmentation measurements
 
 Ola 3 measurement task of `generic-waddling-hartmanis.md` (§0 R7/R8, §3.1-3.4, §4.4-4.7). Repo
-`/Users/Cristian/Proyectos/urdira`, main `46d36a3` (verify green per this task's own preamble).
+`~/Proyectos/urdira`, main `46d36a3` (verify green per this task's own preamble).
 Worked without isolation on main. Code changes made in this task, exactly as authorized:
 `scripts/v4-population-floors.json` (ratio recalibration only, §A.3 below) and this evidence file.
 No other files touched.
@@ -143,7 +143,7 @@ inside "other" if a future frente wants finer detail.
 
 ### A.2b -- Frente E-P0i (2026-09-07, later session): `v4_different_target=673` root cause found and fixed
 
-Follow-up to §A.2's P0. Repo `/Users/Cristian/Proyectos/urdira`, branch
+Follow-up to §A.2's P0. Repo `~/Proyectos/urdira`, branch
 `frente-ep0i-ambient-wrong-target` off `8ff1981` (E-P0h tip + this evidence file's own prior
 commit; verify green there per that commit's own preamble).
 

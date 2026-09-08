@@ -1,6 +1,6 @@
 # Frente S-H: periodic sweep no longer aborts semantic maintenance; full n8n-scale query latency
 
-Plan `generic-waddling-hartmanis.md` §0/§4. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `generic-waddling-hartmanis.md` §0/§4. Repo `~/Proyectos/urdira`,
 main `050d23a` at task start (S-A..S-G merged). Worked in worktree
 `.claude/worktrees/agent-a86016b99c81661de`, branch
 `frente-sh-semantic-sweep-latency`. Input: `docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md`

@@ -2,7 +2,7 @@
 # entity-candidate streaming, a NEW severe P0 (`nativeTopKChunked` infinite
 # recursion), and final n8n-scale embed/latency/incremental-edit measurements
 
-Plan `resilient-knitting-twilight.md` §0/§4. Repo `/Users/Cristian/Proyectos/urdira`,
+Plan `resilient-knitting-twilight.md` §0/§4. Repo `~/Proyectos/urdira`,
 main `6546997` at task start (Frente S-D's own merge commit). Worked in worktree
 `.claude/worktrees/agent-a6a4d9b2759502b10`, branch `frente-se-semantic-close`.
 Inputs: `docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`

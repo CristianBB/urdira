@@ -2,7 +2,7 @@
 # query latency
 
 Plan `resilient-knitting-twilight.md` §0 (performance without compromising
-integrity; exactness intact per decision 06). Repo `/Users/Cristian/Proyectos/urdira`,
+integrity; exactness intact per decision 06). Repo `~/Proyectos/urdira`,
 main `676bc84` at task start (S-H merged). Worked in worktree
 `.claude/worktrees/agent-a2ebfed04feb69a34`, branch `frente-si-native-scan`.
 Input: `docs/evidence/2026-09-08-v4-semantic-sweep-and-full-scale-latency.md`
