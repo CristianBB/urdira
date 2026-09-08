@@ -3205,6 +3205,548 @@ fn vector_distance(left: &[f64], right: &[f64], metric: DistanceMetric) -> Nativ
     }
 }
 
+// ---------------------------------------------------------------------------
+// Frente S-I (2026-09-08, plan `generic-waddling-hartmanis.md` §0): resident
+// vector buffer + single-call exact top-k.
+//
+// `exact_packed_vector_top_k_batch` above (and `exact_vector_top_k_batch`/
+// `exact_vector_top_k`) pay THREE costs on every call: (1) the caller
+// (`nativeTopKChunked`, `packages/engine/src/semantic-retrieval.ts`) packs a
+// FRESH candidate byte buffer per call/chunk (a `Uint8Array.set` copy per
+// candidate), (2) this crate decodes every candidate from wire bytes to a
+// freshly allocated `Vec<f64>` PER CANDIDATE (`decode_packed_vector_request`),
+// and (3) `exact_vector_top_k` does a full `O(n log n)` SORT of the whole
+// candidate list even when only the top few are kept. At n8n's own measured
+// scale (72,922 entity-grain candidates, `docs/evidence/2026-09-08-v4-semantic-sweep-and-full-scale-latency.md`),
+// the 4,095-candidate-per-call batch bound forces ~18 chunks, so ALL THREE
+// costs are paid 18 TIMES per query even though the underlying vector data
+// (the daemon's own `residentVectorCache`, `canonical-query-data-port.ts`)
+// is already a SINGLE contiguous, generation-stable buffer that does not
+// change between queries at all. Measured live: 581.4ms for the bounded
+// entity-lane scan alone, attributed (by elimination -- 72,922 x 384-dim dot
+// products is tens of millions of FLOPs, sub-10ms territory) to exactly this
+// per-call marshaling/chunking overhead, not to floating-point compute.
+//
+// `register_vector_buffer` lets the JS side hand this crate ONE contiguous
+// `f32` buffer PER (handle, generation) -- copied into Rust-owned memory
+// EXACTLY ONCE per generation (a cache miss on the JS side, i.e. a real
+// structural/semantic publish), never once per query. `exact_top_k_contiguous`
+// then does the ENTIRE scan against that already-resident buffer in ONE
+// N-API call: no per-query candidate marshaling, no f64 upcast allocation
+// (the accumulation upcasts each element as it's read, matching this same
+// file's own `vector_distance`'s f64 arithmetic, but never materializes a
+// second full-size buffer), and partial (not full) selection --
+// `select_nth_unstable_by` is expected O(n), strictly better than the
+// O(n log k) a binary-heap selection would cost, and never allocates more
+// than the input's own length.
+//
+// Correctness (decision 06: no ANN, no sampling, exact only): the caller
+// MUST register `data` pre-sorted by ITS OWN candidate identifier, ascending
+// (`canonical-query-data-port.ts`'s `residentVectorCache`/lane buffers are
+// already built from a `SELECT ... ORDER BY projection_record_id` query, so
+// this is free, not an extra sort) -- `exact_top_k_contiguous` tie-breaks
+// STRICTLY by ascending buffer index on an exact distance tie, which is
+// therefore ascending-identifier order too, exactly matching every other
+// exact-vector code path in this crate (`exact_vector_top_k`'s own
+// `left.0.as_bytes().cmp(right.0.as_bytes())`) and the JS oracle
+// (`semantic-retrieval.ts`'s `utf8Compare`). The caller maps returned
+// indices back to identifiers using the SAME index-aligned id array it used
+// to build the registered buffer.
+//
+// Generation invalidation: `register_vector_buffer`'s `generation` argument
+// is an opaque, caller-owned monotonic counter (not necessarily the
+// workspace's own structural generation number -- see the call site's own
+// doc comment) stored alongside the buffer. `exact_top_k_contiguous` rejects
+// a call whose `generation` does not match the CURRENTLY registered one for
+// that handle -- the caller (never this crate) decides when to re-register
+// (a fresh cache miss) versus reuse (a cache hit, skipping the copy
+// entirely) -- this crate only enforces "never silently scan stale data".
+
+use std::sync::{Mutex, OnceLock};
+
+/// Above this candidate count, `exact_top_k_contiguous` computes distances
+/// with `rayon`'s data-parallel iterator instead of a plain sequential loop.
+/// n8n's own full entity-grain lane (72,922 candidates) is comfortably past
+/// this threshold; a 100-file corpus's lanes (low thousands) are not, so a
+/// small/medium query never pays thread-pool dispatch overhead for a
+/// workload a single core finishes in well under a millisecond.
+const RESIDENT_VECTOR_PARALLEL_THRESHOLD: usize = 50_000;
+
+struct ResidentVectorBuffer {
+    generation: u32,
+    dimensions: usize,
+    data: Vec<f32>,
+}
+
+fn resident_vector_registry() -> &'static Mutex<HashMap<String, ResidentVectorBuffer>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, ResidentVectorBuffer>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Registers (replacing any prior entry for `handle_id`) one contiguous,
+/// row-major `f32` buffer of `data.len() / dimensions` vectors, tagged with
+/// `generation`. Copies `data` once; every `exact_top_k_contiguous` call
+/// against this `(handle_id, generation)` pair afterward reuses the SAME
+/// Rust-owned allocation, no further copies.
+pub fn register_vector_buffer(
+    handle_id: &str,
+    generation: u32,
+    dimensions: usize,
+    data: Vec<f32>,
+) -> NativeCoreResult<()> {
+    if dimensions == 0 {
+        return Err(NativeCoreError::new(
+            "Resident vector buffer dimensions must be positive.",
+        ));
+    }
+    if !data.len().is_multiple_of(dimensions) {
+        return Err(NativeCoreError::new(
+            "Resident vector buffer length is not a multiple of its dimensions.",
+        ));
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(NativeCoreError::new(
+            "Resident vector buffer contains a non-finite value.",
+        ));
+    }
+    let mut registry = resident_vector_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.insert(
+        handle_id.to_owned(),
+        ResidentVectorBuffer {
+            generation,
+            dimensions,
+            data,
+        },
+    );
+    Ok(())
+}
+
+/// Drops any buffer registered for `handle_id` (a no-op if none is
+/// registered). Exists for test isolation and for a caller that wants to
+/// free the resident memory of a handle it will never query again (e.g. a
+/// workspace being closed) -- not currently called by the daemon's own
+/// steady-state query path, which only ever REPLACES a handle's entry on
+/// the next generation.
+pub fn forget_vector_buffer(handle_id: &str) {
+    let mut registry = resident_vector_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.remove(handle_id);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExactTopKContiguousMatch {
+    pub index: u32,
+    pub distance: f64,
+}
+
+#[inline]
+fn dot_f32_as_f64(a: &[f32], b: &[f32]) -> f64 {
+    // Chunked (unrolled-by-8) accumulation: auto-vectorizable by LLVM at
+    // release opt levels (contiguous slices, no bounds-check-defeating
+    // indirection), while still upcasting each element to `f64` as it's
+    // multiplied so a 384-dimension dot product accumulates in the SAME
+    // precision `vector_distance` (above) and the JS oracle both use --
+    // only the SUMMATION ORDER differs (8 partial lanes merged at the end
+    // rather than one strict left-to-right running sum), which can only
+    // ever move a result by a few ULP, never flip a real (non-tied) rank
+    // ordering; a genuine tie is broken by index, not by distance, so it is
+    // unaffected either way.
+    let (a_chunks, a_remainder) = a.as_chunks::<8>();
+    let (b_chunks, b_remainder) = b.as_chunks::<8>();
+    let mut lanes = [0f64; 8];
+    for (a_chunk, b_chunk) in a_chunks.iter().zip(b_chunks) {
+        for lane in 0..8 {
+            lanes[lane] += f64::from(a_chunk[lane]) * f64::from(b_chunk[lane]);
+        }
+    }
+    let mut total: f64 = lanes.iter().sum();
+    for (x, y) in a_remainder.iter().zip(b_remainder) {
+        total += f64::from(*x) * f64::from(*y);
+    }
+    total
+}
+
+#[inline]
+fn squared_l2_f32_as_f64(a: &[f32], b: &[f32]) -> f64 {
+    let (a_chunks, a_remainder) = a.as_chunks::<8>();
+    let (b_chunks, b_remainder) = b.as_chunks::<8>();
+    let mut lanes = [0f64; 8];
+    for (a_chunk, b_chunk) in a_chunks.iter().zip(b_chunks) {
+        for lane in 0..8 {
+            let difference = f64::from(a_chunk[lane]) - f64::from(b_chunk[lane]);
+            lanes[lane] += difference * difference;
+        }
+    }
+    let mut total: f64 = lanes.iter().sum();
+    for (x, y) in a_remainder.iter().zip(b_remainder) {
+        let difference = f64::from(*x) - f64::from(*y);
+        total += difference * difference;
+    }
+    total
+}
+
+fn resident_distance(
+    query: &[f32],
+    query_norm: f64,
+    candidate: &[f32],
+    metric: DistanceMetric,
+) -> NativeCoreResult<f64> {
+    match metric {
+        DistanceMetric::SquaredL2 => {
+            let distance = squared_l2_f32_as_f64(query, candidate);
+            if !distance.is_finite() {
+                return Err(NativeCoreError::new("Exact vector distance is not finite."));
+            }
+            Ok(distance)
+        }
+        DistanceMetric::Cosine => {
+            let candidate_norm = dot_f32_as_f64(candidate, candidate).sqrt();
+            if candidate_norm == 0.0 {
+                return Err(NativeCoreError::new(
+                    "Cosine exact vector top-k does not accept zero vectors.",
+                ));
+            }
+            let dot = dot_f32_as_f64(query, candidate);
+            if !dot.is_finite() || !candidate_norm.is_finite() {
+                return Err(NativeCoreError::new("Exact vector distance is not finite."));
+            }
+            let distance = 1.0 - dot / (query_norm * candidate_norm);
+            if distance.is_finite() {
+                Ok(distance)
+            } else {
+                Err(NativeCoreError::new("Exact vector distance is not finite."))
+            }
+        }
+    }
+}
+
+/// Exact top-`k` (or all `count`, whichever is smaller) over the buffer
+/// registered for `handle_id` at `generation`, against `query`. Returns
+/// `(index, distance)` pairs sorted by ascending distance, ties broken by
+/// ascending `index` -- see this section's own header comment for why that
+/// is a correct, exact tie-break as long as the caller registered `data` in
+/// ascending-identifier order.
+pub fn exact_top_k_contiguous(
+    handle_id: &str,
+    generation: u32,
+    query: &[f32],
+    k: usize,
+    metric: DistanceMetric,
+) -> NativeCoreResult<Vec<ExactTopKContiguousMatch>> {
+    if k == 0 {
+        return Err(NativeCoreError::new(
+            "Resident exact top-k must be positive.",
+        ));
+    }
+    if query.iter().any(|value| !value.is_finite()) {
+        return Err(NativeCoreError::new(
+            "Resident exact top-k query has a non-finite value.",
+        ));
+    }
+    let registry = resident_vector_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let buffer = registry.get(handle_id).ok_or_else(|| {
+        NativeCoreError::new(format!(
+            "No resident vector buffer is registered for handle '{handle_id}'."
+        ))
+    })?;
+    if buffer.generation != generation {
+        return Err(NativeCoreError::new(format!(
+            "Resident vector buffer handle '{handle_id}' is stale: registered generation {}, requested {generation}.",
+            buffer.generation
+        )));
+    }
+    if query.len() != buffer.dimensions {
+        return Err(NativeCoreError::new(
+            "Resident exact top-k query dimensions do not match the registered buffer.",
+        ));
+    }
+    let dims = buffer.dimensions;
+    let count = buffer.data.len() / dims;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let k = k.min(count);
+    let query_norm = match metric {
+        DistanceMetric::Cosine => {
+            let norm = dot_f32_as_f64(query, query).sqrt();
+            if norm == 0.0 {
+                return Err(NativeCoreError::new(
+                    "Cosine exact vector top-k does not accept zero vectors.",
+                ));
+            }
+            norm
+        }
+        DistanceMetric::SquaredL2 => 0.0,
+    };
+    let data = &buffer.data;
+    let distance_at = |index: usize| -> NativeCoreResult<f64> {
+        let candidate = &data[index * dims..(index + 1) * dims];
+        resident_distance(query, query_norm, candidate, metric)
+    };
+    let distances: Vec<f64> = if count > RESIDENT_VECTOR_PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        (0..count)
+            .into_par_iter()
+            .map(distance_at)
+            .collect::<NativeCoreResult<Vec<_>>>()?
+    } else {
+        (0..count)
+            .map(distance_at)
+            .collect::<NativeCoreResult<Vec<_>>>()?
+    };
+    // Partial selection: `select_nth_unstable_by` places the k smallest
+    // (by this comparator) elements in `indexed[..k]`, in unspecified order
+    // among themselves -- the trailing `sort_by` below then orders just
+    // those `k` elements (never the full `count`).
+    let mut indexed: Vec<(usize, f64)> =
+        (0..count).map(|index| (index, distances[index])).collect();
+    let cmp = |left: &(usize, f64), right: &(usize, f64)| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    if k < count {
+        indexed.select_nth_unstable_by(k - 1, cmp);
+        indexed.truncate(k);
+    }
+    indexed.sort_by(cmp);
+    Ok(indexed
+        .into_iter()
+        .map(|(index, distance)| ExactTopKContiguousMatch {
+            index: index as u32,
+            distance,
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod resident_vector_tests {
+    use super::*;
+
+    fn buffer_from_rows(rows: &[[f32; 4]]) -> Vec<f32> {
+        rows.iter().flat_map(|row| row.iter().copied()).collect()
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_matches_squared_l2_oracle_order() {
+        let rows: Vec<[f32; 4]> = vec![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.9, 0.1, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        register_vector_buffer("test:squared-l2", 1, 4, buffer_from_rows(&rows)).unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let result =
+            exact_top_k_contiguous("test:squared-l2", 1, &query, 2, DistanceMetric::SquaredL2)
+                .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].index, 0);
+        assert_eq!(result[1].index, 2);
+        assert!(result[0].distance < result[1].distance);
+        forget_vector_buffer("test:squared-l2");
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_breaks_exact_ties_by_ascending_index() {
+        // Two candidates at IDENTICAL distance from the query -- registered
+        // in ascending-identifier order (index 1 stands for a smaller
+        // identifier than index 3, matching this crate's own contract), so
+        // the tie-break must prefer index 1 over index 3 when k=1.
+        let rows: Vec<[f32; 4]> = vec![
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ];
+        register_vector_buffer("test:ties", 1, 4, buffer_from_rows(&rows)).unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let result =
+            exact_top_k_contiguous("test:ties", 1, &query, 1, DistanceMetric::SquaredL2).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].index, 1);
+        forget_vector_buffer("test:ties");
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_caps_k_to_count() {
+        let rows: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+        register_vector_buffer("test:k-gt-n", 1, 4, buffer_from_rows(&rows)).unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let result =
+            exact_top_k_contiguous("test:k-gt-n", 1, &query, 100, DistanceMetric::SquaredL2)
+                .unwrap();
+        assert_eq!(result.len(), 2);
+        forget_vector_buffer("test:k-gt-n");
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_rejects_a_stale_generation() {
+        let rows: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0]];
+        register_vector_buffer("test:stale", 1, 4, buffer_from_rows(&rows)).unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let error = exact_top_k_contiguous("test:stale", 2, &query, 1, DistanceMetric::SquaredL2)
+            .unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        forget_vector_buffer("test:stale");
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_rejects_an_unregistered_handle() {
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let error = exact_top_k_contiguous(
+            "test:never-registered",
+            1,
+            &query,
+            1,
+            DistanceMetric::SquaredL2,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("No resident vector buffer"));
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_agrees_with_exact_vector_top_k_on_a_random_corpus() {
+        // Cross-checks the new resident kernel's ranking against this same
+        // file's own pre-existing `exact_vector_top_k` (the f64, no-shortcuts
+        // oracle every other native vector path in this crate already
+        // trusts) over a corpus too large to eyeball, including a k that
+        // does not evenly divide the corpus.
+        let dims = 12usize;
+        let count = 733usize;
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rows: Vec<[f32; 12]> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut row = [0f32; 12];
+            for slot in row.iter_mut() {
+                *slot = ((next() % 2001) as f32 - 1000.0) / 1000.0;
+            }
+            rows.push(row);
+        }
+        let mut query = [0f32; 12];
+        for slot in query.iter_mut() {
+            *slot = ((next() % 2001) as f32 - 1000.0) / 1000.0;
+        }
+        let flat: Vec<f32> = rows.iter().flat_map(|row| row.iter().copied()).collect();
+        register_vector_buffer("test:random-corpus", 7, dims, flat).unwrap();
+        let k = 17usize;
+        let resident = exact_top_k_contiguous(
+            "test:random-corpus",
+            7,
+            &query,
+            k,
+            DistanceMetric::SquaredL2,
+        )
+        .unwrap();
+        forget_vector_buffer("test:random-corpus");
+
+        let candidates: Vec<VectorCandidate> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| VectorCandidate {
+                // Zero-padded so lexicographic byte order matches ascending
+                // numeric order, exactly mirroring the buffer's own
+                // ascending-index registration order.
+                id: format!("id-{index:04}"),
+                vector: row.iter().map(|value| *value as f64).collect(),
+            })
+            .collect();
+        let oracle = exact_vector_top_k(&ExactVectorRequest {
+            query: query.iter().map(|value| *value as f64).collect(),
+            candidates,
+            k,
+            metric: DistanceMetric::SquaredL2,
+        })
+        .unwrap();
+
+        assert_eq!(resident.len(), oracle.len());
+        for (resident_match, oracle_match) in resident.iter().zip(oracle.iter()) {
+            let expected_index: usize = oracle_match.projection_record_id[3..].parse().unwrap();
+            assert_eq!(
+                resident_match.index as usize, expected_index,
+                "resident kernel and exact_vector_top_k disagree on rank order"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_top_k_contiguous_agrees_with_the_oracle_past_the_rayon_parallel_threshold() {
+        // `RESIDENT_VECTOR_PARALLEL_THRESHOLD` is 50,000 -- this corpus is
+        // deliberately past it, so `exact_top_k_contiguous`'s distance
+        // computation runs through the `rayon::prelude::into_par_iter`
+        // branch, not the sequential one the test above already covers.
+        // Cosine metric this time (the other test only covers squared L2),
+        // matching n8n's own real query shape
+        // (`canonical-query-data-port.ts`'s `trySemanticSearch` hardcodes
+        // `distance_metric: "cosine"` for both lanes).
+        let dims = 8usize;
+        let count = 60_001usize;
+        let mut state: u64 = 0xD1B54A32D192ED03;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rows: Vec<[f32; 8]> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut row = [0f32; 8];
+            for slot in row.iter_mut() {
+                *slot = ((next() % 2001) as f32 - 1000.0) / 1000.0;
+            }
+            rows.push(row);
+        }
+        let mut query = [0f32; 8];
+        for slot in query.iter_mut() {
+            *slot = ((next() % 2001) as f32 - 1000.0) / 1000.0;
+        }
+        let flat: Vec<f32> = rows.iter().flat_map(|row| row.iter().copied()).collect();
+        register_vector_buffer("test:rayon-corpus", 3, dims, flat).unwrap();
+        let k = 25usize;
+        let resident =
+            exact_top_k_contiguous("test:rayon-corpus", 3, &query, k, DistanceMetric::Cosine)
+                .unwrap();
+        forget_vector_buffer("test:rayon-corpus");
+        assert_eq!(resident.len(), k);
+
+        let candidates: Vec<VectorCandidate> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| VectorCandidate {
+                id: format!("id-{index:05}"),
+                vector: row.iter().map(|value| *value as f64).collect(),
+            })
+            .collect();
+        let oracle = exact_vector_top_k(&ExactVectorRequest {
+            query: query.iter().map(|value| *value as f64).collect(),
+            candidates,
+            k,
+            metric: DistanceMetric::Cosine,
+        })
+        .unwrap();
+
+        assert_eq!(resident.len(), oracle.len());
+        for (resident_match, oracle_match) in resident.iter().zip(oracle.iter()) {
+            let expected_index: usize = oracle_match.projection_record_id[3..].parse().unwrap();
+            assert_eq!(
+                resident_match.index as usize, expected_index,
+                "resident kernel (rayon path) and exact_vector_top_k disagree on rank order"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod depth_boundary_tests {
     //! P2-2l item 3: proves `update_uce_value` and `encode_publication_

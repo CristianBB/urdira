@@ -17,6 +17,8 @@ describe("native logical digest publication adapter", () => {
       structuralKernelCanonicalBatch: () => ({ kernel: { canonical_records: [], canonical_dependencies: [], record_facets: [], record_structural_attestations: [], record_digests: [], record_ids: [], publication_records: [], record_body_payload_hexes: [], publication_descriptor: { record_count: 0, body_byte_length: 0, first_record_id: null, last_record_id: null, sequence_digest: `sha256:${"0".repeat(64)}` }, records_digest: `sha256:${"0".repeat(64)}`, dependencies_digest: `sha256:${"0".repeat(64)}`, canonical_byte_length: 0 }, records: [], dependencies: [], record_schema_attestations: [] }),
       structuralObservationBatch: () => ({ owners: [] }),
       exactVectorTopKBatch: () => [],
+      registerVectorBuffer: () => undefined,
+      exactTopKContiguous: () => [],
     };
     const port = createNativeLogicalDigestPort(binding);
     const source = { b: [true, Uint8Array.from([0, 255])], absent: undefined, a: 7 };

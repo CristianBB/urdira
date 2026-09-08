@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { resolveNativeTarget, type NativeLibc, type NativeTarget } from "./targets.js";
 import type { NativeBinding } from "./types.js";
 
-export const NATIVE_API_VERSION = 16;
+export const NATIVE_API_VERSION = 17;
 export const NODE_API_VERSION = 10;
 export const NATIVE_PACKAGE_MANIFEST_VERSION = 1;
 export const NATIVE_WORKER_PROTOCOL = "urdira.ipc.v2";
@@ -71,7 +71,7 @@ function bindingFunction(value: Partial<NativeBinding>, name: keyof NativeBindin
 function validateBinding(value: unknown, target: NativeTarget): NativeBinding {
   if (typeof value !== "object" || value === null) throw new NativeBindingError("Urdira native artifact did not export an object.");
   const binding = value as Partial<NativeBinding>;
-  for (const name of ["nativeApiVersion", "nativeTargetTriple", "logicalDigestBatch", "verifyLogicalRecordBatch", "logicalValueDigestBatch", "verifyLogicalValueBatch", "structuralKernelBatch", "structuralKernelCanonicalBatch", "structuralObservationBatch", "exactVectorTopKBatch"] as const) bindingFunction(binding, name);
+  for (const name of ["nativeApiVersion", "nativeTargetTriple", "logicalDigestBatch", "verifyLogicalRecordBatch", "logicalValueDigestBatch", "verifyLogicalValueBatch", "structuralKernelBatch", "structuralKernelCanonicalBatch", "structuralObservationBatch", "exactVectorTopKBatch", "registerVectorBuffer", "exactTopKContiguous"] as const) bindingFunction(binding, name);
   const completeBinding = binding as NativeBinding;
   if (completeBinding.nativeApiVersion() !== NATIVE_API_VERSION) throw new NativeBindingError(`Urdira native API mismatch; expected ${NATIVE_API_VERSION}.`);
   const actualTarget = completeBinding.nativeTargetTriple();

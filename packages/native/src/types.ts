@@ -186,6 +186,19 @@ export interface VectorTopKMatch {
   readonly rank: number;
 }
 
+/**
+ * Frente S-I (2026-09-08): one (index, distance) result of a resident-buffer
+ * exact top-k scan. `index` is the position of the winning row within the
+ * buffer most recently registered for this call's `handleId` (see
+ * `registerVectorBuffer`'s own doc comment) -- the caller (`semantic-retrieval.ts`)
+ * maps it back to the candidate identifier it registered at that same
+ * position.
+ */
+export interface ResidentVectorTopKMatch {
+  readonly index: number;
+  readonly distance: number;
+}
+
 export interface NativeBinding {
   nativeApiVersion(): number;
   nativeTargetTriple(): string;
@@ -197,4 +210,26 @@ export interface NativeBinding {
   structuralKernelCanonicalBatch(batch: StructuralKernelCanonicalBatch): StructuralKernelCanonicalResult;
   structuralObservationBatch(request: StructuralObservationProjectionRequest): StructuralObservationProjectionResult;
   exactVectorTopKBatch(requests: readonly ExactVectorRequest[]): readonly (readonly VectorTopKMatch[])[];
+  /**
+   * Frente S-I: registers ONE contiguous, row-major `Float32Array` of
+   * `buffer.length / dimensions` vectors under `handleId`, tagged with
+   * `generation` -- copies `buffer` into native-owned memory exactly once,
+   * replacing any prior registration for the same `handleId`. The caller
+   * MUST register rows in ascending candidate-identifier order (see
+   * `exactTopKContiguous`'s own doc comment for why).
+   */
+  registerVectorBuffer(handleId: string, generation: number, dimensions: number, buffer: Float32Array): void;
+  /**
+   * Frente S-I: exact top-k (or all rows, whichever is smaller) over the
+   * buffer most recently `registerVectorBuffer`-registered for `handleId`,
+   * scored against `query`. Rejects (throwing) when `generation` does not
+   * match the currently registered one for `handleId` -- the caller must
+   * re-register before retrying. Results are sorted by ascending distance,
+   * ties broken by ascending `index` -- exact and deterministic ONLY when
+   * the registered buffer's rows are themselves in ascending
+   * candidate-identifier order (the tie-break operates on buffer position,
+   * not on the identifier itself, since the native buffer holds no
+   * identifiers).
+   */
+  exactTopKContiguous(handleId: string, generation: number, query: Float32Array, k: number, metric: DistanceMetric): readonly ResidentVectorTopKMatch[];
 }

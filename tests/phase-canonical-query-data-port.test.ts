@@ -10,9 +10,11 @@ import {
   QueryPlanError,
   RecordBodyInterner,
   SqliteCanonicalQuerySnapshotPort,
+  configureResidentVectorTopKPort,
   createLocalHashProvider,
   type CanonicalQueryRecord,
   type CanonicalQuerySnapshotPort,
+  type ResidentVectorTopKPort,
   type ResolvedSemanticProvider,
 } from "../packages/engine/src/index.js";
 
@@ -2275,6 +2277,88 @@ describe("CanonicalRecordQueryDataPort core:search_semantic ranking", () => {
       expect(candidateValues(semanticEvaluation).length).toBeGreaterThan(0);
       const hybridEvaluation = await dataPort.execute(semanticOperation("core:search_hybrid"));
       expect(candidateValues(hybridEvaluation).length).toBeGreaterThan(0);
+    });
+  });
+
+  /**
+   * Frente S-I (2026-09-08): a byte-correct (not merely order-preserving)
+   * REFERENCE implementation of `ResidentVectorTopKPort` -- registers each
+   * handle's buffer, then computes real cosine/squared-L2 distances over it
+   * from scratch on every `exactTopKContiguous` call (never trusting a
+   * cached ranking), so a test using this fake proves the WIRING
+   * (`residentLaneScan`/`packResidentLane`/handle construction) produces
+   * the CORRECT candidate set, not just "some" candidate set. `registrations`
+   * records every `registerVectorBuffer` call so a test can assert exactly
+   * how many real buffer copies happened.
+   */
+  function referenceResidentVectorPort(): { readonly port: ResidentVectorTopKPort; readonly registrations: readonly { readonly handleId: string; readonly generation: number }[] } {
+    const buffers = new Map<string, { readonly generation: number; readonly dimensions: number; readonly data: Float32Array }>();
+    const registrations: { readonly handleId: string; readonly generation: number }[] = [];
+    return {
+      registrations,
+      port: {
+        registerVectorBuffer(handleId, generation, dimensions, buffer) {
+          registrations.push({ handleId, generation });
+          buffers.set(handleId, { generation, dimensions, data: Float32Array.from(buffer) });
+        },
+        exactTopKContiguous(handleId, generation, query, k, metric) {
+          const entry = buffers.get(handleId);
+          if (entry === undefined || entry.generation !== generation) throw new Error(`test fake: no resident buffer for '${handleId}' at generation ${generation}.`);
+          const count = entry.data.length / entry.dimensions;
+          const ranked = Array.from({ length: count }, (_unused, index) => {
+            const candidate = entry.data.subarray(index * entry.dimensions, (index + 1) * entry.dimensions);
+            let distance: number;
+            if (metric === "squared_l2") {
+              distance = 0;
+              for (let dimension = 0; dimension < entry.dimensions; dimension += 1) { const difference = query[dimension]! - candidate[dimension]!; distance += difference * difference; }
+            } else {
+              let dot = 0, queryNorm = 0, candidateNorm = 0;
+              for (let dimension = 0; dimension < entry.dimensions; dimension += 1) { dot += query[dimension]! * candidate[dimension]!; queryNorm += query[dimension]! ** 2; candidateNorm += candidate[dimension]! ** 2; }
+              distance = 1 - dot / (Math.sqrt(queryNorm) * Math.sqrt(candidateNorm));
+            }
+            return { index, distance };
+          }).sort((left, right) => left.distance - right.distance || left.index - right.index);
+          return ranked.slice(0, Math.min(k, count));
+        },
+      },
+    };
+  }
+
+  it("Frente S-I: the resident-buffer fast path returns the SAME ranking as the default path, and reuses ONE registration across repeated queries at the same generation", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedThreeDocumentWorkspace(opened, provider);
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+
+      const baseline = await dataPort.execute(semanticOperation("core:search_semantic"));
+      const baselineIds = candidateValues(baseline).map((candidate) => candidate.value.body.artifact_id);
+      expect(baselineIds.length).toBeGreaterThan(0);
+
+      const { port, registrations } = referenceResidentVectorPort();
+      configureResidentVectorTopKPort(port);
+      try {
+        const first = await dataPort.execute(semanticOperation("core:search_semantic"));
+        expect(candidateValues(first).map((candidate) => candidate.value.body.artifact_id)).toEqual(baselineIds);
+        expect(registrations.length).toBeGreaterThan(0);
+        const registrationsAfterFirst = registrations.length;
+
+        // A second, IDENTICAL query at the same (unbumped) generation must
+        // return the exact same ranking WITHOUT any new registration -- the
+        // whole point of this frente: the native buffer is copied once per
+        // generation, never once per query.
+        const second = await dataPort.execute(semanticOperation("core:search_semantic"));
+        expect(candidateValues(second).map((candidate) => candidate.value.body.artifact_id)).toEqual(baselineIds);
+        expect(registrations.length).toBe(registrationsAfterFirst);
+
+        // Hybrid reuses the SAME artifact-lane handle (only the entity lane
+        // and the lexical lane differ) -- still no new artifact registration.
+        const artifactRegistrationsBeforeHybrid = registrations.filter((entry) => entry.handleId.endsWith(":artifact")).length;
+        const hybrid = await dataPort.execute(semanticOperation("core:search_hybrid"));
+        expect(candidateValues(hybrid).length).toBeGreaterThan(0);
+        expect(registrations.filter((entry) => entry.handleId.endsWith(":artifact")).length).toBe(artifactRegistrationsBeforeHybrid);
+      } finally {
+        configureResidentVectorTopKPort(undefined);
+      }
     });
   });
 

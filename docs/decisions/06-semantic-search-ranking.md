@@ -419,3 +419,28 @@ open. This amendment documents what shipped:
   does not reach the canonical query port layer) so an agent can act on
   `affected_artifact_page` without an extra round trip, then page further
   with `core:semantic_affected_page`.
+
+## Amendment (2026-09-08, Frente S-I): resident-buffer native kernel
+
+`exactVectorScan`'s native path (`nativeTopKChunked`) re-packed a fresh
+candidate byte buffer and decoded every candidate to `f64` on EVERY query,
+even though the underlying vector data does not change between queries at
+an unchanged generation -- at n8n scale (72,922 entity-grain candidates)
+this cost 581-1,416ms per query by itself, dominating end-to-end latency.
+A new native kernel (`crates/urdira-native-core`'s `register_vector_buffer`/
+`exact_top_k_contiguous`) registers one contiguous `f32` buffer ONCE per
+generation and scans it directly on each query with no re-marshaling,
+partial selection (`select_nth_unstable_by`), and `rayon` parallelism
+above 50,000 candidates. `canonical-query-data-port.ts`'s `trySemanticSearch`
+uses it via `residentLaneScan` whenever no `paths` filter is present and
+the profile is plain `float32`, falling back to the pre-existing
+`exactVectorScan` path unchanged otherwise (including on ANY native
+failure -- no silent approximation, decision 06's exactness is unchanged).
+Measured live: the two-lane scan cost dropped from 581-1,999.9ms to 5-6ms
+at n8n scale; end-to-end `core:search_semantic`/`core:search_hybrid` p99
+dropped 1,722.2ms/2,192.7ms -> 134.99ms/178.33ms (12.8x/12.3x), meeting the
+plan's 250ms n8n-scale target. See `docs/evidence/2026-09-08-v4-semantic-native-scan-latency.md`
+for the full phase decomposition, the `packages/cli`/100-file scale
+results, and a live measurement-methodology bug found and fixed mid-session
+(a module-instance duplication trap in the throwaway benchmark harness,
+unrelated to the shipped implementation).

@@ -10,7 +10,7 @@ import { expandRelations, findShortestPaths, type OperationEvaluation, type Oper
 import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
-import { exactVectorScan, fuseSemanticLanes, rerankSemanticMatches, type ExactVectorMatch, type RankedSemanticCandidate } from "./semantic-retrieval.js";
+import { exactVectorScan, fuseSemanticLanes, rerankSemanticMatches, residentExactVectorScan, residentVectorTopKPortConfigured, utf8Compare, type ExactVectorMatch, type RankedSemanticCandidate } from "./semantic-retrieval.js";
 import type { StageSetHandle } from "./stage-set-handle.js";
 
 export interface CanonicalQueryRecord {
@@ -550,6 +550,10 @@ const SEMANTIC_ENTITY_CANDIDATE_CAP = SEMANTIC_CANDIDATE_CAP;
 const ENTITY_SEGMENT_FANOUT_BOUND = 8;
 /** Frente S-F (2026-09-08): `ENTITY_SEGMENT_FANOUT_BOUND`'s own doc comment. */
 const SEMANTIC_ENTITY_SEGMENT_SCAN_LIMIT = SEMANTIC_ENTITY_CANDIDATE_CAP * ENTITY_SEGMENT_FANOUT_BOUND;
+/** Frente S-I: placeholder passed to `residentExactVectorScan` on a cache
+ * hit, where `needsRegister: false` means the buffer argument is never
+ * read -- avoids allocating a real buffer just to satisfy the parameter. */
+const EMPTY_FLOAT32 = new Float32Array(0);
 /** Plan 2026-09-06 (Frente S-A, §4.2): the coverage view's embedded first affected page size -- `min(response_budget.max_items, 20)`; see `trySemanticSearch`'s own call site for why the plain `20` is used here (`response_budget` does not reach this layer). Exported (Frente S-F) so `semantic-reconciler.ts`'s own materialization write caps `affected_first_page` at the SAME size this module's own live/fallback page-building already uses. */
 export const SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT = 20;
 /** `core:semantic_affected_page`'s own default/maximum `limit` -- default mirrors the coverage view's embedded first page, maximum bounds a single continuation call's cost the same way `MAX_MCP_PAGE_ITEMS` bounds `response_budget.max_items` one layer up. */
@@ -2523,6 +2527,56 @@ function dedupeVectorsByDocumentRef(vectors: readonly SemanticVectorRow[]): read
   return [...byRef.values()];
 }
 
+/**
+ * Frente S-I: a zero-copy `Float32Array` VIEW of `bytes` when it is exactly
+ * `dimensions * 4` bytes long and 4-byte aligned within its own backing
+ * buffer (always true for a row sliced out of `semantic_vectors`' own
+ * contiguous backing `ArrayBuffer` -- every row is the SAME `dimensions * 4`
+ * byte length, so a cumulative offset built from uniform-length slices stays
+ * a multiple of 4) -- falls back to copying into a fresh, correctly-aligned
+ * buffer for the rare input that is neither (defensive only; never expected
+ * on this port's own data). `undefined` when the byte length itself is
+ * wrong (not this profile's `float32` encoding at these `dimensions`).
+ */
+function float32ViewOf(bytes: Uint8Array, dimensions: number): Float32Array | undefined {
+  if (bytes.byteLength !== dimensions * 4) return undefined;
+  if (bytes.byteOffset % 4 === 0) return new Float32Array(bytes.buffer, bytes.byteOffset, dimensions);
+  return new Float32Array(Uint8Array.from(bytes).buffer, 0, dimensions);
+}
+
+/**
+ * Frente S-I: packs `vectors` into ONE contiguous, row-major `Float32Array`
+ * for the native resident kernel, choosing each row's candidate identifier
+ * via `idOf` (`owner_artifact_version_id` for the artifact lane,
+ * `projection_record_id` for the entity lane -- see `trySemanticSearch`'s
+ * own two `exactVectorScan` call sites this fast path mirrors) and sorting
+ * rows ascending by that identifier (`utf8Compare`, the SAME comparator
+ * `exactVectorScan`'s own JS-side tie-break uses) BEFORE packing -- required
+ * so the native kernel's ascending-buffer-INDEX tie-break
+ * (`crates/urdira-native-core/src/lib.rs`'s "Frente S-I" section) reproduces
+ * this ascending-STRING tie-break exactly, regardless of `vectors`' own
+ * input order (`dedupeVectorsByOwner`'s dedup order is `projection_record_id`
+ * order, NOT `owner_artifact_version_id` order, so this sort is NOT
+ * redundant for the artifact lane). Returns `undefined` (never throws) when
+ * any row is not this profile's plain `float32` encoding at `dimensions` --
+ * the caller falls back to the existing `exactVectorScan` path for the
+ * whole lane in that case, exactly as if no resident port were configured.
+ */
+function packResidentLane(vectors: readonly SemanticVectorRow[], dimensions: number, idOf: (vector: SemanticVectorRow) => string): { readonly buffer: Float32Array; readonly ids: readonly string[] } | undefined {
+  const ordered = vectors
+    .map((vector) => ({ id: idOf(vector), vector }))
+    .sort((left, right) => utf8Compare(left.id, right.id));
+  const buffer = new Float32Array(ordered.length * dimensions);
+  for (let index = 0; index < ordered.length; index += 1) {
+    const row = ordered[index]!.vector;
+    if (row.element_type !== "float32") return undefined;
+    const view = float32ViewOf(row.vector_payload, dimensions);
+    if (view === undefined) return undefined;
+    buffer.set(view, index * dimensions);
+  }
+  return { buffer, ids: ordered.map((entry) => entry.id) };
+}
+
 /** True iff `marker` reflects a semantic maintenance pass that is BOTH caught up to the scope's current generation AND embedded under the CURRENTLY configured provider's exact identity -- a marker current under a since-replaced provider is not "current" for this provider's purposes, mirroring the reconciler's own profile-swap-close discipline. */
 function isSemanticMarkerCurrent(marker: SemanticIndexStateSnapshot | undefined, provider: ResolvedSemanticProvider | undefined): boolean {
   return marker !== undefined && provider !== undefined && marker.completed_generation === marker.generation && marker.profile_id === provider.profile.embedding_profile_id && marker.executable_binding_id === provider.binding.executable_binding_digest;
@@ -2895,6 +2949,38 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   /** Relation joins retain only identities and endpoint pairs, never complete
    * decoded records (which would duplicate the corpus in the join cache). */
   private readonly relationIndexCache = new Map<string, { readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }>();
+
+  /**
+   * Frente S-I (2026-09-08, `generic-waddling-hartmanis.md` §0): one entry
+   * per resident-kernel handle (`${workspace_id}:${profile_id}:${executable_binding_id}:${lane}`,
+   * `lane` "artifact" or "entity"), used ONLY by `trySemanticSearch`'s own
+   * `residentLaneScan` fast path. `sourceVectors` is NOT the lane's own
+   * derived candidate array (`artifactVectorsForScan`/`entityVectorsForScan`
+   * -- `dedupeVectorsByOwner`/`.filter(...)` allocate a FRESH array on
+   * EVERY call, so comparing against THAT would never hit) -- it is
+   * `allVectors`, the RAW result of `this.snapshots.semantic_vectors`
+   * BEFORE this call's own dedup/filter derive the lane arrays from it.
+   * `this.snapshots.semantic_vectors`'s own resident cache
+   * (`SqliteCanonicalQuerySnapshotPort.residentVectorCache`) always returns
+   * the SAME `allVectors` array reference (`===`, never a content
+   * comparison) on a cache hit for an unchanged generation, so comparing
+   * against IT is a correct, zero-bookkeeping proxy for "nothing changed
+   * since this handle's native buffer was registered" -- no separate
+   * generation counter needs to be threaded through the
+   * `CanonicalQuerySnapshotPort` interface to get this right.
+   * `generationTag` is this class's own opaque, monotonically
+   * increasing counter (`nextResidentLaneGenerationTag`) -- NOT the
+   * workspace's structural/semantic generation number -- handed to the
+   * native side purely so it can detect "this handle's buffer was replaced
+   * since your last call" (see `crates/urdira-native-core/src/lib.rs`'s own
+   * "Frente S-I" section). `ids` is the buffer's row-index-aligned candidate
+   * identifier array, already sorted ascending (`utf8Compare`) -- the exact
+   * order `packResidentLane` packed the native buffer in, which is what
+   * makes the native kernel's ascending-INDEX tie-break equivalent to this
+   * port's own ascending-STRING tie-break.
+   */
+  private readonly residentLaneBufferCache = new Map<string, { readonly sourceVectors: readonly SemanticVectorRow[]; readonly generationTag: number; readonly ids: readonly string[] }>();
+  private nextResidentLaneGenerationTag = 1;
 
   constructor(private readonly snapshots: CanonicalQuerySnapshotPort, private readonly options: { readonly semantic?: ResolvedSemanticProvider } = {}) {}
 
@@ -3825,8 +3911,72 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * real-row) subject kind in v1 for this flag to exclude, so honoring it is
    * a no-op by construction, not an oversight.
    */
+  /**
+   * Frente S-I (2026-09-08): the resident-buffer fast path for ONE lane of
+   * ONE `trySemanticSearch` call. `handleId` names the native buffer slot
+   * (`${workspace_id}:${profile_id}:${executable_binding_id}:${lane}`);
+   * `laneVectors` is this call's already-filtered/deduped candidate set for
+   * that lane (`artifactVectorsForScan`/`entityVectorsForScan`'s own
+   * no-path-filter value), used ONLY to rebuild the native buffer on a
+   * cache MISS. `freshnessKey` is the SEPARATE, STABLE reference the cache
+   * is actually keyed against -- the caller's own `allVectors` (the raw
+   * result of `this.snapshots.semantic_vectors`, BEFORE this call's own
+   * `dedupeVectorsByOwner`/`.filter(...)` derive `laneVectors` from it).
+   * This split matters: `dedupeVectorsByOwner`/`.filter(...)` allocate a
+   * FRESH array on every single call, even when nothing changed, so
+   * `laneVectors itself` is NEVER `===` across two calls -- comparing
+   * against it would re-register (re-copy, re-cross-N-API) on EVERY query,
+   * defeating the entire "once per generation" point of this fast path.
+   * `allVectors`, by contrast, IS the literal same array reference across
+   * calls at an unchanged generation (`semantic_vectors`'s own
+   * `residentVectorCache` doc comment: "returns the LITERAL SAME array"),
+   * so comparing against IT is the correct, zero-bookkeeping freshness
+   * check. Returns `undefined` (falls back to `exactVectorScan`) whenever
+   * the resident port is not configured, the lane is empty, or any row is
+   * not this profile's plain `float32` encoding -- never a correctness
+   * compromise, only a performance one.
+   */
+  private residentLaneScan(handleId: string, freshnessKey: readonly SemanticVectorRow[], laneVectors: readonly SemanticVectorRow[], dimensions: number, idOf: (vector: SemanticVectorRow) => string, query: Float32Array, k: number): readonly ExactVectorMatch[] | undefined {
+    const debug = process.env["URDIRA_DEBUG_TIMING"] === "1";
+    if (!residentVectorTopKPortConfigured()) { if (debug) console.error(`[urdira] residentLaneScan(${handleId}) SKIP: port not configured`); return undefined; }
+    if (laneVectors.length === 0) { if (debug) console.error(`[urdira] residentLaneScan(${handleId}) SKIP: empty lane`); return undefined; }
+    const cached = this.residentLaneBufferCache.get(handleId);
+    if (cached !== undefined && cached.sourceVectors === freshnessKey) {
+      if (debug) console.error(`[urdira] residentLaneScan(${handleId}) HIT generation=${cached.generationTag} candidates=${laneVectors.length} k=${k}`);
+      return residentExactVectorScan({ handleId, generationTag: cached.generationTag, needsRegister: false, buffer: EMPTY_FLOAT32, dimensions, ids: cached.ids, query, k, metric: "cosine" });
+    }
+    const packed = packResidentLane(laneVectors, dimensions, idOf);
+    if (packed === undefined) { if (debug) console.error(`[urdira] residentLaneScan(${handleId}) SKIP: packResidentLane returned undefined (non-float32 row) candidates=${laneVectors.length}`); return undefined; }
+    const generationTag = this.nextResidentLaneGenerationTag;
+    this.nextResidentLaneGenerationTag += 1;
+    if (debug) console.error(`[urdira] residentLaneScan(${handleId}) MISS-REBUILD generation=${generationTag} candidates=${laneVectors.length} k=${k} cachedWasPresent=${cached !== undefined}`);
+    this.residentLaneBufferCache.set(handleId, { sourceVectors: freshnessKey, generationTag, ids: packed.ids });
+    return residentExactVectorScan({ handleId, generationTag, needsRegister: true, buffer: packed.buffer, dimensions, ids: packed.ids, query, k, metric: "cosine" });
+  }
+
   private async trySemanticSearch(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
     if (operation.operation_id !== "core:search_semantic" && operation.operation_id !== "core:search_hybrid") return undefined;
+    // Frente S-I (2026-09-08): phase decomposition for the "descomposición
+    // exacta" task item, gated behind the SAME `URDIRA_DEBUG_TIMING=1`
+    // convention `workspace-indexing-session.ts`/`semantic-reconciler.ts`
+    // already use, so it costs nothing (not even a `performance.now()` call)
+    // when unset. Logged once, right before this function's own success
+    // return -- an early throw/degrade branch above that point (index
+    // unavailable, unsupported filter) never reaches it, matching this
+    // task's own scope (decomposing a SUCCESSFUL query's phases).
+    const semanticDebugTiming = process.env["URDIRA_DEBUG_TIMING"] === "1";
+    const semanticStartedAt = performance.now();
+    const semanticPhaseTimings: Record<string, number> = {};
+    const semanticTimed = async <T>(phase: string, action: () => Promise<T>): Promise<T> => {
+      if (!semanticDebugTiming) return action();
+      const startedAt = performance.now();
+      try { return await action(); } finally { semanticPhaseTimings[phase] = Math.round((semanticPhaseTimings[phase] ?? 0) + (performance.now() - startedAt)); }
+    };
+    const semanticTimedSync = <T>(phase: string, action: () => T): T => {
+      if (!semanticDebugTiming) return action();
+      const startedAt = performance.now();
+      try { return action(); } finally { semanticPhaseTimings[phase] = Math.round((semanticPhaseTimings[phase] ?? 0) + (performance.now() - startedAt)); }
+    };
     const isHybrid = operation.operation_id === "core:search_hybrid";
     const workspaceScope = requireSingleWorkspaceScope(operation.scope);
     const args = object(operation.arguments);
@@ -3878,7 +4028,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // index has never initialized at all; every other branch's result is
     // unchanged, and the "unused-when-marker-is-undefined" result is
     // dropped exactly as before via `allVectors` below.
-    const [capabilityStates, marker, allVectorsRaw, counts, entityCounts, coverageSummary] = await Promise.all([
+    const [capabilityStates, marker, allVectorsRaw, counts, entityCounts, coverageSummary] = await semanticTimed("snapshot_reads", () => Promise.all([
       this.snapshots.capability_states?.(operation.scope) ?? Promise.resolve([]),
       portReady ? this.snapshots.semantic_index_state!(operation.scope) : Promise.resolve(undefined),
       portReady && provider !== undefined
@@ -3901,7 +4051,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       provider !== undefined && this.snapshots.semantic_coverage_summary !== undefined
         ? this.snapshots.semantic_coverage_summary(operation.scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest)
         : Promise.resolve(undefined),
-    ]);
+    ]));
     const isCurrent = isSemanticMarkerCurrent(marker, provider);
     const allVectors = marker !== undefined ? allVectorsRaw : [];
     // Decision 17: an entity-grain row must NEVER enter `dedupeVectorsByOwner`
@@ -4003,18 +4153,40 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       entityVectorsForScan = entityVectorsForScan.filter((vector) => matchesPathPrefix(paths.get(vector.owner_artifact_version_id), pathPrefixes));
     }
 
-    const queryVector = await this.embedQuery(provider!, operation, queryText);
+    const queryVector = await semanticTimed("embed_query", () => this.embedQuery(provider!, operation, queryText));
+    // Frente S-I (2026-09-08): the resident-buffer fast path only ever
+    // applies to an UNFILTERED query (`pathPrefixes.length === 0`) -- see
+    // `residentLaneBufferCache`'s own doc comment for why a path filter
+    // narrows the per-query candidate set in a way the buffer (built once
+    // per generation) cannot reflect. `residentQueryVector` is `undefined`
+    // whenever that fast path cannot apply at all this call (filtered, or
+    // this profile is not `float32`) -- computed once, shared by both
+    // lanes below, since both scans embed the SAME query. Both lanes'
+    // metric is hardcoded `"cosine"` (never `provider.profile.distance_metric`)
+    // exactly like the pre-existing `exactVectorScan` calls below, and
+    // cosine similarity is invariant to any positive rescaling of either
+    // vector -- so using the RAW (never `canonicalVectorBytes`-normalized)
+    // `queryVector.vector` bytes here, unlike `exactVectorScan`'s own
+    // internal `canonicalVectorBytes(query, ...)` call, changes nothing:
+    // the native kernel divides by its own freshly computed `|query|` norm
+    // regardless (`crates/urdira-native-core/src/lib.rs`'s `exact_top_k_contiguous`).
+    const residentQueryVector = pathPrefixes.length === 0 && provider!.profile.element_type === "float32"
+      ? float32ViewOf(queryVector.vector, provider!.profile.dimensions)
+      : undefined;
     // Re-keyed to `owner_artifact_version_id` rather than the vector's own
     // `projection_record_id`: v1 writes exactly one (deduplicated) artifact
     // vector per owner, so this is a lossless bijection, and it gives the
     // artifact lane the SAME fusion key the lexical lane (`search_literal`,
     // artifact-version-keyed by construction) already uses -- `fuseSemanticLanes`
     // matches lanes by this id, so both lanes must agree on what it means.
-    const semanticRanks = exactVectorScan(
+    const semanticRanks = semanticTimedSync("artifact_scan", () => (residentQueryVector === undefined ? undefined : this.residentLaneScan(
+      `${workspaceScope.workspace_id}:${provider!.profile.embedding_profile_id}:${provider!.binding.executable_binding_digest}:artifact`,
+      allVectors, artifactVectorsForScan, provider!.profile.dimensions, (vector) => vector.owner_artifact_version_id, residentQueryVector, SEMANTIC_CANDIDATE_CAP,
+    )) ?? exactVectorScan(
       artifactVectorsForScan.map((vector) => ({ projection_record_id: vector.owner_artifact_version_id, profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, vector: vector.vector_payload })),
       queryVector.vector,
       { profile_id: provider!.profile.embedding_profile_id, executable_binding_id: provider!.binding.executable_binding_digest, dimensions: provider!.profile.dimensions, element_type: provider!.profile.element_type as "float32" | "float64", distance_metric: "cosine", normalization: provider!.profile.normalization as "none" | "l2", limit: SEMANTIC_CANDIDATE_CAP },
-    );
+    ));
     // Frente S-B (decision 17 segmentation): the entity lane's OWN exact-scan
     // runs over EVERY visible SEGMENT row, keyed by its own unique
     // `projection_record_id` (never `document_ref` -- a multi-segment entity
@@ -4086,14 +4258,31 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const entitySegmentScanLimit = Math.min(SEMANTIC_ENTITY_SEGMENT_SCAN_LIMIT, entityScanCandidates.length);
     let entityRanks: readonly RankedSemanticCandidate[] = [];
     let matchedSegmentByDocumentRef: ReadonlyMap<string, { readonly index: number; readonly start_char: number; readonly end_char: number }> = new Map();
-    if (entitySegmentScanLimit > 0) {
-      const fastEntitySegmentRanks = exactVectorScan(entityScanCandidates, queryVector.vector, { ...entityScanOptions, limit: entitySegmentScanLimit });
-      ({ ranks: entityRanks, matchedSegmentByDocumentRef } = aggregateEntityRanks(fastEntitySegmentRanks));
-      if (entityRanks.length < SEMANTIC_ENTITY_CANDIDATE_CAP && entityScanCandidates.length > entitySegmentScanLimit) {
-        const fullEntitySegmentRanks = exactVectorScan(entityScanCandidates, queryVector.vector, entityScanOptions);
-        ({ ranks: entityRanks, matchedSegmentByDocumentRef } = aggregateEntityRanks(fullEntitySegmentRanks));
+    // Frente S-I: same resident-buffer fast path as the artifact lane above,
+    // keyed by a distinct `:entity` handle (the entity lane's own candidate
+    // set, keyed by `projection_record_id` rather than
+    // `owner_artifact_version_id` -- see `residentLaneScan`'s own doc
+    // comment). Both the fast (`entitySegmentScanLimit`) and the escalation
+    // (uncapped) call below pass the SAME `entityVectorsForScan` array
+    // reference as `laneVectors` -- the escalation call is therefore always
+    // a cache HIT (no second buffer registration) whenever the fast call
+    // just registered it, since nothing about the candidate set changed
+    // between the two calls within this one `trySemanticSearch` invocation.
+    const entityResidentHandleId = `${workspaceScope.workspace_id}:${provider!.profile.embedding_profile_id}:${provider!.binding.executable_binding_digest}:entity`;
+    semanticTimedSync("entity_scan", () => {
+      if (entitySegmentScanLimit > 0) {
+        const fastEntitySegmentRanks = (residentQueryVector === undefined ? undefined : this.residentLaneScan(
+          entityResidentHandleId, allVectors, entityVectorsForScan, provider!.profile.dimensions, (vector) => vector.projection_record_id, residentQueryVector, entitySegmentScanLimit,
+        )) ?? exactVectorScan(entityScanCandidates, queryVector.vector, { ...entityScanOptions, limit: entitySegmentScanLimit });
+        ({ ranks: entityRanks, matchedSegmentByDocumentRef } = aggregateEntityRanks(fastEntitySegmentRanks));
+        if (entityRanks.length < SEMANTIC_ENTITY_CANDIDATE_CAP && entityScanCandidates.length > entitySegmentScanLimit) {
+          const fullEntitySegmentRanks = (residentQueryVector === undefined ? undefined : this.residentLaneScan(
+            entityResidentHandleId, allVectors, entityVectorsForScan, provider!.profile.dimensions, (vector) => vector.projection_record_id, residentQueryVector, entityScanCandidates.length,
+          )) ?? exactVectorScan(entityScanCandidates, queryVector.vector, entityScanOptions);
+          ({ ranks: entityRanks, matchedSegmentByDocumentRef } = aggregateEntityRanks(fullEntitySegmentRanks));
+        }
       }
-    }
+    });
 
     // Grain lookup for the FUSED ranked ids below -- artifact ids
     // (`owner_artifact_version_id`) and entity ids (`record_id`) are
@@ -4121,7 +4310,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       { lane_id: "semantic-entity", candidates: entityRanks },
     ];
     if (isHybrid) {
-      const lexicalRanked = await this.rankedLexicalMatches(operation, queryText, pathPrefixes, !includeArtifactLane);
+      const lexicalRanked = await semanticTimed("lexical_lane", () => this.rankedLexicalMatches(operation, queryText, pathPrefixes, !includeArtifactLane));
       // `undefined` here means the LEXICAL lane specifically is stale/missing
       // -- the semantic lanes just proved themselves available above -- so
       // hybrid degrades to semantic-only (both grains) for this call, not to
@@ -4134,7 +4323,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const fused = fuseSemanticLanes(lanes);
     const finalRanked = rerankSemanticMatches(fused);
 
-    const candidates = await this.hydrateSemanticCandidates(operation.scope, finalRanked.map((entry) => ({ id: entry.projection_record_id, grain: grainById.get(entry.projection_record_id) ?? "artifact" })), matchedSegmentByDocumentRef);
+    const candidates = await semanticTimed("hydration", () => this.hydrateSemanticCandidates(operation.scope, finalRanked.map((entry) => ({ id: entry.projection_record_id, grain: grainById.get(entry.projection_record_id) ?? "artifact" })), matchedSegmentByDocumentRef));
     // Coverage counts come from `semantic_scope_counts`/`semantic_entity_scope_counts`
     // + `dedupedVectors`/`dedupedEntityVectors` (the FULL, unfiltered,
     // uncapped visible-vector sets) -- never from
@@ -4142,8 +4331,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // `entityRanks`/`candidates` -- so a narrow `paths` filter or either
     // lane's own cap never makes the coverage view understate how much of
     // the workspace is actually materialized.
-    const coverage = buildSemanticCoverageView({ provider, marker, isCurrent, counts, coveredCount: dedupedVectors.length, indexSupported: true, entityCount: entityCounts.entity_count, coveredEntityCount: dedupedEntityVectors.length, realCounts, affectedPage });
-    return result({ candidates, semantic_coverage: [coverageItem(coverage)] }, capabilityStates, semanticEvaluationState(coverage.materialization_state));
+    const coverage = semanticTimedSync("coverage_view", () => buildSemanticCoverageView({ provider, marker, isCurrent, counts, coveredCount: dedupedVectors.length, indexSupported: true, entityCount: entityCounts.entity_count, coveredEntityCount: dedupedEntityVectors.length, realCounts, affectedPage }));
+    const response = semanticTimedSync("render", () => result({ candidates, semantic_coverage: [coverageItem(coverage)] }, capabilityStates, semanticEvaluationState(coverage.materialization_state)));
+    if (semanticDebugTiming) {
+      semanticPhaseTimings["total"] = Math.round(performance.now() - semanticStartedAt);
+      console.error(`[urdira] ${operation.operation_id} timings ms=${JSON.stringify(semanticPhaseTimings)}`);
+    }
+    return response;
   }
 
   /**

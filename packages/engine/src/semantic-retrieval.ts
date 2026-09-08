@@ -49,7 +49,14 @@ function matchesFilter(metadata: SemanticMetadata | undefined, filter: SemanticM
 
 const textEncoder = new TextEncoder();
 
-function utf8Compare(left: string, right: string): number {
+/** Exported (Frente S-I) so `canonical-query-data-port.ts` can sort a
+ * resident lane buffer's rows into the SAME ascending order this module's
+ * own tie-break already assumes, before registering it with the native
+ * resident kernel (which tie-breaks by buffer INDEX, not by string -- see
+ * `residentExactVectorScan`'s own doc comment) -- reusing this exact
+ * function, rather than a second reimplementation, is what makes that
+ * index tie-break provably equivalent to this one. */
+export function utf8Compare(left: string, right: string): number {
   const leftBytes = textEncoder.encode(left.normalize("NFC"));
   const rightBytes = textEncoder.encode(right.normalize("NFC"));
   const length = Math.min(leftBytes.length, rightBytes.length);
@@ -325,6 +332,102 @@ export function fuseSemanticLanes(lanes: readonly SemanticLaneRanks[]): readonly
 
 export interface SemanticRerankOptions {
   readonly lane_weights?: Readonly<Record<string, Rational>>;
+}
+
+/**
+ * Frente S-I (2026-09-08, plan `generic-waddling-hartmanis.md` §0): a
+ * SEPARATE port from `NativeExactVectorTopKPort` above -- that one is
+ * deliberately call-owned/stateless ("The engine supplies call-owned packed
+ * buffers and retains no native or JavaScript objects after the batch
+ * call"), which is exactly the shape that forces `nativeTopKChunked` to
+ * re-pack and re-cross the N-API boundary on every chunk of every query even
+ * though the underlying candidate data (`canonical-query-data-port.ts`'s own
+ * resident vector cache) does not change between queries at all. This port
+ * is deliberately STATEFUL on the native side: `registerVectorBuffer` copies
+ * a caller-owned `Float32Array` into native memory ONCE per `(handleId,
+ * generation)`, and `exactTopKContiguous` scans that already-resident buffer
+ * directly, with no per-query marshaling. See `crates/urdira-native-core/src/lib.rs`'s
+ * own module-level doc comment (search "Frente S-I") for the full mechanism
+ * and correctness argument (ascending-identifier registration order + an
+ * index tie-break replacing a string tie-break exactly).
+ */
+export interface ResidentVectorTopKMatch {
+  readonly index: number;
+  readonly distance: number;
+}
+
+export interface ResidentVectorTopKPort {
+  registerVectorBuffer(handleId: string, generation: number, dimensions: number, buffer: Float32Array): void;
+  exactTopKContiguous(handleId: string, generation: number, query: Float32Array, k: number, metric: "cosine" | "squared_l2"): readonly ResidentVectorTopKMatch[];
+}
+
+let activeResidentPort: ResidentVectorTopKPort | undefined;
+
+/** Mirrors `configureNativeExactVectorTopKPort`'s own contract: once
+ * selected, a native failure propagates -- query execution never retries
+ * through a TypeScript fallback for a handle this port itself is
+ * responsible for. `undefined` disables the resident fast path entirely
+ * (every caller falls back to `exactVectorScan`'s existing chunked path). */
+export function configureResidentVectorTopKPort(port: ResidentVectorTopKPort | undefined): void {
+  activeResidentPort = port;
+}
+
+export function residentVectorTopKPortConfigured(): boolean {
+  return activeResidentPort !== undefined;
+}
+
+export interface ResidentExactVectorScanRequest {
+  /** Stable identity for the native-side buffer slot -- typically
+   * `${workspace_id}:${profile_id}:${executable_binding_id}:${lane}`. */
+  readonly handleId: string;
+  /** Caller-owned monotonic tag; opaque to this function -- see this
+   * module's own header comment on `ResidentVectorTopKPort` for why it need
+   * not be the workspace's own structural/semantic generation number. */
+  readonly generationTag: number;
+  /** `true` when the caller just (re)built `buffer`/`ids` (a cache miss on
+   * the CALLER's own side) and the native buffer must be re-registered
+   * before this call's scan; `false` to reuse whatever is already resident
+   * for `handleId` at `generationTag` (the common case: same generation,
+   * same lane, a later query). */
+  readonly needsRegister: boolean;
+  /** Row-major, `ids.length * dimensions` elements, row `i` at
+   * `ids[i]` -- REQUIRED to be sorted by `ids` ascending (UTF-8 byte order)
+   * for the native tie-break to reproduce `utf8Compare`'s own ordering.
+   * Ignored (may be a zero-length placeholder) when `needsRegister` is
+   * `false`. */
+  readonly buffer: Float32Array;
+  readonly dimensions: number;
+  /** Index-aligned with the registered buffer's rows. */
+  readonly ids: readonly string[];
+  readonly query: Float32Array;
+  readonly k: number;
+  readonly metric: "cosine" | "squared_l2";
+}
+
+/**
+ * Runs one resident-buffer exact top-k scan, returning `undefined` when no
+ * resident port is configured (the caller falls back to `exactVectorScan`).
+ * Defensively validates the native result's shape exactly as
+ * `nativeExactVectorTopK` (`native-exact-vector.ts`) does for the
+ * call-owned port -- a native/JS contract mismatch throws here rather than
+ * silently returning a wrong ranking.
+ */
+export function residentExactVectorScan(request: ResidentExactVectorScanRequest): readonly ExactVectorMatch[] | undefined {
+  const port = activeResidentPort;
+  if (port === undefined) return undefined;
+  if (request.ids.length === 0) return [];
+  if (request.needsRegister) port.registerVectorBuffer(request.handleId, request.generationTag, request.dimensions, request.buffer);
+  const k = Math.min(request.k, request.ids.length);
+  const matches = port.exactTopKContiguous(request.handleId, request.generationTag, request.query, k, request.metric);
+  if (matches.length !== k) throw new Error("Resident exact vector top-k returned a malformed result count.");
+  const seenIndices = new Set<number>();
+  return matches.map((match, order) => {
+    if (!Number.isInteger(match.index) || match.index < 0 || match.index >= request.ids.length || seenIndices.has(match.index)) {
+      throw new Error("Resident exact vector top-k returned a malformed result.");
+    }
+    seenIndices.add(match.index);
+    return { projection_record_id: request.ids[match.index]!, rank: order + 1 };
+  });
 }
 
 export function rerankSemanticMatches(candidates: readonly FusedSemanticCandidate[], options: SemanticRerankOptions = {}): readonly SemanticSearchResult[] {
