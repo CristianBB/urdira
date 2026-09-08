@@ -3905,6 +3905,56 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                                         None => TypeflowCallResolution::Unresolved,
                                     };
                                 }
+                                // E-P0m (2026-09-08): the SAME "never trust
+                                // a naive name match" discipline as the
+                                // `TypeQuery` check right above, widened to
+                                // a member whose OWN annotation is REAL
+                                // (a type alias, an indexed-access, ...) but
+                                // failed to resolve -- indistinguishable
+                                // from "no annotation at all" at `member_
+                                // type_ref`'s own `None` result, which is
+                                // exactly why this needs a SEPARATE query.
+                                // Found live: `_fetch: FetchFunction`
+                                // (`FetchFunction` an alias into ANOTHER
+                                // file's `typeof globalThis.fetch`) and
+                                // `_createMessageRequestHandler:
+                                // IMcpServerRequestHandlerOptions
+                                // ['createMessageRequestHandler']` (an
+                                // indexed-access into a cross-file `extends`
+                                // target) -- both member's own declaration
+                                // is NEVER what the call actually means, so
+                                // staying pending here is the only sound
+                                // answer, matching the SAME rule the
+                                // `TypeQuery` case above already applies.
+                                //
+                                // Gated on `target` NOT already being a
+                                // callable kind (method/getter/setter/
+                                // constructor, `narrowed_target_is_a_
+                                // callable_kind`'s own predicate): for a
+                                // REAL method, `type_ref` is its own
+                                // RETURN type, which has NOTHING to do with
+                                // whether the METHOD ITSELF is the right
+                                // call target -- `transition(): Task`
+                                // called as `this.transition(...)` is
+                                // correct regardless of whether `Task`'s
+                                // own cross-file reference resolves. Found
+                                // live (adversarial re-check, same session):
+                                // an UNGATED version wrongly demoted every
+                                // method whose OWN return type merely
+                                // failed to resolve, breaking `cold_scan_
+                                // materializes_member_entities_and_
+                                // confirms_a_typeflow_member_call`/
+                                // `residual_pass_accounts_for_every_
+                                // possible_site_in_the_shared_fixture`.
+                                if !Self::narrowed_target_is_a_callable_kind(&target)
+                                    && index.member_annotation_is_unresolved(
+                                        &base_entity,
+                                        member.property.name.as_str(),
+                                        is_static,
+                                    )
+                                {
+                                    return TypeflowCallResolution::Unresolved;
+                                }
                                 return TypeflowCallResolution::Resolved(target, rule);
                             }
                             urdira_jsts_typeflow::MemberLookup::Many(targets) => {

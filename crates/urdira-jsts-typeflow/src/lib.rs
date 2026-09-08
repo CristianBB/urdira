@@ -3111,6 +3111,25 @@ struct ResolvedMember {
     is_static: bool,
     entity_id: String,
     type_ref: Option<ResolvedTypeRef>,
+    /// E-P0m (2026-09-08): `true` when this member's OWN raw annotation
+    /// (`MemberEntry::type_ref`, captured before any cross-file resolution)
+    /// is anything OTHER than `RawTypeRef::Unknown` -- i.e. the member DOES
+    /// have a real, named type reference, whether or not it ended up fully
+    /// resolving into `type_ref` above. Lets a caller (`member_annotation_
+    /// is_unresolved`) tell "no annotation at all" (safe to trust a naive
+    /// name-based fallback) apart from "a real annotation that failed to
+    /// resolve" (an unresolved import, a known type alias that never
+    /// converged, ...) -- `type_ref: None` alone cannot express that
+    /// distinction. Found live: `_fetch: FetchFunction` (`FetchFunction`
+    /// itself an alias into ANOTHER file's `typeof globalThis.fetch`) and
+    /// `_createMessageRequestHandler: IMcpServerRequestHandlerOptions
+    /// ['createMessageRequestHandler']` (an indexed-access into a
+    /// cross-file `extends` target) both stayed silently `None` whenever
+    /// the underlying cross-file link did not resolve, letting `resolve_
+    /// call_target_typeflow`'s naive name-based fallback confirm the
+    /// member's OWN declaration as the call target instead of staying
+    /// pending -- `docs/evidence/2026-09-07-v4-vscode-campaign.md` §13.
+    had_named_type_reference: bool,
 }
 
 /// A resolved container (class or interface) ready for `ProgramIndex::
@@ -3297,6 +3316,7 @@ fn resolve_members_for(
                 import_targets,
                 alias_targets,
             ),
+            had_named_type_reference: !matches!(member.type_ref, RawTypeRef::Unknown),
         })
         .collect()
 }
@@ -4767,6 +4787,42 @@ impl ProgramIndex {
         lookup_member_type_ref(&self.containers, entity_id, name, is_static)
     }
 
+    /// E-P0m (2026-09-08, rule (b) closure for pattern G's `_fetch`/
+    /// `_createMessageRequestHandler`/`_elicitationRequestHandler`
+    /// residual, `docs/evidence/2026-09-07-v4-vscode-campaign.md` §13):
+    /// `true` when `member_type_ref` above would return `None` for THIS
+    /// EXACT `(entity_id, name, is_static)` NOT because the member has no
+    /// type annotation at all, but because it has a REAL one (a type alias,
+    /// an indexed-access, an imported type reference, ...) that failed to
+    /// resolve -- see `ResolvedMember::had_named_type_reference`'s own doc
+    /// comment for the two live samples this closes. A caller (`resolve_
+    /// call_target_typeflow`'s member branch) uses this to refuse a naive
+    /// name-based call-target confirmation whenever the member's OWN
+    /// declared type is a known unknown, never just an absent one -- the
+    /// conservative, "stay pending" side of "never guess": widens the
+    /// EXISTING `TypeQuery`-only redirect/downgrade check to also cover a
+    /// same-shaped case that never made it as far as `TypeQuery` at all
+    /// (an unresolved import upstream of it), without touching resolver.rs'
+    /// own import-resolution machinery (see that file's own doc comment,
+    /// right above `push_candidate_variants`, for why a broader fix there
+    /// was attempted and reverted this same session).
+    pub fn member_annotation_is_unresolved(
+        &self,
+        entity_id: &str,
+        name: &str,
+        is_static: bool,
+    ) -> bool {
+        let mut visited = std::collections::HashSet::new();
+        collect_member_annotation_unresolved(
+            &self.containers,
+            entity_id,
+            name,
+            is_static,
+            &mut visited,
+            true,
+        )
+    }
+
     /// P1-A (rule (a)): a top-level named function's own declared return
     /// type, already resolved through the same import table as everything
     /// else in this index. `None` when `entity_id` is not a known function,
@@ -5418,6 +5474,61 @@ fn collect_member_type_ref(
         }
     }
     None
+}
+
+/// E-P0m (2026-09-08): byte-identical own-body-then-`extends`-then-
+/// `implements` walk to `collect_member_type_ref` right above (same
+/// `matches.len() == 1` own-level short-circuit, same "an own-level
+/// ambiguous match never falls through to heritage" rule, same `visited`/
+/// depth guard) -- the ONLY difference is the leaf: instead of returning
+/// the member's resolved type, it reports whether that SAME member has a
+/// real, named annotation that failed to resolve (`had_named_type_
+/// reference && type_ref.is_none()`, see that field's own doc comment).
+/// `false` for "no member with this name found at all" (nothing to be
+/// unresolved) exactly like `collect_member_type_ref` returns `None` there
+/// -- never a guess either way.
+fn collect_member_annotation_unresolved(
+    containers: &HashMap<String, ResolvedContainer>,
+    entity_id: &str,
+    name: &str,
+    is_static: bool,
+    visited: &mut std::collections::HashSet<String>,
+    allow_implements_fallback: bool,
+) -> bool {
+    const MAX_DEPTH: usize = 32;
+    if visited.len() >= MAX_DEPTH || !visited.insert(entity_id.to_owned()) {
+        return false;
+    }
+    let Some(container) = containers.get(entity_id) else {
+        return false;
+    };
+    let effective_static = is_static && !container.is_interface;
+    let matches: Vec<&ResolvedMember> = container
+        .members
+        .iter()
+        .filter(|member| member.name == name && member.is_static == effective_static)
+        .collect();
+    if matches.len() == 1 {
+        return matches[0].had_named_type_reference && matches[0].type_ref.is_none();
+    }
+    if !matches.is_empty() {
+        return false;
+    }
+    for base in &container.extends {
+        if collect_member_annotation_unresolved(containers, base, name, is_static, visited, false) {
+            return true;
+        }
+    }
+    if allow_implements_fallback {
+        for interface in &container.implements {
+            if collect_member_annotation_unresolved(
+                containers, interface, name, false, visited, false,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// D.2 (2026-09-05, references-parity task): `entity_id` as a HERITAGE
@@ -7242,6 +7353,85 @@ mod tests {
             index.member_type_ref(&transport_id, "_fetch", false),
             Some(ResolvedTypeRef::TypeQuery(Some(fetchfn_id)))
         );
+    }
+
+    /// E-P0m (2026-09-08, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §13): the SAME two-hop alias shape as the test right above, but with
+    /// the `./types` import LEFT UNRESOLVED (empty `import_targets`,
+    /// exactly what happens live when the underlying specifier fails to
+    /// resolve) -- `member_type_ref` correctly stays `None` (it always did:
+    /// `dealias_entity`'s `Some(None)` branch), but `member_annotation_is_
+    /// unresolved` must now report `true` for `_fetch` (a REAL annotation
+    /// that failed, not "no annotation") so `resolve_call_target_typeflow`
+    /// never falls back to `_fetch`'s own declaration as the call target.
+    #[test]
+    fn member_annotation_is_unresolved_when_the_alias_chain_import_never_resolves() {
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "types.ts".to_owned(),
+            summary_for(
+                "types.ts",
+                "export function fetchFn(url: string) {}\nexport type GitHubFetch = typeof fetchFn;\n",
+            ),
+        );
+        let transport_summary = summary_for(
+            "transport.ts",
+            "import { GitHubFetch } from './types';\ntype FetchFunction = GitHubFetch;\nclass Transport {\n  private readonly _fetch: FetchFunction;\n}\n",
+        );
+        let transport_id = transport_summary.classes[0].entity_id.clone();
+        summaries.insert("transport.ts".to_owned(), transport_summary);
+        // No `import_targets` entry at all -- `./types`'s own `GitHubFetch`
+        // never resolves, exactly like a `.js`-suffixed specifier the
+        // resolver cannot map to `types.ts` (the live root cause).
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(index.member_type_ref(&transport_id, "_fetch", false), None);
+        assert!(index.member_annotation_is_unresolved(&transport_id, "_fetch", false));
+    }
+
+    /// E-P0m: the negative control -- a member with NO type annotation at
+    /// all must never be reported as "unresolved" (there is nothing to be
+    /// unresolved; a naive name-based call target is exactly as safe as
+    /// before this task).
+    #[test]
+    fn member_annotation_is_unresolved_is_false_for_an_untyped_member() {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Widget {\n  private _label = 'x';\n  rename(next: string) { this._label = next; }\n}\n",
+        );
+        let widget_id = file_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert!(!index.member_annotation_is_unresolved(&widget_id, "_label", false));
+    }
+
+    /// E-P0m: the other negative control -- a member whose annotation DOES
+    /// fully resolve must also never be reported as "unresolved".
+    #[test]
+    fn member_annotation_is_unresolved_is_false_for_a_fully_resolved_member() {
+        let mut summaries = BTreeMap::new();
+        summaries.insert(
+            "a.ts".to_owned(),
+            summary_for("a.ts", "export class Base {}\n"),
+        );
+        let base_id = summaries["a.ts"].classes[0].entity_id.clone();
+        let holder_summary = summary_for(
+            "b.ts",
+            "import { Base } from './a';\nclass Holder {\n  owner: Base;\n}\n",
+        );
+        let holder_id = holder_summary.classes[0].entity_id.clone();
+        summaries.insert("b.ts".to_owned(), holder_summary);
+        let mut import_targets = HashMap::new();
+        import_targets.insert(
+            ("b.ts".to_owned(), "./a".to_owned(), "Base".to_owned()),
+            base_id.clone(),
+        );
+        let index = ProgramIndex::build(&summaries, &import_targets, &HashMap::new());
+        assert_eq!(
+            index.member_type_ref(&holder_id, "owner", false),
+            Some(ResolvedTypeRef::Entity(base_id))
+        );
+        assert!(!index.member_annotation_is_unresolved(&holder_id, "owner", false));
     }
 
     #[test]

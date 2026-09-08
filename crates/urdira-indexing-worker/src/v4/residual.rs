@@ -6204,7 +6204,27 @@ mod tests {
         // baseline; w256/w512/w1024 unbounded all agreed at the pre-D
         // baseline, partition effect refuted by C.6) are unchanged -- only
         // the live target shifted with the reference-record count.
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_807;
+        //
+        // Refreshed AGAIN 2026-09-08 (E-P0m, `docs/evidence/2026-09-07-
+        // v4-vscode-campaign.md` §13): `resolve_call_target_typeflow`'s new
+        // `member_annotation_is_unresolved` guard (closing pattern G's
+        // `_fetch`/`_createMessageRequestHandler`/`_elicitationRequestHandler`
+        // residual) DELIBERATELY demotes a member CALL to pending whenever
+        // the member's own declared type is a real, named reference that
+        // failed to resolve (was previously falling back to the member's
+        // OWN declaration as a guess) -- a handful of n8n call sites share
+        // this exact shape (a property/parameter-property typed with an
+        // alias/indexed-access this crate cannot fully resolve, called
+        // through `this`), so `confirmed_combined` drops by 55 (161,807 ->
+        // **161,752**, re-verified identically by both `n8n_residual_pass_
+        // debug_histogram` and this schedule-resume harness on the same
+        // build/corpus). This is the INTENDED, safety-improving direction
+        // (fewer confirmed sites, never a wrong one -- `different == 0`
+        // holds in both VS Code and n8n parity for this same build, see
+        // the evidence doc's own §13) -- not a regression to chase down.
+        // The +-4 tolerance itself is unchanged (still the pre-existing,
+        // unexplained +-2 drift's own bound); only the live target moved.
+        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_752;
         const CONFIRMED_COMBINED_TOLERANCE: u64 = 4;
         let confirmed_combined_diff =
             final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);
@@ -6213,8 +6233,10 @@ mod tests {
             "confirmed_combined after schedule() fully converges via truncate-then-resume \
              ({final_confirmed_combined}) must be within {CONFIRMED_COMBINED_TOLERANCE} of the \
              unbounded pass's own figure ({REFERENCE_CONFIRMED_COMBINED}) -- got a difference \
-             of {confirmed_combined_diff}. Reference refreshed post-Q5-D-merge to 161,807 (was \
-             161,794); the +-2 drift documented pre-D (schedule7/schedule8) is still the known \
+             of {confirmed_combined_diff}. Reference refreshed 2026-09-08 (E-P0m) to 161,752 \
+             (was 161,807) after `member_annotation_is_unresolved` correctly demoted a handful \
+             of previously-guessed n8n call sites to pending -- see this constant's own doc \
+             comment. The +-2 drift documented pre-D (schedule7/schedule8) is still the known \
              source of variance -- this is an owner decision pending, do not widen this bound \
              further without new evidence"
         );

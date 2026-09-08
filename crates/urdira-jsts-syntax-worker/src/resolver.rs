@@ -71,6 +71,33 @@ const RESOLUTION_EXTENSIONS: [&str; 11] = [
 
 const MAX_EXTENDS_DEPTH: u8 = 10;
 
+// E-P0m (2026-09-08): a general `.js`/`.jsx`/`.mjs`/`.cjs` -> `.ts`/`.tsx`/
+// `.mts`/`.cts` relative-specifier extension-substitution mechanism was
+// attempted here (`js_to_ts_extension_substitutes`, threaded into
+// `push_candidate_variants` right after the literal-candidate check) --
+// found live closing pattern G's `_fetch`/`githubTransport.ts` two-hop
+// alias residual (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §12.2)
+// and, measured against the real VS Code corpus, recovering the single
+// largest `v4_missing` contributor (`import_binding/unresolved_specifier`,
+// 668,534 sites, 99.7% of it) -- but REVERTED: it also newly resolves
+// thousands of relative imports that were PREVIOUSLY unresolved-by-
+// construction across the whole test suite, and `cargo test`'s own
+// `reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree`/
+// `reconcile_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree`/
+// `brand_new_declarer_and_consumer_linked_through_a_same_batch_edited_
+// barrel_matches_an_independent_oracle` (the last one an INDEPENDENT-ORACLE
+// self-consistency check, not merely a stale hardcoded value) all failed
+// with it enabled -- the last one specifically means the INCREMENTAL/
+// mixed-batch reconcile path and a fresh full scan of the IDENTICAL final
+// tree state disagree once this class of import edge is newly reachable, a
+// genuine (if previously invisible, since the edge never resolved before)
+// incremental-consistency gap this session did not have the remaining risk
+// budget to root-cause and fix safely. `_fetch`/`_createMessageRequestHandler`/
+// `_elicitationRequestHandler` are instead closed by §13's OWN, narrower
+// fix (`member_annotation_is_unresolved`, semantic_sites.rs/lib.rs) which
+// needs no import-resolution change at all. Recommended as the next
+// owner-queue item under this same P0's own tracking id -- see §13.
+
 // H (E-P0l, 2026-09-08): a declaration/implementation sibling-preference
 // mechanism was attempted here (and in `semantic_sites.rs`'s `resolve_
 // named_binding_via_specifier`) and REMOVED -- see that function's own H
@@ -1281,7 +1308,10 @@ fn resolve_direct_export(
                 // the three shapes recognized under `FirstDeclaration`.
                 // `UniqueOrAmbiguous` (the call-target policy) never picks
                 // among candidates, unconditionally `Ambiguous`.
-                match (policy, first_declaration_merge_target(several)) {
+                match (
+                    policy,
+                    first_declaration_merge_target(several, &file.namespace_members),
+                ) {
                     (ExportPolicy::FirstDeclaration, Some(target)) => {
                         resolved_ids.insert(target.id.clone());
                     }
@@ -1321,7 +1351,10 @@ fn resolve_direct_export(
 ///    non-namespace candidates (a genuine name COLLISION, not a supported
 ///    merge -- e.g. `const X` next to `namespace X`) is NOT this shape and
 ///    falls through to `None`.
-fn first_declaration_merge_target<'e>(candidates: &[&'e SyntaxEntity]) -> Option<&'e SyntaxEntity> {
+fn first_declaration_merge_target<'e>(
+    candidates: &[&'e SyntaxEntity],
+    namespace_members: &[crate::NamespaceMember],
+) -> Option<&'e SyntaxEntity> {
     let first_kind = candidates.first()?.kind;
     if matches!(first_kind, EntityKind::Function | EntityKind::Method)
         && candidates.iter().all(|entity| entity.kind == first_kind)
@@ -1332,6 +1365,36 @@ fn first_declaration_merge_target<'e>(candidates: &[&'e SyntaxEntity]) -> Option
         .iter()
         .all(|entity| entity.kind == EntityKind::Namespace)
     {
+        // E-P0m (2026-09-08): the plain "earliest in source order" rule
+        // above (`resolve_named_export_repeated_namespace_merge_resolves_
+        // to_the_first_declaration`, validated against n8n) is WRONG when
+        // one of the merged blocks is a genuine placeholder with NO
+        // exported members at all -- found live against the VS Code corpus
+        // (`src/vs/platform/mcp/common/modelContextProtocol.ts`: an EARLIER
+        // `export namespace MCP { // Nothing, yet }` "proposals" placeholder
+        // merged with a LATER, fully-populated `export namespace MCP {
+        // /* JSON-RPC types */ ... }` -- 26/64 of a random `v4_different_
+        // target` sample, 100% agreeing v3's real answer is the non-empty
+        // block, never the empty placeholder). When EXACTLY ONE candidate
+        // has at least one `NamespaceMember` fact (a real, direct `export`
+        // inside its own block) while every other candidate has NONE, that
+        // one is unambiguously "the" namespace for identity purposes (an
+        // empty block contributes nothing a reference could ever mean).
+        // Zero or more than one non-empty candidate falls through to the
+        // EXISTING "earliest" rule unchanged -- this refinement only ever
+        // narrows the guess for the specific empty-placeholder shape it was
+        // found to get wrong, never widens it.
+        let non_empty: Vec<&&SyntaxEntity> = candidates
+            .iter()
+            .filter(|entity| {
+                namespace_members
+                    .iter()
+                    .any(|member| member.namespace_entity_id == entity.id)
+            })
+            .collect();
+        if let [only] = non_empty.as_slice() {
+            return Some(**only);
+        }
         return candidates.iter().copied().min_by_key(|entity| entity.start);
     }
     let non_namespace: Vec<&SyntaxEntity> = candidates
@@ -1957,6 +2020,19 @@ fn is_standard_global_name(name: &str) -> bool {
         "TextDecoder",
         "ErrorConstructor",
         "IdleDeadline",
+        // E-P0m (2026-09-08): same recipe again, found live only AFTER
+        // fixing the `.js`->`.ts` relative-specifier extension gap (see
+        // `js_to_ts_extension_substitutes`) let hundreds of thousands more
+        // references resolve at all -- `lib.es2015.iterable.d.ts`'s global
+        // `interface Iterable<T>` (used bare, no import, as a TYPE
+        // position: `x: Iterable<T>`) collided with `src/vs/base/common/
+        // iterator.ts`'s OWN `export namespace Iterable { ... }` (a VALUE,
+        // always reached through a normal import, so it never goes through
+        // `resolve_global`/this function at all -- see this function's own
+        // doc comment on `HTMLElement` for why an IMPORTED same-name
+        // binding is unaffected either way). 12/64 of a random `v4_
+        // different_target` sample, 100% agreeing v3 -> the lib interface.
+        "Iterable",
     ];
     NAMES.contains(&name)
 }
@@ -2807,6 +2883,76 @@ mod tests {
         assert_eq!(
             resolve_named_export(&files, "a.ts", "Cfg", ExportPolicy::UniqueOrAmbiguous),
             ExportResolution::Ambiguous
+        );
+    }
+
+    /// E-P0m (2026-09-08): the SAME shape as the test right above, EXCEPT
+    /// one of the two merged `namespace MCP {}` blocks is a genuine empty
+    /// placeholder (no `NamespaceMember` facts of its own) while the other
+    /// actually exports something -- the non-empty one wins, REGARDLESS of
+    /// source order (here the empty one is EARLIER, at `10`, matching the
+    /// real `modelContextProtocol.ts` shape this fixes: an earlier
+    /// "proposals" placeholder merged with a later, populated block).
+    #[test]
+    fn resolve_named_export_namespace_merge_with_one_empty_placeholder_prefers_the_non_empty_block()
+    {
+        let mut files = BTreeMap::new();
+        let mut placeholder_then_real = file(
+            "a.ts",
+            vec![
+                entity(EntityKind::Namespace, "a.ts", 10, "MCP"),
+                entity(EntityKind::Namespace, "a.ts", 50, "MCP"),
+            ],
+            vec![binding("MCP", "MCP", None, None)],
+        );
+        placeholder_then_real.namespace_members = vec![crate::NamespaceMember {
+            namespace_entity_id: "jsts:namespace:a.ts:50:MCP".to_owned(),
+            name: "CreateMessageRequest".to_owned(),
+            member_entity_id: "jsts:interface:a.ts:60:CreateMessageRequest".to_owned(),
+        }];
+        files.insert("a.ts".to_owned(), placeholder_then_real);
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "MCP", ExportPolicy::FirstDeclaration),
+            ExportResolution::Resolved("jsts:namespace:a.ts:50:MCP".to_owned())
+        );
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "MCP", ExportPolicy::UniqueOrAmbiguous),
+            ExportResolution::Ambiguous
+        );
+    }
+
+    /// E-P0m: BOTH merged blocks are non-empty (a genuinely ambiguous case
+    /// this refinement must never guess at) -- falls through to the
+    /// existing, unchanged "earliest in source order" rule, exactly like
+    /// the all-empty case right above.
+    #[test]
+    fn resolve_named_export_namespace_merge_with_two_non_empty_blocks_falls_back_to_first_declaration()
+     {
+        let mut files = BTreeMap::new();
+        let mut both_real = file(
+            "a.ts",
+            vec![
+                entity(EntityKind::Namespace, "a.ts", 50, "MCP"),
+                entity(EntityKind::Namespace, "a.ts", 10, "MCP"),
+            ],
+            vec![binding("MCP", "MCP", None, None)],
+        );
+        both_real.namespace_members = vec![
+            crate::NamespaceMember {
+                namespace_entity_id: "jsts:namespace:a.ts:50:MCP".to_owned(),
+                name: "A".to_owned(),
+                member_entity_id: "jsts:interface:a.ts:60:A".to_owned(),
+            },
+            crate::NamespaceMember {
+                namespace_entity_id: "jsts:namespace:a.ts:10:MCP".to_owned(),
+                name: "B".to_owned(),
+                member_entity_id: "jsts:interface:a.ts:20:B".to_owned(),
+            },
+        ];
+        files.insert("a.ts".to_owned(), both_real);
+        assert_eq!(
+            resolve_named_export(&files, "a.ts", "MCP", ExportPolicy::FirstDeclaration),
+            ExportResolution::Resolved("jsts:namespace:a.ts:10:MCP".to_owned())
         );
     }
 
