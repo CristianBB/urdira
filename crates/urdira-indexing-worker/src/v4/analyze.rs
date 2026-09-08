@@ -280,6 +280,29 @@ pub(crate) fn read_owner_source_text(
 /// source_target_path)` pair already.
 type ExportedSurfaceEntry = (String, Option<String>, Option<String>, Option<String>);
 
+/// E-P0n (2026-09-08): `true` for an [`ExportedSurfaceEntry`] a pending
+/// IMPORT BINDING elsewhere could actually be waiting on -- a real
+/// top-level `exported_name` (`export { X }`/`export function X() {}`/a
+/// named re-export) or the bare `"*"` barrel-star sentinel
+/// (`exported_surface`'s own doc comment) -- as opposed to a `member:`/
+/// `param:`/`type:`/`member_type:` synthetic entry (E-P0g/E-P0h's own
+/// additions to this surface, tracking a class member, a function
+/// parameter, or a declared-type digest): none of those synthetic kinds is
+/// ever the target of an `import { X } from ...`/`export { X } from ...`
+/// binding, so a PURE ADDITION of one can never satisfy a pending import
+/// resolution the way a brand-new EXPORTED NAME can. See `run_scoped`'s own
+/// `surface_changed` check for why this distinction matters: it decides
+/// whether a pure addition to a candidate's exported surface must still
+/// widen `affected_paths` (a real exported name) or may keep narrowing to
+/// the literal edit (a member/param/type-only addition).
+fn is_importable_surface_entry(entry: &ExportedSurfaceEntry) -> bool {
+    let name = &entry.0;
+    !(name.starts_with("member:")
+        || name.starts_with("param:")
+        || name.starts_with("type:")
+        || name.starts_with("member_type:"))
+}
+
 /// Frente E-P0g: kinds counted as part of a locally-exported CLASS/
 /// INTERFACE's own "public surface" -- see `exported_surface`'s doc comment
 /// for why membership alone (unlike `EntityKind::Parameter`) matters here.
@@ -667,24 +690,53 @@ pub fn run_scoped(
             // Conservative by construction: any candidate this cannot
             // certify as unchanged (no prior baseline, no post-edit file)
             // counts as "surface changed" and keeps the full widened
-            // closure. A PURE ADDITION (every prior binding still present,
-            // unchanged -- `prior.is_subset(&next)`) does NOT count as
-            // changed: no EXISTING importer's already-resolved reference
-            // could have been invalidated by a new export appearing.
-            // Removing/renaming/re-shifting an existing binding always
-            // counts (`prior` is then NOT a subset of `next`). Documented
-            // residual, not a correctness gap this task closes: an
-            // importer that already carries an UNRESOLVED import naming
-            // exactly the newly-added export (`checker_pending` on its own
-            // side) will not be reprocessed by this scan and stays
-            // unresolved one generation longer than a from-scratch scan
-            // would leave it -- an existing, pre-P3-3 limitation of the
-            // hybrid lane's own incremental scoping (the same
-            // `path_membership_incremental` fast path already accepts an
-            // equivalent gap for pure add/remove batches, see its own doc
-            // comment), not one this narrowing introduces new.
+            // closure. A removal/rename/re-shift of an EXISTING entry
+            // always counts (`prior` is then NOT a subset of `next`) --
+            // unchanged from before this task.
+            //
+            // E-P0n (2026-09-08): a PURE ADDITION used to NEVER count as
+            // changed on the theory that "no EXISTING importer's already-
+            // resolved reference could have been invalidated by a new
+            // export appearing" -- true for an ALREADY-RESOLVED importer,
+            // but false for one with a PENDING import naming exactly the
+            // new export (typeflow's own `pending_importers_of`, waiting
+            // for this exact MODULE-LEVEL name to appear): that importer's
+            // own reference stays wrongly pending forever, since it is
+            // dropped from `affected_paths`/the hybrid lane's own
+            // reprocessing set right here, one layer above `syntax.
+            // analyze`'s already-correct `ImportReverseIndex`/`pending_
+            // importers_of` widening -- flagged as an accepted residual
+            // when P3-3 shipped (reasoned to be rare) but reproduces live,
+            // at fixture scale, once this task's `.js`->`.ts` extension-
+            // substitution fix makes this exact "brand-new declarer +
+            // consumer through a barrel edited in a later generation"
+            // shape common instead of rare
+            // (`brand_new_declarer_and_consumer_linked_through_a_same_
+            // batch_edited_barrel_matches_an_independent_oracle`,
+            // `tests_e2e.rs`).
+            //
+            // Fixed NARROWLY: an addition counts as "changed" only when it
+            // adds an entry a pending IMPORT BINDING could actually be
+            // waiting on -- a real top-level `exported_name` or a bare `"*"`
+            // barrel entry (`is_importable_surface_entry`, below), NEVER a
+            // `member:`/`param:`/`type:`/`member_type:` synthetic entry
+            // (E-P0g/E-P0h's own additions to this surface): a class
+            // member, a function parameter, or a declared-type digest is
+            // never the target of an `import { X } from ...`/`export { X }
+            // from ...` binding, so adding one can never satisfy a pending
+            // IMPORT resolution the way a brand-new EXPORTED NAME can --
+            // confirmed live, this session, both ways: widening on EVERY
+            // addition broke `barrel_hub_adding_a_named_reexport_keeps_
+            // owners_to_the_barrel_itself`/`exported_class_member_addition_
+            // and_reorder_keep_owners_at_the_literal_edit_only` (both
+            // explicitly pin the narrow behavior for a pure member/re-export
+            // addition), while narrowing this precisely still keeps the
+            // barrel/declarer/consumer test above green.
             match (prior, next.as_ref()) {
-                (Some(prior), Some(next)) => !prior.is_subset(next),
+                (Some(prior), Some(next)) => {
+                    !prior.is_subset(next)
+                        || next.difference(prior).any(is_importable_surface_entry)
+                }
                 _ => true,
             }
         });
@@ -879,6 +931,22 @@ pub fn run_scoped(
     // means here). `build_index` itself still runs a full closure pass
     // over the cached summaries, using the SAME `resolver`/`available`/
     // `project_files` this generation's hybrid lane already built above.
+    // E-P0n (2026-09-08): widen `TypeflowCache`'s own reflow set to every
+    // path THIS scan already proved needs reprocessing (`affected_paths`,
+    // finalized above) -- `TypeflowCache::mark_reflow`'s own doc comment
+    // has the full root-cause writeup: `TypeflowCache` re-derives import-
+    // target resolution independently of `syntax`'s already-correct
+    // `direct_imports[].target_path`, and has no reverse index of its own
+    // for "an add/remove elsewhere in this batch shadowed/unshadowed one of
+    // MY specifiers via extension priority" the way `CandidateIndex`
+    // already does at the syntax layer. A no-op for the overwhelmingly
+    // common case (a path already `replace_file`/`add`/`remove`d this same
+    // batch, or one with no cached summary at all), bounded by the same
+    // `affected_paths` set the hybrid lane below already reprocesses in
+    // full -- no new complexity class.
+    for path in &affected_paths {
+        typeflow.mark_reflow(path);
+    }
     let typeflow_index_started = std::time::Instant::now();
     let typeflow_index = typeflow.build_index(&resolver, &available, project_files);
     let typeflow_index_elapsed = typeflow_index_started.elapsed();

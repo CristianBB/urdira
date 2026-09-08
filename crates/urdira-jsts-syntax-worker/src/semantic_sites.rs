@@ -565,6 +565,34 @@ pub fn reset_resolved_ambient_would_be_external_count() {
 /// to a `checker_pending` site.
 const REASON_UNRESOLVED_GLOBAL: &str = "unresolved_global";
 const REASON_IMPORT_BINDING: &str = "import_binding";
+/// E-P0n (2026-09-08) VS Code gate finding: TypeScript keeps a SEPARATE
+/// type-space and value-space per name -- an `import { Foo } from '...'`
+/// binding a plain `namespace Foo { ... }` (no companion `interface`/
+/// `class`/`type`/`enum` of the same name -- `first_declaration_merge_
+/// target`'s own rule #3 already resolves that MERGED shape to the value
+/// declaration, never a bare `Namespace` kind) has NO type-space meaning at
+/// all: `Foo` is a valid VALUE reference (`Foo.member(...)`), but referencing
+/// bare `Foo` in a TYPE position (`x: Foo<T>`, `let x: Foo`) is a compile
+/// error against a REAL tsc UNLESS a DIFFERENT, workspace-invisible
+/// declaration (typically a `lib.*.d.ts` global, e.g. `interface
+/// Iterable<T>`) supplies the type-space meaning instead -- this crate's own
+/// import-binding resolution conflates the two, confirming the VALUE-only
+/// namespace for a TYPE reference too. Root-caused live: 126 `v4_different_
+/// target` references-parity sites on the VS Code corpus, ALL a bare
+/// `Iterable<T>`/`Iterable<[K, V]>` type annotation in a file that ALSO
+/// imports `Iterable` (the VALUE namespace, `src/vs/base/common/
+/// iterator.ts`) for genuine value use elsewhere in the same file
+/// (`Iterable.map`/`.filter`/`.first`/...) -- previously invisible only
+/// because the `.js`-extension import itself silently failed to resolve at
+/// all (this task's own `js_to_ts_extension_substitutes` fix newly resolves
+/// it, correctly, for the VALUE uses). Fixed at `resolve_identifier_
+/// reference`'s own import-bound branch: a reference site whose immediate
+/// AST parent is a `TSTypeReference` naming this SAME identifier, resolving
+/// to a `DeclKind::Namespace` target, demotes to pending under this reason
+/// instead of confirming -- never a guess at the REAL (workspace-invisible)
+/// type-space declaration.
+const REASON_TYPE_REFERENCE_TARGETS_A_VALUE_ONLY_NAMESPACE: &str =
+    "type_reference_targets_a_value_only_namespace";
 const REASON_MULTIPLE_DECLARATIONS: &str = "multiple_declarations";
 const REASON_UNSUPPORTED_DECLARATION_KIND: &str = "unsupported_declaration_kind";
 const REASON_MEMBER_ACCESS: &str = "member_access";
@@ -2372,6 +2400,26 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         )
     }
 
+    /// E-P0n (2026-09-08): whether `ident` is literally the (non-qualified)
+    /// type NAME of its own immediate parent `TSTypeReference` (`Foo` in
+    /// `Foo<T>`/a bare `let x: Foo` -- `TSTypeName::IdentifierReference`,
+    /// never `TSTypeName::QualifiedName`'s own `Foo.Bar`, a different AST
+    /// shape this function does not match). See `REASON_TYPE_REFERENCE_
+    /// TARGETS_A_VALUE_ONLY_NAMESPACE`'s own doc comment for why this
+    /// distinction matters: a name resolving to a plain `namespace` import
+    /// binding is a valid VALUE reference but never a valid bare TYPE
+    /// reference on its own.
+    fn identifier_is_a_type_reference_name(&self, ident: &IdentifierReference<'a>) -> bool {
+        matches!(
+            self.nodes.parent_kind(ident.node_id.get()),
+            AstKind::TSTypeReference(reference)
+                if matches!(
+                    &reference.type_name,
+                    TSTypeName::IdentifierReference(inner) if inner.span == ident.span
+                )
+        )
+    }
+
     fn push_site(
         &mut self,
         site_kind: SiteKind,
@@ -2480,10 +2528,30 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             } else {
                 &self.import_bindings_ref
             };
-            return bindings
+            let resolution = bindings
                 .get(&symbol_id)
                 .cloned()
                 .unwrap_or(ReferenceResolution::Pending(REASON_IMPORT_BINDING));
+            // E-P0n: see `REASON_TYPE_REFERENCE_TARGETS_A_VALUE_ONLY_
+            // NAMESPACE`'s own doc comment -- a bare TYPE reference to an
+            // import bound to a plain `namespace` declaration is never
+            // valid TypeScript on its own (a namespace merged with a
+            // class/interface/enum of the same name never reaches here as
+            // `DeclKind::Namespace` -- `first_declaration_merge_target`'s
+            // own rule #3 already resolves that shape to the VALUE
+            // declaration instead), so confirming it would either be wrong
+            // (the real target is some OTHER, workspace-invisible type-
+            // space declaration, e.g. a `lib.*.d.ts` global) or, at best,
+            // an unprovable guess -- demote to pending instead.
+            if self.identifier_is_a_type_reference_name(ident)
+                && let ReferenceResolution::Resolved { target_id, .. } = &resolution
+                && target_id_kind_is_one_of(target_id, &[DeclKind::Namespace])
+            {
+                return ReferenceResolution::Pending(
+                    REASON_TYPE_REFERENCE_TARGETS_A_VALUE_ONLY_NAMESPACE,
+                );
+            }
+            return resolution;
         }
         if !self.scoping.symbol_redeclarations(symbol_id).is_empty() {
             return ReferenceResolution::Pending(REASON_MULTIPLE_DECLARATIONS);
@@ -3436,6 +3504,31 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// binding is simply absent from `local_types`, which `type_of_
     /// expression`'s `Identifier` arm already treats as "untyped", never a
     /// guess).
+    ///
+    /// E-P0n (2026-09-08) VS Code gate finding: the initializer fallback
+    /// used to run whenever the ANNOTATION failed to resolve to a
+    /// `TypeflowValue` (`.or_else`, regardless of whether an annotation was
+    /// even present) -- unsound whenever an explicit annotation EXISTS but
+    /// names something `type_ref_of_ts_type` does not resolve (chiefly: a
+    /// type-ALIAS name, e.g. `type HitTestResult = A | B` -- resolving an
+    /// alias's own right-hand side is explicitly out of this LOCAL,
+    /// owner-only walker's scope, see this function's own doc comment
+    /// above; `resolve_identifier_to_kind`'s `[Class, Interface]` allow-list
+    /// never matches a `DeclKind::Type` entity). The variable's STATIC type
+    /// for every read for the rest of its scope is whatever the ANNOTATION
+    /// declares, NEVER the initializer's own (possibly narrower, possibly
+    /// stale after a later reassignment) runtime type -- falling back to it
+    /// produced a real, live WRONG target: `let result: HitTestResult =
+    /// new UnknownHitTestResult(); /* ...later reassigned... */
+    /// result.type` confirmed to `UnknownHitTestResult`'s own declaration
+    /// (the initializer's concrete class, which also happens to be
+    /// `HitTestResult`'s FIRST union constituent) even after `result` was
+    /// reassigned to a `ContentHitTestResult` -- a `v4_different_target`
+    /// gate violation (`docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §11.4/§13.4/§14). Fixed: the initializer fallback now runs ONLY when
+    /// there is NO annotation at all (`annotation.is_none()`) -- an
+    /// annotation that fails to resolve leaves the binding untyped/pending,
+    /// never guessed from the initializer.
     fn record_local_type(
         &mut self,
         binding: &BindingPattern<'a>,
@@ -3445,10 +3538,12 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         if self.ctx.typeflow_index.is_none() {
             return;
         }
-        let tagged = self
-            .type_ref_of_annotation(annotation)
-            .map(|value| (value, "member_declared_type"))
-            .or_else(|| initializer.and_then(|init| self.type_of_expression(init)));
+        let tagged = if annotation.is_some() {
+            self.type_ref_of_annotation(annotation)
+                .map(|value| (value, "member_declared_type"))
+        } else {
+            initializer.and_then(|init| self.type_of_expression(init))
+        };
         match binding {
             BindingPattern::BindingIdentifier(ident) => {
                 if let (Some(symbol_id), Some(tagged)) = (ident.symbol_id.get(), tagged) {
@@ -9935,6 +10030,61 @@ mod tests {
         assert!(resolved(&semantics).is_empty());
     }
 
+    /// E-P0n (2026-09-08) VS Code gate finding: a bare TYPE reference to a
+    /// name imported as a plain `namespace` (no companion class/interface/
+    /// type/enum of the same name) must stay pending -- a namespace alone
+    /// has no type-space meaning in real TypeScript, so confirming it would
+    /// either be wrong (the real type-space declaration is some OTHER,
+    /// workspace-invisible one, e.g. a `lib.*.d.ts` global -- the EXACT
+    /// live shape: `import { Iterable } from './iterator.js'` used both as
+    /// `Iterable.first(x)` (a valid VALUE reference) and `let x: Iterable<T>`
+    /// (a TYPE reference that real `tsc` resolves to `lib.es2015.iterable.
+    /// d.ts`'s own global `interface Iterable<T>`, never the imported
+    /// namespace) -- or an unprovable guess. The VALUE reference to the SAME
+    /// import must still resolve normally (this fix is TYPE-position-only,
+    /// never a blanket "namespace imports never resolve" regression).
+    #[test]
+    fn bare_type_reference_to_a_namespace_import_stays_pending_but_its_value_use_resolves() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "iterator.ts".to_owned(),
+            target_file(
+                "iterator.ts",
+                vec![target_entity(
+                    crate::EntityKind::Namespace,
+                    "iterator.ts",
+                    8,
+                    "Iterable",
+                )],
+                vec![export_binding("Iterable", "Iterable")],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import { Iterable } from \"./iterator\";\nfunction first(x: Iterable<number>): number | undefined {\n  return Iterable.first(x);\n}\n";
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let resolved_targets = resolved(&semantics);
+        // The VALUE use (`Iterable.first`, a `StaticMemberExpression` whose
+        // object is `Iterable`) still resolves to the namespace import.
+        assert!(
+            resolved_targets
+                .iter()
+                .any(|(_, _, _, target)| target.contains("jsts:namespace:iterator.ts:8:Iterable")),
+            "the VALUE reference to the namespace import must still resolve: {resolved_targets:?}"
+        );
+        // The TYPE use (`Iterable<number>`) must stay pending under the new
+        // reason, never confirm to the namespace.
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.reason.as_deref()
+                    == Some(REASON_TYPE_REFERENCE_TARGETS_A_VALUE_ONLY_NAMESPACE)),
+            "the TYPE reference to a plain namespace import must stay pending: {:?}",
+            semantics.pending_sites
+        );
+    }
+
     /// 3a (2026-09-05): a PLAIN reference (never called) to an overloaded
     /// import resolves to the FIRST declaration in source order -- v3's own
     /// checker behavior, 11/11 sampled clusters (see `resolver::resolve_
@@ -10404,6 +10554,52 @@ mod tests {
             ambient_index: Box::leak(Box::new(resolver::AmbientModuleIndex::default())),
         };
         (ctx, index)
+    }
+
+    /// E-P0n (2026-09-08) VS Code gate finding, live-reproduced exactly:
+    /// `mouseTarget.ts`'s own `let result: HitTestResult = new
+    /// UnknownHitTestResult(); ... result = new ContentHitTestResult(); ...
+    /// result.type` -- a LOCAL VARIABLE declared with an explicit
+    /// TYPE-ALIAS-TO-A-UNION annotation (`type HitTestResult = A | B`,
+    /// unresolvable by this walker's own owner-local `type_ref_of_ts_type`,
+    /// see `record_local_type`'s own doc comment), reassigned to a
+    /// DIFFERENT union constituent after its initial value. Before this
+    /// fix, the annotation's own resolution failure fell back to the
+    /// INITIALIZER's concrete type (`UnknownHitTestResult`, coincidentally
+    /// also `HitTestResult`'s FIRST union constituent), wrongly confirming
+    /// `result.type` to `UnknownHitTestResult`'s own `type` property even
+    /// though `result` was reassigned to `ContentHitTestResult` before the
+    /// read -- a `v4_different_target` gate violation. Must now stay
+    /// pending: never `UnknownHitTestResult`'s property, and never a guess
+    /// at `ContentHitTestResult`'s either (this crate does not track
+    /// per-assignment narrowing across reassignment, only the DECLARED
+    /// type, which itself did not resolve here).
+    #[test]
+    fn local_variable_annotated_with_an_unresolvable_type_alias_never_falls_back_to_the_initializers_type()
+     {
+        let source = "\
+class UnknownHitTestResult {\n  type = 1;\n}\n\
+class ContentHitTestResult {\n  type = 2;\n}\n\
+type HitTestResult = UnknownHitTestResult | ContentHitTestResult;\n\
+function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestResult();\n  result = new ContentHitTestResult();\n  return result.type;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let resolved_targets = resolved(&semantics);
+        // `new UnknownHitTestResult()`/`new ContentHitTestResult()` are
+        // legitimate, unrelated CLASS-NAME references (the constructor
+        // call's own callee) -- only a `property:`-kind target naming
+        // either class's own `type` FIELD would mean this fix's own gap
+        // reopened.
+        assert!(
+            resolved_targets.iter().all(|(_, _, _, target)| {
+                !(target.contains(":property:") && target.contains("HitTestResult"))
+            }),
+            "result.type must never confirm to either union constituent's own `type` property \
+             (the variable's declared union type never resolved, so its member access must \
+             stay pending, never guessed from a stale initializer or a later reassignment): \
+             {resolved_targets:?}"
+        );
     }
 
     // -- D.4 (2026-09-05, references-parity task): call_chain hop diagnosis

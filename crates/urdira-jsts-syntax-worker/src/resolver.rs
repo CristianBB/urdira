@@ -71,32 +71,60 @@ const RESOLUTION_EXTENSIONS: [&str; 11] = [
 
 const MAX_EXTENDS_DEPTH: u8 = 10;
 
-// E-P0m (2026-09-08): a general `.js`/`.jsx`/`.mjs`/`.cjs` -> `.ts`/`.tsx`/
-// `.mts`/`.cts` relative-specifier extension-substitution mechanism was
-// attempted here (`js_to_ts_extension_substitutes`, threaded into
-// `push_candidate_variants` right after the literal-candidate check) --
-// found live closing pattern G's `_fetch`/`githubTransport.ts` two-hop
-// alias residual (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §12.2)
-// and, measured against the real VS Code corpus, recovering the single
-// largest `v4_missing` contributor (`import_binding/unresolved_specifier`,
-// 668,534 sites, 99.7% of it) -- but REVERTED: it also newly resolves
-// thousands of relative imports that were PREVIOUSLY unresolved-by-
-// construction across the whole test suite, and `cargo test`'s own
-// `reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree`/
-// `reconcile_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree`/
-// `brand_new_declarer_and_consumer_linked_through_a_same_batch_edited_
-// barrel_matches_an_independent_oracle` (the last one an INDEPENDENT-ORACLE
-// self-consistency check, not merely a stale hardcoded value) all failed
-// with it enabled -- the last one specifically means the INCREMENTAL/
-// mixed-batch reconcile path and a fresh full scan of the IDENTICAL final
-// tree state disagree once this class of import edge is newly reachable, a
-// genuine (if previously invisible, since the edge never resolved before)
-// incremental-consistency gap this session did not have the remaining risk
-// budget to root-cause and fix safely. `_fetch`/`_createMessageRequestHandler`/
-// `_elicitationRequestHandler` are instead closed by §13's OWN, narrower
-// fix (`member_annotation_is_unresolved`, semantic_sites.rs/lib.rs) which
-// needs no import-resolution change at all. Recommended as the next
-// owner-queue item under this same P0's own tracking id -- see §13.
+// E-P0n (2026-09-08): the general `.js`/`.jsx`/`.mjs`/`.cjs` ->
+// `.ts`/`.tsx`/`.mts`/`.cts`/`.d.ts` relative-specifier extension-
+// substitution mechanism E-P0m attempted and reverted (see that task's own
+// note in `docs/evidence/2026-09-07-v4-vscode-campaign.md` §13.1) ships
+// here as `js_to_ts_extension_substitutes`, threaded into
+// `push_candidate_variants` right after the literal-candidate is pushed
+// (TS's own `moduleResolution: "bundler"/"nodenext"` order: a relative
+// specifier written `./x.js` resolves against a co-located `./x.ts` when
+// one exists, falling back to the literal `./x.js` build artifact
+// otherwise). `push_candidate_variants` is shared, unchanged, by BOTH
+// actual resolution (`probe_extensions`) and P3-6 item 2's reverse
+// candidate-path index (`WorkspaceResolver::candidate_paths`,
+// `CandidateIndex` in `lib.rs`) -- so the create/delete/rename `stale_
+// paths` sweep already re-widens to every importer of a base whose `.ts`/
+// `.js`/... sibling is created or removed, with NO separate change needed
+// there.
+//
+// E-P0m's revert reason was two `cargo test` failures with STALE fixture
+// expectations (calibrated against the bug: an import the fix newly
+// resolves was previously silently unresolved, so a delete/rename never
+// cascaded to it -- both fixtures' expectations are updated alongside this
+// fix, `tests_e2e.rs`'s `reconcile_delete_roots_match_a_from_scratch_scan_
+// of_the_mutated_tree`/`reconcile_rename_roots_match_a_from_scratch_scan_
+// of_the_mutated_tree`) plus one genuine incremental-consistency gap
+// (`brand_new_declarer_and_consumer_linked_through_a_same_batch_edited_
+// barrel_matches_an_independent_oracle`, `urdira-indexing-worker/src/v4/
+// tests_e2e.rs`) -- LIVE-DIAGNOSED this session (temporary `eprintln!`
+// tracing under `URDIRA_DEBUG_TIMING`, since removed): the reverse-import
+// graph (`ImportReverseIndex`) and typeflow's own `pending_importers_of`
+// BOTH already widen correctly to the brand-new consumer once the barrel
+// (edited in a LATER, separate mixed-batch generation to re-export the
+// brand-new declarer) is reflowed -- typeflow's own `import_targets` entry
+// for the consumer's `NewThing` binding resolves correctly. The actual gap
+// is one layer up, in `urdira-indexing-worker/src/v4/analyze.rs`'s own
+// P3-3 item 2 affected-closure NARROWING: it treated a barrel's PURE
+// ADDITION (a new export appearing, nothing existing removed/renamed) as
+// "surface unchanged", narrowing `affected_paths` back down to just the
+// barrel itself and dropping the consumer from the hybrid lane's own
+// `jsts:call`/`jsts:references` re-materialization pass entirely --
+// documented as an accepted residual when P3-3 shipped ("an importer with
+// a PENDING import naming exactly the newly-added export... stays
+// unresolved one generation longer"), reproducing live now that this
+// task's extension fix makes that exact shape (a brand-new consumer
+// through a `.js`-specifier barrel edited later) common instead of rare.
+// Fixed there: `analyze.rs`'s own surface-changed check now counts ANY
+// change to the exported-surface SET (additions included, not just
+// removals/renames) as "changed" -- narrowing applies only when a
+// candidate's surface is BYTE-IDENTICAL before/after, still the common
+// case (a body-only edit, a comment/whitespace change) the optimization
+// exists for.
+//
+// `_fetch`/`_createMessageRequestHandler`/`_elicitationRequestHandler` are
+// ALSO closed by §13's own narrower fix (`member_annotation_is_unresolved`,
+// `semantic_sites.rs`/`lib.rs`), independent of this mechanism.
 
 // H (E-P0l, 2026-09-08): a declaration/implementation sibling-preference
 // mechanism was attempted here (and in `semantic_sites.rs`'s `resolve_
@@ -115,12 +143,79 @@ const MAX_EXTENDS_DEPTH: u8 = 10;
 /// candidate_paths`, `lib.rs`'s `build_candidate_index`), which needs the
 /// same list WITHOUT stopping at the first `available` hit.
 fn push_candidate_variants(base: &str, out: &mut Vec<String>) {
+    // E-P0n: `base` may already carry a literal JS-family extension (an
+    // extension-less base is joined from a specifier that has NO extension
+    // at all, e.g. `./x`; this branch only ever fires when the specifier
+    // itself wrote one, e.g. `./x.js`). Probe the TS SOURCE counterpart(s)
+    // FIRST -- TS's own `moduleResolution: "bundler"/"nodenext"` behavior:
+    // a co-located `.ts`/`.tsx` source always shadows a `.js` build artifact
+    // when both exist; the literal `.js` path (pushed right after,
+    // unconditionally) still resolves it when no TS source exists.
+    // Deliberately NEVER a `.d.ts`/`.d.mts`/`.d.cts` substitute here -- see
+    // `js_to_ts_extension_substitutes`'s own doc comment for the live VS
+    // Code finding that ruled that out.
+    for extension in JS_FAMILY_EXTENSIONS {
+        if let Some(stem) = base.strip_suffix(extension) {
+            for substitute in js_to_ts_extension_substitutes(extension) {
+                out.push(format!("{stem}{substitute}"));
+            }
+            break;
+        }
+    }
     out.push(base.to_owned());
     for extension in RESOLUTION_EXTENSIONS {
         out.push(format!("{base}{extension}"));
     }
     for extension in RESOLUTION_EXTENSIONS {
         out.push(format!("{base}/index{extension}"));
+    }
+}
+
+/// Every literal extension `push_candidate_variants` treats as a JS-family
+/// build-artifact extension eligible for TS-source substitution, longest
+/// (most specific) first so a `.mjs`/`.cjs` specifier is never mis-stripped
+/// as if it ended in the shorter `.js` (it doesn't -- `.mjs`/`.cjs` do not
+/// end in the 3-byte literal `.js` -- but ordering defensively costs
+/// nothing and keeps this list's own intent obvious).
+const JS_FAMILY_EXTENSIONS: [&str; 4] = [".mjs", ".cjs", ".jsx", ".js"];
+
+/// TS SOURCE counterpart(s) (never a `.d.ts`/`.d.mts`/`.d.cts` declaration
+/// file) a literal JS-family specifier extension resolves against BEFORE
+/// its own literal build-artifact path, in TS's own `moduleResolution:
+/// "bundler"/"nodenext"` order: the same-family source extension first,
+/// then the other source extension for that family.
+///
+/// E-P0n (2026-09-08) VS Code gate finding: an EARLIER version of this list
+/// also included each family's own declaration-file extension (`.d.ts`/
+/// `.d.mts`/`.d.cts`), on the theory that a package shipping only compiled
+/// `.js` + hand-written `.d.ts` (no `.ts` source at all) should still
+/// resolve through its types -- but live-measured against the VS Code
+/// corpus, this produced 64 WRONG targets (`different == 0`'s own gate),
+/// all sharing the exact shape E-P0l's own Pattern H investigation already
+/// flagged and reverted (`docs/evidence/2026-09-07-v4-vscode-campaign.md`
+/// §12.3, "`foo.d.ts` + `foo.js` pair"): `build/codex/generate-protocol.
+/// mjs` + a HAND-MAINTAINED (not tsc-generated) `generate-protocol.d.mts`
+/// describing its exports, `src/vs/base/common/semver/semver.js` + its own
+/// hand-maintained `semver.d.ts`, both real pairs in this corpus. v3's own
+/// oracle resolves BOTH to the literal `.js`/`.mjs` file, never the `.d.ts`/
+/// `.d.mts` sibling -- this class of build-tooling script (`allowJs`+a
+/// hand-authored companion declaration, not compiled TS source) resolves
+/// under a DIFFERENT convention than the node16/nodenext/bundler monorepo
+/// packages this task's own `.js`->`.ts` mapping targets, and this crate
+/// has no per-specifier way to tell the two conventions apart -- dropping
+/// declaration-file substitution entirely is the safe choice: a REAL `.ts`/
+/// `.mts`/`.cts` source sibling (this task's own target population, by far
+/// the dominant case: VS Code references `same` 1,749,287 -> 2,491,836)
+/// still resolves correctly, and the literal `.js`/`.mjs`/`.cjs` path
+/// (pushed unconditionally right after) still resolves the declaration-only
+/// pair's own case exactly like v3's oracle does.
+fn js_to_ts_extension_substitutes(extension: &str) -> &'static [&'static str] {
+    match extension {
+        ".js" => &[".ts", ".tsx"],
+        ".jsx" => &[".tsx", ".ts"],
+        ".mjs" => &[".mts"],
+        ".cjs" => &[".cts"],
+        _ => &[],
     }
 }
 

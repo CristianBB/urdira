@@ -6224,7 +6224,26 @@ mod tests {
         // the evidence doc's own §13) -- not a regression to chase down.
         // The +-4 tolerance itself is unchanged (still the pre-existing,
         // unexplained +-2 drift's own bound); only the live target moved.
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_752;
+        //
+        // Refreshed AGAIN 2026-09-08 (E-P0n, `docs/evidence/2026-09-07-v4-
+        // vscode-campaign.md` §14): `resolver.rs`'s `js_to_ts_extension_
+        // substitutes` (a relative specifier written `./x.js` now resolves
+        // against a co-located `./x.ts` before falling back to the literal
+        // `.js`, TS's own `moduleResolution: "bundler"/"nodenext"` order --
+        // E-P0m's own attempt at this, reverted for an incremental-
+        // consistency gap this task root-caused and fixed, see `resolver.
+        // rs`'s own E-P0n doc comment) resolves thousands of previously
+        // silently-unresolved relative `.js` imports across the n8n corpus,
+        // newly reaching real call targets through them -- `confirmed_
+        // combined` rises by 160 (161,752 -> **161,912**, re-verified
+        // identically by both `n8n_residual_pass_debug_histogram` and this
+        // schedule-resume harness on the same build/corpus). This is the
+        // INTENDED, coverage-improving direction (more sites correctly
+        // resolved, not a new wrong target -- `different == 0` holds in
+        // both VS Code and n8n parity for this same build, see the evidence
+        // doc's own §14) -- not a regression to chase down. The +-4
+        // tolerance itself is unchanged; only the live target moved.
+        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_912;
         const CONFIRMED_COMBINED_TOLERANCE: u64 = 4;
         let confirmed_combined_diff =
             final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);

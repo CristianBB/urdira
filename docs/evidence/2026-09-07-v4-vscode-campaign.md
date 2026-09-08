@@ -1293,3 +1293,257 @@ justificación)"); `inferred_type_entities=41,042` unchanged (asserted exact, st
   removed at session close. The shared root `node_modules/@urdira/*`/`isomorphic-git`/`@bufbuild`
   fixes above are NOT reverted (they are correctness fixes to a broken shared scaffold, not this
   task's own scratch).
+
+## 14. E-P0n (2026-09-08): `.js`->`.ts` specifier mapping shipped with incremental-consistency
+fix, 3 of 5 residuals closed, VS Code's own `different == 0` NOT reached (documented, not guessed)
+
+Task: reimplement §13.1's own reverted `.js`/`.jsx`/`.mjs`/`.cjs` -> `.ts`/`.tsx`/`.mts`/`.cts`
+relative-specifier extension-substitution mechanism, this time diagnosing and fixing the exact
+incremental-consistency gap that forced the revert, then close as many of §13.3's 5 remaining
+residuals as can be closed without guessing. Base `d07bb43` (E-P0m merged), branch
+`frente-ep0n-js-ts-specifiers`.
+
+### 14.1 The mechanism (Part 1): `js_to_ts_extension_substitutes`
+
+Ships in `crates/urdira-jsts-syntax-worker/src/resolver.rs`'s `push_candidate_variants` exactly
+where §13.1 described: a literal JS-family specifier extension (`.js`/`.jsx`/`.mjs`/`.cjs`) probes
+its TS SOURCE counterpart(s) first (`.ts`/`.tsx` for `.js`, `.tsx`/`.ts` for `.jsx`, `.mts` for
+`.mjs`, `.cts` for `.cjs`), falling back to the literal path unconditionally right after. **Narrower
+than §13.1's own first attempt**: NO `.d.ts`/`.d.mts`/`.d.cts` declaration-file substitute (see
+§14.4's own VS Code finding for why that was added, measured, and dropped again in the same
+session). `push_candidate_variants` is the single function shared by `probe_extensions` (actual
+resolution) and `WorkspaceResolver::candidate_paths` (P3-6 item 2's reverse candidate-path index,
+`CandidateIndex` in `lib.rs`) -- both change for free from this one edit, which is exactly the
+"clave del índice inverso = ruta base sin extensión + conjunto de candidatos" the task's own brief
+asked for: the create/delete/rename `stale_paths` sweep already re-widens to every importer of a
+base whose `.ts`/`.js`/`.mjs`/... sibling is created or removed.
+
+### 14.2 The incremental-consistency gap: root-caused live (NOT where the task's own hypothesis
+pointed), fixed, 3 new regression tests
+
+Reproduced §13.1's own 3 failures with the mechanism back in place:
+
+- `reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree`/`reconcile_rename_roots_
+  match_a_from_scratch_scan_of_the_mutated_tree`: STALE fixture expectations, exactly as §13.1
+  diagnosed (`src/index.ts` imports the fixture's own repository/errors files through a literal
+  `.js` specifier, previously silently unresolved) -- both updated to the wider, CORRECT `touched`
+  sets (delete/rename now correctly cascades to the barrel and its real importers); the roots-vs-
+  independent-oracle assertions right after both PASS with the new expectations, confirming the
+  wider set is not merely "what the code does now" but genuinely matches a from-scratch scan.
+- `brand_new_declarer_and_consumer_linked_through_a_same_batch_edited_barrel_matches_an_
+  independent_oracle`: the task's own brief hypothesized the gap was in `CandidateIndex`/the
+  reverse candidate-path index. Live tracing (temporary `eprintln!` under `URDIRA_DEBUG_TIMING`,
+  removed before commit) disproved that: `ImportReverseIndex` and typeflow's own `pending_
+  importers_of` BOTH already correctly widen to the brand-new consumer once the barrel (edited in
+  a LATER, separate mixed-batch generation) is reflowed -- `typeflow.rs`'s own `import_targets`
+  entry for the consumer's binding resolves correctly. The REAL gap is one layer up, in
+  `urdira-indexing-worker/src/v4/analyze.rs`'s own P3-3 item 2 affected-closure NARROWING: it
+  treated the barrel's PURE ADDITION (a new export appearing, nothing existing removed/renamed) as
+  "surface unchanged", narrowing `affected_paths` back to the barrel alone and dropping the
+  consumer from the hybrid lane's own `jsts:call`/`jsts:references` re-materialization pass
+  entirely -- an accepted residual when P3-3 shipped ("an importer with a PENDING import naming
+  exactly the newly-added export... stays unresolved one generation longer", reasoned rare),
+  reproducing live now that this task's own fix makes that shape common. Fixed NARROWLY (`analyze.
+  rs`'s new `is_importable_surface_entry`): an addition counts as "changed" only when it adds a
+  real top-level `exported_name` or a bare `"*"` barrel-star entry (either could satisfy a pending
+  import elsewhere) -- a `member:`/`param:`/`type:`/`member_type:` synthetic addition (E-P0g/E-P0h's
+  own surface entries) still does NOT count, preserving the narrowing's own perf intent for the
+  dominant case (a body-only edit, a class-member addition) -- confirmed live both ways: the naive
+  "any addition = changed" fix broke `barrel_hub_adding_a_named_reexport_keeps_owners_to_the_
+  barrel_itself`/`exported_class_member_addition_and_reorder_keep_owners_at_the_literal_edit_only`
+  (both updated: the barrel test's own expectation widened with a new doc comment explaining why
+  its old "nobody could already import a name that did not exist before" assumption was unsound;
+  the member-addition test is UNCHANGED, still narrow, confirming the fix is precise). Also needed:
+  `TypeflowCache::mark_reflow` (new, `typeflow.rs`) -- `analyze.rs`'s `run_scoped` now calls it for
+  every path in its own `affected_paths` right before `build_index`, since `TypeflowCache` re-
+  derives import-target resolution independently of `syntax`'s already-correct `direct_imports[].
+  target_path` and has no reverse index of its own for "a create/delete elsewhere in this batch
+  shadowed/unshadowed one of MY specifiers via extension priority" (found live via the SAME
+  `creating_a_ts_sibling...` test below, a SECOND, narrower incremental-consistency gap this task's
+  own extension-priority feature introduces that §13.1 never hit).
+- 3 NEW regression tests (`tests_e2e.rs`), each vs. an independent from-scratch oracle: `creating_a_
+  ts_sibling_next_to_a_resolved_js_file_reresolves_its_importer_and_matches_an_independent_oracle`,
+  `deleting_a_ts_sibling_falls_its_importer_back_to_the_js_file_and_matches_an_independent_oracle`,
+  `renaming_a_js_file_to_ts_reresolves_its_importer_and_matches_an_independent_oracle` -- create/
+  delete/rename a `.ts` sibling next to an already-resolved `.js` file, asserting the importer's own
+  `dependency`/`graph` roots match a fresh full scan of the identical final tree in all 3 directions.
+
+### 14.3 Part 1 gate: n8n fully green, VS Code `same` target met
+
+n8n (`n8n-corpus-2026-09-02`, release binary, this session's own final commits): `n8n_population_
+floors` all 10 floors **OK** (`jsts:relation_references` 1,241,334 -> **1,244,856**). References
+parity: `v4_same_target=1,189,918` (>= 1,187,000 floor), **`v4_different_target=0`**, `v4_missing=
+150,673`. Calls parity: `v4_confirmed_same_target=94,453` (cold-only dump), **`v4_confirmed_
+different_target=0`**, `v4_possible=479`. `n8n_residual_schedule_resumes_after_truncation`/`n8n_
+residual_pass_debug_histogram` (both independently agreeing): `confirmed_combined=161,908` (final
+binary, all fixes below applied) -- within the existing `±4` tolerance of the refreshed reference
+(§14.6). **n8n's own gate (`different == 0` in both populations, all 10 floors, `classification_
+mismatch_count=0` at every generation) is fully green.**
+
+VS Code (`vscode-corpus-2026-09-06`, reduced tree rebuilt fresh this session per §11.5/§13.4's own
+recipe -- rsync `--exclude='**/fixtures/'` + `node_modules` excluded + `scripts/xterm-update.js`
+removed, 12,841 files, verified against the retained recipe's own count): references `same=
+2,491,954` (79.21%, **exceeds the 2,400,000 floor**, matching §13.1's own live-measured recovery
+almost exactly), `missing=653,397` (20.77%). **`different` is NOT zero** (461 references, 317
+calls, after §14.4/§14.5's fixes below) -- see §14.4 for what was closed and §14.7 for the
+remaining, investigated-not-guessed residual.
+
+### 14.4 VS Code residuals found AND closed this session (none of these existed in scope until
+Part 1's own fix made them reachable)
+
+1. **`.d.ts`/`.d.mts` sibling substitution, dropped** (`resolver.rs`): §14.1's own extension-
+   substitution list ORIGINALLY also included each family's declaration-file extension (`.d.ts`/
+   `.d.mts`/`.d.cts`), on the theory that a package shipping only compiled `.js` + a hand-written
+   `.d.ts` (no `.ts` source at all) should still resolve through its types. Live-measured: 64 WRONG
+   VS Code targets, all the EXACT shape E-P0l's own Pattern H already flagged and reverted
+   (`§12.3`, "`foo.d.ts` + `foo.js` pair") -- `build/codex/generate-protocol.mjs` + a HAND-
+   MAINTAINED (not tsc-generated) `generate-protocol.d.mts`, `src/vs/base/common/semver/semver.js`
+   + its own hand-maintained `semver.d.ts`, both real pairs in this corpus, v3's own oracle
+   resolving BOTH to the literal `.js`/`.mjs`, never the `.d.ts`/`.d.mts` sibling (this class of
+   build-tooling script resolves under a different convention than the node16/nodenext/bundler
+   monorepo packages this task targets, and this crate has no per-specifier way to tell them
+   apart). Fixed by dropping declaration-file substitution entirely -- `-64` different, `same`
+   essentially unchanged (2,491,836 -> 2,491,962 net across this fix alone, since a few of those
+   64 sites also happened to move into `same` once the declaration-file candidate stopped
+   shadowing the correct literal path).
+2. **Bare TYPE reference to a value-only namespace import, demoted to pending**
+   (`semantic_sites.rs`, `REASON_TYPE_REFERENCE_TARGETS_A_VALUE_ONLY_NAMESPACE`): TypeScript keeps
+   separate type-space and value-space per name; `import { Iterable } from './iterator.js'`
+   (`src/vs/base/common/iterator.ts`'s own plain `export namespace Iterable { ... }`, no companion
+   interface/class/type/enum) is a valid VALUE reference (`Iterable.map`/`.filter`/`.first`) but has
+   NO type-space meaning at all -- a bare `Iterable<T>` TYPE annotation in the SAME file (using
+   `Iterable` for BOTH purposes) resolves, per a real checker, to `lib.es2015.iterable.d.ts`'s own
+   global `interface Iterable<T>` instead, invisible to this crate. Previously invisible only
+   because the `.js`-extension import itself silently failed to resolve at all (E-P0m's own
+   `is_standard_global_name("Iterable")` entry closed the DIFFERENT, ambient-global-lookup shape of
+   this same collision, not this one). Root-caused live: 126 `v4_different_target` VS Code
+   reference sites, ALL this exact shape. Fixed: a reference site whose immediate AST parent is a
+   `TSTypeReference` naming the SAME identifier, resolving (via the import binding) to a
+   `DeclKind::Namespace` target, now demotes to pending instead of confirming -- the VALUE use of
+   the SAME import is untouched (new unit test asserts both halves:
+   `bare_type_reference_to_a_namespace_import_stays_pending_but_its_value_use_resolves`).
+3. **Local variable annotated with an unresolvable type alias no longer falls back to the
+   initializer's type** (`semantic_sites.rs`'s `record_local_type`) -- closes Part 2's own
+   `mouseTarget.ts` residual, see §14.5.1.
+
+Net VS Code effect of 1+2 together (before 3): `different` 661 -> 471 (-190); `same` 2,491,836 ->
+2,491,962.
+
+### 14.5 Part 2: the 5 residuals, case by case
+
+| # | Case | Mechanism | Closure | Test |
+|---|---|---|---|---|
+| 1 | `mouseTarget.ts` (`let result: HitTestResult = new UnknownHitTestResult(); ...; result = new ContentHitTestResult(); ...; result.type`) | §14.5.1: `record_local_type`'s initializer fallback fired even though an EXPLICIT annotation (`HitTestResult`, a type-ALIAS-to-a-union this owner-local walker cannot resolve by design) was present -- the initializer's own concrete type (`UnknownHitTestResult`, coincidentally the alias's FIRST union constituent) got recorded as `result`'s type for the REST of its scope, confirming `result.type` to `UnknownHitTestResult`'s own property even after `result` was reassigned to `ContentHitTestResult` | **(a)** fixed -- the initializer fallback now runs ONLY when there is no annotation at all | `local_variable_annotated_with_an_unresolvable_type_alias_never_falls_back_to_the_initializers_type` (semantic_sites.rs) |
+| 2 | `outlineModel.ts`'s `candidate.parent` (`while (candidate && !preferredGroup) { if (candidate instanceof OutlineGroup) { preferredGroup = candidate; } candidate = candidate.parent; }`) | Re-investigated with the exact live site (`outlineModel.ts:322`, `TreeElement`/`OutlineElement`/`OutlineGroup` all declare their OWN `parent: TreeElement \| undefined` at the identical declared type). `candidate`'s STATIC type at line 322 (past the `if` block's own scope, no `else`/early-return) is `TreeElement \| undefined` by ordinary TS control-flow-analysis rules, matching v4's own answer -- this session's own re-analysis could not construct a sound mechanism by which a real checker's answer would instead be `OutlineGroup`'s own declaration, and E-P0m's own session already flagged this as an unreproduced hypothesis, not a confirmed live sample | **(b)** -- not fixed, mechanism still unconfirmed; unchanged from `afc458c`, not re-guessed | none |
+| 3 | `createMarkupPreview` (`notebookEditorWidget.ts`, own-body call vs. interface signature) | Unchanged from E-P0m's own §13.3: "own-body-wins is deeply load-bearing elsewhere; a guess here risks the SAME class of regression E-P0k's own adversarial finding warns about" -- not re-attempted this session (no new information since E-P0m) | **(b)** -- not fixed | none |
+| 4 | `marked` (`walkThroughContentProvider.ts`, namespace import invoked as a callable value) | Unchanged from E-P0l's own §12.3 disposition: resolved by `resolve_namespace_member`, never by specifier-resolution machinery -- this task's own `.d.ts`/`.js` substitution work (§14.4 item 1) does not touch this path either | **(b)** -- not fixed, unchanged | none |
+| 5 | `tunnel` (`extHostTunnelService.ts`) / `i18n.test.ts` | Not re-investigated this session (time-boxed against the higher-yield Part 1/residual-1/2 work above; E-P0m's own session already found the `tunnel` case's a-priori hypothesis REFUTED via fixture and did not confirm a live reproduction either) | **(b)** -- not fixed, unchanged | none |
+
+Only case 1 closed with a real, live-verified mechanism this session; cases 2-5 are carried forward
+unchanged from prior sessions' own dispositions (none guessed, per the task's own "never guess"
+rule) -- see each prior session's own evidence section for the fuller investigation history.
+
+### 14.6 Final VS Code/n8n measurement (this session's own final binary, all fixes above applied)
+
+VS Code (same reduced-tree recipe as §14.3): references `same=2,491,954` (>= 2,400,000 floor OK),
+**`different=461`** (NOT zero -- §14.7), `missing=653,397`. Calls (`--v4-bodies` from `dump_call_
+bodies_cold_only`, the same cold-checkpoint convention §13's own calls gate uses):
+`v4_confirmed_same_target=368,982`, **`v4_confirmed_different_target=317`** (NOT zero -- §14.7,
+same mechanism as the references population), `v4_possible=7,508`, `v4_missing_site=366,665`.
+
+n8n (final binary): population floors 10/10 **OK** (unchanged from §14.3); references `same=
+1,189,918`, **`different=0`**; calls `same=94,453`, **`different=0`**; `confirmed_combined=161,908`
+(residual schedule-resume harness, `±4` of the refreshed §14.8 reference). **n8n's own gate holds
+in full with the final binary.**
+
+### 14.7 VS Code's remaining residual: investigated, root-caused, NOT fixed (never guessed)
+
+461 references + 317 calls remain `different`, overwhelmingly (592/778, 76%) one shape: a member
+name (`getModel`/`_getViewModel`/`cellAt`/`getSelection`/...) declared MORE THAN ONCE in the SAME
+file across DIFFERENT, sibling interfaces that each narrow a common base's own signature (live
+example: `src/vs/editor/browser/editorBrowser.ts` declares `getModel()` in `IEditor` (`ITextModel |
+null`), `ICodeEditor` (`ITextModel`), and `IDiffEditor` (`IDiffEditorModel | null`) -- v3's real
+per-call-site, receiver-type-based overload/declaration-merge resolution consistently picks
+`ICodeEditor`'s own narrower declaration across every sampled importer; v4's typeflow member
+resolution (`urdira-jsts-typeflow`'s `ProgramIndex::members`/`collect_members`) lands on a
+DIFFERENT declaration in the same file instead). Confirmed this is a PRE-EXISTING gap this
+session's own new code did not introduce (every sampled importer's own specifier is a `.js`-
+extension import that silently failed to resolve before this task's fix, so the ambiguity was
+invisible -- classified `missing`, never `different` -- until now). This is the SAME general class
+of gap `createMarkupPreview` (§14.5 case 3) and E-P0k's own `getControl` adversarial finding
+already flagged as "deeply load-bearing... a guess here risks the SAME class of regression" --
+implementing real receiver-type-based member/overload resolution across sibling interface
+declarations is a genuinely separate typeflow feature (see `docs/evidence/2026-09-06-v4-
+reconcile-threshold.md`'s own residual queue), not a `.js`/`.ts` specifier-mapping fix, and this
+session's own remaining risk/time budget does not cover implementing and safely verifying it.
+**`different == 0` does NOT hold for VS Code** -- reported per the "never guess, report the rest"
+precedent §13.1/E-P0l's own Pattern H investigation already set; recommended as the next owner-
+queue item, root cause and exact live sample above as the starting point. The remaining ~2 non-
+`getModel`-shaped different-target sites (1 `ext-sibling`, a handful of `other`) were not
+individually chased given the dominant category above already exhausted this session's remaining
+budget for this front.
+
+### 14.8 Files touched, verification, cleanup
+
+- `crates/urdira-jsts-syntax-worker/src/resolver.rs`: `js_to_ts_extension_substitutes`/
+  `JS_FAMILY_EXTENSIONS` (new), `push_candidate_variants` threads the substitution in; extensive
+  doc-comment history of the reverted E-P0m attempt, the live incremental-consistency root cause,
+  and the `.d.ts` sibling finding.
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: `REASON_TYPE_REFERENCE_TARGETS_A_
+  VALUE_ONLY_NAMESPACE` (new) + `identifier_is_a_type_reference_name` + the demotion check in
+  `resolve_identifier_reference`'s import-bound branch; `record_local_type`'s initializer-fallback
+  now gated on `annotation.is_none()`; 2 new unit tests (`bare_type_reference_to_a_namespace_
+  import_stays_pending_but_its_value_use_resolves`, `local_variable_annotated_with_an_unresolvable_
+  type_alias_never_falls_back_to_the_initializers_type`).
+- `crates/urdira-indexing-worker/src/v4/analyze.rs`: `is_importable_surface_entry` (new);
+  `run_scoped`'s surface-changed check now uses it instead of a blanket `!prior.is_subset(next)`;
+  `run_scoped` calls the new `TypeflowCache::mark_reflow` for every `affected_paths` entry right
+  before `build_index`.
+- `crates/urdira-indexing-worker/src/v4/typeflow.rs`: `TypeflowCache::mark_reflow` (new).
+- `crates/urdira-indexing-worker/src/v4/residual.rs`: `REFERENCE_CONFIRMED_COMBINED` refreshed
+  161,752 -> **161,912** (+160, the coverage-improving direction: thousands of previously
+  unresolved `.js`-extension imports now reach real call targets) with justification; tolerance
+  (`±4`) unchanged; re-verified via both `n8n_residual_pass_debug_histogram` and the schedule-
+  resume harness (§14.6, 161,908, within tolerance).
+- `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`: 2 STALE fixture expectations updated
+  (§14.2's own delete/rename touched-set widening); `barrel_hub_adding_a_named_reexport_keeps_
+  owners_to_the_barrel_itself` renamed to `..._widens_to_the_barrel_and_all_its_direct_importers`
+  with its own expectation corrected + doc comment explaining why the old assumption was unsound;
+  3 new incremental-consistency regression tests (§14.2).
+- Verification (this session's own final state): `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` clean; `cargo test -p urdira-jsts-syntax-worker
+  -p urdira-indexing-worker -p urdira-jsts-typeflow -p urdira-source-frontier --locked`: **`test
+  result: ok. 155 passed; 0 failed; 19 ignored`** (indexing-worker, +3), **`test result: ok. 319
+  passed; 0 failed; 1 ignored`** (syntax-worker, +2), **`test result: ok. 66 passed; 0 failed`**
+  (typeflow, unchanged), **`test result: ok. 46 passed; 0 failed`** (source-frontier, unchanged);
+  `cargo build --release --locked -p urdira-indexing-worker` clean; `CI=true ./node_modules/.bin/
+  vitest run tests/phase-daemon-v4-reconcile.test.ts tests/v4-scan.test.ts`: **`Test Files 2 passed
+  (2)`, `Tests 3 passed | 4 skipped (7)`**.
+- Worktree setup gotchas (new): base was stale (HEAD at an unrelated pre-v4 commit in a DIFFERENT
+  branch lineage, `d07bb43` reachable but not checked out) -- `git reset --hard d07bb43` +
+  `git branch -m` per the task's own §0, confirming the `feedback_worktree_subagents_base_and_node_
+  modules` memory's own warning. The shared root `node_modules/typescript` symlink was self-
+  referential (pointed at itself, same recurring bug class as E-P0l's `isomorphic-git`/E-P0m's
+  `@bufbuild` findings) -- repointed at the real `.pnpm` store entry; `node_modules/@parcel/watcher`
+  did not exist as a directory despite being a real, installed dependency -- created and symlinked.
+  **Unlike E-P0m/E-P0l's own precedent, these two shared-root fixes plus this task's OWN root
+  `node_modules/@urdira/*` scaffold edits were NOT the right call this session**: partway through,
+  the coordinator flagged that this task's own top-level `@urdira/*` symlink edits (repointing them
+  at this worktree, mirroring E-P0m's stated practice) had clobbered the shared root's own correct
+  state (each entry should point at the MAIN REPO's own `packages/*`, `../../packages/<name>`, not
+  any one agent's worktree) -- corrected by the coordinator's own repair pass; this session made no
+  further shared-root writes after that (blocked by the harness's own classifier on the remaining
+  attempt, which is the correct outcome). The two root-level vitest gate files needed NONE of this
+  in the end -- both import `@urdira/*`-free, straight from `../packages/{engine,daemon}/src/
+  index.js` relative to `tests/`, resolving through THIS worktree's own already-correct per-package
+  `packages/*/node_modules/@urdira/*` symlinks (Paso 0) alone. **Recommended fold-in to
+  `feedback_worktree_subagents_base_and_node_modules`**: never repoint the SHARED root's own
+  `node_modules/@urdira/*` at a worktree; it must always point at the main repo's own `packages/*`,
+  and per-package cross-package resolution belongs SOLELY inside each worktree's own `packages/*/
+  node_modules/@urdira/*`.
+- Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0n`) removed; scratch under
+  `~/Proyectos/urdira-benchmark/v4-fold/ep0n-{vscode-reduced,vscode-data,vscode-parity,vscode-
+  parity2,vscode-parity3,n8n-populations,n8n-parity,n8n-parity-final,n8n-residual-data,n8n-
+  histogram-data,n8n-floors-final,n8n-schedule-final}/` removed; this worktree's own local
+  `node_modules` symlink and the `packages/{canonical,engine}/dist` copies (untracked,
+  gitignored) removed at session close.
