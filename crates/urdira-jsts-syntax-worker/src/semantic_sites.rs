@@ -37,7 +37,7 @@ use crate::{
     bounded_sha256_identity, canonical_evidence, canonical_json, canonical_span,
     facets_list_from_value, proposal_record_key,
 };
-use oxc_allocator::Allocator;
+use oxc_allocator::{Allocator, ArenaVec};
 use oxc_ast::AstKind;
 use oxc_ast::Comment;
 use oxc_ast::ast::{
@@ -48,11 +48,11 @@ use oxc_ast::ast::{
     ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier, ImportOrExportKind,
     ImportSpecifier, LogicalExpression, LogicalOperator, MethodDefinition, MethodDefinitionKind,
     ModuleExportName, ObjectPattern, ObjectProperty, PropertyDefinition, PropertyKey, PropertyKind,
-    StaticMemberExpression, TSCallSignatureDeclaration, TSConstructSignatureDeclaration,
+    Statement, StaticMemberExpression, TSCallSignatureDeclaration, TSConstructSignatureDeclaration,
     TSConstructorType, TSEnumDeclaration, TSFunctionType, TSInterfaceDeclaration,
     TSMethodSignature, TSMethodSignatureKind, TSModuleDeclaration, TSQualifiedName, TSSignature,
     TSType, TSTypeAliasDeclaration, TSTypeAnnotation, TSTypeName, TSTypePredicate,
-    TSTypePredicateName, TSTypeQueryExprName, ThisExpression, VariableDeclaration,
+    TSTypePredicateName, TSTypeQueryExprName, ThisExpression, UnaryOperator, VariableDeclaration,
     VariableDeclarator,
 };
 use oxc_ast_visit::{
@@ -1637,6 +1637,32 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// callee object; never touched by a plain member read, so reads keep
     /// consulting `instanceof_narrowings` exactly as before.
     suppress_instanceof_narrowing_for_calls: std::cell::Cell<bool>,
+    /// E-P0p (2026-09-09): same stack shape and same lexical scoping rules
+    /// as `instanceof_narrowings` (guarded region only -- an `if`'s own
+    /// consequent, or the right-hand side of a `&&` -- pushed/popped at the
+    /// exact same two call sites, `visit_if_statement`/`visit_logical_
+    /// expression`), for a DIFFERENT proof: a user-defined `this is T`
+    /// return-type type-predicate call (`if (x.hasModel())`) rather than a
+    /// literal `instanceof` check. See `extract_type_predicate_narrowings`'
+    /// own doc comment for the exact shape this proves, and `docs/decisions/
+    /// 28-v4-rust-semantics-and-residual-checker.md`'s own amendment for
+    /// why this is a genuinely separate mechanism from `instanceof_
+    /// narrowings` (a different syntax proving the SAME kind of control-
+    /// flow fact this crate does model, deliberately narrow -- see that
+    /// function's doc comment). Deliberately NOT suppressed for a call's
+    /// own target resolution the way `instanceof_narrowings` is (no
+    /// `suppress_..._for_calls`-shaped cell here): unlike an `instanceof`-
+    /// narrowed subclass override (virtual dispatch already makes THAT
+    /// case correctly polymorphic at the unnarrowed declared type, see
+    /// `narrowed_target_is_a_callable_kind`'s own doc comment), a type-
+    /// predicate narrows the receiver to a DIFFERENT, unrelated-by-
+    /// override interface shape (`IActiveCodeEditor` redeclares `getModel`
+    /// narrower, it does not override `IEditor`'s in a virtual-dispatch
+    /// sense) -- v3's real answer for a CALL through a predicate-narrowed
+    /// receiver DOES follow the narrowing (`docs/evidence/2026-09-07-v4-
+    /// vscode-campaign.md` §16's own live counter-example), the opposite of
+    /// the `instanceof`-for-calls exception.
+    type_predicate_narrowings: Vec<(SymbolId, String)>,
     /// Parameter entities, "referenced-only" variant: the nearest enclosing
     /// declaration a `FormalParameter` directly inside it should attribute
     /// `parent_id` to, innermost last -- `None` when that nearest enclosing
@@ -1973,6 +1999,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             explicit_this_param_stack: Vec::new(),
             instanceof_narrowings: Vec::new(),
             suppress_instanceof_narrowing_for_calls: std::cell::Cell::new(false),
+            type_predicate_narrowings: Vec::new(),
             param_owner_stack: Vec::new(),
             pending_function_owner: None,
             declarator_owns_entity: false,
@@ -2770,6 +2797,168 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         Some((symbol_id, class_id))
     }
 
+    /// E-P0p (2026-09-09): `expr` is (through the SAME parenthesization/
+    /// `&&`-chain shapes `extract_instanceof_narrowings` already handles) a
+    /// set of user-defined type-predicate CALLS this crate can PROVE
+    /// narrow their own receiver -- `x.hasModel()` where `hasModel`'s own
+    /// declared return type is `this is T` (`ProgramIndex::member_
+    /// predicate_receiver_narrowing`). Mirrors `extract_instanceof_
+    /// narrowings` exactly (paren/`&&` recursion, a single call contributes
+    /// at most one narrowing, anything else contributes nothing) but for a
+    /// DIFFERENT proof shape -- a call, not a binary `instanceof`
+    /// expression. See `type_predicate_narrowings`'s own doc comment for
+    /// why this is never suppressed for a call's own target resolution the
+    /// way `instanceof_narrowings` is.
+    fn extract_type_predicate_narrowings(&self, expr: &Expression<'a>) -> Vec<(SymbolId, String)> {
+        match expr {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.extract_type_predicate_narrowings(&parenthesized.expression)
+            }
+            Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::And => {
+                let mut narrowings = self.extract_type_predicate_narrowings(&logical.left);
+                narrowings.extend(self.extract_type_predicate_narrowings(&logical.right));
+                narrowings
+            }
+            Expression::CallExpression(call) => self
+                .type_predicate_narrowing_of_call(call)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The single-call half of `extract_type_predicate_narrowings` -- `x.
+    /// hasModel()`: `x` a plain local/parameter identifier with a real,
+    /// unambiguous binding (same certainty bar `instanceof_narrowing_of_
+    /// binary` already enforces -- never an import, a destructured
+    /// pattern, or a redeclared binding), `hasModel` resolved through the
+    /// SAME typeflow member lookup every other member call uses (`type_of_
+    /// expression` + `Self::as_entity` + `ProgramIndex::member_predicate_
+    /// receiver_narrowing`) to a member whose own declared return type is
+    /// `this is T`. `None` for anything else -- a non-member callee, a
+    /// computed/non-identifier receiver, a member that is not a proven
+    /// receiver-narrowing predicate -- never a guess.
+    fn type_predicate_narrowing_of_call(
+        &self,
+        call: &CallExpression<'a>,
+    ) -> Option<(SymbolId, String)> {
+        let index = self.ctx.typeflow_index?;
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return None;
+        };
+        let Expression::Identifier(object) = &member.object else {
+            return None;
+        };
+        let reference_id = object.reference_id.get()?;
+        let reference = self.scoping.get_reference(reference_id);
+        let symbol_id = reference.symbol_id()?;
+        if self.scoping.symbol_flags(symbol_id).is_import()
+            || !self.scoping.symbol_redeclarations(symbol_id).is_empty()
+        {
+            return None;
+        }
+        let (base_value, _rule) = self.type_of_expression(&member.object)?;
+        let (base_entity, is_static) = Self::as_entity(&base_value)?;
+        let narrowed_entity_id = index.member_predicate_receiver_narrowing(
+            &base_entity,
+            member.property.name.as_str(),
+            is_static,
+        )?;
+        Some((symbol_id, narrowed_entity_id))
+    }
+
+    /// E-P0p (2026-09-09): the SAME proof `type_predicate_narrowing_of_
+    /// call` establishes for `if (x.hasModel()) { ...narrowed here... }`,
+    /// generalized to VS Code's own DOMINANT real idiom for this exact
+    /// predicate (live count against `vscode-corpus-2026-09-06`: 238
+    /// negated-early-return call sites vs. a smaller but still real
+    /// positive-form count) -- `if (!x.hasModel()) return; ...narrowed
+    /// for the rest of this block...`. Reaching any statement AFTER such
+    /// an `if` proves its test was false; when the test is (through any
+    /// number of `||`-joined disjuncts -- reaching past an `A || B` early
+    /// exit proves BOTH `A` and `B` false, so EACH negated-predicate
+    /// disjunct independently narrows) a negated predicate call, "the test
+    /// was false" means the predicate call ITSELF was true, exactly the
+    /// same fact `if (x.hasModel())`'s own consequent proves -- just
+    /// reached through the OPPOSITE branch. `statement_definitely_exits`
+    /// (right below) is this function's own soundness precondition: this
+    /// is consulted ONLY by `visit_statements`'s own override, and ONLY
+    /// when the `if` has no `else` (an `if`/`else` pair needs a
+    /// DIFFERENT, unimplemented merge-at-join-point analysis this crate
+    /// does not attempt) and its consequent PROVABLY never falls through
+    /// to the statements after it.
+    fn extract_negated_predicate_narrowings_from_early_exit_test(
+        &self,
+        expr: &Expression<'a>,
+    ) -> Vec<(SymbolId, String)> {
+        match expr {
+            Expression::ParenthesizedExpression(parenthesized) => self
+                .extract_negated_predicate_narrowings_from_early_exit_test(
+                    &parenthesized.expression,
+                ),
+            Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+                let mut narrowings =
+                    self.extract_negated_predicate_narrowings_from_early_exit_test(&logical.left);
+                narrowings.extend(
+                    self.extract_negated_predicate_narrowings_from_early_exit_test(&logical.right),
+                );
+                narrowings
+            }
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                self.type_predicate_narrowing_of_negated_operand(&unary.argument)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The single-negated-operand half of `extract_negated_predicate_
+    /// narrowings_from_early_exit_test` -- `!<operand>`, `<operand>`
+    /// unwrapped through any number of parens, contributes a narrowing
+    /// only when it is itself a type-predicate call (`type_predicate_
+    /// narrowing_of_call`'s own shape) -- never a guess for anything else
+    /// (`!a && !b`, a plain boolean, ...).
+    fn type_predicate_narrowing_of_negated_operand(
+        &self,
+        operand: &Expression<'a>,
+    ) -> Vec<(SymbolId, String)> {
+        match operand {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.type_predicate_narrowing_of_negated_operand(&parenthesized.expression)
+            }
+            Expression::CallExpression(call) => self
+                .type_predicate_narrowing_of_call(call)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// E-P0p (2026-09-09): whether `stmt` PROVABLY never falls through to
+    /// whatever follows it -- a bare `return`/`throw`/`continue`/`break`,
+    /// or a `{ ... }` block whose OWN LAST statement itself provably never
+    /// falls through (recursively, through any depth of nested blocks).
+    /// Deliberately narrow, matching this crate's "never guess past what's
+    /// proven" discipline everywhere else: an `if`/`else` where BOTH
+    /// branches exit, a `switch` where every case exits, a loop that
+    /// always executes at least once and always exits on its first
+    /// iteration, ... are all real controlflow shapes TypeScript's own
+    /// checker WOULD prove exhaustive, but none of them are attempted here
+    /// -- only ever a MISSED early-exit proof, never a wrongly-assumed
+    /// one.
+    fn statement_definitely_exits(stmt: &Statement<'a>) -> bool {
+        match stmt {
+            Statement::ReturnStatement(_)
+            | Statement::ThrowStatement(_)
+            | Statement::ContinueStatement(_)
+            | Statement::BreakStatement(_) => true,
+            Statement::BlockStatement(block) => block
+                .body
+                .last()
+                .is_some_and(Self::statement_definitely_exits),
+            _ => false,
+        }
+    }
+
     /// Resolve a `CallExpression`'s target (E3, T1): only when the callee is
     /// a plain identifier (never a member expression, `this`, `super`, or
     /// any other expression -- `new` never even reaches here, see
@@ -3069,6 +3258,18 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // `ProgramIndex::member_type_ref` instead, never through this
             // relative-chain path.
             urdira_jsts_typeflow::ResolvedTypeRef::TypeQuery(_) => None,
+            // E-P0p (2026-09-09): a `this is T`/`param is T` predicate's
+            // own REAL runtime return value is `boolean`, never `T` --
+            // this relative-chain path is for a call's own VALUE
+            // propagation (`a.b().c()`), so it must never treat the
+            // predicate's asserted type as the call's own result type
+            // (that would let `x.hasModel().anyMemberOfIActiveCodeEditor`
+            // silently "resolve" through a value that is actually a bare
+            // `boolean` at runtime). The predicate's own target is
+            // consulted ONLY through the dedicated narrowing path
+            // (`ProgramIndex::member_predicate_receiver_narrowing`,
+            // `type_predicate_narrowing_of_call`), never here.
+            urdira_jsts_typeflow::ResolvedTypeRef::TypePredicate { .. } => None,
         }
     }
 
@@ -3098,24 +3299,37 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             .is_some_and(|kind| matches!(kind, "method" | "getter" | "setter" | "constructor"))
     }
 
-    /// E-P0o (2026-09-08, sibling-declaration ambiguity, decision 28): does
+    /// E-P0o (2026-09-08, sibling-declaration ambiguity, decision 28) /
+    /// E-P0p (2026-09-09, generalized to an INHERITED match too): does
     /// `rule` (`type_of_expression`'s own second return value, tagging HOW
     /// the receiver's type was derived) already pin the receiver to ITS
     /// resolved entity uniquely enough that `ProgramIndex::sibling_extends_
-    /// overrides` never needs consulting at all? ONLY consulted, per its own
-    /// call site's own gate, when the match came from the entity's OWN
-    /// direct declaration (`ProgramIndex::own_member_ids` non-empty), never
-    /// an inherited one -- see that function's own doc comment for the live
-    /// `ICodeEditor`/`IActiveCodeEditor` counter-example proving an
-    /// inherited match is a structurally DIFFERENT shape (unmodeled control-
-    /// flow narrowing, not a same-file ambiguity) this mechanism must not
-    /// also claim, and for why `instanceof_narrowing_never_applies_to_a_
-    /// calls_own_target_resolution`'s own adversarial regression guard
-    /// (`EditorPane` DOES declare `getControl` itself, `MergeEditor extends
-    /// EditorPane` overrides it, v3's own proven CALL answer is still
-    /// `EditorPane`'s own declaration unconditionally) requires the direct-
-    /// declaration case to stay confirmed even in the PRESENCE of a known
-    /// sibling override, whenever `rule` here is reliable.
+    /// overrides` never needs consulting at all?
+    ///
+    /// E-P0o originally consulted this ONLY when the match came from the
+    /// entity's OWN direct declaration (`ProgramIndex::own_member_ids`
+    /// non-empty), gating an INHERITED match out entirely -- an earlier,
+    /// cruder generalization attempt that dropped that gate WITHOUT also
+    /// consulting this same reliable-rule allow-list broke `instanceof_
+    /// narrowing_never_applies_to_a_calls_own_target_resolution` (see
+    /// `docs/evidence/2026-09-07-v4-vscode-campaign.md` §15.2). E-P0p
+    /// re-examined that regression guard directly: `EditorPane` DOES
+    /// declare `getControl` itself (an OWN-declaration match, not an
+    /// inherited one), `activePane`'s own rule for that test's CALL is
+    /// `"member_declared_type"` (an explicit parameter annotation --
+    /// `suppress_instanceof_narrowing_for_calls` already keeps `instanceof_
+    /// narrowed` out of it) -- reliable EITHER WAY, own or inherited, so
+    /// gating this check on `rule` ALONE (never on own-vs-inherited) keeps
+    /// that regression guard's own answer unconditionally CONFIRMED without
+    /// needing the separate `own_member_ids` gate at all. `ProgramIndex::
+    /// sibling_extends_overrides(entity_id, ...)` itself already only ever
+    /// returns DESCENDANTS of `entity_id` regardless of whether `entity_id`
+    /// declares the member directly or inherits it -- the live `ICodeEditor`
+    /// (inherits `getModel` from `IEditor`) / `IActiveCodeEditor extends
+    /// ICodeEditor` (redeclares it) counter-example is caught by the exact
+    /// same call, unconditionally, once callers stop gating on `own_member_
+    /// ids`. See `resolve_static_member_reference`'s/`resolve_call_target_
+    /// typeflow`'s own call sites for the `own_member_ids` gate's removal.
     ///
     /// The task's own three named "reliable" shapes -- "a parameter
     /// annotated with a concrete interface", "`this` in a concrete class",
@@ -3126,7 +3340,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// type`'s explicit-annotation branch, used identically for a
     /// parameter's own annotation and a local variable's own annotation --
     /// see that function's doc comment: the untyped-initializer fallback
-    /// only ever runs when NO annotation exists at all). Three more are
+    /// only ever runs when NO annotation exists at all). Four more are
     /// reliable for the SAME reason (a literal, unambiguous name/proof,
     /// never a guess) even though the task's own examples do not name them
     /// individually: `"super"` (`super.m` bypasses any subclass override by
@@ -3134,23 +3348,29 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// all), `"instanceof_narrowed"` (a PROVEN control-flow fact about this
     /// exact position, not an inferred/propagated type -- see `narrowed_
     /// target_is_a_callable_kind`'s own doc comment for the one place this
-    /// crate already treats it as authoritative), `"member_class_static"`
-    /// and `"member_new_expression"` (`ClassName.member`/`new ClassName()`
-    /// name one concrete declaration directly, by literal syntax, exactly
-    /// like an explicit annotation does). Every OTHER rule (`"member_
-    /// declared_type_chain"`, `"call_return_type"`, `"object_shape_static"`,
-    /// `"array_element"`, `"record_element"`, `"await"`, `"parenthesized"`,
-    /// `"non_null"`, `"as_expression"`, `"type_assertion"`, `"inline_type_
-    /// literal_member"`, ...) is some form of INFERENCE or PROPAGATION
-    /// through a chain this crate does not itself narrow the way TypeScript's
-    /// real checker does -- not reliable enough to trust `members()`'s own-
-    /// declaration match over a known sibling override.
+    /// crate already treats it as authoritative), `"type_predicate_
+    /// narrowed"` (E-P0p, 2026-09-09: the SAME kind of proven control-flow
+    /// fact as `instanceof_narrowed`, just reached through a user-defined
+    /// `this is T` predicate call instead of a literal `instanceof` check
+    /// -- see `type_predicate_narrowings`'s own doc comment), `"member_
+    /// class_static"` and `"member_new_expression"` (`ClassName.member`/
+    /// `new ClassName()` name one concrete declaration directly, by literal
+    /// syntax, exactly like an explicit annotation does). Every OTHER rule
+    /// (`"member_declared_type_chain"`, `"call_return_type"`, `"object_
+    /// shape_static"`, `"array_element"`, `"record_element"`, `"await"`,
+    /// `"parenthesized"`, `"non_null"`, `"as_expression"`, `"type_
+    /// assertion"`, `"inline_type_literal_member"`, ...) is some form of
+    /// INFERENCE or PROPAGATION through a chain this crate does not itself
+    /// narrow the way TypeScript's real checker does -- not reliable enough
+    /// to trust `members()`'s own match (own OR inherited) over a known
+    /// sibling override.
     fn rule_pins_receiver_uniquely(rule: &str) -> bool {
         matches!(
             rule,
             "this"
                 | "super"
                 | "instanceof_narrowed"
+                | "type_predicate_narrowed"
                 | "member_declared_type"
                 | "member_class_static"
                 | "member_new_expression"
@@ -3344,6 +3564,29 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                             is_static: false,
                         },
                         "instanceof_narrowed",
+                    ));
+                }
+                // E-P0p (2026-09-09): an active user-defined type-predicate
+                // narrowing (see `type_predicate_narrowings`'s own doc
+                // comment) -- the SAME "most specific, proven fact about
+                // THIS exact position" priority as `instanceof_narrowed`
+                // right above, searched the same innermost-first way.
+                // Deliberately NOT suppressed for a call's own target
+                // resolution -- see `type_predicate_narrowings`'s own doc
+                // comment for why this mechanism's call behavior is the
+                // opposite of `instanceof_narrowed`'s.
+                if let Some((_, narrowed_entity_id)) = self
+                    .type_predicate_narrowings
+                    .iter()
+                    .rev()
+                    .find(|(narrowed_symbol, _)| *narrowed_symbol == symbol_id)
+                {
+                    return Some((
+                        TypeflowValue::Entity {
+                            entity_id: narrowed_entity_id.clone(),
+                            is_static: false,
+                        },
+                        "type_predicate_narrowed",
                     ));
                 }
                 if let Some(tagged) = self.local_types.get(&symbol_id).cloned() {
@@ -3853,22 +4096,24 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // `Self::narrowed_target_is_a_callable_kind`'s own doc comment.
             && !(rule == "instanceof_narrowed" && Self::narrowed_target_is_a_callable_kind(&target))
         {
-            // E-P0o (2026-09-08, sibling-declaration ambiguity): `target`
-            // came from `base_entity`'s OWN direct declaration only when
-            // `own_member_ids` is non-empty (an INHERITED match is a
-            // structurally different, unmodeled-narrowing shape -- see
-            // `ProgramIndex::own_member_ids`'s own doc comment for the live
-            // `ICodeEditor`/`IActiveCodeEditor` counter-example and why it
-            // is NOT treated the same way here). Only consulted when `rule`
-            // does not already pin the receiver to `base_entity` uniquely
-            // (`rule_pins_receiver_uniquely`) -- a reliably-typed receiver's
-            // own resolution stands, matching decision 28's "confirmation
-            // stays when the receptor is typed uniquely" carve-out.
-            if !Self::rule_pins_receiver_uniquely(rule)
-                && !index
-                    .own_member_ids(&base_entity, expr.property.name.as_str(), is_static)
-                    .is_empty()
-            {
+            // E-P0o (2026-09-08, sibling-declaration ambiguity) / E-P0p
+            // (2026-09-09, generalized to an INHERITED match too): a known
+            // `extends`-descendant of `base_entity` might ALSO redeclare
+            // this exact member, regardless of whether `target` came from
+            // `base_entity`'s own direct declaration or one it inherits --
+            // `ProgramIndex::sibling_extends_overrides` already only ever
+            // returns DESCENDANTS of `base_entity`, so no separate "own vs
+            // inherited" gate is needed here at all, only `rule_pins_
+            // receiver_uniquely`'s own reliable-rule allow-list (see that
+            // function's own doc comment for why gating on `rule` alone,
+            // rather than on `ProgramIndex::own_member_ids`, keeps the
+            // `EditorPane`/`MergeEditor` regression guard confirmed while
+            // also correctly catching the live `ICodeEditor`/
+            // `IActiveCodeEditor` counter-example). A reliably-typed
+            // receiver's own resolution stands, matching decision 28's
+            // "confirmation stays when the receptor is typed uniquely"
+            // carve-out.
+            if !Self::rule_pins_receiver_uniquely(rule) {
                 let mut candidates = index.sibling_extends_overrides(
                     &base_entity,
                     expr.property.name.as_str(),
@@ -4224,22 +4469,16 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                                     return TypeflowCallResolution::Unresolved;
                                 }
                                 // E-P0o (2026-09-08, sibling-declaration
-                                // ambiguity): same check, same rationale
-                                // (own declaration only, see `ProgramIndex::
-                                // own_member_ids`'s own doc comment), as
-                                // `resolve_static_member_reference`'s own --
-                                // see that function's own doc comment and
-                                // `rule_pins_receiver_uniquely`'s doc comment
-                                // for the exact "reliable rule" allow-list.
-                                if !Self::rule_pins_receiver_uniquely(rule)
-                                    && !index
-                                        .own_member_ids(
-                                            &base_entity,
-                                            member.property.name.as_str(),
-                                            is_static,
-                                        )
-                                        .is_empty()
-                                {
+                                // ambiguity) / E-P0p (2026-09-09,
+                                // generalized to an INHERITED match too):
+                                // same check, same rationale, as `resolve_
+                                // static_member_reference`'s own -- see
+                                // that function's own doc comment and
+                                // `rule_pins_receiver_uniquely`'s doc
+                                // comment for the exact "reliable rule"
+                                // allow-list (no separate own-vs-inherited
+                                // gate needed here either).
+                                if !Self::rule_pins_receiver_uniquely(rule) {
                                     let mut candidates = index.sibling_extends_overrides(
                                         &base_entity,
                                         member.property.name.as_str(),
@@ -5767,11 +6006,53 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         let narrowings = self.extract_instanceof_narrowings(&stmt.test);
         let restore_len = self.instanceof_narrowings.len();
         self.instanceof_narrowings.extend(narrowings);
+        // E-P0p (2026-09-09): `type_predicate_narrowings`'s own guarded
+        // region -- same bracketing as `instanceof_narrowings` right above,
+        // a separate stack (see its own doc comment for why).
+        let predicate_narrowings = self.extract_type_predicate_narrowings(&stmt.test);
+        let predicate_restore_len = self.type_predicate_narrowings.len();
+        self.type_predicate_narrowings.extend(predicate_narrowings);
         self.visit_statement(&stmt.consequent);
         self.instanceof_narrowings.truncate(restore_len);
+        self.type_predicate_narrowings
+            .truncate(predicate_restore_len);
         if let Some(alternate) = &stmt.alternate {
             self.visit_statement(alternate);
         }
+    }
+
+    /// E-P0p (2026-09-09): overrides the default `walk_statements` loop
+    /// (visits every statement exactly the same way, in the same order --
+    /// see `oxc_ast_visit::walk::walk_statements`) to ALSO extend `type_
+    /// predicate_narrowings` across the REST of this exact statement list
+    /// after a qualifying negated-early-exit `if` (`extract_negated_
+    /// predicate_narrowings_from_early_exit_test`/`statement_definitely_
+    /// exits`'s own doc comments) -- VS Code's own dominant idiom for this
+    /// predicate shape (`if (!editor.hasModel()) return; ...editor.
+    /// getModel()...`), found live in `coreCommands.ts`/`goToCommands.ts`/
+    /// dozens more. Shared by every statement-list site this visitor
+    /// reaches (a block body, a function/program top level, ...) since
+    /// `oxc_ast_visit` funnels every one of those through this single
+    /// method -- the SAME reason `visit_statements` (as opposed to a
+    /// per-statement-list-kind override) is the right hook. Truncated back
+    /// to `restore_len` at the end of THIS list only -- a narrowing
+    /// established here never leaks into an ENCLOSING list (matches
+    /// `instanceof_narrowings`/`type_predicate_narrowings`'s own general
+    /// "guarded region only" contract).
+    fn visit_statements(&mut self, stmts: &ArenaVec<'a, Statement<'a>>) {
+        let restore_len = self.type_predicate_narrowings.len();
+        for stmt in stmts {
+            self.visit_statement(stmt);
+            if let Statement::IfStatement(if_stmt) = stmt
+                && if_stmt.alternate.is_none()
+                && Self::statement_definitely_exits(&if_stmt.consequent)
+            {
+                let narrowings =
+                    self.extract_negated_predicate_narrowings_from_early_exit_test(&if_stmt.test);
+                self.type_predicate_narrowings.extend(narrowings);
+            }
+        }
+        self.type_predicate_narrowings.truncate(restore_len);
     }
 
     /// E-P0k: `x instanceof C && ...right...` narrows `x` to `C` for the
@@ -5792,8 +6073,15 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
         let narrowings = self.extract_instanceof_narrowings(&expr.left);
         let restore_len = self.instanceof_narrowings.len();
         self.instanceof_narrowings.extend(narrowings);
+        // E-P0p (2026-09-09): same bracketing for `type_predicate_
+        // narrowings` -- see `visit_if_statement`'s own identical addition.
+        let predicate_narrowings = self.extract_type_predicate_narrowings(&expr.left);
+        let predicate_restore_len = self.type_predicate_narrowings.len();
+        self.type_predicate_narrowings.extend(predicate_narrowings);
         self.visit_expression(&expr.right);
         self.instanceof_narrowings.truncate(restore_len);
+        self.type_predicate_narrowings
+            .truncate(predicate_restore_len);
     }
 
     /// Found during E1c's cardinality reconciliation: an import specifier's
@@ -11561,29 +11849,27 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         );
     }
 
-    /// Live VS Code counter-example, investigated and DELIBERATELY NOT
-    /// generalized to (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §15,
-    /// `ProgramIndex::own_member_ids`'s own doc comment): an EXPLICITLY
-    /// annotated parameter (`mid: IMid`, `member_declared_type`) whose
-    /// entity does NOT itself declare the member (the match comes from its
-    /// OWN ancestor, `IBase`, via ordinary inheritance) while a FURTHER
-    /// descendant of `IMid` (`INarrow extends IMid`) redeclares it --
-    /// reproduces `ICodeEditor` (declares no `getModel` of its own, inherits
-    /// `IEditor`'s) vs. `IActiveCodeEditor extends ICodeEditor` (redeclares
-    /// it narrower, reached in the real corpus through a `hasModel(): this
-    /// is IActiveCodeEditor` user-defined type-predicate guard this crate
-    /// does not model). An EARLIER version of this fix generalized the
-    /// sibling check to this inherited shape too, but that broke the
-    /// adversarial regression guard `instanceof_narrowing_never_applies_to_
-    /// a_calls_own_target_resolution` (own-declaration + a known override
-    /// must stay CONFIRMED for a call, proven live) -- the two shapes are
-    /// NOT interchangeable, so this crate deliberately leaves the inherited
-    /// shape CONFIRMED (to the ancestor's own declaration) rather than
-    /// mis-representing an unmodeled control-flow-narrowing fact as a
-    /// same-file candidate ambiguity. This is the residual E-P0o's own §15
-    /// reports rather than guesses at.
+    /// E-P0p (2026-09-09) control case, formerly named `..._stays_
+    /// confirmed_not_generalized_to`: an EXPLICITLY annotated parameter
+    /// (`mid: IMid`, `member_declared_type` -- one of `rule_pins_receiver_
+    /// uniquely`'s reliable rules) whose entity does NOT itself declare the
+    /// member (the match comes from its OWN ancestor, `IBase`, via ordinary
+    /// inheritance) while a FURTHER descendant of `IMid` (`INarrow extends
+    /// IMid`) redeclares it. E-P0o originally left this CONFIRMED only
+    /// because it never even consulted the sibling-candidate mechanism for
+    /// an inherited match at all (`own_member_ids`-gated); E-P0p removed
+    /// that gate, so this test now demonstrates the SAME `rule_pins_
+    /// receiver_uniquely` control decision 28 already established for the
+    /// OWN-declaration shape (`explicitly_annotated_parameter_of_the_
+    /// narrower_sibling_interface_still_confirms`, right above) -- a
+    /// reliably-typed receiver's own resolution stands regardless of
+    /// whether the match is a direct or an inherited declaration. See
+    /// `sibling_declaration_ambiguous_inherited_match_produces_candidate_
+    /// reference_rows_when_the_receiver_is_not_reliably_typed` right below
+    /// for the shape that DOES now change (an inherited match reached
+    /// through a NON-reliable rule).
     #[test]
-    fn sibling_declaration_via_an_inherited_match_stays_confirmed_not_generalized_to() {
+    fn sibling_declaration_via_an_inherited_match_with_a_reliable_rule_still_confirms() {
         let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IMid extends IBase {\n  other(): void;\n}\ninterface INarrow extends IMid {\n  getModel(): string;\n}\nfunction use(mid: IMid) {\n  mid.getModel;\n}\n";
         let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
         let semantics =
@@ -11599,16 +11885,320 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
                 .iter()
                 .any(|row| row.3 == base_get_model_id),
             "mid.getModel must stay confirmed to IMid's own inherited \
-             (IBase) declaration -- the inherited shape is deliberately NOT \
-             covered by the sibling-declaration check, see this test's own \
-             doc comment: rows={:?}",
+             (IBase) declaration -- an explicitly annotated, reliably-typed \
+             receiver stands regardless of own vs. inherited: rows={:?}",
             resolved(&semantics)
         );
         assert!(
             semantics.candidate_reference_rows.is_empty(),
-            "the inherited shape must never produce a sibling candidate \
-             row: rows={:?}",
+            "a reliably-typed receiver must never produce a sibling \
+             candidate row, own or inherited: rows={:?}",
             semantics.candidate_reference_rows
+        );
+    }
+
+    /// E-P0p (2026-09-09): the actual generalization -- same `IBase`/
+    /// `IMid`/`INarrow` inheritance shape as the control test right above,
+    /// but the receiver is reached through `this.mid.getModel` (`this.mid`
+    /// typed via `"member_declared_type_chain"`, NOT one of `rule_pins_
+    /// receiver_uniquely`'s reliable rules -- structurally the SAME
+    /// unreliable-rule shape `sibling_declaration_ambiguous_member_read_
+    /// produces_candidate_reference_rows_never_a_confirmed_one` already
+    /// covers for an OWN-declaration match). `IMid` does not declare
+    /// `getModel` itself (inherited from `IBase`); `INarrow extends IMid`
+    /// redeclares it -- reproduces the live `ICodeEditor`/`IActiveCodeEditor`
+    /// shape structurally (module names aside). Must now demote to
+    /// `possible` with both candidates, never guess `IBase`'s declaration.
+    #[test]
+    fn sibling_declaration_ambiguous_inherited_match_produces_candidate_reference_rows_when_the_receiver_is_not_reliably_typed()
+     {
+        let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IMid extends IBase {\n  other(): void;\n}\ninterface INarrow extends IMid {\n  getModel(): string;\n}\nclass Host {\n  mid: IMid;\n  read() {\n    this.mid.getModel;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:20:getModel";
+        let narrow_get_model_id = "jsts:method:a.ts:128:getModel";
+        assert_eq!(
+            source[20..].get(..8),
+            Some("getModel"),
+            "test's own assumed IBase::getModel offset drifted"
+        );
+        assert_eq!(
+            source[128..].get(..8),
+            Some("getModel"),
+            "test's own assumed INarrow::getModel offset drifted"
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != base_get_model_id && row.3 != narrow_get_model_id),
+            "this.mid.getModel must NEVER confirm to either declaration \
+             once the receiver is not reliably typed -- an inherited match \
+             is exactly as ambiguous as an own-declaration one when a \
+             known descendant also redeclares the member: rows={:?}",
+            resolved(&semantics)
+        );
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([base_get_model_id.to_owned(), narrow_get_model_id.to_owned()]),
+            "both the inherited-from declaration and the descendant's own \
+             redeclaration must be present as candidates: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+    }
+
+    /// E-P0p (2026-09-09): the live counter-example itself, reproduced
+    /// structurally -- `ICodeEditor` (declares no `getModel` of its own,
+    /// inherits `IEditor`'s) / `IActiveCodeEditor extends ICodeEditor`
+    /// (redeclares it narrower), reached through a `hasModel(): this is
+    /// IActiveCodeEditor` user-defined type-predicate guard on `IEditor`
+    /// itself (`hasModel` need not live on the SAME entity the predicate
+    /// narrows away from -- the live shape declares it once, on the wider
+    /// base). Inside the guarded `if`, the receiver is proven narrowed to
+    /// `IActiveCodeEditor` (`"type_predicate_narrowed"`, one of `rule_pins_
+    /// receiver_uniquely`'s reliable rules) -- both the PROPERTY READ and
+    /// the CALL must confirm directly to `IActiveCodeEditor`'s own
+    /// redeclaration, never fall into the sibling-candidate ambiguity the
+    /// test right above exercises for the UNGUARDED case.
+    #[test]
+    fn type_predicate_narrowing_confirms_the_narrowed_descendants_own_declaration_for_read_and_call()
+     {
+        let source = "interface IEditor {\n  getModel(): unknown;\n  hasModel(): this is IActiveCodeEditor;\n}\ninterface IActiveCodeEditor extends IEditor {\n  getModel(): string;\n}\nfunction use(editor: IEditor) {\n  if (editor.hasModel()) {\n    editor.getModel;\n    editor.getModel();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:22:getModel";
+        let active_get_model_id = "jsts:method:a.ts:134:getModel";
+        assert_eq!(
+            source[22..].get(..8),
+            Some("getModel"),
+            "test's own assumed IEditor::getModel offset drifted"
+        );
+        assert_eq!(
+            source[134..].get(..8),
+            Some("getModel"),
+            "test's own assumed IActiveCodeEditor::getModel offset drifted"
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == active_get_model_id),
+            "editor.getModel, inside the hasModel() guard, must confirm to \
+             IActiveCodeEditor's own narrower declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != base_get_model_id),
+            "editor.getModel, inside the guard, must never confirm to \
+             IEditor's own wider (unnarrowed) declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics.candidate_reference_rows.is_empty(),
+            "a type-predicate-narrowed receiver must never produce a \
+             sibling candidate row: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+        let call_targets: Vec<String> = semantics
+            .typeflow_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            call_targets
+                .iter()
+                .any(|target| target == active_get_model_id),
+            "editor.getModel(), inside the guard, must confirm to \
+             IActiveCodeEditor's own narrower declaration: {call_targets:?}"
+        );
+        assert!(
+            call_targets
+                .iter()
+                .all(|target| target != base_get_model_id),
+            "editor.getModel(), inside the guard, must never confirm to \
+             IEditor's own wider (unnarrowed) declaration: {call_targets:?}"
+        );
+        assert!(
+            semantics.candidate_call_rows.is_empty(),
+            "a type-predicate-narrowed receiver's call must never produce a \
+             sibling candidate row either: rows={:?}",
+            semantics.candidate_call_rows
+        );
+    }
+
+    /// E-P0p (2026-09-09) safety companion, mirroring `instanceof_
+    /// narrowing_never_leaks_past_its_own_guarded_region`: the SAME shape,
+    /// but the read is OUTSIDE the guarded region (after the whole `if`) --
+    /// `editor: IEditor` is an EXPLICIT parameter annotation naming
+    /// `IEditor` directly (`"member_declared_type"`, one of `rule_pins_
+    /// receiver_uniquely`'s reliable rules) and `IEditor` declares
+    /// `getModel` itself (an OWN declaration, not inherited) -- so once
+    /// OUTSIDE the guard, the receiver's ordinary (unnarrowed) resolution
+    /// correctly stays CONFIRMED to `IEditor`'s own declaration REGARDLESS
+    /// of `IActiveCodeEditor`'s own known redeclaration (decision 28's
+    /// established "a reliably-typed receiver's own resolution stands"
+    /// carve-out, unaffected by any sibling -- see `explicitly_annotated_
+    /// parameter_of_the_narrower_sibling_interface_still_confirms`'s
+    /// identical shape). The only thing this test proves is that the
+    /// `hasModel()` narrowing itself does NOT leak past its own guarded
+    /// region -- `editor.getModel` after the `if` must never resolve to
+    /// `IActiveCodeEditor`'s own (narrowed) redeclaration.
+    #[test]
+    fn type_predicate_narrowing_never_leaks_past_its_own_guarded_region() {
+        let source = "interface IEditor {\n  getModel(): unknown;\n  hasModel(): this is IActiveCodeEditor;\n}\ninterface IActiveCodeEditor extends IEditor {\n  getModel(): string;\n}\nfunction use(editor: IEditor) {\n  if (editor.hasModel()) {\n    // narrowed here only\n  }\n  editor.getModel;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:22:getModel";
+        let active_get_model_id = "jsts:method:a.ts:134:getModel";
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == base_get_model_id),
+            "editor.getModel AFTER the guarded if-block must still resolve \
+             normally to IEditor's own (unnarrowed, reliably-typed) \
+             declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != active_get_model_id),
+            "editor.getModel AFTER the guarded if-block must never resolve \
+             to IActiveCodeEditor's own declaration -- the hasModel() \
+             narrowing must not leak past its own guarded region: \
+             rows={:?}",
+            resolved(&semantics)
+        );
+    }
+
+    /// E-P0p (2026-09-09): VS Code's own DOMINANT real idiom for this
+    /// exact predicate (live count against `vscode-corpus-2026-09-06`:
+    /// `if (!editor.hasModel()) return;` -- 238 sites vs. a smaller
+    /// positive-form count, `coreCommands.ts`/`goToCommands.ts`/dozens
+    /// more) -- `visit_statements`'s own override, `statement_definitely_
+    /// exits`/`extract_negated_predicate_narrowings_from_early_exit_test`.
+    /// Both the property READ and the CALL, positioned AFTER the guard
+    /// (never inside it -- there is nothing to narrow inside a consequent
+    /// that unconditionally returns), must confirm to `IActiveCodeEditor`'s
+    /// own narrower declaration.
+    #[test]
+    fn negated_early_return_type_predicate_narrows_the_rest_of_the_block() {
+        let source = "interface IEditor {\n  getModel(): unknown;\n  hasModel(): this is IActiveCodeEditor;\n}\ninterface IActiveCodeEditor extends IEditor {\n  getModel(): string;\n}\nfunction use(editor: IEditor) {\n  if (!editor.hasModel()) {\n    return;\n  }\n  editor.getModel;\n  editor.getModel();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:22:getModel";
+        let active_get_model_id = "jsts:method:a.ts:134:getModel";
+        assert_eq!(
+            source[22..].get(..8),
+            Some("getModel"),
+            "test's own assumed IEditor::getModel offset drifted"
+        );
+        assert_eq!(
+            source[134..].get(..8),
+            Some("getModel"),
+            "test's own assumed IActiveCodeEditor::getModel offset drifted"
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == active_get_model_id),
+            "editor.getModel, after the `if (!editor.hasModel()) return;` \
+             guard, must confirm to IActiveCodeEditor's own narrower \
+             declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != base_get_model_id),
+            "editor.getModel, after the guard, must never confirm to \
+             IEditor's own wider (unnarrowed) declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics.candidate_reference_rows.is_empty(),
+            "a type-predicate-narrowed receiver must never produce a \
+             sibling candidate row: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+        let call_targets: Vec<String> = semantics
+            .typeflow_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            call_targets
+                .iter()
+                .any(|target| target == active_get_model_id),
+            "editor.getModel(), after the guard, must confirm to \
+             IActiveCodeEditor's own narrower declaration: {call_targets:?}"
+        );
+        assert!(
+            call_targets
+                .iter()
+                .all(|target| target != base_get_model_id),
+            "editor.getModel(), after the guard, must never confirm to \
+             IEditor's own wider (unnarrowed) declaration: {call_targets:?}"
+        );
+    }
+
+    /// E-P0p (2026-09-09) safety companion: the SAME negated-guard shape,
+    /// but the consequent does NOT definitely exit (no `return`/`throw`/
+    /// `continue`/`break` at all) -- `statement_definitely_exits` must
+    /// refuse to narrow anything past this `if`, since reaching the
+    /// statement after it proves nothing about whether the guard's own
+    /// body ran to completion or fell through.
+    #[test]
+    fn negated_predicate_guard_without_a_definite_exit_never_narrows_what_follows() {
+        let source = "interface IEditor {\n  getModel(): unknown;\n  hasModel(): this is IActiveCodeEditor;\n}\ninterface IActiveCodeEditor extends IEditor {\n  getModel(): string;\n}\nfunction use(editor: IEditor) {\n  if (!editor.hasModel()) {\n    console.log('no model');\n  }\n  editor.getModel;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:22:getModel";
+        let active_get_model_id = "jsts:method:a.ts:134:getModel";
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == base_get_model_id),
+            "editor.getModel, after a guard that does not definitely exit, \
+             must still resolve normally to IEditor's own (unnarrowed) \
+             declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != active_get_model_id),
+            "editor.getModel must never be wrongly narrowed when the guard \
+             does not provably exit: rows={:?}",
+            resolved(&semantics)
         );
     }
 

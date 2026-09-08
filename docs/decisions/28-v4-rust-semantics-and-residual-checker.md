@@ -385,3 +385,70 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   This residual (~281 VS Code references, ~153 VS Code calls at this task's own measurement,
   down from 461/317 pre-fix) is reported, not guessed at — implementing real type-predicate
   narrowing (`x is T`) is a genuinely separate typeflow feature, out of this decision's scope.
+
+## Amendment 2026-09-09 (Frente E-P0p, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §16)
+
+- **Sibling-candidate rule generalized to an INHERITED match too.** `ProgramIndex::own_member_ids`
+  (the gate the 2026-09-08 amendment used to restrict the sibling check to an entity's OWN direct
+  declaration) is **removed**. `ProgramIndex::sibling_extends_overrides(entity_id, ...)` already
+  only ever returns transitive `extends` DESCENDANTS of `entity_id`, regardless of whether
+  `entity_id` declares the member directly or inherits it — so the only gate the sibling check
+  needs is `rule_pins_receiver_uniquely(rule)`, applied uniformly to both shapes. Re-examining the
+  2026-09-08 amendment's own regression guard (`instanceof_narrowing_never_applies_to_a_calls_own_
+  target_resolution`) directly showed why the ORIGINAL `own_member_ids` gate was never actually
+  load-bearing for it: `activePane: EditorPane`'s own rule for that test's CALL is
+  `"member_declared_type"` (an explicit parameter annotation, already one of `rule_pins_receiver_
+  uniquely`'s reliable rules, with `instanceof`-narrowing already suppressed for a call's own
+  target resolution) — reliable EITHER WAY, own-declaration or inherited, so the earlier, cruder
+  generalization attempt that broke this guard must have applied the sibling check WITHOUT also
+  consulting `rule_pins_receiver_uniquely` for the inherited branch, not because the two shapes are
+  inherently incompatible.
+- **New mechanism: `this is T` type-predicate narrowing (`PredicateSubject::Receiver`).**
+  `RawTypeRef`/`ResolvedTypeRef::TypePredicate` (`urdira-jsts-typeflow`) captures a method's own
+  declared return type when it is a user-defined type predicate; `ProgramIndex::member_predicate_
+  receiver_narrowing` exposes the resolved narrowed entity for a `this is T` predicate specifically
+  (`param is T`, `PredicateSubject::Parameter`, is represented but NOT yet consulted by any
+  resolver — narrowing a function's own ARGUMENT by parameter name/position needs a per-function
+  parameter table this index does not otherwise keep; no live sample forced this, scoped out).
+  `semantic_sites.rs`'s new `type_predicate_narrowings` stack mirrors `instanceof_narrowings`'
+  bracketing (an `if`'s own consequent, or the right-hand side of a `&&`) for a call shape instead
+  of a binary expression (`x.hasModel()`), tagging the receiver with a new reliable rule,
+  `"type_predicate_narrowed"` — added to `rule_pins_receiver_uniquely`. Unlike `instanceof_
+  narrowed`, this new rule is **never suppressed for a call's own target resolution**: a
+  type-predicate narrows the receiver to a DIFFERENT interface shape entirely (not a subclass
+  override reachable via virtual dispatch at the unnarrowed type), so v3's own real answer for a
+  CALL through a predicate-narrowed receiver DOES follow the narrowing — confirmed live: the
+  `ICodeEditor`/`IActiveCodeEditor`/`hasModel(): this is IActiveCodeEditor` counter-example the
+  2026-09-08 amendment reported as its own residual now resolves correctly to `IActiveCodeEditor`'s
+  own declaration for both a read and a call, in the positive `if (x.hasModel())`/`&&`-right-side
+  form.
+- **Second mechanism: the SAME predicate narrowing generalized to VS Code's own DOMINANT idiom for
+  it, `if (!x.hasModel()) return; ...narrowed for the rest of this block...`** (live count against
+  `vscode-corpus-2026-09-06`: 238 negated-early-return call sites for `hasModel` alone vs. a
+  smaller positive-form count) — `semantic_sites.rs`'s new `visit_statements` override (replacing
+  the default `walk_statements` loop for every statement-list context this visitor reaches: a
+  block body, a function/program top level, ...) extends `type_predicate_narrowings` across the
+  REST of the SAME statement list after an `if` with no `else` whose test is a negated predicate
+  call (through any number of `||`-joined disjuncts — reaching past an `A || B` early exit proves
+  BOTH false) AND whose consequent `statement_definitely_exits` (a bare/nested-block
+  `return`/`throw`/`continue`/`break` — deliberately narrow, never an `if`/`else`-both-exit or
+  `switch`-exhaustiveness proof). Reused, in-scope naming: this is the SAME kind of "proven,
+  bounded, syntax-local control-flow fact" `instanceof_narrowings` already established, not a new
+  discipline.
+- **Live measurement** (`vscode-corpus-2026-09-06` reduced tree, 10,044 TS/JS files this session's
+  own rsync pass produced — a smaller reduction than the 2026-09-08 amendment's own 12,841, not
+  reconciled further, see the evidence doc's own §16.1 for the exact recipe used): VS Code
+  references `different` 281 → 189 (-33%), calls `different` 153 → 58 (-62%). **`different == 0`
+  does NOT hold for VS Code** at this task's own final measurement — the classification in the
+  evidence doc's own §16.4 accounts for the remainder as SEPARATE, out-of-scope root causes (chiefly
+  an `implements`-not-`extends` sibling-conformance shape deliberately NOT generalized to, for the
+  same "real subclassing, not interface conformance" reason `extends_chain_reaches`'s own doc
+  comment already established — widening to `implements` would need to enumerate every known
+  implementer of a common interface, an effectively unbounded candidate set for a widely-implemented
+  shape like `IAction`, risking a large precision regression across confirmations this mechanism has
+  no way to bound; a negated-`instanceof`-early-return variant of the SAME gap `instanceof_
+  narrowings` itself still has, distinct from the type-predicate mechanism this amendment adds;
+  and several previously-reported, unrelated residuals — `createMarkupPreview`, the `McpApps`
+  namespace bug — unchanged). n8n (unreduced): `different == 0` in BOTH populations (unchanged from
+  2026-09-08); `confirmed_combined=161,903`, an EXACT match to `REFERENCE_CONFIRMED_COMBINED`
+  (no refresh needed).
