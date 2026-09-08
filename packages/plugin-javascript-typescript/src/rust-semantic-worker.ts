@@ -78,7 +78,14 @@ function configureAddon(path: unknown): void {
   if (path === undefined || path === null) return;
   if (typeof path !== "string" || !isAbsolute(path)) throw new Error("Rust semantic bridge addon path is invalid.");
   const loaded = createRequire(import.meta.url)(path) as Partial<StructuralKernelPort> & { readonly nativeApiVersion?: () => number };
-  if (typeof loaded.nativeApiVersion !== "function" || loaded.nativeApiVersion() !== 16
+  // Must track NATIVE_API_VERSION in packages/native/src/loader.ts (and
+  // crates/urdira-native-node/src/lib.rs); this process worker can't import
+  // that constant across the child-process boundary, so the literal is
+  // duplicated here. S-I bumped it 16 -> 17 (resident contiguous vector
+  // buffer + single-call native exact top-K) and this literal was left
+  // behind, so every addon handshake failed closed with "Rust semantic
+  // bridge structural kernel binding is incompatible.".
+  if (typeof loaded.nativeApiVersion !== "function" || loaded.nativeApiVersion() !== 17
     || typeof loaded.structuralKernelBatch !== "function" || typeof loaded.structuralKernelCanonicalBatch !== "function"
     || typeof loaded.structuralObservationBatch !== "function") throw new Error("Rust semantic bridge structural kernel binding is incompatible.");
   configureStructuralKernelPort({

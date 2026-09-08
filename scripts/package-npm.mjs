@@ -119,7 +119,13 @@ export function createNativePlatformPublishManifest({ target, version, addonDige
     schema_version: 1,
     target,
     rust_target: rustTarget,
-    binding_api: 16,
+    // Must track NATIVE_API_VERSION in packages/native/src/loader.ts (and
+    // crates/urdira-native-node/src/lib.rs) by hand: this script is plain
+    // JS run outside the TS build, so it can't import that constant.
+    // S-I bumped it 16 -> 17 (resident contiguous vector buffer + single-
+    // call native exact top-K) and this literal was left behind, breaking
+    // tests/native-loader.test.ts's platform/offline manifest checks.
+    binding_api: 17,
     node_api: 10,
     worker_protocol: "urdira.ipc.v2",
     files: {

@@ -100,7 +100,16 @@ export async function stageNativeArtifacts({ artifactRoot, stageRoot, target }) 
     schema_version: 1,
     target,
     rust_target: inspection.rust_target,
-    binding_api: 16,
+    // Must track NATIVE_API_VERSION in packages/native/src/loader.ts (and
+    // crates/urdira-native-node/src/lib.rs) by hand: this script is plain
+    // JS run outside the TS build, so it can't import that constant. S-I
+    // bumped it 16 -> 17 (resident contiguous vector buffer + single-call
+    // native exact top-K) and this literal was left behind, so every
+    // freshly staged offline manifest still declared API 16 while the
+    // staged addon itself reported 17 -- "Offline Urdira native manifest
+    // API mismatch" in tests/v3-external-module-record-id-collision.test.ts
+    // and tests/v4-mutation-harness.test.ts.
+    binding_api: 17,
     node_api: 10,
     worker_protocol: "urdira.ipc.v2",
     files: {
