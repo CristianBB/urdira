@@ -250,10 +250,20 @@ const snippetLinesFieldSchema: JsonSchema = {
   type: "integer",
   minimum: 0,
   maximum: 3,
-  description: "Number of source-snippet lines rendered inline per compact-text result for structural/discovery bundles (core:find_references/core:get_outline/core:search_hybrid/core:search_semantic). Optional; default: 1. 0 disables inline snippet lines (rendering only -- the engine still hydrates the snippet server-side).",
+  description: "Number of source-snippet lines rendered inline per compact-text result for structural/discovery bundles (core:find_references/core:get_outline/core:search_hybrid/core:search_semantic). Optional; default: 0 (opt-in). Set to 1-3 to enable inline snippet lines (rendering only -- the engine still hydrates the snippet server-side either way).",
 };
 
-const DEFAULT_SNIPPET_LINES = 1;
+// R14 (2026-09-08 benchmark, docs/evidence/2026-09-08-agent-benchmark-
+// inline-snippets.md; plan `generic-waddling-hartmanis.md` §0/§5.2): the
+// mechanism shipped with this default ON (1) pending a benchmark
+// comparison against the text+policy arm's single existing pre-snippets
+// run. Two fresh runs with snippets ON both missed task requirement 4 (the
+// `restore.ts` allow-list) that the pre-snippets run got right, so the
+// rule's "6/6 in both" acceptance gate did not hold (cost was well inside
+// budget in both runs, but that is moot once the correctness gate fails).
+// Per R14's explicit fallback, the default is now 0 -- an agent must opt in
+// with `snippet_lines: 1..3` to get inline snippets at all.
+const DEFAULT_SNIPPET_LINES = 0;
 
 const responseBudgetSchema: JsonSchema = objectSchema({
   max_items: { type: "integer", minimum: 1, description: "Maximum result bundles to hydrate across all streams. Optional; default: 50." },
@@ -1076,7 +1086,8 @@ interface BundleDescriptor {
    * `core:build_context`'s own much larger, caller-configured snippets
    * (`resultSetLabel` "sources"/"context") or `core:search_text`'s
    * grep-style match (`isMatchStyle`). Rendered as one or more `    | `
-   * lines, capped at `snippet_lines` (default 1) -- unlike the full-body
+   * lines, capped at `snippet_lines` (default 0, R14 2026-09-08 -- opt-in)
+   * -- unlike the full-body
    * style below, which never re-truncates a caller-configured read.
    */
   readonly isCompactSnippetStyle: boolean;
@@ -1345,7 +1356,7 @@ function bundleCountOf(resultSet: JsonRecord): number {
   return bundlesOf(resultSet["confirmed"]).length + bundlesOf(resultSet["possible"]).length;
 }
 
-/** Renders a `QueryResultPage`-shaped envelope (see `publicQueryPage`) as compact, grep/ctags-density plain text. This is the default `content[0].text` for `urdira_query`/`urdira_analyze_change`/`urdira_build_context`; the full JSON page is still reachable via `render: "json"`. `snippetLines` (plan 2026-09-06, Frente N) caps how many lines of a SNIPPET_POLICY-hydrated bundle's inline snippet get printed; optional, default 1 (see `DEFAULT_SNIPPET_LINES`). */
+/** Renders a `QueryResultPage`-shaped envelope (see `publicQueryPage`) as compact, grep/ctags-density plain text. This is the default `content[0].text` for `urdira_query`/`urdira_analyze_change`/`urdira_build_context`; the full JSON page is still reachable via `render: "json"`. `snippetLines` (plan 2026-09-06, Frente N) caps how many lines of a SNIPPET_POLICY-hydrated bundle's inline snippet get printed; optional, default 0 -- opt-in, R14 2026-09-08 (see `DEFAULT_SNIPPET_LINES`). */
 function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SNIPPET_LINES): string {
   const resultSets = Array.isArray(page["result_sets"]) ? page["result_sets"] as JsonRecord[] : [];
   const totalItems = typeof page["returned_items"] === "number" ? page["returned_items"] : resultSets.reduce((sum, resultSet) => sum + bundleCountOf(resultSet), 0);
@@ -1529,7 +1540,7 @@ export interface FormatUrdiraResultOptions {
   readonly page_kind?: "query" | "index_status";
   /** Optional; default: "agent". The web profile adds schema-validated structuredContent. */
   readonly presentation_profile?: McpPresentationProfile;
-  /** Optional; default: 1. See `snippetLinesFieldSchema`. */
+  /** Optional; default: 0 (R14 2026-09-08, opt-in). See `snippetLinesFieldSchema`. */
   readonly snippet_lines?: number;
 }
 

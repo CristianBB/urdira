@@ -1145,6 +1145,12 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
+      // R14 (2026-09-08 benchmark, docs/evidence/2026-09-08-agent-benchmark-
+      // inline-snippets.md): `snippet_lines` now defaults to 0 (opt-in), so
+      // this test -- which exercises the compact-snippet rendering
+      // mechanism itself -- opts in explicitly instead of relying on the
+      // old default of 1.
+      snippet_lines: 1,
       query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
@@ -1154,6 +1160,52 @@ describe("Phase 13 Urdira MCP adapter", () => {
     // and the snippet are on separate lines, never joined with ": ".
     expect(text).not.toContain("src/service.ts:42: doStuff(x);");
     expect(text).not.toContain("optional_source_snippets");
+  });
+
+  // R14 (2026-09-08 benchmark, docs/evidence/2026-09-08-agent-benchmark-
+  // inline-snippets.md, plan `generic-waddling-hartmanis.md` §0/§5.2): two
+  // fresh runs of the text+policy benchmark arm with snippets ON both
+  // missed task requirement 4 (the `restore.ts` allow-list) that the single
+  // existing pre-snippets run of that arm got right, so `6/6 in both` did
+  // not hold and R14's fallback applies -- `snippet_lines` now defaults to
+  // 0 (opt-in) instead of 1. This test locks in that default: an ordinary
+  // `urdira_query` call that never sets `snippet_lines` must render no
+  // compact snippet line at all, even though the engine still attaches
+  // `optional_source_snippets` per SNIPPET_POLICY.
+  it("omits the inline compact snippet line by default (snippet_lines defaults to 0, R14)", async () => {
+    const call = vi.fn(async () => success({
+      query_execution_id: "execution-snippet-default-off",
+      streams: {
+        references: {
+          items: [{
+            stable_sort_key: "confirmed rel-3",
+            value: {
+              subject_type: "relation",
+              record_id: "rel-3",
+              universal_kind: "core:call",
+              kind: "jsts:relation_call",
+              classification: "confirmed",
+              body: { path: "src/service.ts" },
+              source_span: { artifact_version_id: "artv-1", start_byte: "800", end_byte: "812", start_line: "42", end_line: "42" },
+              optional_source_snippets: [{ text: "doStuff(x);", span: { artifact_version_id: "artv-1", start_byte: "798", end_byte: "812", start_line: "42", end_line: "42" }, truncated: false, redacted: false, redactions: [] }],
+            },
+          }],
+          has_next: false, has_previous: false,
+        },
+      },
+      completeness: { overall_status: "complete", dimensions: [] },
+    }));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
+    const result = await definition.invoke({
+      request_type: "query",
+      // No `snippet_lines` field at all -- this is the ordinary agent call
+      // shape and must fall back to the new default of 0.
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } } },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("src/service.ts:42");
+    expect(text).not.toContain("    | ");
+    expect(text).not.toContain("doStuff(x);");
   });
 
   it("renders a get_outline root member's inline snippet as its opening (signature) line", async () => {
@@ -1182,6 +1234,8 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
+      // R14: opt in explicitly -- see the previous test's comment.
+      snippet_lines: 1,
       query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:get_outline", arguments: { container: { subject_type: "artifact", path: "src/task-service.ts" } } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
@@ -1247,6 +1301,10 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
+      // R14: opt in explicitly so this test still exercises snippet
+      // shedding under a tight budget rather than vacuously passing
+      // because no snippet line was ever requested.
+      snippet_lines: 1,
       query: {
         api_version: 3,
         scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
@@ -1292,6 +1350,8 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const args = {
       request_type: "query",
+      // R14: opt in explicitly -- see the first snippet test's comment.
+      snippet_lines: 1,
       query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } } },
     };
     const first = await definition.invoke(args);
@@ -1375,13 +1435,17 @@ describe("Phase 13 Urdira MCP adapter", () => {
     // nothing to show), the 50 bare descriptor lines alone must ALSO
     // exceed 6000 -- otherwise stage 1 alone would already satisfy the
     // budget and stage 2 (whole-bundle dropping) would never fire.
-    const unbudgeted = await invokeOnce();
+    // R14: opt in explicitly on every call that needs snippets rendered --
+    // `snippet_lines` now defaults to 0, so omitting it here would make
+    // `unbudgeted` and `bareDescriptorsOnly` identical by construction
+    // rather than by the shedding logic this test exists to exercise.
+    const unbudgeted = await invokeOnce({ snippetLines: 1 });
     const bareDescriptorsOnly = await invokeOnce({ snippetLines: 0 });
     expect(unbudgeted.length).toBeGreaterThan(6000);
     expect(bareDescriptorsOnly.length).toBeGreaterThan(6000);
 
-    const first = await invokeOnce({ maxCharacters: 6000 });
-    const second = await invokeOnce({ maxCharacters: 6000 });
+    const first = await invokeOnce({ snippetLines: 1, maxCharacters: 6000 });
+    const second = await invokeOnce({ snippetLines: 1, maxCharacters: 6000 });
 
     // (a) Fits the budget.
     expect(first.length).toBeLessThanOrEqual(6000);

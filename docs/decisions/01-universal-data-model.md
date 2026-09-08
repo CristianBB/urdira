@@ -6906,9 +6906,23 @@ model, plus the engine-side hydration it renders.
   stays outside `response_budget` (it would need a fifth field re-admitted
   at all four payload-construction sites); revisit only if a future
   measurement shows the hydration cost matters enough to justify that.
-- **Acceptance (R14, pending)**: whether `snippet_lines` defaults to 1 or to
-  0 (opt-in) is decided by a benchmark comparison (2 corridas of the
-  text+policy arm with snippets ON vs. the existing 3 corridas of that arm
-  without them) reserved for the plan's ola 3; this amendment ships the
-  mechanism with the default ON (`snippet_lines: 1`) pending that
-  measurement.
+- **Acceptance (R14, decided 2026-09-08)**: full numbers, commands, and
+  transcripts in
+  `docs/evidence/2026-09-08-agent-benchmark-inline-snippets.md`. Ola 3 ran 2
+  fresh runs of the text+policy benchmark arm against `main@934b330` with
+  snippets ON (the default this amendment shipped with). The plan text named
+  "3 corridas existentes del brazo 6" as the without-snippets comparison
+  point; only **one** such run actually exists in
+  `~/Proyectos/urdira-benchmark/bench-2026-08-14-rerun/`
+  (`urdira-g6-run.jsonl`, predating this amendment entirely since the
+  snippet mechanism did not exist yet) -- a plan inaccuracy, decided in
+  implementation per §0 rather than returned as a question, and documented
+  in the evidence doc. Results: cost stayed well inside R14's budget (2 new
+  runs: $2.66 and $4.19, both under 1.10 x the single historical run's
+  $6.10), but correctness did not hold -- both new runs missed task
+  requirement 4 (the `restore.ts` `boxSelectionMode` allow-list) that the
+  single historical without-snippets run got right, so "6/6 in both" never
+  held. Per R14's explicit fallback, `snippet_lines` now defaults to **0**
+  (opt-in); `DEFAULT_SNIPPET_LINES` in `packages/mcp/src/index.ts` and its
+  test coverage in `tests/phase13-mcp.test.ts` were updated accordingly. An
+  agent that wants inline snippets sets `snippet_lines: 1..3` explicitly.
