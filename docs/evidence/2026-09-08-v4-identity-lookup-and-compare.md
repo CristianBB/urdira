@@ -414,20 +414,52 @@ bounds the fetch -- it is exactly as fast as any other `selection`-bound
 
 ### 5.4 VS Code
 
-VS Code's own live sweep (~4.5M records, a corpus roughly 2x n8n's size)
-was run with the identical methodology as §5.1-5.3 above, in a background
-task in parallel with writing this evidence doc, to avoid this frente's
-own session blocking on a second multi-minute cold scan after n8n's own
-sweep and the full verification suite (§7) were already complete and
-committed (`c7d2a74`). The identity-index fix's own mechanism is
-corpus-size-independent by construction (indexed hash-map/binary-search
-lookups, not a scan -- proven directly via the `iterVisibleBatch` spy in
-§4, not just inferred from n8n's own wall-clock numbers), so n8n's
-results already establish the fix works; VS Code's own numbers, once
-captured, corroborate the SAME mechanism at roughly double the corpus
-scale and are appended to this evidence doc as a follow-up amendment
-rather than blocking this frente's own commit on a second long-running
-scan.
+VS Code's own live sweep (`~/Proyectos/urdira-benchmark/vscode-corpus-
+2026-09-06`, `workspace:vscode-corpus-2026-09-06:a95b92ac-...`,
+**4,468,099 visible records** -- confirms Q1/Q2's own prior "~4.5M"
+figure precisely), identical methodology to §5.1-5.3, real daemon IPC,
+this worktree's own build. Target: `core:resolve_symbol` resolved
+`registerCommand` (`entity_id: entity:ffa6753164db3b03c60501056caa9c03849
+457403bf486c627051f519171526a`, 5 declarations, 58ms).
+
+| operation | run 1 | run 2 | run 3 | before (Q-3's own measurement) | speedup |
+|---|---:|---:|---:|---:|---:|
+| `core:analyze_impact` | 205ms | 205ms | 207ms | 3,280-3,667ms | ~16-17x |
+| `core:find_related_tests` | 174ms | 174ms | 173ms | 3,261-3,292ms | ~18-19x |
+| `core:find_references` | 281ms | 242ms | 233ms | (Q1's own path, unchanged) | -- |
+| `core:expand_relations` | 205ms | 206ms | 207ms | (unchanged) | -- |
+| `core:find_paths` | 267ms (1 call) | -- | -- | (unchanged) | -- |
+| `core:index_status` | 21ms | -- | -- | (unchanged) | -- |
+
+Every one of these meets the task's own target (p50 < 500ms, p99 <
+1.5s) by a wide margin at VS Code's own ~4.5M-record scale, and no call
+returned `core:execution_resource_limit`, a raw `TypeError`, or any
+other error. `core:locate_implementation@1` was not attempted at this
+scale: it requires semantic search, disabled in this measurement
+environment (`URDIRA_SEMANTIC_INDEX=0`, orthogonal to this frente, same
+convention as §5's own n8n sweep) -- not forced on, per this frente's own
+"never fabricate a passing number" discipline.
+
+`core:compare` was measured on n8n only (§5.3): registering VS Code
+twice (a second ~2.3GB corpus copy) to repeat the identical, already-
+corpus-size-independent comparison-scope IPC proof was judged
+disproportionate to the marginal evidence it would add -- the mechanism
+being proven (participant resolution + `selection`-bound
+`records_by_ids` + `identity_key` diffing) is the exact same code path
+already exercised at n8n's own ~2.2M-record scale in §5.3, with no
+VS-Code-specific branch or cost center in `executeCompare`/
+`resolveComparisonParticipant`/`recordsForComparisonParticipant` that
+n8n's own sweep would not already exercise identically.
+
+### 5.5 Cleanup confirmation
+
+Both scratch data roots, the scratch driver script, and the second n8n
+corpus copy used for the `core:compare` sweep were deleted at the end of
+the measurement session; no daemon or `urdira-indexing-worker` process
+from this session's own scratch data roots was left running (confirmed
+via `pgrep`/`ps` at session end). No machine contention was observed
+during either sweep (clean, single-shot runs, no retries needed for the
+final reported numbers).
 
 ## 6. Registry/decision changes
 
