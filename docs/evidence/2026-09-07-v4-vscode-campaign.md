@@ -1789,3 +1789,219 @@ both VS Code and n8n parity for this exact build. `REFERENCE_CONFIRMED_COMBINED`
   after,reports}/` removed; this worktree's own local `node_modules` symlink, per-package `packages/
   */node_modules/@urdira/*` symlinks, and every `packages/*/dist`/`*.tsbuildinfo` this session
   produced (untracked, gitignored) removed at session close.
+
+## 16. E-P0p (2026-09-09): the last VS Code pattern — inherited member match + type-predicate
+narrowing
+
+Base: `a7438ec` (E-P0o merged). Same reduced-tree RECIPE as prior sessions (rsync `--exclude=
+'**/fixtures/'` + `node_modules` excluded from the copy then symlinked back in + `scripts/xterm-
+update.js` removed), but a FRESH pass this session against the SAME retained `vscode-corpus-2026-
+09-06` checkout produced **10,044** TS/JS files (`find ... -name '*.ts' -o -tsx -o -js -o -mjs -o
+-cjs`, `node_modules` excluded) — smaller than the 2026-09-08 session's own 12,841. Not reconciled
+further (a `--exclude` glob edge case or a filesystem walk-order difference between sessions,
+neither investigated — the walker's own frontier at scan time, not this `find` count, is what a
+cold scan actually processes either way, same caveat §11.5's own evidence already recorded for a
+similar discrepancy). n8n corpus (`n8n-corpus-2026-09-02`, unreduced) unchanged. v3 oracles:
+`v3-vscode-2026-09-07`/`v3-n8n-2026-09-07-b`, both retained, read-only, unchanged.
+
+### 16.1 The mechanism
+
+§15.2's own residual (the `ICodeEditor`/`IActiveCodeEditor` counter-example, deliberately NOT
+generalized to by E-P0o) is closed by TWO changes:
+
+**1. `ProgramIndex::own_member_ids` removed (`crates/urdira-jsts-typeflow/src/lib.rs`)** — the
+sibling-candidate check (`ProgramIndex::sibling_extends_overrides`) now fires whenever `!rule_pins_
+receiver_uniquely(rule)`, regardless of whether the member match came from the receiver's own
+direct declaration or an inherited one. `sibling_extends_overrides(entity_id, ...)` already only
+ever returns transitive `extends` DESCENDANTS of `entity_id` — this was true before this task too —
+so no separate own-vs-inherited gate was ever structurally necessary; re-examining E-P0o's own
+adversarial regression guard (`instanceof_narrowing_never_applies_to_a_calls_own_target_
+resolution`) directly (rather than re-deriving the earlier, reverted attempt) showed its own
+receiver (`activePane: EditorPane`) is typed through `"member_declared_type"`, already reliable
+regardless of own vs. inherited, so this generalization changes nothing about it. Call sites:
+`resolve_static_member_reference`/`resolve_call_target_typeflow` (`semantic_sites.rs`).
+
+**2. `this is T` type-predicate narrowing (new mechanism).** `RawTypeRef`/`ResolvedTypeRef::
+TypePredicate { subject: PredicateSubject, target }` (`urdira-jsts-typeflow/src/lib.rs`) — a
+method/function's own declared return type when it is a TypeScript user-defined type predicate;
+`PredicateSubject::Receiver` for `this is T` (the only shape consulted below), `Parameter(name)`
+for `param is T` (represented for correctness — never misclassified as a plain type — but NOT
+consulted by any resolver: narrowing a function's own ARGUMENT by parameter name/position needs a
+per-function parameter table this index does not keep, and no live sample forced building one).
+`ProgramIndex::member_predicate_receiver_narrowing(entity_id, name, is_static)` resolves a `this is
+T` member's own asserted `T` to a concrete entity id, reusing `member_type_ref`'s existing own-
+then-`extends`-then-`implements` traversal (`lookup_member_type_ref`) — no new traversal code.
+
+`semantic_sites.rs`'s new `type_predicate_narrowings: Vec<(SymbolId, String)>` stack mirrors
+`instanceof_narrowings`' own bracketing exactly for the POSITIVE form (`extract_type_predicate_
+narrowings`, pushed/popped in `visit_if_statement`'s consequent and `visit_logical_expression`'s
+`&&` right-hand side) — `x.hasModel()` narrows `x` to `T` for the guarded region. A NEW rule
+string, `"type_predicate_narrowed"`, added to `rule_pins_receiver_uniquely`'s reliable set. Unlike
+`instanceof_narrowed`, this rule is **never suppressed for a call's own target resolution** — no
+`suppress_..._for_calls`-shaped cell exists for it — because the live counter-example itself is a
+CALL (`editor.getModel()`) that DOES need to follow the narrowing (a type predicate narrows the
+receiver to a genuinely different, non-override-related interface shape, unlike `instanceof`
+narrowing a receiver to a virtual-dispatch subclass override the unnarrowed type already resolves
+correctly for calls).
+
+**3. The SAME predicate narrowing, generalized to the negated-early-return idiom** — VS Code's own
+DOMINANT real shape for `hasModel()` specifically (live count against the reduced tree: 238 sites
+matching `if (!x.hasModel())`/`if (!x.hasModel() || ...)` vs. a smaller positive-form count,
+`grep -rn` against `vscode-corpus-2026-09-06/src`). `semantic_sites.rs`'s new `fn visit_statements`
+override (replacing the default `oxc_ast_visit::walk::walk_statements` loop for EVERY statement-
+list context this visitor reaches — a block body, a function/program top level, ...) recognizes an
+`if` with no `else` whose test is a negated predicate call (`extract_negated_predicate_narrowings_
+from_early_exit_test`, through any number of `||`-joined disjuncts) and whose consequent
+`statement_definitely_exits` (a bare or nested-block-ending `return`/`throw`/`continue`/`break` —
+deliberately narrow: an `if`/`else` where both branches exit, a `switch` where every case exits,
+... are real reachability proofs TypeScript's own checker would make but this crate does not
+attempt), and extends `type_predicate_narrowings` across the REST of that SAME statement list.
+Reaching any statement after such an `if` proves the test was false; for a negated predicate call
+that means the predicate itself was true — the identical fact the positive form's own consequent
+proves, reached through the opposite branch.
+
+Unit tests (`semantic_sites.rs`): `sibling_declaration_via_an_inherited_match_with_a_reliable_rule_
+still_confirms` (renamed/re-justified control, formerly `..._not_generalized_to`), `sibling_
+declaration_ambiguous_inherited_match_produces_candidate_reference_rows_when_the_receiver_is_not_
+reliably_typed` (the actual generalization, new), `type_predicate_narrowing_confirms_the_narrowed_
+descendants_own_declaration_for_read_and_call` (the `ICodeEditor`/`IActiveCodeEditor` shape,
+reproduced structurally), `type_predicate_narrowing_never_leaks_past_its_own_guarded_region`
+(rewritten from its own earlier draft after the FIRST version's own assumption — that the
+unguarded read stays ambiguous — turned out wrong: `editor: IEditor` is explicitly, reliably typed
+and `IEditor` declares `getModel` itself, so it correctly stays confirmed to `IEditor`'s own
+declaration outside the guard, exactly like `explicitly_annotated_parameter_of_the_narrower_
+sibling_interface_still_confirms`'s own established control — this test now asserts THAT, plus that
+the narrowing itself does not leak past its scope), `negated_early_return_type_predicate_narrows_
+the_rest_of_the_block` (the new dominant idiom), `negated_predicate_guard_without_a_definite_exit_
+never_narrows_what_follows` (safety companion: a guard that does not provably exit narrows
+nothing).
+
+### 16.2 The E-P0k test that "broke" (per this task's own §0 instruction, disposition decided)
+
+`instanceof_narrowing_never_applies_to_a_calls_own_target_resolution` (`EditorPane`/`MergeEditor`,
+`getControl`) asserts that `instanceof`-narrowing must NEVER change a CALL's own target resolution
+— a protection about `instanceof` specifically, not about inherited-member-plus-sibling ambiguity
+at all. **Unaffected by this task's own diff, unchanged, still green** — `activePane`'s own rule
+for the call is `"member_declared_type"` (an explicit parameter annotation; `instanceof`-narrowing
+is separately suppressed for a call's own target resolution by the PRE-EXISTING `suppress_
+instanceof_narrowing_for_calls` cell, untouched here), already in `rule_pins_receiver_uniquely`'s
+reliable set REGARDLESS of own-vs-inherited, so the sibling-candidate check this task generalized
+never even engages for it. No test rewrite was needed for this one; `sibling_declaration_via_an_
+inherited_match_with_a_reliable_rule_still_confirms` (§16.1) is the test that DID need
+re-justifying, since it exercises the actual own-vs-inherited boundary this task changed (verified:
+its own outcome — stays confirmed — is UNCHANGED by the generalization, because its own receiver is
+ALSO reliably typed; see that test's own doc comment for why).
+
+### 16.3 Final gate measurement (this session's own final binary)
+
+**VS Code** (reduced tree, 10,044 files, `--v4-bodies` from a single cold-scan run producing both
+dumps): references `v3 confirmed core:references sites=3,145,812`; `same=2,482,169` (78.90%, **≥
+2,400,000 floor OK**), **`different=189`** (0.01%, down from 281, **-33%**), `missing=663,454`
+(21.09%). Calls: `v3 confirmed core:call sites=743,472`; `v4_confirmed_same_target=360,654`
+(48.51%), **`v4_confirmed_different_target=58`** (0.01%, down from 153, **-62%**),
+`v4_possible=16,158` (2.17%, undercounted by design — `dump_call_bodies_cold_only` skips the
+pending-call-site-as-possible-row synthesis, see `n8n_references_parity_debug_dump`'s own doc
+comment), `v4_missing_site=366,602` (49.31%, same undercount artifact). **`different == 0` still
+does NOT hold for VS Code** — §16.4 classifies the remainder.
+
+Sibling-declaration demotions during the VS Code cold scan: `sibling_declaration_ambiguous` pending
+`IdentifierRef` sites `11,232` (down slightly from E-P0o's own 11,086-of-a-different-generation
+figure — same order of magnitude, expected: this generalization also CONVERTS some previously
+`different`/wrongly-confirmed sites into demotions, but also RECOVERS some previously-demoted own-
+declaration sites into confirmed via the new `"type_predicate_narrowed"` reliable rule, netting out
+close to flat).
+
+**n8n** (unreduced corpus): references `same=1,189,872` (**≥ 1,187,000 floor OK**),
+**`different=0`**; calls `same=94,425`, **`different=0`**; `sibling_declaration_ambiguous` pending
+sites `62` (down from E-P0o's own 95, both real, small, corpus-proportional). **n8n's own gate
+holds in full**, unchanged from E-P0o.
+
+`n8n_residual_schedule_resumes_after_truncation` (`URDIRA_V4_RESIDUAL_BUDGET_MS=15000`, the
+dedicated `confirmed_combined` regression harness): **`confirmed_combined=161,903`** (core:call
+confirmed 160,035 + possible 407, heritage confirmed 1,868) — an EXACT match to `REFERENCE_
+CONFIRMED_COMBINED=161,903` (diff 0, well inside the ±4 tolerance). No constant refresh needed;
+`different == 0` continues to hold in n8n's own parity for this exact build.
+
+### 16.3b Residual pass (60s budget, VS Code) -- `confirmed_combined` before/after
+
+`URDIRA_V4_RESIDUAL_BUDGET_MS=60000`, same reduced tree, `n8n_residual_pass_debug_histogram`
+(historical name, generic harness):
+
+| | `core:call` confirmed | `core:call` possible | heritage confirmed | `confirmed_combined` |
+|---|---:|---:|---:|---:|
+| COLD (generation 1) | 413,478 | 56,429 | 13,004 | **426,482** |
+| AFTER residual, 60s budget (generation 2) | 436,818 | 52,287 | 13,243 | **450,061** |
+
+Nearly identical to E-P0o's own COLD=426,497/AFTER=450,080 (+23,583) measurement: this session's
+own COLD=426,482/AFTER=450,061 (**+23,579**) — consistent within the small file-count discrepancy
+§16's own preamble already noted (10,044 vs. 12,841 files), confirming this task's own diff did not
+regress the residual pass itself. As before, this run does not isolate how many of the
+SPECIFICALLY `sibling_declaration_ambiguous`/`type_predicate`-reasoned pending sites the residual
+pass upgraded (a site-level before/after diff keyed on `reason`, not performed this session either
+— same known measurement gap E-P0o's own §15.5 already reported, still not closed).
+
+### 16.4 The remaining VS Code residual, classified (not guessed at)
+
+A representative sample of the 189 reference / 58 call `different` sites (drawn from the parity
+scripts' own 30-per-bucket reservoir, both before and after this task's own fix, cross-checked
+against the live source) resolves into the following DISTINCT root causes, none of them the
+`this is T`/inherited-member shape this task's own mechanism targets:
+
+| # | Pattern | Live sample | Disposition |
+|---|---|---|---|
+| 1 | **`implements`-not-`extends` sibling conformance**: the receiver's static type is an INTERFACE (`IAction`, `ICellViewModel`, `IEditorPane`, ...) declaring a member itself or via inheritance, and the CONCRETE class v3 resolves to (`Action`, `BaseCellViewModel`, `EditorPane`, ...) reaches it by `implements`, never `extends` — `ProgramIndex::sibling_extends_overrides`'s own "real subclassing, not interface conformance" restriction (`extends_chain_reaches`'s own doc comment, E-P0k) deliberately never walks this edge. | `run`/`getId`/`getSelection`/`getName`/`getEOL`/`getData`/`compare`/`getFocus`/`getEditState`/`updateEditState`/`handle`/`uri`/`outputsViewModels`/`editStateSource`/`domNode`/`getControl`/`getScrollPosition`/`copy`/`accept`/`reject`/`resolve` — the large majority of the remaining samples | **(b) not fixed, reported** — generalizing the sibling check to `implements` would need to enumerate EVERY known implementer of a common interface (`IAction`-shaped interfaces can have dozens across a codebase this size), an effectively unbounded candidate set with no way to bound false ambiguity — risks a large, unmeasured precision regression across every ordinary confirmed call/read through such an interface. Out of this task's own scope (member INHERITANCE + type-PREDICATE narrowing specifically). |
+| 2 | **Negated `instanceof` early-return** — the SAME general shape this task's own negated-predicate-call generalization closes, but for a literal `instanceof` check (`if (!(editor instanceof SimpleCommentEditor)) { return null; }`), which `instanceof_narrowings` (E-P0k) itself only brackets for the POSITIVE form, never a negated early exit. | `commentsInputContentProvider.ts`'s own `getModel` call, reached through `editor: ICodeEditor` narrowed to `SimpleCommentEditor` | **(b) not fixed, reported** — a real, closely related gap in the PRE-EXISTING `instanceof_narrowings` mechanism (E-P0k), not the type-predicate mechanism this task adds; extending `instanceof_narrowings` itself to the negated-early-return idiom is a well-scoped follow-up (the SAME `visit_statements`/`statement_definitely_exits` infrastructure this task built would need a second extraction function mirroring `instanceof_narrowing_of_binary`) but is a DIFFERENT decision's own scope, not exercised here. |
+| 3 | **Standalone function `param is T` predicate** (`isSelectionAwareEditorPane(x): x is T`, called as a bare function `isFoo(x)` rather than a member call) | `historyService.ts`'s own `getSelection` call, reached through `isSelectionAwareEditorPane(editorPane)` | **(b) not fixed, reported** — `PredicateSubject::Parameter` is represented in `RawTypeRef::TypePredicate` (§16.1) precisely so this shape is never MISCLASSIFIED, but resolving it needs a per-function parameter-name-to-position table this index does not keep; no consumer built this session, per the task's own scope decision (`this is T` via a member call was the authorized, measured-necessary shape). |
+| 4 | `createMarkupPreview` (`notebookEditorWidget.ts`) | unchanged from E-P0m/E-P0o | **(b) unchanged** — "own body wins over interface signature" is the OPPOSITE preference from every mechanism in this file; already investigated (E-P0m §13.3) and reported, mechanism not identified, out of scope here too. |
+| 5 | `McpApps` namespace (4 duplicate-target samples, all the SAME two-declaration pair) | `modelContextProtocolApps.ts` — TWO `namespace McpApps` declarations in the SAME file, v3 and v4 pick different ones | **(b) unchanged, newly exposed** — a namespace-declaration-merge selection bug, structurally unrelated to member/call resolution entirely (this task's diff touches neither `resolve_namespace_member` nor any namespace-declaration code path); not investigated further, time-boxed against this task's own higher-yield pattern-1/§16.1 work. |
+| 6 | `getTargetOperatingSystem`/`getFloatingBarButtonStyles` (`typeof`-value-copy-shaped, `debugConfigurationManager.ts`/`issueReporterOverlay.ts`) | 2 samples | **(b) unchanged** — E-P0l/E-P0m's own `typeof`/call-return-type residual class, this task's diff does not touch `raw_type_ref_of_value_copy_expression` or `resolve_call_target_typeflow`'s `TypeQuery` branch. |
+
+Patterns 1-6 account for every sampled `different` site this session inspected; none is a
+regression (all pre-existed this task's own diff, several ALREADY reported unresolved by earlier
+frentes — §16 simply removed the ONE pattern, `this is T` via a member call, that WAS this task's
+own authorized scope, at both its dominant real idioms). Per the task's own §0 "never guess"
+discipline and this campaign's own consistent precedent (E-P0n §14.7, E-P0m §13.4, E-P0o §15.3 all
+reported a nonzero, classified VS Code residual rather than chase every remaining shape into an
+unrelated mechanism), pattern 1 in particular is a DELIBERATE non-fix: the risk profile (unbounded
+candidate sets for widely-implemented interfaces) is qualitatively different from — and larger
+than — every sibling-candidate shape fixed so far, which is why `extends_chain_reaches` drew this
+exact line back in E-P0k and why this task does not cross it.
+
+### 16.5 Files touched, verification, cleanup
+
+- `crates/urdira-jsts-typeflow/src/lib.rs`: `PredicateSubject` (new); `RawTypeRef`/
+  `ResolvedTypeRef::TypePredicate` (new variants, plus every exhaustive match site: `raw_type_ref_
+  of_ts_type`'s new `TSTypePredicate` arm, `resolve_raw_type_ref`/`resolve_raw_type_ref_deferred`/
+  `resolve_type_ref_chasing_aliases`/`contains_deferred`'s new arms); `ProgramIndex::own_member_ids`
+  removed; `ProgramIndex::member_predicate_receiver_narrowing` (new); `sibling_extends_overrides`'s
+  own doc comment rewritten to describe the generalization and its own history.
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: `type_predicate_narrowings` stack
+  (new); `extract_type_predicate_narrowings`/`type_predicate_narrowing_of_call` (new, positive
+  form); `extract_negated_predicate_narrowings_from_early_exit_test`/`type_predicate_narrowing_of_
+  negated_operand`/`statement_definitely_exits` (new, negated-early-return form); `visit_
+  statements` override (new); `visit_if_statement`/`visit_logical_expression` extended to also
+  bracket `type_predicate_narrowings`; `type_of_expression`'s `Identifier` arm consults it
+  (`"type_predicate_narrowed"`, never suppressed for calls); `rule_pins_receiver_uniquely` extended
+  (new reliable rule, doc comment rewritten for the `own_member_ids` removal); `resolve_static_
+  member_reference`/`resolve_call_target_typeflow`'s own sibling-check call sites simplified (gate
+  removed); `resolve_type_ref_relative`'s new `TypePredicate` arm (`None` — never this call's own
+  VALUE type); imports: `Statement`, `UnaryOperator`, `ArenaVec`; 6 new/rewritten unit tests
+  (§16.1).
+- `docs/decisions/28-v4-rust-semantics-and-residual-checker.md`: amendment recording both new
+  mechanisms and the final classified residual (this section).
+- Verification (this session's own final state): `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` clean; `cargo test -p urdira-jsts-syntax-
+  worker -p urdira-jsts-typeflow --locked`: **`test result: ok. 328 passed; 0 failed; 1 ignored`**
+  (syntax-worker, +5 over E-P0o's own 323), **`test result: ok. 66 passed; 0 failed`** (typeflow,
+  unchanged).
+- Worktree setup: base was stale (HEAD at an unrelated, much later commit, `7d04d49`) — `git reset
+  --hard a7438ec` + `git branch -m`, confirming `feedback_worktree_subagents_base_and_node_modules`
+  yet again. `packages/canonical`/`packages/storage` (plus `contracts`) built fresh in-worktree via
+  `tsc --build` (needed only for the `.mjs` parity-diff scripts' own `decodeCanonical`/schema
+  imports, never for the Rust binary itself).
+- Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0p`) removed; scratch under
+  `~/Proyectos/urdira-benchmark/v4-fold/ep0p-{vscode-reduced,reports,vscode-residual-data,n8n-
+  residual-data}/` removed; this worktree's own local `node_modules` symlink, per-package
+  `packages/{canonical,storage,contracts}/node_modules/@urdira/*` symlinks, and every
+  `packages/*/dist`/`*.tsbuildinfo` this session produced (untracked, gitignored) removed at
+  session close.

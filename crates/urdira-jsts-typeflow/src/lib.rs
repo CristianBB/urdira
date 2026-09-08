@@ -37,7 +37,7 @@ use oxc_ast::ast::{
     Argument, Class, ClassElement, ClassType, Expression, Function, FunctionBody, FunctionType,
     IdentifierReference, MethodDefinitionKind, Program, PropertyKey, Statement,
     TSInterfaceDeclaration, TSLiteral, TSSignature, TSType, TSTypeAliasDeclaration,
-    TSTypeAnnotation, TSTypeName, TSTypeQueryExprName,
+    TSTypeAnnotation, TSTypeName, TSTypePredicateName, TSTypeQueryExprName,
 };
 use oxc_ast_visit::utf8_to_utf16::Utf8ToUtf16;
 use oxc_parser::Parser;
@@ -179,12 +179,53 @@ pub enum RawTypeRef {
     /// zero-wrong-target record is never spent on a genuine receiver
     /// ambiguity.
     Union(Vec<RawTypeRef>),
+    /// E-P0p (2026-09-09): a method/function's own declared return type IS
+    /// a TypeScript user-defined type-predicate (`this is T` or `param is
+    /// T`) -- `docs/evidence/2026-09-07-v4-vscode-campaign.md` §15.2's own
+    /// live counter-example (`hasModel(): this is IActiveCodeEditor`).
+    /// `subject` says WHICH thing the predicate narrows when the call
+    /// proves true (`PredicateSubject::Receiver` for `this is T` -- the
+    /// only shape this crate's own consumer, `semantic_sites.rs`'s
+    /// `type_predicate_narrowing_of_call`, ever ACTS on; `Parameter(name)`
+    /// for `param is T` is represented here so this variant is never a
+    /// MISCLASSIFICATION of the syntax, but no consumer resolves it yet --
+    /// doing so soundly needs a per-function parameter-name/position table
+    /// this index does not otherwise keep, see that function's own doc
+    /// comment for the scope decision). `target` is the predicate's own
+    /// asserted type (`T`), a plain `RawTypeRef` exactly like any other
+    /// declared type -- resolved through the SAME `resolve_raw_type_ref`/
+    /// `resolve_raw_type_ref_deferred` pipeline as every other leaf.
+    /// Deliberately NOT treated as this call's own VALUE type anywhere
+    /// (`resolve_type_ref_relative`'s own `TypePredicate` arm, `semantic_
+    /// sites.rs`) -- a predicate-returning call's real runtime value is
+    /// `boolean`, never `T`; `target` is consulted ONLY by the dedicated
+    /// narrowing path, never by ordinary fluent-chain/call-return-type
+    /// propagation.
+    TypePredicate {
+        subject: PredicateSubject,
+        target: Box<RawTypeRef>,
+    },
     /// Anything this crate does not (yet) reason about: a conditional/
     /// mapped/keyof/tuple type, a qualified type name, a type-parameter
     /// reference, ... -- never a guess. (A union type is `Union` instead,
     /// see its own doc comment, unless it contaminates to `Unknown` per
     /// that variant's own rule.)
     Unknown,
+}
+
+/// E-P0p (2026-09-09): which side of a `this is T` / `param is T` return-
+/// type predicate `RawTypeRef::TypePredicate`/`ResolvedTypeRef::
+/// TypePredicate`'s own `target` narrows -- see `RawTypeRef::TypePredicate`'s
+/// doc comment for which of the two this crate actually consults today.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PredicateSubject {
+    /// `this is T` -- narrows the method's own RECEIVER (the object a
+    /// member call/read reaches it through).
+    Receiver,
+    /// `param is T` -- narrows a NAMED parameter of the declaring function/
+    /// method itself, by name (not yet consulted by any resolver in this
+    /// crate -- see `RawTypeRef::TypePredicate`'s doc comment).
+    Parameter(String),
 }
 
 impl From<HeritageTarget> for RawTypeRef {
@@ -233,6 +274,14 @@ pub enum ResolvedTypeRef {
     /// unresolved (`ResolvedTypeRef` itself being absent) -- a caller must
     /// still refuse to fall back to the member's own declaration.
     TypeQuery(Option<String>),
+    /// E-P0p (2026-09-09): see `RawTypeRef::TypePredicate`'s doc comment --
+    /// `target` here is fully resolved (an `Entity(id)` when `T` names a
+    /// known class/interface, `None`-shaped states elsewhere collapsing the
+    /// same way any other unresolved leaf does).
+    TypePredicate {
+        subject: PredicateSubject,
+        target: Box<ResolvedTypeRef>,
+    },
 }
 
 /// One member of a class or interface: enough to answer "does this
@@ -2034,6 +2083,34 @@ fn raw_type_ref_of_ts_type(
             scoping,
             import_specifiers,
         )),
+        // E-P0p (2026-09-09): `this is T` / `param is T` -- see
+        // `RawTypeRef::TypePredicate`'s own doc comment. `Unknown` (never a
+        // guess) when the predicate has no `is T` clause at all (a bare
+        // `asserts x` assertion function, TypeScript's OTHER predicate
+        // shape -- out of scope, no live sample found; `TSTypePredicate::
+        // type_annotation` is `None` for that syntax).
+        TSType::TSTypePredicate(predicate) => {
+            let Some(type_annotation) = &predicate.type_annotation else {
+                return RawTypeRef::Unknown;
+            };
+            let subject = match &predicate.parameter_name {
+                TSTypePredicateName::This(_) => PredicateSubject::Receiver,
+                TSTypePredicateName::Identifier(ident) => {
+                    PredicateSubject::Parameter(ident.name.as_str().to_owned())
+                }
+            };
+            let target = raw_type_ref_of_ts_type(
+                &type_annotation.type_annotation,
+                path,
+                scoping,
+                import_specifiers,
+                synthetic_interfaces,
+            );
+            RawTypeRef::TypePredicate {
+                subject,
+                target: Box::new(target),
+            }
+        }
         _ => RawTypeRef::Unknown,
     }
 }
@@ -4748,62 +4825,10 @@ impl ProgramIndex {
             .is_empty()
     }
 
-    /// `entity_id`'s own OWN `members` list only (never `extends`/
-    /// `implements`) -- the member entity id(s) `entity_id` declares
-    /// DIRECTLY at the given static/instance disposition. Used by
-    /// `semantic_sites.rs` to tell apart a `members()` `One` outcome that
-    /// came from `entity_id`'s own declaration (eligible for the E-P0o
-    /// sibling-declaration check below) from one that came from an
-    /// INHERITED ancestor declaration.
-    ///
-    /// E-P0o (2026-09-08) adversarial finding: an INHERITED match is NOT
-    /// treated the same way, even though it looks structurally identical --
-    /// live VS Code counter-example (`editor: ICodeEditor` in `coreCommands.
-    /// ts`, guarded by `if (!editor.hasModel()) return;`): `ICodeEditor`
-    /// itself does not declare `getModel` (own list here would be empty,
-    /// the match comes from its OWN ancestor `IEditor`), and a FURTHER
-    /// descendant, `IActiveCodeEditor extends ICodeEditor`, redeclares it --
-    /// but v3's real answer is REACHED THROUGH a `hasModel(): this is
-    /// IActiveCodeEditor` user-defined type-predicate guard genuinely
-    /// narrowing `editor` to `IActiveCodeEditor` for the rest of the
-    /// function, a control-flow fact this crate does not model (the same
-    /// general class of gap as `instanceof` narrowing, just a different
-    /// syntax) -- NOT an unresolvable ambiguity between two equally
-    /// plausible candidates the way the own-declaration shape is. Reusing
-    /// the sibling-candidate mechanism for this shape would misrepresent a
-    /// DETERMINISTIC-but-unmodeled fact as a genuine ambiguity, and a
-    /// regression-tested counter-example on the OWN-declaration side
-    /// (`instanceof_narrowing_never_applies_to_a_calls_own_target_
-    /// resolution`: `EditorPane` DOES declare `getControl` itself, `MergeEditor
-    /// extends EditorPane` overrides it, and v3's own proven answer for a
-    /// CALL is still `EditorPane`'s own declaration, unconditionally) proves
-    /// the inherited and direct cases are NOT interchangeable -- own-
-    /// declaration wins unconditionally for a call/read whose receiver type
-    /// itself declares the member (matches TypeScript's real declared-type
-    /// resolution: a type that itself declares a member is used exactly as
-    /// declared, regardless of what unrelated subtypes might also declare),
-    /// while an INHERITED match leaves open exactly this kind of unmodeled
-    /// narrowing. So the E-P0o sibling check below is gated on THIS
-    /// function being non-empty -- see `resolve_static_member_reference`'s
-    /// own call site. The inherited-match residual this leaves (~281 VS
-    /// Code sites at this task's own measurement, `docs/evidence/2026-09-07-
-    /// v4-vscode-campaign.md` §15) is reported, not guessed at.
-    pub fn own_member_ids(&self, entity_id: &str, name: &str, is_static: bool) -> Vec<String> {
-        let Some(container) = self.containers.get(entity_id) else {
-            return Vec::new();
-        };
-        let effective_static = is_static && !container.is_interface;
-        container
-            .members
-            .iter()
-            .filter(|member| member.name == name && member.is_static == effective_static)
-            .map(|member| member.entity_id.clone())
-            .collect()
-    }
-
     /// E-P0o (2026-09-08, sibling-declaration ambiguity -- 76% of VS Code's
     /// remaining `different`-target residual, `docs/evidence/2026-09-07-v4-
-    /// vscode-campaign.md` §14.7): every OTHER known container that is a
+    /// vscode-campaign.md` §14.7) / E-P0p (2026-09-09, generalized to an
+    /// INHERITED match too, §16): every OTHER known container that is a
     /// transitive `extends` DESCENDANT of `entity_id` (never `implements` --
     /// same "real subclassing, not interface conformance" restriction as
     /// `extends_chain_reaches`'s own doc comment) and ALSO declares its OWN
@@ -4833,17 +4858,34 @@ impl ProgramIndex {
     /// own doc comment, ...). This function surfaces the full candidate set
     /// so the caller (which alone knows whether the receiver's OWN typing
     /// `rule` already pins it to `entity_id` specifically -- an explicit
-    /// annotation, `this`, ... -- see `semantic_sites.rs`'s `rule_pins_
-    /// receiver_uniquely`) can decide confirmed vs. ambiguous.
+    /// annotation, `this`, an active narrowing, ... -- see `semantic_sites.
+    /// rs`'s `rule_pins_receiver_uniquely`) can decide confirmed vs.
+    /// ambiguous.
     ///
-    /// The caller (`semantic_sites.rs`) only ever consults this for
-    /// `entity_id` when `own_member_ids(entity_id, name, is_static)` is
-    /// NON-empty -- i.e. `members(entity_id, ...)` matched `entity_id`'s OWN
-    /// direct declaration, never an inherited one -- see that function's own
-    /// doc comment for the live counter-example (`ICodeEditor`/
-    /// `IActiveCodeEditor`) proving an INHERITED match is a genuinely
-    /// different (unmodeled control-flow narrowing, not a same-file
-    /// ambiguity) shape this mechanism must not also claim.
+    /// **E-P0o originally gated the caller on a SEPARATE `own_member_ids`
+    /// check** (`entity_id` must declare `name` DIRECTLY, never merely
+    /// inherit it) before ever consulting this function at all -- an
+    /// INHERITED match (`ICodeEditor` inherits `getModel` from `IEditor`;
+    /// `IActiveCodeEditor extends ICodeEditor` redeclares it) was left
+    /// CONFIRMED to the ancestor's own declaration, unconditionally,
+    /// because an early, cruder attempt at removing that gate broke the
+    /// `instanceof_narrowing_never_applies_to_a_calls_own_target_
+    /// resolution` regression guard (`docs/evidence/2026-09-07-v4-vscode-
+    /// campaign.md` §15.2). **E-P0p (2026-09-09) removed that gate**: this
+    /// function already only ever returns DESCENDANTS of `entity_id`
+    /// regardless of whether `entity_id` declares `name` directly or
+    /// inherits it, so the ONLY gate the caller needs is `rule_pins_
+    /// receiver_uniquely(rule)` -- re-examining the regression guard
+    /// directly showed its own receiver (`activePane: EditorPane`) is typed
+    /// through `"member_declared_type"`, already reliable EITHER way (own
+    /// or inherited), so dropping the separate gate never affects it. The
+    /// live `ICodeEditor`/`IActiveCodeEditor` counter-example is now caught
+    /// by this SAME call, unconditionally -- and, when reached through a
+    /// `hasModel(): this is IActiveCodeEditor` user-defined type-predicate
+    /// guard, correctly stays CONFIRMED instead (never even reaching this
+    /// candidate path) via the new `"type_predicate_narrowed"` rule --
+    /// `PredicateSubject`/`member_predicate_receiver_narrowing`'s own doc
+    /// comments, `docs/evidence/2026-09-07-v4-vscode-campaign.md` §16.
     ///
     /// A linear scan over every container this index knows about, same
     /// performance tradeoff `has_known_subclass_override` already made for
@@ -4921,6 +4963,39 @@ impl ProgramIndex {
         is_static: bool,
     ) -> Option<ResolvedTypeRef> {
         lookup_member_type_ref(&self.containers, entity_id, name, is_static)
+    }
+
+    /// E-P0p (2026-09-09): when member `name` on `entity_id` (walking the
+    /// SAME own-then-`extends`-then-`implements` order `member_type_ref`
+    /// itself uses) is a method/function whose own declared return type is
+    /// a `this is T` user-defined type-predicate AND `T` resolved to a
+    /// single known entity, `Some(entity_id_of_T)` -- the receiver's
+    /// narrowed type once a call through this member proves true (`if (x.
+    /// <name>())`). `None` for every other shape: no member found, an
+    /// ambiguous/union member, a plain (non-predicate) return type, a
+    /// `param is T` predicate (`PredicateSubject::Parameter` -- represented
+    /// in the index but not yet consulted by any resolver, see `RawTypeRef
+    /// ::TypePredicate`'s own doc comment for the scope decision), or a
+    /// predicate whose own asserted type did not resolve to a plain entity
+    /// (an `ArrayOf`/`Union`/... -- never a guess at which constituent).
+    pub fn member_predicate_receiver_narrowing(
+        &self,
+        entity_id: &str,
+        name: &str,
+        is_static: bool,
+    ) -> Option<String> {
+        let ResolvedTypeRef::TypePredicate { subject, target } =
+            self.member_type_ref(entity_id, name, is_static)?
+        else {
+            return None;
+        };
+        if !matches!(subject, PredicateSubject::Receiver) {
+            return None;
+        }
+        match *target {
+            ResolvedTypeRef::Entity(id) => Some(id),
+            _ => None,
+        }
     }
 
     /// E-P0m (2026-09-08, rule (b) closure for pattern G's `_fetch`/
@@ -5136,6 +5211,21 @@ fn resolve_type_ref_chasing_aliases(
             )))
         }
         RawTypeRef::ReturnTypeOfFn(_) | RawTypeRef::IndexedAccess { .. } => None,
+        // E-P0p (2026-09-09): mirrors `ArrayOf`/`PromiseOf`/`RecordOf`
+        // above -- a predicate's own target chasing through a type alias
+        // (`type T = SomeAlias; ...): this is T`) resolves the SAME way.
+        RawTypeRef::TypePredicate { subject, target } => resolve_type_ref_chasing_aliases(
+            target,
+            owning_path,
+            import_targets,
+            raw_by_id,
+            visiting,
+            depth,
+        )
+        .map(|resolved| ResolvedTypeRef::TypePredicate {
+            subject: subject.clone(),
+            target: Box::new(resolved),
+        }),
         RawTypeRef::Unknown => None,
     }
 }
@@ -5259,6 +5349,19 @@ fn resolve_raw_type_ref(
                 |entity_ref| resolve_type_query_entity_ref(entity_ref, owning_path, import_targets),
             )))
         }
+        // E-P0p (2026-09-09): resolves fully in THIS pass -- the predicate
+        // target is a plain declared type, exactly like `ArrayOf`/
+        // `PromiseOf`'s own inner leaf (never a `ReturnTypeOfFn`/
+        // `IndexedAccess` special case of its own).
+        RawTypeRef::TypePredicate { subject, target } => Some(ResolvedTypeRef::TypePredicate {
+            subject: subject.clone(),
+            target: Box::new(resolve_raw_type_ref(
+                target,
+                owning_path,
+                import_targets,
+                alias_targets,
+            )?),
+        }),
         RawTypeRef::Unknown => None,
     }
 }
@@ -5326,6 +5429,9 @@ fn contains_deferred(raw: &RawTypeRef) -> bool {
         }
         // P2-2j: a union needs the later pass if ANY constituent does.
         RawTypeRef::Union(items) => items.iter().any(contains_deferred),
+        // E-P0p (2026-09-09): needs the later pass exactly when its own
+        // predicate target does -- mirrors `ArrayOf`/`PromiseOf`/`RecordOf`.
+        RawTypeRef::TypePredicate { target, .. } => contains_deferred(target),
         // G (E-P0l): resolves fully in the first pass (`resolve_raw_type_
         // ref`) -- see that function's own `TypeQuery` arm doc comment.
         RawTypeRef::Local(_)
@@ -5466,6 +5572,21 @@ fn resolve_raw_type_ref_deferred(
                 |entity_ref| resolve_type_query_entity_ref(entity_ref, owning_path, import_targets),
             )))
         }
+        // E-P0p (2026-09-09): mirrors `ArrayOf`/`PromiseOf`/`RecordOf`
+        // above -- the predicate target may itself need this same deferred
+        // pass (e.g. `this is ReturnType<typeof f>`, never seen live but
+        // not excluded either).
+        RawTypeRef::TypePredicate { subject, target } => resolve_raw_type_ref_deferred(
+            target,
+            owning_path,
+            import_targets,
+            containers,
+            function_return_types,
+        )
+        .map(|resolved| ResolvedTypeRef::TypePredicate {
+            subject: subject.clone(),
+            target: Box::new(resolved),
+        }),
         RawTypeRef::Unknown => None,
     }
 }
