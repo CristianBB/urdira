@@ -443,3 +443,130 @@ restarts, cleanly resolved with no data loss), and the literal
 processing-rate floor observed (~0.03 status-rows/second after ~366k rows
 classified, independent of worker count or machine contention) -- the
 stalled phase itself was not identified within this session's time budget.
+
+## Amendment (2026-09-08, Frente S-H): periodic sweep no longer aborts in-flight semantic maintenance; resident vector cache at full n8n scale
+
+Two bugs closed this session, both diagnosed by
+`docs/evidence/2026-09-08-v4-semantic-embed-stall-root-cause.md` (Frente
+S-G's own Bug 4, explicitly left unfixed there) and its own query-latency
+finding (super-linear growth at full n8n scale, target NOT met).
+
+**Bug 4 (scheduling)**: `scheduleWorkspaceScan` (`packages/daemon/src/runtime.ts`)
+called `lexicalThreadRuns.get(id)?.abort()`/`semanticThreadRuns.get(id)?.abort()`
+UNCONDITIONALLY the instant ANY scan was admitted -- including the periodic
+reconciliation sweep's own `"checking_for_updates"` scan, which by
+construction does not yet know whether anything changed. At real n8n scale
+this tore down and restarted the semantic-maintenance child process every
+sweep tick, forever, before it could ever reach its own finalize step --
+the literal mechanism behind S-F's/S-G's own "never reaches
+`semantic.current`" observations. Fixed: the two abort calls at admission
+now fire only when `activity !== "checking_for_updates"` (every OTHER
+admission -- a genuine edit, `core:reindex`, a first scan, outdated-format
+recovery -- is by construction always about to publish, unchanged from
+before); for the one ambiguous case, the abort is instead called lazily,
+from the scan's own run body, at the earliest point it can confirm a real
+generation is about to publish (`onQueryableLive` for v4 -- never invoked by
+a `Reconcile`/`Noop` scan, R3 -- and `on_stage_published` for v3, which
+likewise only fires once a stage's own `runFullWorkspaceScan` call actually
+published). A second, related bug was found live measuring the fix at real
+scale: `runV4WorkspaceScan`'s own unconditional `submitSemanticMaintenance`
+call at the end of EVERY scan, combined with that function's own
+coalesced-pending retry, spawned a fresh semantic-maintenance child process
+(the THREADED default) on every no-op sweep tick that landed while an
+earlier real pass was still running -- fixed by skipping that call entirely
+once maintenance has genuinely been submitted at least once already for the
+workspace and the just-completed scan is a `Reconcile`/`Noop`.
+End-to-end regression test (`tests/phase-daemon-v4-semantic.test.ts`, real
+daemon + real worker binary, `reconciliation_sweep_interval_ms: 25`):
+reverting the admission-gating fix reproduces the exact livelock live
+(`semantic.current` never reached within 60s, `pollUntilSemanticCurrent`
+times out); with the fix, `semantic.current` is reached and
+`on_semantic_maintenance_started` (new test-only counter,
+`DaemonRuntimeOptions`) fires exactly once. Validated live at full n8n
+scale too (this amendment's own measurement below): `reconciliation_sweep_interval_ms: 20_000`
+against the real ~20k-file corpus, no restarts observed, `semantic.current`
+reached in 2,238,157ms (~37.3 minutes) from `workspace_add`.
+
+**Latency (Part 2, lever 1 -- resident vector cache)**: `SqliteCanonicalQuerySnapshotPort.semantic_vectors`
+(`packages/engine/src/canonical-query-data-port.ts`) used to re-run its own
+`vector_projection_rows` SELECT, `vector_shards` lookup, and one
+`packed.slice(...)` allocation PER VECTOR on EVERY `core:search_semantic`/
+`core:search_hybrid` call -- at n8n's own real scale (93,060 vectors) this
+alone measured **5,223.9ms COLD**. Fixed: a per-`(workspace_id, profile_id,
+executable_binding_id)` cache, tagged with the `generation` it was built
+for (folded into the SAME `approxWarmBytes()`/`evictWarmRecords()` budget
+loop `recordsCache`/`shardBytesCache` already use -- one ceiling, not a new
+knob), holding the fully-decoded result. A hit for the CURRENT generation
+(the common case: nothing changed between two queries) skips the SQL read,
+the shard lookup, AND the slice allocations entirely, returning the exact
+same array -- measured **9.8ms WARM** (a >500x reduction). Every surviving
+row's bytes now also land in ONE contiguous backing `ArrayBuffer` (built
+once per cache miss), each row's own `vector_payload` a zero-copy view into
+it, rather than N independent per-row allocations even on the cache-miss
+path. `evictWarmRecords()`/`approxWarmBytes()` cover the new cache; a
+generation bump is not masked (verified live: a real new-generation vector
+is visible on the very next call, never served from the stale cached
+array). Regression test:
+`tests/phase-canonical-query-data-port.test.ts` ("Frente S-H: caches the
+fully-decoded semantic_vectors result...").
+
+Net, measured live end-to-end against the real daemon, full n8n scale
+(93,060 vectors: 72,922 entity-grain segments across 28,373 covered
+documents, 20,138 artifact-grain), 20x `core:search_semantic` + 20x
+`core:search_hybrid` (one warm-up excluded, `snippets: {mode: "none"}`,
+matching S-F's/S-G's own methodology exactly), MiniLM neural provider (the
+shipped default, model already resident locally, no download):
+
+| operation | metric | S-G baseline (before this frente) | this frente (after lever 1) | improvement |
+|---|---|---:|---:|---:|
+| `core:search_semantic` | p50 | 2,538.8ms | 1,588.3ms | 1.6x |
+| `core:search_semantic` | p95/p99 (20 samples, both collapse to max) | 2,825.8ms / 4,085.8ms | 1,722.2ms / 1,722.2ms | 1.6x / 2.4x |
+| `core:search_hybrid` | p50 | 6,525.6ms | 1,620.2ms | 4.0x |
+| `core:search_hybrid` | p95/p99 | 11,896.5ms / 18,311.2ms | 2,192.7ms / 2,192.7ms | 5.4x / 8.4x |
+
+**Target (p99 <= 250ms) NOT MET at full n8n scale** -- reported honestly,
+with the physical floor demonstrated rather than assumed. A standalone
+phase decomposition against the SAME real, already-embedded n8n sidecar
+data (read-only, no daemon; the SAME `SqliteCanonicalQuerySnapshotPort` +
+`exactVectorScan` + the SAME native exact-vector-top-k kernel port the real
+daemon configures) isolates where the remaining ~1.6-1.7s/~1.6-2.2s actually
+goes:
+
+| phase | measured |
+|---|---:|
+| query embed (warm, resident model) | ~0.6-2ms |
+| `semantic_vectors` WARM (resident cache hit) | 9.8ms |
+| `semantic_vectors` COLD (paid once per generation, not per query) | 5,223.9ms |
+| entity-lane `exactVectorScan`, bounded (native kernel, limit=800 of 72,922 segments) | 581.4ms |
+| entity-lane `exactVectorScan`, uncapped escalation (native kernel, all 72,922 ranked) | 1,415.9ms |
+| artifact-lane `exactVectorScan` (native kernel, limit=100 of 20,138) | 54.0ms |
+| remainder (aggregation, `records_by_ids` hydration, coverage/capability point lookups, JSON render) | not decomposed further this session -- the residual between the ~1.6-1.7s end-to-end total and the phases above (~640-650ms), a bounded target for a future frente |
+
+S-G's own hypothesis (the bounded-vs-uncapped escalation branch,
+`canonical-query-data-port.ts` ~line 3893, dominating the super-linear
+growth) is confirmed real but SMALLER than assumed: the bounded attempt
+ALSO scans every one of the 72,922 candidates (`limit` bounds the RESULT
+count exactcVectorScan returns, not how many candidates it evaluates -- both
+branches pay the same distance computation over the full set), so bounded
+(581ms) and uncapped (1,416ms) differ by ~2.4x, not an order of magnitude.
+The genuine physical floor this session found and demonstrates with a
+number: **entity-lane exact top-K over n8n's own real 72,922-segment
+candidate set costs 581ms through the NATIVE kernel port even in its
+CHEAPEST (bounded-output) form** -- more than double the 250ms end-to-end
+budget by itself, before hydration/render/aggregation are even counted.
+This is very unlikely to be raw FLOP cost (72,922 x 384-dim dot products is
+low tens of millions of multiply-adds, sub-10ms territory on this
+hardware) and much more likely `nativeTopKChunked`'s own per-call
+marshaling/recursive-merge overhead at ~18 chunks of ~4,096 candidates
+each (`NATIVE_BATCH_RECORD_BUDGET`, `semantic-retrieval.ts`) -- flagged
+precisely, with the measured number and the exact file/constant, for a
+future frente to confirm via instrumentation and fix (candidates: raise
+the native chunk byte/record budget now that this session's own number
+shows chunking overhead, not compute, dominates; or reduce marshaling by
+reusing one packed buffer across chunks instead of allocating one per
+`nativeTopKChunked` recursion level) -- not attempted this session (a Rust/
+native-boundary change, out of this frente's remaining time budget after
+its own two required fixes). Per plan §0 (accuracy never sacrificed for
+latency), no exactness was traded for this session's own 1.6-8.4x
+improvement: every scan remains the exact, deterministic top-K this
+project has always guaranteed.

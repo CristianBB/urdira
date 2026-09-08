@@ -354,6 +354,19 @@ Evaluation datasets, metrics, acceptance thresholds, performance budgets, and pr
 
 This decision is architecturally complete. A concrete release is acceptable only when its immutable model pack and ranking-profile registry pass the semantic, deterministic, resource, and privacy gates defined by the dependent specifications.
 
+## Amendment (2026-09-08, Frente S-H): resident vector cache does not change ranking semantics
+
+`SqliteCanonicalQuerySnapshotPort.semantic_vectors` now caches its own
+fully-decoded result per `(workspace_id, profile_id, executable_binding_id,
+generation)` (see `docs/decisions/16-semantic-search-wiring.md`'s own
+amendment for the mechanism and the measured latency numbers). This is a
+pure caching/memory-layout change: the exact same set of vectors, the same
+ranking, and the same top-K guarantee this decision's own "exact, never
+approximate" architecture requires are returned whether the cache is warm
+or cold -- a generation bump always invalidates it (verified live), and no
+scan's own exactness is traded for the speedup. Recorded here only as a
+cross-reference; the substantive amendment lives in decision 16.
+
 ## Amendment 2026-09-06 (Frente S-A): affected-artifact pagination implementation
 
 §"Materialization and coverage" above pins the SHAPE (`SemanticCoverageView`'s
