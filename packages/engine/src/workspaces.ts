@@ -462,17 +462,42 @@ export class WorkspaceRegistry {
    * changing its queryable status or current snapshot -- a workspace can be
    * `"ready"`/`"degraded"` and serving a perfectly good (if now stale)
    * generation while this is set. Callers pair this with a `markReady(...,
-   * "degraded")` (or leave the workspace `"indexing"` on a first-ever-scan
-   * failure) immediately after; `markReady(..., "ready")` on the next
-   * successful scan clears these fields again. Exists so
-   * `core:index_status` can report `freshness_status: "stale"` instead of
-   * silently claiming `"current"` for a workspace whose latest scan attempt
-   * actually failed (see `resolveIndexStatusRequest` /
-   * `packages/daemon/src/runtime.ts`).
+   * "degraded")` immediately after WHEN a snapshot (prior generation, or an
+   * intermediate stage this same failed attempt published) exists to re-pin
+   * to; `markReady(..., "ready")` on the next successful scan clears these
+   * fields again. Exists so `core:index_status` can report
+   * `freshness_status: "stale"` instead of silently claiming `"current"` for
+   * a workspace whose latest scan attempt actually failed (see
+   * `resolveIndexStatusRequest` / `packages/daemon/src/runtime.ts`).
+   *
+   * **Terminal-failure re-pin (2026-09-08 P0 fix).** A workspace whose very
+   * first scan attempt fails before publishing ANY structural stage has no
+   * snapshot at all for the runtime's own `markReady(..., "degraded")` call
+   * to target -- `markReady` requires a non-empty snapshot id, so the
+   * runtime skips it entirely in that case. Left alone, `status` stayed
+   * `"indexing"` forever with no way for a caller to distinguish a
+   * genuinely stuck daemon from one still working: reproduced live in
+   * `docs/evidence/2026-09-07-v4-vscode-campaign.md` §4.0 -- a v3 scan
+   * failed at t=83.9s (`core:engine_failed`) and polling
+   * `core:workspace_admin_show`/`core:index_status` kept reporting
+   * `status: "indexing"` for over 100 minutes while the daemon process sat
+   * fully idle. Fix: flip `status` straight to `"degraded"` here whenever
+   * the workspace is `"indexing"` AND has no `current_snapshot_id` at all
+   * (no prior generation, no intermediate stage published this attempt
+   * either) -- `last_scan_error`/`last_scan_error_at` are set either way,
+   * so `core:index_status`/`core:workspace_admin_show` now always surface a
+   * visible failure, and `core:reindex`/`beginReconciliation` (both
+   * unconditional on current status) can relaunch the scan on the very next
+   * call. A workspace that DOES have a snapshot keeps `status: "indexing"`
+   * here unchanged -- the runtime's own catch block re-pins it via a
+   * separate `markReady(..., "degraded")` call right after this returns,
+   * which must preserve `current_snapshot_id`, something this method must
+   * not touch.
    */
   recordScanFailure(workspaceId: string, errorCode: string): RegisteredWorkspace {
     const workspace = this.requireMutable(workspaceId);
-    return this.replace(workspaceId, { ...workspace, last_scan_error: errorCode, last_scan_error_at: this.clock() });
+    const stuckWithNoIndex = workspace.status === "indexing" && workspace.current_snapshot_id === undefined;
+    return this.replace(workspaceId, { ...workspace, ...(stuckWithNoIndex ? { status: "degraded" as const } : {}), last_scan_error: errorCode, last_scan_error_at: this.clock() });
   }
 
   /** Mark a registered workspace as requiring a serialized full reconciliation. */

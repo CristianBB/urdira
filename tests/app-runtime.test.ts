@@ -530,6 +530,90 @@ describe("Urdira application runner", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 15_000);
+
+  // 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md
+  // §6.0/§9 item 3): `core:index_pack_export` used to fall through to the
+  // IPC transport's hardcoded ~30s default deadline (never in `runUrdira`'s
+  // own `longRunning` list), aborting a legitimate multi-minute export with
+  // `core:ipc_timeout`. Uses the same fake-daemon-over-a-real-socket
+  // harness as "reuses a live daemon..." above (a real `LocalIpcServer`, no
+  // real workspace or export work) purely to observe the `deadline_at` this
+  // runner actually sends and the progress frames it forwards.
+  it("gives core:index_pack_export an effectively unbounded deadline by default, honors --timeout, and forwards progress", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-index-pack-export-timeout-"));
+    const paths = await daemonPaths(root);
+    const lock = await ProcessLock.acquire(paths.process_lock, {
+      pid: process.pid,
+      started_at: "2026-09-08T00:00:00.000Z",
+    });
+    const descriptor = new EndpointDescriptorStore(paths);
+    const deadlines: string[] = [];
+    const server = new LocalIpcServer({
+      endpoint: paths.endpoint,
+      handler: async (request, context) => {
+        if (request.call === "core:status") {
+          return {
+            state: "ready",
+            engine_build_id: "build-index-pack-export-timeout",
+            private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION,
+            rpc_capabilities: daemonRpcCapabilities(true),
+          };
+        }
+        if (request.call === "core:index_pack_export") {
+          deadlines.push(request.deadline_at);
+          context.reportProgress({ phase: "index_pack_export", completed: 10, total: 100, message: "writing index pack (10 bytes so far)" });
+          return { workspace_id: "workspace:fake", out_path: "/tmp/fake.urdira-index-pack-v4", pack_path: "/tmp/fake.urdira-index-pack-v4", generation: 1, bytes: 10, roots: {}, export_wall_ms: 1 };
+        }
+        throw new DaemonError("core:unknown_call", `Unexpected test call ${request.call}.`);
+      },
+    });
+    const progressPhases: string[] = [];
+    try {
+      await server.listen();
+      await descriptor.write({
+        protocol_version: 1,
+        private_interface_version: DAEMON_PRIVATE_INTERFACE_VERSION,
+        rpc_capabilities: daemonRpcCapabilities(true),
+        endpoint: paths.endpoint,
+        pid: process.pid,
+        owner_uid: process.getuid?.() ?? 0,
+        engine_build_id: "build-index-pack-export-timeout",
+        started_at: "2026-09-08T00:00:00.000Z",
+      });
+
+      const beforeDefault = Date.now();
+      const defaultResult = await runUrdira(["index-pack-export", "workspace:fake", "/tmp/fake.urdira-index-pack-v4", "--confirm"], {
+        daemon: { data_root: root, engine_build_id: "build-index-pack-export-timeout", scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} } },
+        on_progress: (entry) => progressPhases.push(entry.phase),
+      });
+      expect(defaultResult.exit_code).toBe(0);
+      expect(deadlines).toHaveLength(1);
+      // No `--timeout` given: the default is 24h out, comfortably clear of
+      // the pre-fix 30s (and even the ordinary 300s admin default) so a
+      // real multi-minute export is never aborted by this runner's own
+      // deadline math.
+      expect(Date.parse(deadlines[0]!) - beforeDefault).toBeGreaterThan(23 * 60 * 60 * 1_000);
+      expect(progressPhases).toContain("index_pack_export");
+
+      deadlines.length = 0;
+      const beforeTimeout = Date.now();
+      const timeoutResult = await runUrdira(["index-pack-export", "workspace:fake", "/tmp/fake.urdira-index-pack-v4", "--timeout", "5", "--confirm"], {
+        daemon: { data_root: root, engine_build_id: "build-index-pack-export-timeout", scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} } },
+      });
+      expect(timeoutResult.exit_code).toBe(0);
+      expect(deadlines).toHaveLength(1);
+      // `--timeout 5` (seconds) overrides the default -- "sin límite de
+      // tiempo salvo --timeout".
+      const timeoutDeadlineMs = Date.parse(deadlines[0]!) - beforeTimeout;
+      expect(timeoutDeadlineMs).toBeGreaterThan(1_000);
+      expect(timeoutDeadlineMs).toBeLessThan(30_000);
+    } finally {
+      await server.close();
+      await descriptor.remove();
+      await lock.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // Exercises the REAL production `WorkspaceScanPluginProvider`

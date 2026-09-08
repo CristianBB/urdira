@@ -55,6 +55,10 @@ interface IndexStatusView {
   readonly last_scan?: {
     readonly kind: "full" | "changed" | "reconcile";
     readonly reconcile?: { readonly mode: "noop" | "delta" | "cold"; readonly fell_back_to_cold: boolean };
+    // 2026-09-08 P0 fix: set only when this reconcile followed a
+    // `core:index_pack_export` pack import -- see `V4LastScanSummary
+    // .import`'s own doc comment (`packages/daemon/src/runtime.ts`).
+    readonly import?: { readonly imported: boolean; readonly import_wall_ms: number; readonly pack_bytes?: number };
   };
 }
 
@@ -187,10 +191,16 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
       const packPath = join(donor.dataRoot, "export.urdira-index-pack-v4");
       const exported = await donor.client.call("core:index_pack_export", { args: [workspaceId, packPath], confirmed: true });
       expect(exported.outcome, JSON.stringify(exported)).toBe("success");
-      const payload = exported.payload as { readonly out_path: string; readonly generation: number; readonly bytes: number; readonly roots: Readonly<Record<string, string>> };
+      const payload = exported.payload as { readonly out_path: string; readonly pack_path: string; readonly generation: number; readonly bytes: number; readonly roots: Readonly<Record<string, string>>; readonly export_wall_ms: number };
       expect(payload.out_path).toBe(packPath);
+      // 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md
+      // §9 item 4): `pack_path` is the design's own field name
+      // (`{pack_path, bytes, generation, roots, export_wall_ms}`), kept
+      // alongside the pre-existing `out_path` for backward compatibility.
+      expect(payload.pack_path).toBe(packPath);
       expect(payload.generation).toBeGreaterThan(0);
       expect(payload.bytes).toBeGreaterThan(0);
+      expect(payload.export_wall_ms).toBeGreaterThanOrEqual(0);
       expect(payload.roots["records"]).toMatch(/^sha256:[0-9a-f]{64}$/);
       expect(existsSync(packPath)).toBe(true);
     } finally {
@@ -264,6 +274,14 @@ describeIfBuilt("v4 index pack wired into the daemon (Frente P-1)", () => {
       expect(status.last_scan?.kind).toBe("reconcile");
       expect(["noop", "cold"]).toContain(status.last_scan?.reconcile?.mode);
       expect(status.last_scan?.reconcile?.fell_back_to_cold).toBe(false);
+      // 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md
+      // §6.2/§9 item 4): the import's own wall time (stat + native copy/
+      // verify + atomic rename) is now a distinct, product-exposed field --
+      // previously only approximable as `ready_elapsed_ms - reconcile_wall`.
+      const importSummary = status.last_scan?.import;
+      expect(importSummary?.imported).toBe(true);
+      expect(importSummary?.import_wall_ms).toBeGreaterThanOrEqual(0);
+      expect(importSummary?.pack_bytes).toBeGreaterThan(0);
 
       const donorResolved = await queryStreams(donor.client, donorWorkspaceId, "core:resolve_symbol", { reference: "InvalidTaskTransitionError", resolution_scope: "exports" });
       const donorDecl = (donorResolved["declarations"]?.items ?? []).map((item) => item.value as Record<string, unknown>);

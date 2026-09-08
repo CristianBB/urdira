@@ -225,3 +225,79 @@ A sweep failure never blocks daemon startup (caught and logged); `core:status` a
 `core:index_status` both gain an `orphaned_workspace_data: {count, bytes}` field reflecting the
 most recently completed sweep (not a fresh one per status call), and the MCP `urdira_index_status`
 renderer adds one hint line when `count > 0`.
+
+## Amendment 2026-09-08 (Frente D-1: a failed scan must never leave `status: "indexing"` forever)
+
+Live evidence (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §4.0): a v3 scan against the full,
+unmodified VS Code monorepo failed at t=83.9s (`core:engine_failed: JS/TS facts are incomplete for
+...`), but `core:workspace_admin_show`/`core:index_status` kept reporting `workspace_status:
+"indexing"` for over 100 minutes afterward -- the daemon process was confirmed alive the whole time
+with only a few seconds of *total* CPU consumed, i.e. genuinely idle, not slow. Any real caller
+polling status the way the CLI/MCP tooling does (and the way this campaign's own harness did) would
+wait forever with no signal that anything went wrong.
+
+**Root cause**, exact and narrow: `packages/daemon/src/runtime.ts`'s scan job terminal-failure
+handler always called `WorkspaceRegistry#recordScanFailure` (sets `last_scan_error`/
+`last_scan_error_at`, `packages/engine/src/workspaces.ts`), then conditionally called `markReady
+(workspaceId, priorSnapshotId, "degraded")` -- but ONLY `if (priorSnapshotId !== undefined)`.
+`markReady` itself requires a non-empty snapshot id (`if (snapshotId.length === 0) throw`), so a
+workspace's very first-ever scan (`priorSnapshotId === undefined`, i.e. no prior generation to
+re-pin to) had no snapshot for that call to target at all -- the code simply skipped the re-pin and
+left `status` at whatever `beginReconciliation` had set it to earlier: `"indexing"`, permanently.
+This was a DELIBERATE prior design choice (`recordScanFailure`'s own doc comment literally said "or
+leave the workspace 'indexing' on a first-ever-scan failure"), not an oversight -- but the campaign
+showed it is a real usability defect: `last_scan_error`/`last_scan_error_at` WERE already being set
+correctly and were already visible in both RPCs' raw payloads (`core:index_status`'s
+`last_scan_error_code`/`last_scan_error_at`, `core:workspace_admin_show`'s raw
+`last_scan_error`/`last_scan_error_at` via `workspaceAdministrativeView`'s `...workspace` spread,
+and the MCP `urdira_index_status` renderer already had a `last_scan_error: <code> at <at>` line) --
+the ONLY gap was `workspace_status`/`freshness_status` themselves never leaving `"indexing"`, which
+made every one of those already-correct fields easy to miss for a caller keying off `status` alone.
+
+**Fix.** `WorkspaceRegistry#recordScanFailure` now flips `status` straight to `"degraded"` itself,
+in exactly the one case that previously had nowhere to go: `workspace.status === "indexing" &&
+workspace.current_snapshot_id === undefined` (no prior generation, AND no intermediate structural
+stage published this same failed attempt either -- `markStructuralStagePublished` can set
+`current_snapshot_id` mid-scan even on a workspace's first-ever attempt, before the whole scan later
+fails; that case is handled separately, see below). `last_scan_error`/`last_scan_error_at` are set
+unconditionally either way, matching the pre-existing contract every other consumer already relies
+on. `current_snapshot_id` is deliberately left untouched (stays `undefined`) -- `"degraded"` here
+means "the last (and, so far, only) scan attempt failed and there has never been a usable index," a
+distinct meaning from `"degraded"`'s pre-existing "a prior snapshot exists and is still being
+served, but the latest scan attempt failed" case; `WorkspaceStatus`'s own type
+(`packages/engine/src/workspaces.ts`) was deliberately NOT extended with a new enum member for this
+-- the existing `"degraded"` value, `current_snapshot_id`'s presence/absence, and
+`last_scan_error`/`last_scan_error_at` together already fully and unambiguously describe both cases,
+and every downstream consumer that gates on `workspace.status` (readiness derivation, RPC admission,
+`beginReconciliation`/`core:reindex`, orphan-sweep classification) already treats `"degraded"`
+uniformly regardless of whether a snapshot exists, so no other call site needed to change.
+
+`packages/daemon/src/runtime.ts`'s own catch block was separately hardened to use the FRESHEST
+snapshot id (re-read from the registry after `recordScanFailure` runs), not just `priorSnapshotId`
+(captured before the scan started): a first-ever scan that got far enough to publish an
+intermediate structural stage (`markStructuralStagePublished`) before failing LATER already has a
+newer usable snapshot than `priorSnapshotId`'s stale `undefined`, and is now correctly re-pinned to
+`"degraded"` against that stage's own snapshot instead of falling through to the "no index at all"
+case above.
+
+**Recovery.** `core:reindex` (`packages/daemon/src/runtime.ts`) was already unconditional on the
+workspace's current status (`beginReconciliation` is idempotent against `"indexing"` and otherwise
+transitions from any other status, including the pre-fix stuck `"indexing"` and the post-fix
+`"degraded"` alike) -- no change was needed there. `core:reindex` (or the next matching watcher
+event) relaunches the scan from either state exactly as it already did from an ordinary `"degraded"`
+workspace.
+
+**CLI/MCP surfacing.** The MCP `urdira_index_status` renderer already showed `last_scan_error: <code>
+at <at>` (unaffected by this fix, verified still correct). `urdira workspace show` (CLI,
+`core:workspace_admin_show`) gained a small human-readable summary line (`workspace: <id> (<root>)`,
+`status: <status>`, `last_scan_error: <code> at <at>` when set) ahead of the raw JSON dump for
+non-`--json` output -- the raw JSON (with `status`/`last_scan_error`/`last_scan_error_at`, registry
+field names, no `_code` suffix) was already present before this fix, just unformatted.
+
+**Test.** `tests/phase-daemon-v4-scan.test.ts`'s existing `"records a diagnosable
+last_scan_error_code when URDIRA_V4=1 but no resolve_workspace_scan_transport is configured"` test
+previously asserted the OLD buggy behavior verbatim (`expect(payload?.workspace_status).toBe
+("indexing")`, with a comment explaining why) -- updated to assert `"degraded"` instead, and
+extended to call `core:reindex` afterward and confirm the workspace re-enters `"indexing"` and
+settles back to a FRESH `"degraded"` state (a new `last_scan_error_at`), proving the recovery path
+live rather than by inspection alone.

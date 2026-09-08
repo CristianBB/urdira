@@ -479,11 +479,44 @@ describe("Daemon v4 workspace-scan wiring (URDIRA_V4 default + explicit opt-out/
       // `Error` with no `.code` (`runV4WorkspaceScan`'s transport-missing
       // throw is exactly that).
       expect(payload?.last_scan_error_code).toBe("core:workspace_scan_failed");
-      // This is the workspace's very first-ever scan: `priorSnapshotId` is
-      // `undefined`, so the terminal-failure handler has nothing to re-pin
-      // to and leaves `workspace_status` at "indexing" forever, rather than
-      // "degraded" -- still diagnosable via `last_scan_error_code` alone.
-      expect(payload?.workspace_status).toBe("indexing");
+      // 2026-09-08 P0 fix (docs/evidence/2026-09-07-v4-vscode-campaign.md
+      // §4.0): this is the workspace's very first-ever scan
+      // (`priorSnapshotId` is `undefined`, no prior generation to re-pin
+      // `markReady(..., "degraded")` to) -- BEFORE the fix, the terminal-
+      // failure handler had nothing to re-pin to at all and left
+      // `workspace_status` at `"indexing"` forever, with no way for a
+      // caller polling `core:index_status`/`core:workspace_admin_show` to
+      // tell a genuinely stuck daemon from one still working (reproduced
+      // live: over 100 minutes, daemon fully idle). `WorkspaceRegistry
+      // #recordScanFailure` (`packages/engine/src/workspaces.ts`) now flips
+      // straight to `"degraded"` in exactly this case.
+      expect(payload?.workspace_status).toBe("degraded");
+      // `core:reindex` must be able to relaunch the scan from this
+      // "degraded, no index at all" state -- it is unconditional on the
+      // workspace's current status (`packages/daemon/src/runtime.ts`'s
+      // `core:reindex` handler calls `beginReconciliation` regardless), but
+      // this test still confirms it live rather than trusting that by
+      // inspection alone. The retry hits the exact same missing-transport
+      // failure again (this harness never wires one), so the observable
+      // effect is: `reindex_started: true`, and the workspace is briefly
+      // `"indexing"` again before settling back to `"degraded"` with a
+      // FRESH `last_scan_error_at`.
+      const beforeReindexErrorAt = payload?.last_scan_error_at;
+      const reindexed = await client.call("core:reindex", { args: [workspaceId] });
+      expect(reindexed.outcome).toBe("success");
+      expect((reindexed.payload as { readonly reindex_started?: boolean }).reindex_started).toBe(true);
+      const reindexDeadline = Date.now() + 20_000;
+      let afterReindex: (IndexStatusWorkspaceView & { readonly last_scan_error_code?: string; readonly last_scan_error_at?: string }) | undefined;
+      while (Date.now() < reindexDeadline) {
+        const response = await client.call("core:index_status", { workspace_ids: [workspaceId] });
+        const workspaces = (response.payload as { readonly workspaces: readonly (IndexStatusWorkspaceView & { readonly last_scan_error_code?: string; readonly last_scan_error_at?: string })[] }).workspaces;
+        afterReindex = workspaces[0];
+        if (afterReindex?.workspace_status === "degraded" && afterReindex.last_scan_error_at !== beforeReindexErrorAt) break;
+        await sleep(50);
+      }
+      expect(afterReindex?.workspace_status).toBe("degraded");
+      expect(afterReindex?.last_scan_error_code).toBe("core:workspace_scan_failed");
+      expect(afterReindex?.last_scan_error_at).not.toBe(beforeReindexErrorAt);
     } finally {
       await runtime?.stop().catch(() => undefined);
       await rm(dataRoot, { recursive: true, force: true });
