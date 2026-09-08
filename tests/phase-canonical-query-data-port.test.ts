@@ -2876,7 +2876,105 @@ describe("CanonicalRecordQueryDataPort semantic_document_status real counts + co
       const page1 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, limit: 10 })));
       const page2 = affectedPage(await dataPort.execute(affectedPageOperation({ affected_artifact_set_id: setId, limit: 10 })));
       expect(page1).toEqual(page2);
-      expect(page1.artifacts.map((item) => item.coverage_status)).toEqual(["pending", "excluded"]);
+      // Frente S-F (2026-09-08): ordered `(status, display_path, ...)` now
+      // (status LEADING, matching the covering index's own column order --
+      // see `semantic_affected_documents`'s own doc comment) -- "excluded"
+      // sorts before "pending" alphabetically, regardless of either row's
+      // own display_path (`src/a.ts` for the pending row, `src/b.ts` for the
+      // excluded one; previously path-first order would have put the
+      // pending row first).
+      expect(page1.artifacts.map((item) => item.coverage_status)).toEqual(["excluded", "pending"]);
+    });
+  });
+
+  it("Frente S-F: semantic_affected_documents' own query plan is one already-sorted covering-index SEARCH -- no SCAN, no TEMP B-TREE", async () => {
+    await withSemanticWorkspace(async (opened) => {
+      const rows = await opened.database.all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes
+           FROM semantic_document_status
+          WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND status IN (?, ?, ?, ?)
+          ORDER BY status, display_path, artifact_id, document_id`,
+        [workspace.workspace_id, "profile-x", "binding-x", "pending", "excluded", "unsupported", "failed"],
+      );
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        expect(row.detail).not.toMatch(/\bSCAN\b/u);
+        expect(row.detail).not.toMatch(/TEMP B-TREE/iu);
+      }
+      // Positive assertion, not just an absence check: the plan is a SEARCH
+      // using the covering index this migration adds.
+      expect(rows.some((row) => /USING (COVERING )?INDEX semantic_document_status_affected_v2/u.test(row.detail))).toBe(true);
+    });
+  });
+
+  it("Frente S-F: semantic_coverage_summary's own point-lookup query plan is one indexed SEARCH -- no SCAN, no sort", async () => {
+    await withSemanticWorkspace(async (opened) => {
+      const rows = await opened.database.all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT generation, unsupported_artifact_count, failed_artifact_count, entity_count, covered_entity_count, affected_artifact_count, affected_artifact_set_id, affected_first_page
+           FROM semantic_coverage_summary
+          WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ?
+          ORDER BY generation DESC LIMIT 1`,
+        [workspace.workspace_id, "profile-x", "binding-x"],
+      );
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        expect(row.detail).not.toMatch(/\bSCAN\b/u);
+        expect(row.detail).not.toMatch(/TEMP B-TREE/iu);
+      }
+    });
+  });
+
+  it("Frente S-F: buildSemanticCoverageView reads the materialized semantic_coverage_summary row instead of recomputing live, when one exists", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      // A real live computation over this workspace's actual
+      // semantic_document_status rows would never produce these exact
+      // numbers (there are zero rows at all yet) -- planting a
+      // semantic_coverage_summary row with distinctive synthetic values and
+      // asserting the coverage view echoes them back verbatim proves the
+      // fast path actually READS this row rather than recomputing live.
+      await markSemanticIndexState(opened, 1, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      await opened.database.run(
+        `INSERT INTO semantic_coverage_summary (workspace_id, profile_id, executable_binding_id, generation, unsupported_artifact_count, failed_artifact_count, entity_count, covered_entity_count, affected_artifact_count, affected_artifact_set_id, affected_first_page, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          workspace.workspace_id, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest, 1,
+          777, 888, 999, 111,
+          1, "sha256:synthetic-set-id", JSON.stringify([{ document_grain: "artifact", document_id: "artv-synthetic", artifact_id: "art-synthetic", artifact_version_id: "artv-synthetic", display_path: "src/synthetic.ts", status: "pending", reason_codes: ["pending_embed"] }]),
+          now,
+        ],
+      );
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+      const view = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      expect(view["unsupported_artifact_count"]).toBe(777);
+      expect(view["failed_artifact_count"]).toBe(888);
+      expect(view["entity_count"]).toBe(999);
+      expect(view["covered_entity_count"]).toBe(111);
+      expect(view["affected_artifact_count"]).toBe(1);
+      expect(view["affected_artifact_set_id"]).toBe("sha256:synthetic-set-id");
+      const page = view["affected_artifact_page"] as AffectedPageValue;
+      expect(page.artifacts).toEqual([{ artifact_id: "art-synthetic", artifact_version_id: "artv-synthetic", display_path: "src/synthetic.ts", coverage_status: "pending", reason_codes: ["pending_embed"], diagnostic_record_ids: [] }]);
+      expect(page.has_next).toBe(false);
+      expect(page.has_previous).toBe(false);
+    });
+  });
+
+  it("Frente S-F: falls back to the live semantic_document_status_counts/semantic_affected_documents pair when no semantic_coverage_summary row exists yet", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertStatusRow(opened, provider, { grain: "artifact", documentId: "artv-a", artifactId: "art-a", artifactVersionId: "artv-a", displayPath: "src/a.ts", status: "pending" });
+      await markSemanticIndexState(opened, 1, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      // No semantic_coverage_summary row inserted -- this workspace predates
+      // materialization (or the reconciler's own write failed, best-effort).
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, cas), { semantic: provider });
+      const view = coverageView(await dataPort.execute(semanticOperation("core:search_semantic")));
+      expect(view["affected_artifact_count"]).toBe(1);
+      const page = view["affected_artifact_page"] as AffectedPageValue;
+      expect(page.artifacts.map((item) => item.artifact_id)).toEqual(["art-a"]);
     });
   });
 });
@@ -3057,6 +3155,41 @@ describe("SqliteCanonicalQuerySnapshotPort warm-records LRU accounting", () => {
       expect(second).toHaveLength(11);
       expect(second.some((record) => record.record_id === "rec-11")).toBe(true);
       expect(await port.has_warm_records(scope)).toBe(true);
+    });
+  });
+
+  it("Frente S-F: caches packed vector_shards bytes by content_hash -- a second semantic_vectors call for the SAME shards never re-reads CAS", async () => {
+    await withSemanticWorkspace(async (opened, cas) => {
+      const provider = createLocalHashProvider();
+      await seedBaseline(opened);
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-1", versionId: "artv-1", path: "src/one.ts", byteLength: 64, validFromGeneration: 1 });
+      await insertSemanticArtifactVersion(opened, { artifactId: "art-2", versionId: "artv-2", path: "src/two.ts", byteLength: 64, validFromGeneration: 1 });
+      await putSemanticVector(opened, provider, { artifactId: "art-1", versionId: "artv-1", text: "function shardCacheOne() {}" });
+      await putSemanticVector(opened, provider, { artifactId: "art-2", versionId: "artv-2", text: "function shardCacheTwo() {}" });
+
+      let reads = 0;
+      const countingCas = { read: async (contentHash: string) => { reads += 1; return cas.read(contentHash); } };
+      const port = new SqliteCanonicalQuerySnapshotPort(opened.database, countingCas);
+
+      const first = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(first).toHaveLength(2);
+      const readsAfterFirst = reads;
+      expect(readsAfterFirst).toBeGreaterThan(0);
+      expect(port.approxWarmBytes()).toBeGreaterThan(0);
+
+      // A second call for the SAME (already-cached) shards must not issue
+      // any new CAS reads.
+      const second = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(second).toEqual(first);
+      expect(reads).toBe(readsAfterFirst);
+
+      // evictWarmRecords() drops the shard cache too -- the next call reads
+      // through CAS again, and still produces the identical result.
+      port.evictWarmRecords();
+      expect(port.approxWarmBytes()).toBe(0);
+      const third = await port.semantic_vectors(scope, provider.profile.embedding_profile_id, provider.binding.executable_binding_digest);
+      expect(third).toEqual(first);
+      expect(reads).toBeGreaterThan(readsAfterFirst);
     });
   });
 });

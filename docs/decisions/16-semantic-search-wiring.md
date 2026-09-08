@@ -390,3 +390,56 @@ investigation, reported with root-cause hypothesis for the owner's queue)
 See `docs/evidence/2026-09-07-v4-semantic-close.md` for full reproduction
 steps, literal counts, and the final embed/latency/incremental-edit
 measurements.
+
+## Amendment (2026-09-08, Frente S-F): the ~5s dominant cost root-fixed; a second, production-only bug found by live measurement
+
+The prior amendment's own "NOT fixed this session" cost center (`semantic_document_status_counts`/
+`semantic_affected_documents` computed live on every call) is root-fixed:
+the reconciler now materializes one `semantic_coverage_summary` row per
+clean pass (same generation as its own `semantic_index_state` marker);
+`buildSemanticCoverageView` reads it via one indexed point lookup instead
+of the two live queries, falling back to the old pair only when no summary
+has materialized yet (never a new correctness requirement). New covering
+index (`semantic_document_status_affected_v2`) + `status IN (...)` (not
+`<>`) + a status-first `ORDER BY` for the pagination query the reconciler's
+own materialization (and `core:semantic_affected_page`'s continuation)
+still runs -- confirmed via `EXPLAIN QUERY PLAN`: no `SCAN`, no `TEMP
+B-TREE`.
+
+Fixing that exposed the SAME symptom (multiple `Promise.all`'d reads all
+costing ~5s, consistent with SQLite-worker-thread queueing behind one slow
+call) had a SECOND, entirely separate root cause specific to production:
+`NativeCanonicalQuerySnapshotPort` -- the port every real v4 (native
+structural store) workspace actually uses, i.e. the daemon's own default --
+hand-delegates every `semantic_*` method to the wrapped SQLite port one at
+a time, and the new `semantic_coverage_summary` method was never added to
+that list (the interface field is optional, so this compiled cleanly but
+silently disabled the fix above in production); its own
+`semantic_entity_scope_counts` also has no SQL to delegate to (structural
+records are not in SQL when the native store is active) and did an
+uncached full-corpus walk on every call, 5.0-5.4s at ~40k records. Both
+fixed (`ef838e3`): the missing delegation, and a per-generation cache for
+the entity count. Neither had ANY prior test coverage in
+`tests/native-query-snapshot-port.test.ts` -- two regression tests added.
+
+Net, measured live end-to-end against the real daemon: `core:search_semantic`
+on a 2,490-file/13,454-vector real corpus, p50/p99 5,978.6ms -> 256.6/308.1ms
+(~19-23x); 100-file workspace p99 222.5ms -> 52.9ms (target <=100ms MET).
+`packages/cli`-scale target (<=250ms p99) not QUITE met (308ms) -- the new
+dominant cost is candidate hydration (`hydrateSemanticCandidates`, ~270ms,
+hydrating the full fused ~200-candidate set regardless of
+`response_budget.max_items`, a documented prior decision not to thread that
+budget down to this port layer) -- reported for a future frente, not fixed
+here.
+
+A full n8n-scale (real corpus, ~20k files) embed was attempted at both
+`URDIRA_SEMANTIC_WORKERS=2` and `=3` this session and did NOT complete --
+consistent with, not a new instance of, the standing "did not complete in
+3h44m" finding from `docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`.
+See `docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md` for the
+full reproduction, an operational incident encountered along the way (disk
+exhaustion + orphaned worker processes from this session's own daemon
+restarts, cleanly resolved with no data loss), and the literal
+processing-rate floor observed (~0.03 status-rows/second after ~366k rows
+classified, independent of worker count or machine contention) -- the
+stalled phase itself was not identified within this session's time budget.

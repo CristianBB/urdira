@@ -1,5 +1,6 @@
 import { canonicalBytes, decodeCanonical, digestBytes } from "@urdira/canonical";
-import { canonicalVectorBytes as storageCanonicalVectorBytes, hydrateRelationalValue, type RelationalValueRow, type SqliteCommand, type VectorProjectionInput, type WorkspaceDatabase } from "@urdira/storage";
+import { canonicalVectorBytes as storageCanonicalVectorBytes, hydrateRelationalValue, type RelationalValueRow, type SqliteCommand, type SqliteDatabase, type VectorProjectionInput, type WorkspaceDatabase } from "@urdira/storage";
+import { AFFECTED_STATUSES, computeAffectedSetId, SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT, type SemanticAffectedDocumentRow, type SemanticDocumentStatusCounts } from "./canonical-query-data-port.js";
 import { buildSemanticDocument } from "./semantic-documents.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
 import { canonicalVectorBytes as engineCanonicalVectorBytes, vectorValues, type Segmentation, type SemanticGeneratedVector } from "./semantic-runtime.js";
@@ -701,6 +702,86 @@ function documentStatusDeleteCommand(input: { readonly workspaceId: string; read
  * the (byte-identical) closed row instead of inserting -- see the insert
  * loop's `catch`.
  */
+/** Frente S-F (2026-09-08): defensive decode of one `semantic_document_status.reason_codes` TEXT column -- same posture as `parseReasonCodes` (`canonical-query-data-port.ts`), duplicated here (not imported) because it is a trivial, self-contained parse with no risk of drifting from its sibling; both always decode this codebase's own reconciler-written JSON-array-of-strings shape. */
+function decodeReasonCodesJson(value: string): readonly string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch { return []; }
+}
+
+/**
+ * Frente S-F (2026-09-08): materializes exactly one `semantic_coverage_summary`
+ * row for `(workspaceId, profileId, executableBindingId, generation)` --
+ * see that table's own DDL comment (`packages/storage/sql/workspace-v4-semantic.sql`)
+ * and `CanonicalQuerySnapshotPort.semantic_coverage_summary`'s own doc
+ * comment (`canonical-query-data-port.ts`) for why this exists. Runs the
+ * SAME two queries `SqliteCanonicalQuerySnapshotPort.semantic_document_status_counts`/
+ * `semantic_affected_documents` run live on every uncached call -- but here,
+ * ONCE per clean reconcile pass, against `semantic_document_status` right
+ * after `syncDocumentStatusBulk` finished writing it for this exact
+ * generation -- so the row this function writes is what a live query would
+ * have returned at this instant, byte-for-byte (same `AFFECTED_STATUSES`
+ * list, same `ORDER BY`, same `computeAffectedSetId` implementation,
+ * imported rather than reimplemented, so the two call sites can never
+ * silently compute two different digests for the same underlying rows).
+ * Called from `reconcileSemanticProjection`'s own `markerWritten` branch,
+ * immediately after `markSemanticComplete` -- best-effort (mirrors the
+ * segment-cache pruning at that same call site): a failure here never fails
+ * the pass that already committed the real completion marker;
+ * `buildSemanticCoverageView` simply falls back to the live pair for its
+ * next call, exactly as it already does for a workspace that predates this
+ * feature (`semantic_coverage_summary`'s own `undefined` branch).
+ */
+async function materializeCoverageSummary(sql: SqliteDatabase, workspaceId: string, profileId: string, executableBindingId: string, generation: number): Promise<void> {
+  const countRows = await sql.all<{ document_grain: string; status: string; n: number }>(
+    "SELECT document_grain, status, COUNT(*) AS n FROM semantic_document_status WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? GROUP BY document_grain, status",
+    [workspaceId, profileId, executableBindingId],
+  );
+  let unsupportedArtifacts = 0, failedArtifacts = 0, entityCount = 0, coveredEntityCount = 0;
+  for (const row of countRows) {
+    if (row.document_grain === "entity") {
+      entityCount += row.n;
+      if (row.status === "covered") coveredEntityCount += row.n;
+    } else {
+      if (row.status === "unsupported") unsupportedArtifacts += row.n;
+      else if (row.status === "failed") failedArtifacts += row.n;
+    }
+  }
+  const counts: SemanticDocumentStatusCounts = { unsupported_artifact_count: unsupportedArtifacts, failed_artifact_count: failedArtifacts, entity_count: entityCount, covered_entity_count: coveredEntityCount };
+
+  const affectedRawRows = await sql.all<{ document_grain: string; document_id: string; artifact_id: string; artifact_version_id: string; display_path: string; status: string; reason_codes: string }>(
+    `SELECT document_grain, document_id, artifact_id, artifact_version_id, display_path, status, reason_codes
+       FROM semantic_document_status
+      WHERE workspace_id = ? AND profile_id = ? AND executable_binding_id = ? AND status IN (${AFFECTED_STATUSES.map(() => "?").join(", ")})
+      ORDER BY status, display_path, artifact_id, document_id`,
+    [workspaceId, profileId, executableBindingId, ...AFFECTED_STATUSES],
+  );
+  const affectedRows: readonly SemanticAffectedDocumentRow[] = affectedRawRows.map((row) => ({
+    document_grain: row.document_grain === "entity" ? "entity" as const : "artifact" as const,
+    document_id: row.document_id, artifact_id: row.artifact_id, artifact_version_id: row.artifact_version_id, display_path: row.display_path, status: row.status,
+    reason_codes: decodeReasonCodesJson(row.reason_codes),
+  }));
+  const bindingId = digestBytes(canonicalBytes({ profile_id: profileId, executable_binding_id: executableBindingId }));
+  const setId = computeAffectedSetId(affectedRows, { bindingId, generation, profileId, executableBindingId });
+  const affectedFirstPage = affectedRows.slice(0, SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT);
+
+  await sql.run(
+    `INSERT INTO semantic_coverage_summary (workspace_id, profile_id, executable_binding_id, generation, unsupported_artifact_count, failed_artifact_count, entity_count, covered_entity_count, affected_artifact_count, affected_artifact_set_id, affected_first_page, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (workspace_id, profile_id, executable_binding_id, generation) DO UPDATE SET
+       unsupported_artifact_count = excluded.unsupported_artifact_count, failed_artifact_count = excluded.failed_artifact_count,
+       entity_count = excluded.entity_count, covered_entity_count = excluded.covered_entity_count,
+       affected_artifact_count = excluded.affected_artifact_count, affected_artifact_set_id = excluded.affected_artifact_set_id,
+       affected_first_page = excluded.affected_first_page, updated_at = excluded.updated_at`,
+    [
+      workspaceId, profileId, executableBindingId, generation,
+      counts.unsupported_artifact_count, counts.failed_artifact_count, counts.entity_count, counts.covered_entity_count,
+      affectedRows.length, setId, JSON.stringify(affectedFirstPage), new Date().toISOString(),
+    ],
+  );
+}
+
 export async function reconcileSemanticProjection(input: ReconcileSemanticProjectionInput): Promise<ReconcileSemanticProjectionResult> {
   const { database, workspace_id: workspaceId, content, provider, should_abort: shouldAbort } = input;
   const waitForQueryDrain = input.wait_for_query_drain ?? (async () => undefined);
@@ -2197,6 +2278,14 @@ export async function reconcileSemanticProjection(input: ReconcileSemanticProjec
   const markerWritten = generationAfter === generation && cleanPass;
   if (markerWritten) {
     await database.projections.markSemanticComplete({ completed_generation: generation, profile_id: profileId, executable_binding_id: executableBindingId, document_grains: ["artifact", "entity"], entity_policy_digest: entityPolicyDigest });
+    // Frente S-F (2026-09-08): materialize the coverage summary for this
+    // exact (generation, profile, binding) -- see `materializeCoverageSummary`'s
+    // own doc comment. Best-effort, like the segment-cache pruning
+    // immediately below: a failure here never fails the pass that already
+    // committed the real marker.
+    try {
+      await materializeCoverageSummary(sql, workspaceId, profileId, executableBindingId, generation);
+    } catch { /* best-effort materialization, see this call's own doc comment */ }
     // Frente S-E (2026-09-07, adversarial review of Lever 3): the segment
     // cache (`semantic_segment_cache`) had no eviction at all -- its own DDL
     // comment admitted "no LRU yet ... pruned only by a future retention

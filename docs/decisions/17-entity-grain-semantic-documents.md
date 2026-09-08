@@ -369,3 +369,37 @@ review of every other S-D lever (sharding row-for-row parity extended to
 `semantic_document_status`/the segment cache, artifact/entity composition
 edge cases, `nativeTopKChunked` tie-breaking under ties spanning chunk
 boundaries) and the final embed/latency/incremental-edit measurements.
+
+## Amendment (2026-09-08, Frente S-F): entity-lane exact scan bounded; coverage view materialized; a production-only bug found and fixed
+
+The entity lane's own `exactVectorScan` call (deliberately uncapped per
+this decision's own "cap 100 tras agregar" -- see the S-D amendment above)
+was measured at 286ms for 10,964 segment candidates. Now attempts a bounded
+top-K scan first (`SEMANTIC_ENTITY_CANDIDATE_CAP * ENTITY_SEGMENT_FANOUT_BOUND`
+= 800) and escalates to the SAME full uncapped scan only when that
+shortfalls (fewer than 100 distinct documents recovered and more candidates
+existed) -- a performance-only fast path: the escalation branch is
+byte-identical to this decision's own pre-existing behavior, so this can
+never change a result, only how fast the common case reaches it.
+`vector_shards`' packed bytes (read via CAS, content-hash keyed) are now
+cached on `SqliteCanonicalQuerySnapshotPort`, replacing a full CAS re-read
+of every distinct shard on every call (~147ms at 6,396 shards).
+
+`buildSemanticCoverageView`'s own real-counts/affected-page inputs
+(`semantic_document_status_counts`/`semantic_affected_documents`, this
+decision's own §4.1/4.2 machinery) are now read from a materialized
+`semantic_coverage_summary` row the reconciler writes once per clean pass,
+not recomputed live on every call -- see decision 16's own S-F amendment
+for the full latency story (5,978.6ms -> 308.1ms p99 at `packages/cli`
+scale) and a SECOND bug this exposed: `NativeCanonicalQuerySnapshotPort`
+(every real v4 workspace's actual port) never delegated the new method,
+silently disabling the fix in production until caught by live measurement
+-- fixed in the same session (`ef838e3`).
+
+A full n8n-scale embed attempt (both `URDIRA_SEMANTIC_WORKERS=2` and `=3`)
+did not complete this session -- see
+`docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md` Part 4 for
+the literal counts (72,922 entity vectors, 366,059 `semantic_document_status`
+rows classified) and the observed processing-rate floor
+(~0.03 status-rows/second, independent of worker count), reported for the
+next frente rather than root-caused here.

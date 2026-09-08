@@ -464,6 +464,77 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
     });
   });
 
+  // Frente S-F (2026-09-08): regression test for a REAL bug this frente
+  // found live -- `semantic_coverage_summary` was added to
+  // `CanonicalQuerySnapshotPort` and to `SqliteCanonicalQuerySnapshotPort`,
+  // but NOT to this class's own explicit per-method delegation list (every
+  // `semantic_*` method here is hand-written, one at a time -- see this
+  // class's own doc comment: "every non-structural method ... delegates to
+  // a wrapped SqliteCanonicalQuerySnapshotPort"). Because the interface
+  // declares it OPTIONAL, TypeScript raised no compile error for the
+  // omission -- `this.snapshots.semantic_coverage_summary !== undefined`
+  // silently read `false` on every v4 native-storage workspace (the
+  // daemon's own default), permanently disabling the fast path and
+  // reproducing the exact multi-second `core:search_semantic` cost this
+  // frente's own materialized-summary fix was built to eliminate. Caught
+  // only by a LIVE daemon latency measurement, not by any existing test --
+  // this test exists so it can never regress silently again.
+  it("Frente S-F: semantic_coverage_summary delegates to the wrapped SQLite port (the exact method missing until this frente's own live measurement caught it)", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+
+      // No summary row yet -- both ports must agree on "undefined" (falls
+      // back to the live pair, never silently different between ports).
+      expect(await native.semantic_coverage_summary!(scope, "profile-x", "binding-x")).toBeUndefined();
+      expect(await sqlite.semantic_coverage_summary!(scope, "profile-x", "binding-x")).toBeUndefined();
+
+      await opened.database.run(
+        `INSERT INTO semantic_coverage_summary (workspace_id, profile_id, executable_binding_id, generation, unsupported_artifact_count, failed_artifact_count, entity_count, covered_entity_count, affected_artifact_count, affected_artifact_set_id, affected_first_page, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [workspace.workspace_id, "profile-x", "binding-x", 1, 1, 2, 3, 4, 5, "sha256:test-set-id", "[]", now],
+      );
+      const nativeSummary = await native.semantic_coverage_summary!(scope, "profile-x", "binding-x");
+      const sqliteSummary = await sqlite.semantic_coverage_summary!(scope, "profile-x", "binding-x");
+      expect(nativeSummary).toEqual(sqliteSummary);
+      expect(nativeSummary).toEqual({
+        generation: 1,
+        counts: { unsupported_artifact_count: 1, failed_artifact_count: 2, entity_count: 3, covered_entity_count: 4 },
+        affected_artifact_count: 5,
+        affected_artifact_set_id: "sha256:test-set-id",
+        affected_first_page: [],
+      });
+    });
+  });
+
+  it("Frente S-F: semantic_entity_scope_counts matches the SQLite port's own count, repeatably (served from its own per-generation cache after the first call)", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+
+      const sqliteCounts = await sqlite.semantic_entity_scope_counts!(scope);
+      const firstNativeCounts = await native.semantic_entity_scope_counts!(scope);
+      expect(firstNativeCounts).toEqual(sqliteCounts);
+      expect(firstNativeCounts.entity_count).toBeGreaterThan(0);
+
+      // A second call for the SAME generation -- whether served from
+      // `entityScopeCountCache` (the fast path this frente added) or
+      // recomputed, the answer must be identical.
+      const secondNativeCounts = await native.semantic_entity_scope_counts!(scope);
+      expect(secondNativeCounts).toEqual(firstNativeCounts);
+
+      // `evictWarmRecords()` drops the cache -- a call after eviction must
+      // still return the identical (recomputed) count.
+      native.evictWarmRecords();
+      const thirdNativeCounts = await native.semantic_entity_scope_counts!(scope);
+      expect(thirdNativeCounts).toEqual(firstNativeCounts);
+    });
+  });
+
   it("core:get_source and core:find_records resolve identically through CanonicalRecordQueryDataPort/QueryEngine on both ports", async () => {
     await withWorkspace(async (opened, storeDir) => {
       await seedFixture(opened);
