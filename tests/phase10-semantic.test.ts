@@ -10,9 +10,11 @@ import {
   buildSemanticDocument,
   canonicalVectorBytes,
   configureNativeExactVectorTopKPort,
+  configureResidentVectorTopKPort,
   exactVectorScan,
   fuseSemanticLanes,
   rerankSemanticMatches,
+  residentExactVectorScan,
   selectBundledProfile,
   SemanticUpdater,
   type SemanticMaterialization,
@@ -369,6 +371,114 @@ describe("Phase 10 semantic engine", () => {
       { projection_record_id: "raw", profile_id: "p", executable_binding_id: "b", vector: [0.5, 0.5] },
     ], [0.6, 0.8], { profile_id: "p", executable_binding_id: "b", dimensions: 2, distance_metric: "squared_l2", normalization: "l2" });
     expect(result[0]?.projection_record_id).toBe("normalized");
+  });
+
+  // Frente S-I (2026-09-08): `residentExactVectorScan` (`semantic-retrieval.ts`)
+  // is the resident-buffer fast path `canonical-query-data-port.ts`'s
+  // `trySemanticSearch` uses instead of `exactVectorScan`'s own
+  // `nativeTopKChunked` marshaling/chunking, when configured. These tests
+  // exercise it directly against a fake `ResidentVectorTopKPort` (mirroring
+  // this file's own `configureNativeExactVectorTopKPort` fakes above) --
+  // the REAL native kernel's own exactness (oracle parity with ties, k > N,
+  // generation invalidation) is proven in Rust
+  // (`crates/urdira-native-core/src/lib.rs`'s `resident_vector_tests`); this
+  // file proves the JS-side CONTRACT: registration is requested exactly
+  // when `needsRegister` says so, results map buffer index back to the
+  // caller's own `ids` array, and a malformed native result fails closed.
+  describe("Frente S-I: residentExactVectorScan (resident-buffer fast path)", () => {
+    afterEach(() => configureResidentVectorTopKPort(undefined));
+
+    it("returns undefined (falls back to exactVectorScan) when no resident port is configured", () => {
+      expect(residentExactVectorScan({
+        handleId: "h", generationTag: 1, needsRegister: true, buffer: new Float32Array([1, 0]), dimensions: 2,
+        ids: ["a"], query: new Float32Array([1, 0]), k: 1, metric: "cosine",
+      })).toBeUndefined();
+    });
+
+    it("returns an empty array without touching the port when the candidate set is empty", () => {
+      let calls = 0;
+      configureResidentVectorTopKPort({
+        registerVectorBuffer: () => { calls += 1; },
+        exactTopKContiguous: () => { calls += 1; return []; },
+      });
+      const result = residentExactVectorScan({
+        handleId: "h", generationTag: 1, needsRegister: true, buffer: new Float32Array(0), dimensions: 2,
+        ids: [], query: new Float32Array([1, 0]), k: 5, metric: "cosine",
+      });
+      expect(result).toEqual([]);
+      expect(calls).toBe(0);
+    });
+
+    it("registers the buffer only when needsRegister is true, and maps buffer index back to the caller's own id array", () => {
+      const registrations: unknown[] = [];
+      const scanCalls: unknown[] = [];
+      configureResidentVectorTopKPort({
+        registerVectorBuffer(handleId, generation, dimensions, buffer) { registrations.push({ handleId, generation, dimensions, buffer: [...buffer] }); },
+        exactTopKContiguous(handleId, generation, query, k, metric) {
+          scanCalls.push({ handleId, generation, query: [...query], k, metric });
+          // Row 2 (id "gamma") wins, then row 0 (id "alpha").
+          return [{ index: 2, distance: 0 }, { index: 0, distance: 1 }];
+        },
+      });
+      const buffer = new Float32Array([1, 0, 0, 1, 0.5, 0.5]);
+      const result = residentExactVectorScan({
+        handleId: "workspace:p:b:artifact", generationTag: 7, needsRegister: true, buffer, dimensions: 2,
+        ids: ["alpha", "beta", "gamma"], query: new Float32Array([0.5, 0.5]), k: 2, metric: "cosine",
+      });
+      expect(registrations).toEqual([{ handleId: "workspace:p:b:artifact", generation: 7, dimensions: 2, buffer: [...buffer] }]);
+      expect(scanCalls).toEqual([{ handleId: "workspace:p:b:artifact", generation: 7, query: [0.5, 0.5], k: 2, metric: "cosine" }]);
+      expect(result).toEqual([{ projection_record_id: "gamma", rank: 1 }, { projection_record_id: "alpha", rank: 2 }]);
+    });
+
+    it("skips registration on a cache hit (needsRegister: false), still scanning against the already-resident buffer", () => {
+      let registerCalls = 0;
+      configureResidentVectorTopKPort({
+        registerVectorBuffer: () => { registerCalls += 1; },
+        exactTopKContiguous: () => [{ index: 1, distance: 0 }],
+      });
+      const result = residentExactVectorScan({
+        handleId: "h", generationTag: 3, needsRegister: false, buffer: new Float32Array(0), dimensions: 2,
+        ids: ["alpha", "beta"], query: new Float32Array([1, 0]), k: 1, metric: "squared_l2",
+      });
+      expect(registerCalls).toBe(0);
+      expect(result).toEqual([{ projection_record_id: "beta", rank: 1 }]);
+    });
+
+    it("caps k to the candidate count before calling the native port", () => {
+      let requestedK: number | undefined;
+      configureResidentVectorTopKPort({
+        registerVectorBuffer: () => undefined,
+        exactTopKContiguous: (_handleId, _generation, _query, k) => { requestedK = k; return [{ index: 0, distance: 0 }, { index: 1, distance: 1 }]; },
+      });
+      const result = residentExactVectorScan({
+        handleId: "h", generationTag: 1, needsRegister: true, buffer: new Float32Array([1, 0, 0, 1]), dimensions: 2,
+        ids: ["alpha", "beta"], query: new Float32Array([1, 0]), k: 100, metric: "squared_l2",
+      });
+      expect(requestedK).toBe(2);
+      expect(result).toHaveLength(2);
+    });
+
+    it("fails closed when the native port returns a result count that does not match the requested k", () => {
+      configureResidentVectorTopKPort({ registerVectorBuffer: () => undefined, exactTopKContiguous: () => [{ index: 0, distance: 0 }] });
+      expect(() => residentExactVectorScan({
+        handleId: "h", generationTag: 1, needsRegister: true, buffer: new Float32Array([1, 0, 0, 1]), dimensions: 2,
+        ids: ["alpha", "beta"], query: new Float32Array([1, 0]), k: 2, metric: "squared_l2",
+      })).toThrow(/malformed result count/u);
+    });
+
+    it("fails closed on an out-of-range or duplicate buffer index from the native port", () => {
+      configureResidentVectorTopKPort({ registerVectorBuffer: () => undefined, exactTopKContiguous: () => [{ index: 5, distance: 0 }] });
+      expect(() => residentExactVectorScan({
+        handleId: "h", generationTag: 1, needsRegister: true, buffer: new Float32Array([1, 0]), dimensions: 2,
+        ids: ["alpha"], query: new Float32Array([1, 0]), k: 1, metric: "squared_l2",
+      })).toThrow(/malformed result/u);
+
+      configureResidentVectorTopKPort({ registerVectorBuffer: () => undefined, exactTopKContiguous: () => [{ index: 0, distance: 0 }, { index: 0, distance: 1 }] });
+      expect(() => residentExactVectorScan({
+        handleId: "h", generationTag: 1, needsRegister: true, buffer: new Float32Array([1, 0, 0, 1]), dimensions: 2,
+        ids: ["alpha", "beta"], query: new Float32Array([1, 0]), k: 2, metric: "squared_l2",
+      })).toThrow(/malformed result/u);
+    });
   });
 
   it("fuses lanes and reranks with exact rational comparisons and stable ties", () => {

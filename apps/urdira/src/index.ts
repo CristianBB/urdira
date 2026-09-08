@@ -11,6 +11,7 @@ import {
   candidateTargetRegistryFromSnapshot,
   configureNativeExactVectorTopKPort,
   configureNativeLogicalDigestPort,
+  configureResidentVectorTopKPort,
   createCanonicalPluginDigestAuthority,
   EngineError,
   engineTimingEnabled,
@@ -24,7 +25,7 @@ import {
 } from "@urdira/engine";
 import { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions, serveUrdiraStdio, type ServeUrdiraStdioOptions, type UrdiraMcpClient } from "@urdira/mcp";
 import { startUrdiraWeb, type UrdiraWebHandle } from "@urdira/web";
-import { createNativeExactVectorTopKPort, createNativeLogicalDigestPort, createNativeStructuralKernelPort, loadNativeBinding, resolveNativeClosure, type ResolvedNativeClosure } from "@urdira/native";
+import { createNativeExactVectorTopKPort, createNativeLogicalDigestPort, createNativeResidentVectorTopKPort, createNativeStructuralKernelPort, loadNativeBinding, resolveNativeClosure, type ResolvedNativeClosure } from "@urdira/native";
 import { WORKSPACE_V3_SCHEMA_DIGEST } from "@urdira/storage";
 export { MCP_BENCHMARK_INSTRUCTIONS, buildBenchmarkInstructions } from "@urdira/mcp";
 import { canonicalJson, configureStructuralKernelPort, type FactDeltaStream, type PluginWorkerRequestEnvelope, type WorkerTransport } from "@urdira/plugin-sdk";
@@ -2395,6 +2396,12 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   const nativeBinding = nativeRuntime === undefined ? undefined : loadNativeBinding({ artifact_path: nativeRuntime.closure.addon_path });
   configureNativeLogicalDigestPort(nativeBinding === undefined ? undefined : createNativeLogicalDigestPort(nativeBinding));
   configureNativeExactVectorTopKPort(nativeBinding === undefined ? undefined : createNativeExactVectorTopKPort(nativeBinding));
+  // Frente S-I (2026-09-08): the resident-buffer exact top-k kernel --
+  // registered from the SAME validated native binding as the two ports
+  // above, alongside them, so a workspace query's `trySemanticSearch`
+  // (`canonical-query-data-port.ts`) can use it whenever this process has a
+  // native binding at all (never gated by a separate flag).
+  configureResidentVectorTopKPort(nativeBinding === undefined ? undefined : createNativeResidentVectorTopKPort(nativeBinding));
   configureStructuralKernelPort(nativeBinding === undefined ? undefined : createNativeStructuralKernelPort(nativeBinding));
   const scanBudgetMs = positiveIntegerEnv("URDIRA_SCAN_BUDGET_MS");
   const scanMaxResponseBytes = positiveIntegerEnv("URDIRA_SCAN_MAX_RESPONSE_BYTES");

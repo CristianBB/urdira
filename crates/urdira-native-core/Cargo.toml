@@ -9,3 +9,10 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Frente S-I: data-parallel distance computation in `exact_top_k_contiguous`
+# above `RESIDENT_VECTOR_PARALLEL_THRESHOLD` candidates (n8n's own full
+# entity-grain lane, 72,922 candidates, is comfortably past it). Already a
+# pinned-in-lockfile dependency of `urdira-indexing-worker`/`urdira-structural-store`/
+# `urdira-source-frontier` at the same unpinned "1" major-version spec, so
+# this adds no new supply-chain surface.
+rayon = "1"

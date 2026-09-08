@@ -1,5 +1,6 @@
 import { getNativeBinding } from "./loader.js";
 import type {
+  DistanceMetric,
   ExactVectorRequest,
   LogicalDigestResult,
   LogicalRecord,
@@ -8,6 +9,7 @@ import type {
   LogicalValueRecord,
   LogicalValueVerification,
   LogicalVerificationResult,
+  ResidentVectorTopKMatch,
   StructuralKernelBatch,
   StructuralKernelCanonicalBatch,
   StructuralKernelCanonicalResult,
@@ -42,6 +44,7 @@ export type {
   LogicalValueVerification,
   LogicalValue,
   LogicalVerificationResult,
+  ResidentVectorTopKMatch,
   StructuralKernelBatch,
   StructuralKernelCanonicalBatch,
   StructuralKernelCanonicalResult,
@@ -172,6 +175,30 @@ export function createNativeExactVectorTopKPort(binding = getNativeBinding()): {
   return {
     exactVectorTopKBatch(requests) {
       return binding.exactVectorTopKBatch(requests);
+    },
+  };
+}
+
+/**
+ * Frente S-I (2026-09-08): composition-owned resident-buffer exact top-k
+ * port. Unlike `createNativeExactVectorTopKPort` above (call-owned, no
+ * cross-call state), this port's whole POINT is native-side state that
+ * outlives one call -- `registerVectorBuffer` copies a caller-owned
+ * `Float32Array` into native memory ONCE per `(handleId, generation)`, and
+ * every subsequent `exactTopKContiguous` call against that same pair reuses
+ * it. See `packages/engine/src/semantic-retrieval.ts`'s `ResidentVectorTopKPort`
+ * for the consumer-side contract this satisfies.
+ */
+export function createNativeResidentVectorTopKPort(binding = getNativeBinding()): {
+  registerVectorBuffer(handleId: string, generation: number, dimensions: number, buffer: Float32Array): void;
+  exactTopKContiguous(handleId: string, generation: number, query: Float32Array, k: number, metric: DistanceMetric): readonly ResidentVectorTopKMatch[];
+} {
+  return {
+    registerVectorBuffer(handleId, generation, dimensions, buffer) {
+      binding.registerVectorBuffer(handleId, generation, dimensions, buffer);
+    },
+    exactTopKContiguous(handleId, generation, query, k, metric) {
+      return binding.exactTopKContiguous(handleId, generation, query, k, metric);
     },
   };
 }

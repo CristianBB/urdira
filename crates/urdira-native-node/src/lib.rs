@@ -2,7 +2,10 @@
 
 mod structural_store_napi;
 
-use napi::{Error, Result, Status, bindgen_prelude::Uint8Array};
+use napi::{
+    Error, Result, Status,
+    bindgen_prelude::{Float32Array, Uint8Array},
+};
 use napi_derive::napi;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -14,15 +17,17 @@ use urdira_native_core::{
     DistanceMetric, LogicalRecord, LogicalRecordVerification, LogicalValueRecord,
     LogicalValueVerification, PackedExactVectorRequest, PackedVectorElementType,
     StructuralKernelBatch, StructuralKernelCanonicalBatch, exact_packed_vector_top_k_batch,
+    exact_top_k_contiguous as core_exact_top_k_contiguous,
     logical_digest_batch as core_logical_digest_batch,
     logical_value_digest_batch as core_logical_value_digest_batch,
+    register_vector_buffer as core_register_vector_buffer,
     structural_kernel_batch as core_structural_kernel_batch,
     structural_kernel_canonical_batch as core_structural_kernel_canonical_batch,
     verify_logical_record_batch as core_verify_logical_record_batch,
     verify_logical_value_batch as core_verify_logical_value_batch,
 };
 
-const NATIVE_API_VERSION: u32 = 16;
+const NATIVE_API_VERSION: u32 = 17;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,4 +201,63 @@ pub fn exact_vector_top_k_batch_binding(
     let results = exact_packed_vector_top_k_batch(&requests)
         .map_err(|error| core_error(error, "exactVectorTopKBatch"))?;
     encode(results, "exactVectorTopKBatch")
+}
+
+/// Frente S-I: registers one contiguous, row-major `f32` vector buffer
+/// (`data.len() / dimensions` rows) in Rust-owned memory, tagged with
+/// `generation`, replacing any prior buffer for `handle_id`. Copies `data`
+/// exactly once -- see `urdira_native_core`'s own module-level doc comment
+/// (just above `register_vector_buffer`) for the full "why" (n8n-scale
+/// per-query marshaling overhead this replaces).
+#[napi(js_name = "registerVectorBuffer")]
+pub fn register_vector_buffer_binding(
+    handle_id: String,
+    generation: u32,
+    dimensions: u32,
+    data: Float32Array,
+) -> Result<()> {
+    core_register_vector_buffer(&handle_id, generation, dimensions as usize, data.to_vec())
+        .map_err(|error| core_error(error, "registerVectorBuffer"))
+}
+
+#[napi(object)]
+pub struct ExactTopKContiguousMatchOutput {
+    pub index: u32,
+    pub distance: f64,
+}
+
+/// Frente S-I: exact top-k over the buffer `registerVectorBuffer` already
+/// registered for `handle_id` at `generation` -- one N-API call per query,
+/// no candidate marshaling (the buffer is already resident), no chunking.
+/// Rejects with a message containing `"stale"` when `generation` does not
+/// match the currently registered one (the caller must re-register before
+/// retrying, never silently scan outdated data).
+#[napi(js_name = "exactTopKContiguous")]
+pub fn exact_top_k_contiguous_binding(
+    handle_id: String,
+    generation: u32,
+    query: Float32Array,
+    k: u32,
+    metric: String,
+) -> Result<Vec<ExactTopKContiguousMatchOutput>> {
+    let metric = match metric.as_str() {
+        "cosine" => DistanceMetric::Cosine,
+        "squared_l2" => DistanceMetric::SquaredL2,
+        other => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("exactTopKContiguous received unsupported metric '{other}'."),
+            ));
+        }
+    };
+    let query: &[f32] = &query;
+    let results = core_exact_top_k_contiguous(&handle_id, generation, query, k as usize, metric)
+        .map_err(|error| core_error(error, "exactTopKContiguous"))?;
+    Ok(results
+        .into_iter()
+        .map(|entry| ExactTopKContiguousMatchOutput {
+            index: entry.index,
+            distance: entry.distance,
+        })
+        .collect())
 }
