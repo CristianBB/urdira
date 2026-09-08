@@ -2261,6 +2261,18 @@ impl Iterator for VisibleIter {
     }
 }
 
+/// Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+/// gap 3): added `entities_index` and `pending` (both previously omitted) to
+/// the pre-touched section list. `entities_index` backs `entity_by_owner_
+/// and_start` (the residual pass's owner+span correlation); `pending` backs
+/// `pending_sites_by_owner`, which `core:get_outline`'s OWN pushdown
+/// (`pendingSitesStreamForOutline`, `canonical-query-data-port.ts`) reads on
+/// every call for a module-shaped container. Both are INDEX-shaped sections
+/// (small, sorted-key tables), never the multi-gigabyte `body`/`ident`
+/// record-content sections -- this list stays bounded to "sections a query
+/// walks to find WHICH records/sites exist", never "the record content
+/// itself", matching this task's own §0 scope (pre-touch the indices, not
+/// the records).
 fn spawn_prefault(inner: &StoreInner) -> Vec<std::thread::JoinHandle<()>> {
     let mut handles = Vec::new();
     for seg in inner.segments.iter().cloned() {
@@ -2273,6 +2285,10 @@ fn spawn_prefault(inner: &StoreInner) -> Vec<std::thread::JoinHandle<()>> {
             touch_pages(&seg.by_identity);
             touch_pages(&seg.adj_out);
             touch_pages(&seg.adj_in);
+            touch_pages(&seg.entities_index);
+            if let Some(pending) = &seg.pending {
+                touch_pages(pending);
+            }
         }));
     }
     handles

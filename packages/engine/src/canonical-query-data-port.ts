@@ -56,6 +56,24 @@ export interface CanonicalQuerySnapshotPort {
   /** Bounded query reader for graph/set operations. Implementations must not
    * retain the complete decoded corpus while yielding batches. */
   readonly records_for_query_batches?: (scope: QueryScope, batch_size?: number) => AsyncIterable<readonly CanonicalQueryRecord[]>;
+  /**
+   * Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+   * item 4 sweep finding): a cheap (no decode) count of visible records for
+   * `scope`'s current generation, used ONLY by `CanonicalRecordQueryDataPort.execute`'s
+   * generic `records_for_query` fallback to refuse an unbounded full-corpus
+   * decode before it happens, rather than after it OOMs. Reproduced live:
+   * `core:analyze_impact` (no pushdown branch exists for it, same gap
+   * `core:index_status`'s pipeline-stage misuse had) OOM-crashed the daemon
+   * on n8n's ~2.2M-record v4 workspace -- `records_for_query`'s full decode
+   * of the entire generation into `CanonicalQueryRecord[]` (plus the
+   * identity maps built over it) exceeds the default V8 heap on a corpus
+   * this size, and would be far worse on VS Code's ~4.5M records. Optional:
+   * a port with no cheap count (or a bounded-by-design corpus, e.g. most
+   * `SqliteCanonicalQuerySnapshotPort` deployments today) omits it, which
+   * `execute()` treats as "no guard available" -- unchanged prior
+   * behavior, never a NEW restriction for a port that never had this problem.
+   */
+  readonly visible_record_count?: (scope: QueryScope) => Promise<number>;
   readonly records: (scope: QueryScope) => Promise<readonly CanonicalQueryRecord[]>;
   readonly capability_states?: (scope: QueryScope) => Promise<readonly SnapshotCapabilityStateEntry[]>;
   readonly artifact_text?: (scope: QueryScope, artifact_version_id: string) => Promise<{ readonly text: string } | undefined>;
@@ -121,21 +139,48 @@ export interface CanonicalQuerySnapshotPort {
    * post-ready by `reconcileLexicalProjection`, `@urdira/engine`'s
    * `lexical-reconciler.ts`) for `core:search_text` pushdown -- this searches
    * real file text, unlike the in-memory corpus path (which only matches
-   * against record body JSON). Returns `undefined` whenever the lexical
-   * projection cannot be trusted as complete for `scope`'s current
-   * generation (no port implementation, or `lexical_index_state.completed_generation`
-   * does not equal the current generation), which callers must treat as "fall
-   * back to the full in-memory path" -- never as "zero matches". Offsets are
-   * string indices into the searched text (case-insensitive offsets are
-   * indices into its NFKC-lowercased normalized form -- see
-   * `WorkspaceProjectionRepository.searchLiteral`,
-   * `packages/storage/src/projections.ts`, whose case/FTS5 semantics this
-   * mirrors), one entry per non-overlapping match. `path_patterns`, when
-   * supplied, is an exact glob filter applied by the lexical provider before
-   * candidate caps and hydration; providers that cannot honor it should omit
-   * this pushdown capability rather than widen the answer.
+   * against record body JSON). Returns `undefined` only when this port has
+   * no CAS content reader at all (or the workspace/generation cannot be
+   * resolved) -- an unconditional "no lexical capability", which callers
+   * must treat as "fall back to the full in-memory path", never as "zero
+   * matches".
+   *
+   * Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+   * gap 2) correction: this doc comment used to also promise `undefined`
+   * whenever `lexical_index_state.completed_generation` does not equal the
+   * current generation. That is NOT what `SqliteCanonicalQuerySnapshotPort`'s
+   * implementation does and never has been reachable that way -- when the
+   * lexical sidecar lags the current generation it instead takes an
+   * alternate, SOURCE-SAFE path (`scanSourceCatalog`: every visible
+   * artifact version's raw CAS text, read and verified in-process, NOT the
+   * FTS candidate lane) and still returns real, correct matches from it.
+   * That is deliberate (a stale FTS index must never silently serve
+   * pre-edit content), but it is also dramatically slower on a large corpus
+   * (every visible file read from CAS and verified, not a bounded FTS
+   * candidate set) -- measured at 6.1-9.8s per call on VS Code's ~13k files
+   * despite `core:index_status` reporting `search_text_ready: true` (the
+   * flag answers "is search_text AVAILABLE", not "will THIS call use the
+   * fast FTS lane"). `CanonicalRecordQueryDataPort.trySearchTextPushdown`
+   * now surfaces this as an explicit `completeness` dimension
+   * (`core:lexical_search` / `partial` / `lexical_projection_behind_current_generation`)
+   * via the sibling `lexical_projection_lag` method below, instead of
+   * silently returning a normal-looking result that happens to be an order
+   * of magnitude slower for no visible reason.
    */
   readonly search_literal?: (scope: QueryScope, pattern: string, options: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly path_patterns?: readonly string[]; readonly include_generated?: boolean; readonly include_external?: boolean }) => Promise<readonly LexicalSearchMatch[] | undefined>;
+  /**
+   * Companion to `search_literal`: reports whether the lexical sidecar is
+   * behind `scope`'s current generation (see that method's own doc comment)
+   * -- `undefined` when the lexical projection is current (or this port has
+   * no lexical capability at all), or `{current_generation,
+   * completed_generation}` when `search_literal` took (or would take) the
+   * slower source-safe verification path instead of the FTS candidate lane.
+   * Read-only, point-lookup cost (two single-row reads, no scan) --
+   * `trySearchTextPushdown` calls it purely to make an already-silent
+   * degradation visible in `completeness.dimensions`, never to change which
+   * path `search_literal` itself takes.
+   */
+  readonly lexical_projection_lag?: (scope: QueryScope) => Promise<{ readonly current_generation: number; readonly completed_generation?: number } | undefined>;
   /**
    * Resolves one artifact-shaped `CanonicalQueryRecord` per given
    * `artifact_version_id`, for turning `search_literal` matches into
@@ -470,6 +515,12 @@ const FIND_RECORDS_PUSHDOWN_LIMIT = 5000;
 // trying to stay exhaustive up to some higher limit.
 const SEARCH_TEXT_PUSHDOWN_ARTIFACT_CAP = 200;
 const SEARCH_TEXT_PUSHDOWN_OFFSET_CAP = 2000;
+// Frente Q-2 (2026-09-08): well above any real test fixture's record count
+// (dozens to low thousands) so no existing bounded-corpus test regresses,
+// and well below the ~2.2M (n8n) / ~4.5M (VS Code) record scale that has
+// been observed to OOM a full JS decode of `CanonicalQueryRecord[]` plus
+// its identity maps.
+const FULL_CORPUS_FALLBACK_RECORD_CAP = 200_000;
 // Exact-scan cap for `trySemanticSearch`'s semantic AND lexical lanes alike
 // (see the pinned spec's "v1 grain" decision: exact scan, no ANN). Structural
 // filters (`paths`/`subject_types`) are applied BEFORE this cap, same
@@ -1615,6 +1666,17 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return matches;
   }
 
+  /** See `CanonicalQuerySnapshotPort.lexical_projection_lag`'s own doc comment. Mirrors `search_literal`'s own `completion`/`generation`/`sourceOnly` computation exactly (same two point-lookups), duplicated rather than threaded through as an out-parameter so `search_literal`'s own return type and every existing caller/test stay untouched. */
+  async lexical_projection_lag(scope: QueryScope): Promise<{ readonly current_generation: number; readonly completed_generation?: number } | undefined> {
+    if (scope.scope_type !== "single_workspace" || this.content === undefined) return undefined;
+    if (scope.snapshot_id?.startsWith("source-snapshot:") === true) return undefined; // Already pinned to a source snapshot; search_literal never compares generations for it.
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return undefined;
+    const completion = await this.database.get<{ completed_generation: number }>("SELECT completed_generation FROM lexical_index_state WHERE workspace_id = ?", [scope.workspace_id]);
+    if (completion?.completed_generation === generation) return undefined;
+    return { current_generation: generation, ...(completion === undefined ? {} : { completed_generation: completion.completed_generation }) };
+  }
+
   async capability_states(scope: QueryScope): Promise<readonly SnapshotCapabilityStateEntry[]> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
     const workspaceId = scope.workspace_id;
@@ -1780,15 +1842,32 @@ function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
 
+// Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+// item 1(a)): `record_id` now leads this priority order, not trails it.
+// `entity_id`/`relation_id`/`diagnostic_id` are always exactly
+// `record.identity_id`'s value re-exposed under a subject-type-specific
+// field name (`recordValue` above), never a distinct identity -- so for the
+// in-memory `maps.by_any_id`-backed call sites (which key on ALL of
+// `record_id`/`identity_id`/`identity_key` equally) this reorder changes
+// nothing observable. It matters for `tryBuildContextPushdown`'s `directIds`
+// (this class, below), which feeds these ids DIRECTLY into
+// `snapshots.records_by_ids` -- a v4 seed selector that (very plausibly, and
+// legitimately) carries an agent-visible `entity_id` copied from an earlier
+// result alongside its own `record_id` used to always prefer the FORMER,
+// which the native store's `records_by_ids` cannot index and now rejects
+// outright (Q-2 item 1(a)) rather than silently scanning for it. Preferring
+// `record_id` first is the exact same fix Q1 already applied to
+// `itemId`/`toSubjectSelector` (`recipe-executor.ts`) for the identical
+// anti-pattern.
 function subjectIdentity(value: unknown): string | undefined {
   const record = object(value);
-  for (const field of ["entity_id", "relation_id", "diagnostic_id", "record_id", "identity_key"]) if (typeof record[field] === "string") return record[field] as string;
+  for (const field of ["record_id", "entity_id", "relation_id", "diagnostic_id", "identity_key"]) if (typeof record[field] === "string") return record[field] as string;
   return undefined;
 }
 
 function subjectIdentities(value: unknown): readonly string[] {
   const record = object(value);
-  return ["entity_id", "relation_id", "diagnostic_id", "record_id", "identity_key"].flatMap((field) => typeof record[field] === "string" ? [record[field] as string] : []);
+  return ["record_id", "entity_id", "relation_id", "diagnostic_id", "identity_key"].flatMap((field) => typeof record[field] === "string" ? [record[field] as string] : []);
 }
 
 /** Resolve execution-local pipeline bindings at the data boundary. The
@@ -2259,6 +2338,37 @@ function completenessDimensions(states: readonly SnapshotCapabilityStateEntry[])
       diagnostic_record_ids: state.diagnostic_record_ids,
     };
   });
+}
+
+/**
+ * Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+ * gap 2): synthesizes a `SnapshotCapabilityStateEntry`-shaped completeness
+ * dimension for `trySearchTextPushdown`'s own `lexical_projection_lag`
+ * check -- surfacing "this `core:search_text` answer came from the slower,
+ * source-safe per-file verification path (real, correct matches; just not
+ * the FTS candidate lane) because the lexical sidecar has not caught up to
+ * the workspace's current generation yet" as a visible `partial` dimension
+ * in the response's `completeness.dimensions`, instead of an identically-
+ * shaped, silently-slower result a caller has no way to distinguish from
+ * the fast path. Status `partial` (not `stale`/`unsupported`): the DATA
+ * returned is fully correct and current (the source-safe path reads the
+ * live CAS text directly), only the SERVING PATH is degraded.
+ */
+function lexicalProjectionLagCapabilityState(lag: { readonly current_generation: number; readonly completed_generation?: number }): SnapshotCapabilityStateEntry {
+  return {
+    capability: "core:lexical_search",
+    capability_contract_version: "1",
+    provider_id: "core:lexical_projection",
+    provider_version: "1",
+    status: "partial",
+    reason_codes: [
+      "lexical_projection_behind_current_generation",
+      `current_generation:${lag.current_generation}`,
+      `lexical_completed_generation:${lag.completed_generation ?? "none"}`,
+    ],
+    affected_artifact_ids: [],
+    diagnostic_record_ids: [],
+  };
 }
 
 function result(streams: Readonly<Record<string, readonly QueryStreamItem[]>>, states: readonly SnapshotCapabilityStateEntry[], semanticState?: OperationEvaluation["semantic_state"]): OperationEvaluation {
@@ -3215,7 +3325,25 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const records: CanonicalQueryRecord[] = [];
 
     const directIds = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
-    if (directIds.length > 0 && this.snapshots.records_by_ids !== undefined) records.push(...await this.snapshots.records_by_ids(operation.scope, [...new Set(directIds)]));
+    if (directIds.length > 0 && this.snapshots.records_by_ids !== undefined) {
+      try {
+        records.push(...await this.snapshots.records_by_ids(operation.scope, [...new Set(directIds)]));
+      } catch (error) {
+        // Frente Q-2 (2026-09-08): a `seeds` entry may legitimately carry
+        // only an `entity_id`/`relation_id`/`diagnostic_id`/`identity_key`
+        // form (no `record_id`) -- `subjectIdentity` above now prefers
+        // `record_id` when both are present, but cannot invent one when it
+        // is truly absent. Against the native v4 store this now throws
+        // `core:selector_unresolvable` (item 1(a)) instead of silently
+        // scanning for it. `build_context`'s own contract is "deliberately
+        // conservative... never a widened full-corpus scan", not "hard-fail
+        // the entire context on one unindexed seed" -- degrade to zero
+        // direct-id records and let the name-based resolution below (and
+        // the caller's own follow-up structural calls) carry the rest,
+        // exactly as an unmatched name already does.
+        if (!(error instanceof EngineError) || error.code !== "core:selector_unresolvable") throw error;
+      }
+    }
 
     const seedNames = selectors.flatMap((selector) => {
       const value = object(selector);
@@ -3335,7 +3463,20 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         return value["subject_type"] === "symbol" && typeof value["name"] === "string" ? [value["name"]] : [];
       });
       if (selectors.some((selector) => object(selector)["subject_type"] === "symbol") && this.snapshots.records_by_name === undefined) return undefined;
-      const directRows = this.snapshots.records_by_ids === undefined || ids.length === 0 ? [] : await this.snapshots.records_by_ids(operation.scope, ids);
+      // Frente Q-2 (2026-09-08): mirrors `tryBuildContextPushdown`'s own
+      // handling of the same error -- a caller-supplied `subjects` selector
+      // may legitimately carry only an entity_id/relation_id/diagnostic_id/
+      // identity_key form (no record_id); against the native v4 store this
+      // now throws `core:selector_unresolvable` (item 1(a)) rather than
+      // scanning for it. Degrade to zero direct-id rows (an unresolved
+      // selector reads as "no source for that subject", same as any other
+      // not-found id) instead of ever falling through to the generic
+      // full-corpus `records_for_query` path this pushdown exists to avoid.
+      let directRows: readonly CanonicalQueryRecord[] = [];
+      if (this.snapshots.records_by_ids !== undefined && ids.length > 0) {
+        try { directRows = await this.snapshots.records_by_ids(operation.scope, ids); }
+        catch (error) { if (!(error instanceof EngineError) || error.code !== "core:selector_unresolvable") throw error; }
+      }
       const namedRows = this.snapshots.records_by_name === undefined ? [] : (await Promise.all([...new Set(symbolNames)].map((name) => this.snapshots.records_by_name!(operation.scope, name)))).flat();
       const rows = [...new Map([...directRows, ...namedRows].map((record) => [record.record_id, record])).values()];
       const byAnyId = new Map<string, CanonicalQueryRecord>();
@@ -3468,7 +3609,8 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       });
     }
     const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
-    return result({ matches: matchItems, subjects: subjectItems }, capabilityStates);
+    const lag = await this.snapshots.lexical_projection_lag?.(operation.scope);
+    return result({ matches: matchItems, subjects: subjectItems }, lag === undefined ? capabilityStates : [...capabilityStates, lexicalProjectionLagCapabilityState(lag)]);
   }
 
   /** Hydrates `path` (the same `body.path` field `records_by_artifact_versions` synthesizes) for every id in `versionIds`, for the `paths` structural filter. Returns an empty map when the port has no `records_by_artifact_versions` (paths filtering degrades to "nothing matches" via `matchesPathPrefix`'s `undefined`-path case, never to "everything matches"). */
@@ -4020,7 +4162,39 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return result({ semantic_affected_artifacts: [{ value: page, stable_sort_key: `unclassified\0${currentSetId}` }] }, capabilityStates);
   }
 
+  /**
+   * Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+   * gap 1): `core:index_status` is a registered, queryable operation
+   * (`packages/contracts/src/registries.ts`, streams `workspaces`/
+   * `activation_issues`/`candidate_issues`, documented for "read status
+   * inside an already scoped query"), but it never emits `ResultSubject`-
+   * shaped stream items and has no pushdown branch in `execute()` below --
+   * naming it as a `core:query` pipeline or recipe stage therefore fell all
+   * the way through every pushdown attempt to the generic
+   * `records_for_query` fallback (decoding the ENTIRE structural corpus into
+   * JS), then still returned empty streams regardless (wrong AND slow).
+   * Reproduced live: three sequential misuse-shaped calls against VS Code's
+   * ~4.5M-record v4 workspace OOM'd the daemon (`FATAL ERROR: Reached heap
+   * limit`). The correct, fast, top-level `core:index_status` RPC (what the
+   * CLI and MCP's own `urdira_index_status` tool use) is unaffected --
+   * this guard only closes the query-pipeline/recipe misuse path. Checked
+   * before any pushdown attempt (cheapest possible rejection point) and for
+   * every port implementation (SQLite would only pay a large-but-bounded
+   * SQL scan here, not an OOM, but the same rejection is still correct: the
+   * operation is nonsensical as a subject-producing pipeline stage
+   * regardless of backing store).
+   */
+  private rejectNonSubjectPipelineOperation(operation: OperationInvocation): void {
+    if (operation.operation_id !== "core:index_status") return;
+    throw new EngineErrorWithDetails(
+      "core:non_subject_operation",
+      `core:index_status cannot be used as a core:query pipeline or recipe stage: it never emits ResultSubject-shaped stream items, so it cannot be bound into or read from a subject-producing pipeline. Call it as a top-level core:index_status request instead (or MCP's urdira_index_status tool).`,
+      { operation_id: operation.operation_id, reason_code: "not_subject_producing" },
+    );
+  }
+
   async execute(operation: OperationInvocation): Promise<OperationEvaluation> {
+    this.rejectNonSubjectPipelineOperation(operation);
     const boundArguments = await materializeHandleBindings(operation.arguments, operation.input_handles);
     const boundOperation: OperationInvocation = boundArguments === operation.arguments ? operation : { ...operation, arguments: boundArguments };
     const pushedSearchText = await this.trySearchTextPushdown(boundOperation);
@@ -4040,6 +4214,21 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const artifacts = await this.snapshots.artifacts_by_filter(boundOperation.scope, object(boundOperation.arguments)["filter"] as StructuralFilter | undefined);
       const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
       return result({ artifacts: artifacts.map((record) => item(record)) }, capabilityStates);
+    }
+    // Frente Q-2 (2026-09-08, item 4 sweep finding): refuse an unbounded
+    // full-corpus decode BEFORE attempting it, for whichever operation
+    // reaches this point with no dedicated pushdown (today: analyze_impact,
+    // find_related_tests, inspect_architecture, compare, discover_definitions
+    // -- see the evidence doc's catalog sweep). `visible_record_count` is a
+    // cheap, no-decode count; a port that omits it (no known OOM history)
+    // is never newly restricted by this check.
+    const visibleCount = await this.snapshots.visible_record_count?.(boundOperation.scope);
+    if (visibleCount !== undefined && visibleCount > FULL_CORPUS_FALLBACK_RECORD_CAP) {
+      throw new EngineErrorWithDetails(
+        "core:execution_resource_limit",
+        `${boundOperation.operation_id} has no bounded pushdown and would require decoding all ${visibleCount} visible records into memory (over the ${FULL_CORPUS_FALLBACK_RECORD_CAP}-record safety cap) -- narrow the request scope or use a subject-selector-bound operation (find_references/get_outline/expand_relations/find_paths) instead.`,
+        { limit_kind: "full_corpus_decode_record_count", configured_limit: FULL_CORPUS_FALLBACK_RECORD_CAP, observed_or_required: visibleCount },
+      );
     }
     // SQL-backed production ports use the uncached paginated query path.
     // `records()` remains only as a compatibility fallback for adapters that

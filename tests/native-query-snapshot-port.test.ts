@@ -340,12 +340,33 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
       const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
 
+      // Frente Q-2 (2026-09-08, docs/evidence/2026-09-08-v4-query-gaps-vscode.md
+      // item 1(a)): investigated and REJECTED rejecting `identity_id`/
+      // `identity_key` forms outright -- `indexedGraphRecords`'s `hydrate()`
+      // (`canonical-query-data-port.ts`) depends on exactly this bounded
+      // linear-scan resolution for every native find_references/get_outline/
+      // expand_relations/find_paths pushdown call (the adjacency index's own
+      // edge-endpoint subject ids come back as identity_key text). The
+      // native port therefore still resolves all three id forms identically
+      // to SQLite -- only the WORST-CASE per-call scan cost is now bounded
+      // (`OTHER_IDS_COUNT_CAP`/`OTHER_IDS_SCAN_ROW_BUDGET`, see below).
       for (const id of ["record:" + "a".repeat(64), "identity:" + "2".repeat(64), "jsts:function:src/index.ts:10:myFunc"]) {
         const sqliteResult = await sqlite.records_by_ids!(scope, [id]);
         const nativeResult = await native.records_by_ids(scope, [id]);
         expectSameRecords(nativeResult, sqliteResult);
         expect(nativeResult.length).toBeGreaterThan(0);
       }
+    });
+  });
+
+  it("records_by_ids rejects an oversized identity_id/identity_key batch outright rather than scanning for it", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      const oversizedBatch = Array.from({ length: 1_001 }, (_, index) => `jsts:function:src/generated-${index}.ts:1:fn${index}`);
+      await expect(native.records_by_ids(scope, oversizedBatch)).rejects.toMatchObject({ code: "core:selector_unresolvable", details: { workspace_id: workspace.workspace_id } });
     });
   });
 
@@ -633,6 +654,58 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       // it was never the fallback's actual trigger (see the evidence doc).
       expect(native.approxWarmBytes()).toBe(0);
       expect(await native.has_warm_records!()).toBe(false);
+    });
+  });
+
+  // Frente Q-2 (2026-09-08, docs/evidence/2026-09-08-v4-query-gaps-vscode.md
+  // gap 3, lever (b)): pins that `core:get_outline`'s native pushdown reads
+  // only the container's OWN owner-scoped rows (`pending_sites_by_owner_artifact`/
+  // `container_records_by_artifact_references`, each a per-segment binary
+  // search in the Rust reader, `StoreReader::pending_sites_by_owner`/
+  // `by_owner`) -- never the full visible generation. Counts calls to both
+  // (bounded, small, independent of corpus size) AND wires every full-corpus
+  // entry point to throw, mirroring this file's own Q1 convention above.
+  it("core:get_outline reads only the container's own owner-scoped rows, never a full-corpus decode", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      const nativePort = new CanonicalRecordQueryDataPort(native);
+
+      let pendingSitesCalls = 0;
+      let containerRecordsCalls = 0;
+      const originalPendingSites = native.pending_sites_by_owner_artifact.bind(native);
+      const originalContainerRecords = native.container_records_by_artifact_references.bind(native);
+      Object.assign(native, {
+        pending_sites_by_owner_artifact: async (...args: Parameters<typeof originalPendingSites>) => { pendingSitesCalls += 1; return originalPendingSites(...args); },
+        container_records_by_artifact_references: async (...args: Parameters<typeof originalContainerRecords>) => { containerRecordsCalls += 1; return originalContainerRecords(...args); },
+        records_for_query: async () => { throw new Error("get_outline pushdown performed a full record scan (records_for_query)"); },
+        records_for_query_batches: async function* () { throw new Error("get_outline pushdown performed a batched full record scan (records_for_query_batches)"); },
+        records: async () => { throw new Error("get_outline pushdown populated the warm record cache (records)"); },
+      });
+
+      // The fixture's module container (`record:...0...1`, owning `src/index.ts`,
+      // `myFunc`'s own owner) -- `get_outline`'s `container` selector resolved
+      // by exact `record_id`, matching the pipeline-bound pattern Q1/Q-2 fixed.
+      const outlineResult = await nativePort.execute({
+        operation_id: "core:get_outline", operation_version: 3, result_streams: ["members", "pending_sites"],
+        arguments: { container: { subject_type: "record", record_id: "record:" + "0".repeat(63) + "1" }, depth: 1 }, scope,
+      });
+      // The fixture has no explicit "contains" relation edge from the
+      // container to `myFunc` (containment here is owner-artifact-based,
+      // not graph-adjacency-based), so `members` (sourced from outbound
+      // adjacency, see `tryGraphPushdown`) is legitimately empty -- this
+      // test's point is that the call SUCCEEDS via the owner-scoped
+      // pushdown (never throwing into the wired-to-throw full-corpus
+      // methods above), not that this particular fixture has members.
+      expect(outlineResult.streams["members"]).toEqual([]);
+
+      // Exactly one call each -- one get_outline call resolves its one
+      // container's members/pending sites through exactly one owner-scoped
+      // native lookup apiece, never a per-record or per-corpus-row count.
+      expect(pendingSitesCalls).toBe(1);
+      expect(containerRecordsCalls).toBeLessThanOrEqual(1);
     });
   });
 

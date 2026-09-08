@@ -59,6 +59,12 @@ const VISIBLE_BATCH_SIZE = 4_096;
 // calls; the caller's documented fallback (the full in-memory scan) takes
 // over, exactly as when any other optional pushdown capability is absent.
 const SELECTOR_COMBO_CAP = 512;
+// Frente Q-2 (2026-09-08): bounds on `records_by_ids`'s `otherIds`
+// (identity_id/identity_key) resolution -- see that method's own doc
+// comment for why these exist and why they cannot break the legitimate
+// small-N graph-pushdown/selector-list callers that rely on this path.
+const OTHER_IDS_COUNT_CAP = 1_000;
+const OTHER_IDS_SCAN_ROW_BUDGET = 200_000;
 
 function strings(value: unknown): readonly string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
@@ -203,6 +209,19 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   readonly has_warm_records = async (): Promise<boolean> => false;
 
+  /**
+   * See `CanonicalQuerySnapshotPort.visible_record_count`'s own doc comment.
+   * `NativeStructuralStoreHandle.visibleCount` (the napi binding over
+   * `StoreReader::visible_count`) is an O(1)-ish header/dictionary read, not
+   * a decode -- safe to call on every reach of the generic fallback guard.
+   */
+  async visible_record_count(scope: QueryScope): Promise<number> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return 0;
+    return this.handle.visibleCount(generation);
+  }
+
   /** No in-process record cache to size or evict -- every read goes
    * straight to the native store's own mmap segments (page-cache-backed,
    * not tracked by the daemon's JS-heap `URDIRA_WARM_RECORDS_BUDGET_MB`
@@ -264,32 +283,74 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       for (const row of this.handle.recordsByIds(hexIds, generation)) found.set(row.recordId, this.decode(row, scope.workspace_id));
     }
     // `identity_id`/`identity_key` forms (the other two shapes a
-    // `SubjectSelector` may carry) have no dedicated native index -- see
-    // the evidence doc's documented gap -- so they're resolved with one
-    // visible-corpus scan, done ONCE for every such id in this call rather
-    // than once per id. Q1 hardening (2026-09-08,
-    // `docs/evidence/2026-09-08-v4-vscode-query-latency.md`): the primary
-    // fix (`toSubjectSelector` in `recipe-executor.ts`) stops the documented
-    // pipeline-binding pattern from ever reaching this branch, but a caller
-    // MAY still legitimately pass an `entity_id`/`relation_id` selector
-    // directly (e.g. copying `resolve_symbol`'s own `declarations[].
-    // entity_id` field by hand, exactly as `packages/mcp/src/index.ts`'s own
-    // binding-hazard comment warns against but does not forbid). `identity_id`/
-    // `identity_key` values are unique per generation (they ARE the record's
-    // identity), so once every requested id has been found there is nothing
-    // left to discover -- stop scanning instead of always paying the full
-    // corpus cost, which turns this fallback from "always O(corpus)" into
-    // "O(corpus) worst case, O(offset of the last match) common case" with
-    // no format or index change.
+    // `SubjectSelector` may carry) have no dedicated native index -- see the
+    // evidence doc's documented gap. Q1 (2026-09-08, `docs/evidence/2026-09-
+    // 08-v4-vscode-query-latency.md`) hardened the one-scan-per-call
+    // fallback with an early exit once every requested id was found.
+    //
+    // Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+    // gap 1) investigated rejecting `otherIds` outright instead of scanning
+    // (as gap 1's own reproduction of the `core:index_status`-in-a-pipeline
+    // OOM initially suggested) -- and found, via the EXISTING regression
+    // test this file's own Q1 section added, that this call is NOT a rare
+    // hand-built-selector edge case: `indexedGraphRecords`'s `hydrate()`
+    // (`canonical-query-data-port.ts`) calls `records_by_ids` with the
+    // adjacency index's OWN edge-endpoint subject ids on every
+    // `find_references`/`get_outline`/`expand_relations`/`find_paths`
+    // native-pushdown call, and `structural_store_napi.rs`'s `adjacency`
+    // (`subject_text_for`) returns those endpoints as their ORIGINAL
+    // identity_key TEXT whenever the store's text sidecar has one (the
+    // common case for a real v4 workspace) -- rejecting outright would have
+    // made the native pushdown for all four operations decline (or error)
+    // on ordinary use, not just on `core:index_status`'s misuse. Confirmed
+    // live: rejecting broke `tests/native-query-snapshot-port.test.ts`'s
+    // own `find_references` pushdown regression test.
+    //
+    // `core:index_status`'s ACTUAL OOM route was never this method -- it
+    // was `CanonicalRecordQueryDataPort.execute`'s generic `records_for_query`
+    // fallback (fixed separately, `rejectNonSubjectPipelineOperation`,
+    // `canonical-query-data-port.ts`). What DOES remain a genuine residual
+    // risk here, independent of that fix, is the ORIGINAL Q1 gap Q1 itself
+    // only partially closed: a SINGLE id that does not exist (or is not
+    // reached until near the end of key order) still forces a scan of the
+    // ENTIRE visible generation before giving up, with no cap -- `§0`
+    // (rendimiento sin comprometer integridad) requires bounding that
+    // worst case too, without breaking the graph-pushdown's small, bounded,
+    // legitimate identity_key resolutions above. Two independent bounds,
+    // applied in order:
+    //  1. `otherIds.size` above `OTHER_IDS_COUNT_CAP` is not a shape any
+    //     legitimate caller produces (a hand-built selector list, a
+    //     `build_context` seeds array, or one BFS frontier's edge endpoints
+    //     are all small) -- reject immediately, typed, without scanning.
+    //  2. Otherwise scan with the SAME early exit as before, but ALSO stop
+    //     once `OTHER_IDS_SCAN_ROW_BUDGET` rows have been visited even if
+    //     ids remain unresolved -- turning "always up to O(corpus)" into
+    //     "at most `min(corpus, OTHER_IDS_SCAN_ROW_BUDGET)`". Ids still
+    //     unresolved when the budget is hit are simply absent from the
+    //     result, exactly like an id that turns out not to exist at all --
+    //     every existing caller already tolerates `records_by_ids`
+    //     returning fewer records than ids requested (`hydrate`'s
+    //     `records.set` loop, `tryBuildContextPushdown`'s/`get_source`
+    //     pushdown's `Map`-dedup-by-whatever-was-found), so this never
+    //     regresses correctness -- it only bounds worst-case cost.
+    if (otherIds.size > OTHER_IDS_COUNT_CAP) {
+      throw new QueryPlanError(
+        "core:selector_unresolvable",
+        `Workspace "${scope.workspace_id}" received ${otherIds.size} identity_id/identity_key-shaped record selectors in one records_by_ids call, above the ${OTHER_IDS_COUNT_CAP} bound the native v4 structural store's linear identity scan accepts per call. Resolve in smaller batches, or prefer the record's own record_id (record:<hex>) -- every ResultSubject already carries one.`,
+        { workspace_id: scope.workspace_id, unresolved_ids: [...otherIds].slice(0, 50) },
+      );
+    }
     if (otherIds.size > 0) {
       let remaining = otherIds.size;
+      let scanned = 0;
       for (const row of this.scanAll(generation)) {
-        if (found.has(row.recordId)) continue;
-        if ((row.identityId !== undefined && otherIds.has(row.identityId)) || (row.identityKey !== undefined && otherIds.has(row.identityKey))) {
+        scanned += 1;
+        if (!found.has(row.recordId) && ((row.identityId !== undefined && otherIds.has(row.identityId)) || (row.identityKey !== undefined && otherIds.has(row.identityKey)))) {
           found.set(row.recordId, this.decode(row, scope.workspace_id));
           remaining -= 1;
           if (remaining <= 0) break;
         }
+        if (scanned >= OTHER_IDS_SCAN_ROW_BUDGET) break;
       }
     }
     return [...found.values()];
@@ -472,6 +533,11 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   async search_literal(scope: QueryScope, pattern: string, options: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly path_patterns?: readonly string[]; readonly include_generated?: boolean; readonly include_external?: boolean }): Promise<readonly LexicalSearchMatch[] | undefined> {
     return this.sqlite.search_literal!(scope, pattern, options);
+  }
+
+  /** Frente Q-2 (2026-09-08): the lexical sidecar lives in SQLite regardless of which store backs the structural corpus (module doc comment) -- delegates exactly like `search_literal` itself. */
+  async lexical_projection_lag(scope: QueryScope): Promise<{ readonly current_generation: number; readonly completed_generation?: number } | undefined> {
+    return this.sqlite.lexical_projection_lag!(scope);
   }
 
   async semantic_index_state(scope: QueryScope): Promise<SemanticIndexStateSnapshot | undefined> {

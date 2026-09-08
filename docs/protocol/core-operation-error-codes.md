@@ -209,3 +209,16 @@ Details schema:
 | `affected_capability` | string | Optional capability when an otherwise optional projection is the only affected component. |
 
 This code is returned only when the failed component is mandatory for the requested operation. An optional semantic materializer continues to use `core:semantic_index_unavailable` with its integrity cause, preserving the narrower recovery contract.
+
+## Amendment 2026-09-08 (Frente Q-2, v4 query gaps at VS-Code scale)
+
+Two codes added, mechanically transcribed into `packages/contracts/src/registries.ts`
+identically to every other entry above; see `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+for the full root-cause analysis and before/after measurements.
+
+| Code | Description | Retryable | Recovery actions | Details fields |
+|---|---|---|---|---|
+| `core:selector_unresolvable` | A record-scoped selector's `identity_id`/`identity_key` form has no dedicated index in the native v4 structural store backing the workspace (or a pipeline/recipe stage produced a stream item with no identity field at all); rejected outright rather than served by an O(corpus) linear scan (`NativeCanonicalQuerySnapshotPort.records_by_ids`'s `otherIds` branch) or passed through as a nonsense selector (`recipe-executor.ts`'s `toSubjectSelector`). | no | `correct_selector`, `discover_definitions`, `inspect_completeness` | `workspace_id?`, `unresolved_ids[]` |
+| `core:non_subject_operation` | A status/administrative operation (`core:index_status`) was named as a `core:query` pipeline or recipe stage. It never emits `ResultSubject`-shaped stream items, so it cannot be bound like a subject-producing operation; call it as the top-level `core:index_status` RPC instead. | no | `correct_pipeline`, `inspect_index_status` | `operation_id`, `reason_code` |
+
+`core:non_subject_operation.reason_code` is exactly `not_subject_producing`.
