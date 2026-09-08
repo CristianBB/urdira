@@ -22024,7 +22024,9 @@
       "core:semantic_coverage_incomplete",
       "core:index_contract_unsupported",
       "core:index_integrity_failed",
-      "core:affected_set_stale"
+      "core:affected_set_stale",
+      "core:selector_unresolvable",
+      "core:non_subject_operation"
     ],
     "diagnostics": [
       "core:parse_failed",

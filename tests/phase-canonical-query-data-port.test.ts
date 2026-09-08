@@ -612,6 +612,57 @@ describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-s
       expect(records[recordCount - 1]?.body["name"]).toBe(`bulk-${recordCount - 1}`);
     });
   }, 60_000);
+
+  // Frente Q-2 (2026-09-08, docs/evidence/2026-09-08-v4-query-gaps-vscode.md
+  // gap 1): `core:index_status` is registered (streams `workspaces`/
+  // `activation_issues`/`candidate_issues`) but never emits ResultSubject-
+  // shaped items and has no pushdown branch, so naming it as a pipeline/
+  // recipe stage used to fall through every pushdown to the generic
+  // `records_for_query` full-corpus fallback -- decoding the ENTIRE corpus
+  // then still returning empty streams. `records`/`records_for_query` are
+  // wired to throw: any regression back to the old fallback fails loudly
+  // instead of silently passing on a slow, wrong path.
+  it("core:index_status is rejected as a non-subject-producing operation before any corpus read", async () => {
+    const forbidden: CanonicalQuerySnapshotPort = {
+      records: () => { throw new Error("core:index_status must never reach records() (the generic full-corpus fallback)"); },
+      records_for_query: () => { throw new Error("core:index_status must never reach records_for_query() (the generic full-corpus fallback)"); },
+    };
+    const dataPort = new CanonicalRecordQueryDataPort(forbidden);
+    await expect(dataPort.execute({ operation_id: "core:index_status", result_streams: ["workspaces", "activation_issues", "candidate_issues"], arguments: {}, scope }))
+      .rejects.toMatchObject({ code: "core:non_subject_operation", details: { operation_id: "core:index_status", reason_code: "not_subject_producing" } });
+  });
+
+  // Frente Q-2 (2026-09-08, item 4 sweep finding): `core:analyze_impact`
+  // (and any other operation with no dedicated pushdown) OOM-crashed the
+  // daemon on a real ~2.2M-record v4 workspace via this same generic
+  // fallback. `visible_record_count` (cheap, no decode) lets `execute()`
+  // refuse the decode outright once the corpus is unreasonably large for
+  // one, instead of attempting it and crashing.
+  it("refuses the generic full-corpus fallback with a typed error once visible_record_count exceeds the safety cap", async () => {
+    let recordsForQueryCalled = false;
+    const oversized: CanonicalQuerySnapshotPort = {
+      records: () => { throw new Error("must not reach records() once visible_record_count exceeds the cap"); },
+      records_for_query: async () => { recordsForQueryCalled = true; return []; },
+      visible_record_count: async () => 200_001,
+    };
+    const dataPort = new CanonicalRecordQueryDataPort(oversized);
+    await expect(dataPort.execute({ operation_id: "core:analyze_impact", result_streams: ["will_break", "must_update", "may_be_affected"], arguments: { target: { subject_type: "record", record_id: "record:" + "a".repeat(64) }, change: { change_type: "delete" } }, scope }))
+      .rejects.toMatchObject({ code: "core:execution_resource_limit", details: { limit_kind: "full_corpus_decode_record_count", configured_limit: 200_000, observed_or_required: 200_001 } });
+    expect(recordsForQueryCalled).toBe(false);
+
+    // A port reporting a count AT or under the cap is unaffected -- the
+    // fallback still runs (an empty corpus here, so every downstream
+    // operation branch trivially returns empty streams rather than
+    // asserting real content, which is not this test's point).
+    const withinCap: CanonicalQuerySnapshotPort = { records: async () => [], records_for_query: async () => [], visible_record_count: async () => 200_000 };
+    await expect(new CanonicalRecordQueryDataPort(withinCap).execute({ operation_id: "core:analyze_impact", result_streams: ["will_break", "must_update", "may_be_affected"], arguments: { target: { subject_type: "record", record_id: "record:" + "a".repeat(64) }, change: { change_type: "delete" } }, scope })).resolves.toBeDefined();
+
+    // A port that never implements `visible_record_count` (e.g. most
+    // `SqliteCanonicalQuerySnapshotPort` deployments today) is never newly
+    // restricted -- omitting the capability is treated as "no guard".
+    const noGuard: CanonicalQuerySnapshotPort = { records: async () => [], records_for_query: async () => [] };
+    await expect(new CanonicalRecordQueryDataPort(noGuard).execute({ operation_id: "core:analyze_impact", result_streams: ["will_break", "must_update", "may_be_affected"], arguments: { target: { subject_type: "record", record_id: "record:" + "a".repeat(64) }, change: { change_type: "delete" } }, scope })).resolves.toBeDefined();
+  });
 });
 
 describe("SqliteCanonicalQuerySnapshotPort.artifact_text", () => {
@@ -1737,6 +1788,38 @@ describe("SqliteCanonicalQuerySnapshotPort D6 pushdown methods", () => {
     });
   });
 
+  // Frente Q-2 (2026-09-08, docs/evidence/2026-09-08-v4-query-gaps-vscode.md
+  // gap 2): companion to `search_literal` -- reports the SAME lag condition
+  // `search_literal` itself uses to choose its source-safe fallback, so
+  // `trySearchTextPushdown` can surface it explicitly instead of silently.
+  it("lexical_projection_lag reports the current/completed generation pair while lagging, and undefined once caught up", async () => {
+    await withWorkspace(async (opened) => {
+      await seedSearchTextWorkspace(opened);
+      const port = new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent());
+
+      // No lexical_index_state row at all yet (fresh workspace, generation 1).
+      await expect(port.lexical_projection_lag(scope)).resolves.toEqual({ current_generation: 1 });
+
+      // Completed an OLDER generation -- still lagging, now with a concrete
+      // `completed_generation`.
+      await markLexicalComplete(opened, 0);
+      await expect(port.lexical_projection_lag(scope)).resolves.toEqual({ current_generation: 1, completed_generation: 0 });
+
+      // Caught up to the current generation -- no lag.
+      await markLexicalComplete(opened, 1);
+      await expect(port.lexical_projection_lag(scope)).resolves.toBeUndefined();
+
+      // A pinned source-snapshot scope never compares generations (mirrors
+      // `search_literal`'s own `sourceOnly` branch).
+      await opened.database.run(
+        "INSERT INTO source_index_state (workspace_id, current_generation, state_revision, checkpoint_id, provider_watermarks, source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [workspace.workspace_id, 1, 1, "source-checkpoint-1", "{}", "source-digest-1", now],
+      );
+      const sourceScope: QueryScope = { scope_type: "single_workspace", workspace_id: workspace.workspace_id, snapshot_id: "source-snapshot:1" };
+      await expect(port.lexical_projection_lag(sourceScope)).resolves.toBeUndefined();
+    });
+  });
+
   it("search_literal finds case-insensitive matches once complete, and case-sensitive matches only the exact case", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
@@ -1802,6 +1885,45 @@ describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () =>
       const end = Number(matches[0]!.value.source_span!.end_byte);
       expect(NEEDLE_FILE_TEXT.slice(start, end).toLowerCase()).toBe("needlehere");
       expect(matches.map((entry) => [entry.value.source_span?.start_line, entry.value.source_span?.end_line])).toEqual([["2", "2"], ["3", "3"]]);
+    });
+  });
+
+  // Frente Q-2 (2026-09-08, docs/evidence/2026-09-08-v4-query-gaps-vscode.md
+  // gap 2): pins that a lagging lexical sidecar is now VISIBLE in
+  // `completeness.dimensions` (a `core:lexical_search`/`partial` entry
+  // naming `lexical_projection_behind_current_generation`) instead of a
+  // silently slower, identically-shaped result -- and that the FTS pushdown
+  // still runs (still real matches, still no fabricated data) via
+  // `search_literal`'s own source-safe fallback path.
+  it("surfaces the lexical sidecar's lag as an explicit completeness dimension instead of a silent slowdown", async () => {
+    await withWorkspace(async (opened) => {
+      await seedSearchTextWorkspace(opened);
+      // NOT marked lexical-complete for generation 1, and a real
+      // `source_index_state` row present -- together these make
+      // `search_literal` take its source-safe scan path (see that method's
+      // own `scanSourceCatalog` computation), not the FTS candidate lane,
+      // while still finding real matches by reading the source directly.
+      await opened.database.run(
+        "INSERT INTO source_index_state (workspace_id, current_generation, state_revision, checkpoint_id, provider_watermarks, source_state_digest, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [workspace.workspace_id, 1, 1, "source-checkpoint-1", "{}", "source-digest-1", now],
+      );
+      const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent()));
+
+      const lagging = await dataPort.execute(searchTextOperation({ syntax: "literal" }));
+      expect(lagging.streams["matches"]).toHaveLength(2);
+      expect(lagging.completeness).toMatchObject({
+        overall_status: "partial",
+        dimensions: [{ capability: "core:lexical_search", status: "partial", reason_codes: expect.arrayContaining(["lexical_projection_behind_current_generation"]) }],
+      });
+
+      // Catch up: a real `lexical_documents`/`lexical_fts` row now exists,
+      // and the completion marker matches the current generation -- the FTS
+      // candidate lane takes over, still with real matches.
+      await insertLexicalDocument(opened, "art-1", "artv-search", NEEDLE_FILE_TEXT, 1);
+      await markLexicalComplete(opened, 1);
+      const caughtUp = await dataPort.execute(searchTextOperation({ syntax: "literal" }));
+      expect(caughtUp.streams["matches"]).toHaveLength(2);
+      expect(caughtUp.completeness).toMatchObject({ overall_status: "complete", dimensions: [] });
     });
   });
 

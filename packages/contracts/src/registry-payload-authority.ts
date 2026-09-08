@@ -3699,5 +3699,17 @@ export const authoritativePayloadMetadata = {
   },
   "core:association.apply": {
     "description": "The `apply` is the closed detail value for `core:association`; normative emission trigger: `source E 1`; `target E,R,A,L,U 1..*` (source: taxonomy/core-taxonomy.md)."
+  },
+  "core:selector_unresolvable.workspace_id": {
+    "description": "The `workspace_id` is the closed detail value for `core:selector_unresolvable`; normative emission trigger: a record-scoped selector's identity_id/identity_key form has no dedicated index in the native v4 structural store backing this workspace, so it is rejected rather than resolved by an O(corpus) scan. (source: docs/evidence/2026-09-08-v4-query-gaps-vscode.md)."
+  },
+  "core:selector_unresolvable.unresolved_ids": {
+    "description": "The `unresolved_ids` is the ordered identifier set for `core:selector_unresolvable`; normative emission trigger: a record-scoped selector's identity_id/identity_key form has no dedicated index in the native v4 structural store backing this workspace, so it is rejected rather than resolved by an O(corpus) scan. (source: docs/evidence/2026-09-08-v4-query-gaps-vscode.md)."
+  },
+  "core:non_subject_operation.operation_id": {
+    "description": "The `operation_id` is the closed detail value for `core:non_subject_operation`; normative emission trigger: a status/administrative operation that never emits ResultSubject-shaped stream items was named as a query-pipeline or recipe stage. (source: docs/evidence/2026-09-08-v4-query-gaps-vscode.md)."
+  },
+  "core:non_subject_operation.reason_code": {
+    "description": "The `reason_code` is the closed detail value for `core:non_subject_operation`; normative emission trigger: a status/administrative operation that never emits ResultSubject-shaped stream items was named as a query-pipeline or recipe stage. (source: docs/evidence/2026-09-08-v4-query-gaps-vscode.md)."
   }
 } as const;

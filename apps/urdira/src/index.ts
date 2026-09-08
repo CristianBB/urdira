@@ -2058,6 +2058,36 @@ function lexicalIndexEnabled(): boolean {
   return !["0", "false", "off", "no"].includes(raw.toLowerCase());
 }
 
+/**
+ * Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+ * gap 2 root cause): this used to be derived as `indexingCoreWorkerPath !==
+ * undefined` -- i.e. TRUE for every v4 workspace using the native Rust
+ * indexing worker, which is the STANDARD v4 configuration
+ * (`URDIRA_INDEXING_CORE_WORKER_PATH` set, or the packaged binary found).
+ * `DaemonRuntimeOptions.lexical_owned_by_rust: true` makes
+ * `runtime.ts`'s `submitLexicalMaintenance` return immediately without ever
+ * running `reconcileLexicalProjection` (the JS-side maintenance job that
+ * populates `lexical_documents`/`lexical_fts`) -- correct ONLY once the
+ * Rust indexing worker itself writes those tables. It does not:
+ * `crates/urdira-indexing-worker/src/v4/scan.rs`'s own `ScanRequest.sidecar_root`
+ * doc comment says outright "Not read yet: the lexical/semantic sidecars
+ * (plan §4.7/P2-6) are out of this task's scope." Confirmed live: after a
+ * full scan plus a full daemon restart (which also runs `runtime.ts`'s own
+ * "startup lexical maintenance" catch-up pass) plus 60s of waiting,
+ * `lexical_documents`/`lexical_index_state` in the workspace's `.lexical.sqlite`
+ * sidecar had zero rows -- `core:search_text` was PERMANENTLY on the slow
+ * source-safe fallback for every v4/native-worker workspace, not merely
+ * "still catching up". Flipped to an opt-in kill switch (default OFF,
+ * mirroring `lexicalIndexEnabled()`'s own convention) so the JS reconciler
+ * keeps running for v4/native workspaces until the Rust side actually lands
+ * this (plan §4.7/P2-6); flip `URDIRA_LEXICAL_OWNED_BY_RUST=1` on that day.
+ */
+function lexicalOwnedByRustEnabled(): boolean {
+  const raw = process.env["URDIRA_LEXICAL_OWNED_BY_RUST"];
+  if (raw === undefined || raw === "") return false;
+  return ["1", "true", "on", "yes"].includes(raw.toLowerCase());
+}
+
 // Default ON: a kill switch, not an opt-in. Mirrors `lexicalIndexEnabled()`
 // above exactly, one layer over: vector projection generation
 // (`vector_projection_rows`) now runs as an async, post-ready maintenance job
@@ -2356,6 +2386,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   const scanIoConcurrency = positiveIntegerEnv("URDIRA_SCAN_IO_CONCURRENCY");
   const casPutConcurrency = positiveIntegerEnv("URDIRA_CAS_PUT_CONCURRENCY");
   const lexicalIndex = lexicalIndexEnabled();
+  const lexicalOwnedByRust = lexicalOwnedByRustEnabled();
   const lexicalThread = lexicalThreadEnabled();
   const semanticThread = semanticThreadEnabled();
   const semanticProcess = semanticProcessEnabled();
@@ -2530,7 +2561,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
     // switch fired, so an unset env var leaves this field omitted like every
     // other optional override here.
     ...(lexicalIndex ? {} : { lexical_index: false }),
-    ...(indexingCoreWorkerPath === undefined ? {} : { lexical_owned_by_rust: true }),
+    ...(lexicalOwnedByRust ? { lexical_owned_by_rust: true } : {}),
     ...(lexicalThread ? {} : { lexical_thread: false }),
     ...(workspaceFork ? {} : { workspace_fork: false }),
     ...(workspaceForkVerify === undefined ? {} : { workspace_fork_verify: workspaceForkVerify }),

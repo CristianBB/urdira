@@ -145,6 +145,28 @@ export function toSubjectSelector(item: QueryStreamItem): Record<string, unknown
     return { subject_type: "artifact", artifact_id: body["artifact_id"], artifact_version_id: body["artifact_version_id"], ...sourceSpanBinding };
   }
   const recordId = typeof value?.["record_id"] === "string" ? value["record_id"] : itemId(item);
+  // Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
+  // item 1(b)): before this fix, `itemId`'s "no identity field found at all"
+  // sentinel (`"unknown"`, see its own doc comment above) flowed straight
+  // through into `{subject_type: "record", record_id: "unknown"}` -- a
+  // syntactically well-formed but semantically empty selector that every
+  // downstream operation would then try, and fail, to resolve on its own
+  // (silently returning nothing against SQLite, or -- worse -- feeding
+  // `NativeCanonicalQuerySnapshotPort.records_by_ids`'s indexed hex path a
+  // non-hex string that always misses and falls into `otherIds`). Reject
+  // HERE, at selector-construction time, in the ONE place both the
+  // `pipeline-executor.ts` and `recipe-executor.ts` stage-binding paths
+  // share, rather than let a manufactured, empty identity travel downstream
+  // to be rediscovered as an error by every operation's own port
+  // independently. §0: fail fast, typed, and exactly where the value is
+  // known to be unresolvable, never as an implicit empty answer.
+  if (recordId === "unknown") {
+    throw new EngineErrorWithDetails(
+      "core:selector_unresolvable",
+      "A pipeline/recipe stage produced a result subject with no record_id, entity_id, relation_id, diagnostic_id, or identity_key field to bind into a downstream SubjectSelector.",
+      { unresolved_ids: ["unknown"] },
+    );
+  }
   return { subject_type: "record", record_id: recordId, ...sourceSpanBinding };
 }
 
