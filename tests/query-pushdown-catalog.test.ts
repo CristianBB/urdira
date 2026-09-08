@@ -1,11 +1,28 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   CanonicalRecordQueryDataPort,
+  NativeCanonicalQuerySnapshotPort,
   SqliteCanonicalQuerySnapshotPort,
+  convertV3WorkspaceToNativeStore,
+  loadNativeStructuralStoreAddon,
   type CanonicalQueryRecord,
   type OperationInvocation,
 } from "../packages/engine/src/index.js";
 import { buildTaskPlannerWorkspace, type PublishedTaskPlannerWorkspace } from "./support/task-planner-workspace.js";
+
+let addonAvailable = true;
+try {
+  loadNativeStructuralStoreAddon();
+} catch {
+  addonAvailable = false;
+}
+const maybeDescribe = addonAvailable ? describe : describe.skip;
+if (!addonAvailable) {
+  console.warn("[query-pushdown-catalog.test] native addon not built; skipping the native-port analyze_impact scan-free proof. Run: node scripts/build-native.mjs");
+}
 
 /**
  * Frente Q-3 (2026-09-08): differential tests for the three pushdowns this
@@ -146,5 +163,56 @@ describe("core:analyze_impact / core:find_related_tests / core:inspect_architect
     await expectDifferential(operation(workspace.workspaceId, "core:discover_definitions", ["definitions", "definition_set"], {
       matcher: { text: "core:call", mode: "exact" },
     }));
+  });
+
+  /**
+   * Frente Q-4 (2026-09-08): decision 25's Q-3 amendment (§5.3 of
+   * `docs/evidence/2026-09-08-v4-full-pushdown-catalog.md`) diagnosed
+   * `core:analyze_impact`/`core:find_related_tests`'s real, measured
+   * n8n/VS-Code-scale cost center precisely: `target`/`subjects`'s
+   * `entity_id`-shaped selector resolves through `resolveIndexedGraphSelectors`
+   * -> `records_by_ids`, and on the NATIVE port (the one this diagnosis and
+   * `docs/evidence/2026-09-08-v4-identity-lookup-and-compare.md`'s own
+   * measurement are both about) that fell into `scanAll(generation)` --
+   * this file's own `cold`/`warm` harness above (`SqliteCanonicalQuery
+   * SnapshotPort`) cannot exercise that at all: `SqliteCanonicalQuery
+   * SnapshotPort.records_by_ids` already resolves every id form in O(1) via
+   * its in-memory `by_any_id` map. This converts the SAME already-seeded
+   * fixture (real `core:call` relation, real `source_id`/`target_id`) to a
+   * native structural store and re-runs `core:analyze_impact` through
+   * `NativeCanonicalQuerySnapshotPort`, spying on the native handle's
+   * `iterVisibleBatch` (`scanAll`'s only FFI call) to prove the diagnosed
+   * gap is closed, not just that `tests/native-query-snapshot-port.test.ts`'s
+   * OWN synthetic fixture proves it.
+   */
+  (addonAvailable ? describe : describe.skip)("core:analyze_impact on the native structural store (decision 25 Q-3 diagnosis, closed by Q-4)", () => {
+    it("resolves an entity_id-shaped target via the indexed identity lookup, never scanAll, matching the SQLite-port answer", async () => {
+      const storeDir = await mkdtemp(join(tmpdir(), "urdira-query-pushdown-catalog-native-"));
+      try {
+        await convertV3WorkspaceToNativeStore(workspace.opened.database, workspace.workspaceId, 1, storeDir);
+        const sqliteSnapshot = new SqliteCanonicalQuerySnapshotPort(workspace.opened.database);
+        const nativeSqliteFallback = new SqliteCanonicalQuerySnapshotPort(workspace.opened.database);
+        const addon = loadNativeStructuralStoreAddon();
+        const iterVisibleBatchSpy = vi.spyOn(addon.NativeStructuralStoreHandle.prototype, "iterVisibleBatch");
+        const nativeSnapshot = NativeCanonicalQuerySnapshotPort.open(workspace.opened.database, storeDir, nativeSqliteFallback);
+        try {
+          const invocation = operation(workspace.workspaceId, "core:analyze_impact", ["will_break", "must_update", "may_be_affected", "tests_to_run", "uncertain_dynamic_usage"], {
+            target: { subject_type: "entity", entity_id: callTarget.identity_id ?? callTarget.record_id },
+            change: { change_kind: "signature_change" },
+          });
+          const sqlitePort = new CanonicalRecordQueryDataPort(sqliteSnapshot);
+          const nativePort = new CanonicalRecordQueryDataPort(nativeSnapshot);
+          const sqliteResult = await sqlitePort.execute(invocation);
+          const nativeResult = await nativePort.execute(invocation);
+          expect((nativeResult.streams["will_break"] ?? []).length).toBeGreaterThan(0);
+          expect(nativeResult.streams["will_break"]).toEqual(sqliteResult.streams["will_break"]);
+          expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
+        } finally {
+          iterVisibleBatchSpy.mockRestore();
+        }
+      } finally {
+        await rm(storeDir, { recursive: true, force: true });
+      }
+    });
   });
 });

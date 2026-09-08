@@ -447,6 +447,68 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(JSON.parse(failureBlock!.text)).toMatchObject({ error: { code: "core:workspace_not_found", message: "missing", details: { workspace_id: "workspace-1" }, retryable: false } });
   });
 
+  /**
+   * Frente Q-4 (2026-09-08): `core:compare`'s stream items are the SAME
+   * flat `recordValue()` shape every other operation's `ResultSubject`
+   * already uses (`subject_type`/`name`/`kind`/`path` at the TOP level),
+   * plus the registry-documented `participant`/`change`/`move`/
+   * `correlation` field layered on top -- decided (canonical-query-data-
+   * port.ts's own doc comments, decision 25's Q-4 amendment) specifically
+   * so the existing generic renderer (`describeBundle`, keyed off
+   * `subject_type` at the top level) needs NO change to render these
+   * streams legibly. This proves that decision empirically rather than by
+   * doc-comment assertion alone: an "added" item (flat + `participant`)
+   * and a "changed" item (flat, target-shaped, + a nested `change` object)
+   * both render the entity's name/kind/path exactly like any other
+   * operation's subject, with no raw `[object Object]`/undefined leakage.
+   */
+  it("renders core:compare's added/changed stream items legibly through the SAME generic renderer, no dedicated compare renderer needed", () => {
+    const pageFor = (resultSet: string, primaryResult: Record<string, unknown>) => ({
+      query_execution_id: "execution-compare-1",
+      scope_kind: "comparison",
+      workspace_snapshot_bindings: [],
+      semantic_coverage_views: [],
+      result_sets: [{
+        result_set: resultSet,
+        confirmed: {
+          classification: "confirmed", page_mode: "summary",
+          result_bundles: [{ result_set: resultSet, primary_result: primaryResult, assessment: { classification: "confirmed", completeness: "complete" }, provenance_path: [], essential_related_entities: [], optional_source_snippets: [] }],
+          total: 1, has_next: false, has_previous: false,
+        },
+        possible: { classification: "possible", page_mode: "summary", result_bundles: [], total: 0, has_next: false, has_previous: false },
+      }],
+      expires_at: "2026-01-01T00:00:00.000Z",
+      returned_items: 1,
+      returned_characters: 0,
+      completeness_report: { workspace_snapshot_binding_ids: [], overall_status: "complete", dimensions: [], diagnostic_record_ids: [] },
+      diagnostic_report: { total: 0, returned: 0, by_severity: { info: 0, warning: 0, error: 0 }, by_completeness_effect: { none: 0, local: 0, capability: 0 }, diagnostics: [], has_more: false },
+    });
+
+    const addedResult = formatUrdiraResult(pageFor("added", {
+      subject_type: "entity", record_id: "record:2", entity_id: "jsts:function:src/b.ts:1:sayHello", identity_key: "jsts:function:src/b.ts:1:sayHello",
+      universal_kind: "core:function", kind: "jsts:entity_callable", classification: "confirmed", body: { name: "sayHello", kind: "function_declaration", path: "src/b.ts" },
+      participant: "target",
+    }));
+    const addedText = addedResult.content.find((block): block is { type: "text"; text: string } => block.type === "text")!.text;
+    expect(addedText).toContain("src/b.ts");
+    expect(addedText).toContain("sayHello function_declaration");
+    expect(addedText).not.toContain("[object Object]");
+
+    const changedResult = formatUrdiraResult(pageFor("changed", {
+      subject_type: "entity", record_id: "record:3", entity_id: "jsts:function:src/c.ts:1:farewell", identity_key: "jsts:function:src/c.ts:1:farewell",
+      universal_kind: "core:function", kind: "jsts:entity_callable", classification: "confirmed", body: { name: "farewell", kind: "function_declaration", path: "src/c.ts" },
+      change: {
+        identity_key: "jsts:function:src/c.ts:1:farewell",
+        before: { subject_type: "entity", record_id: "record:3-before", body: { name: "farewell", kind: "function_declaration", path: "src/c.ts" } },
+        after: { subject_type: "entity", record_id: "record:3", body: { name: "farewell", kind: "function_declaration", path: "src/c.ts" } },
+      },
+    }));
+    const changedText = changedResult.content.find((block): block is { type: "text"; text: string } => block.type === "text")!.text;
+    expect(changedText).toContain("src/c.ts");
+    expect(changedText).toContain("farewell function_declaration");
+    expect(changedText).not.toContain("[object Object]");
+  });
+
   it("renders the first source-snippet line as a grep-style locator when the primary result has no line", () => {
     const textResult = formatUrdiraResult({
       query_execution_id: "execution-lines",

@@ -1023,6 +1023,105 @@ impl NativeStructuralStoreHandle {
         Ok(out)
     }
 
+    /// Frente Q-4 (2026-09-08): indexed counterpart of `records_by_ids`
+    /// for the `identity_key` TEXT form (e.g. `"jsts:entity:src/foo.ts:
+    /// 120:myFunction"`), digested with the on-disk `identity_key_digest`
+    /// field's writer scheme and read via the visibility-filtered
+    /// `StoreReader::by_identity_key`.
+    ///
+    /// Two candidate digests are tried, matching the TWO existing writers
+    /// of that same field (a pre-existing inconsistency in this codebase,
+    /// not introduced here -- see each writer's own comment):
+    /// 1. `urdira_native_core::uce_text_digest_bytes` -- the real
+    ///    v4-native-pipeline writer (`structural_kernel_batch_parts_with_
+    ///    records`, domain-separated UCE hash).
+    /// 2. Plain `Sha256::digest` -- the v3-conversion path's OWN writer
+    ///    (`NativeStoreBuilder::add_records`, this file: `identity_key_
+    ///    digest = sha256_32(key.as_bytes())`, no UCE domain separation).
+    /// The cost of trying both is one extra SHA-256 over a single short
+    /// string per requested key -- negligible next to the O(corpus)
+    /// `scanAll` this replaces, and still O(k), not O(corpus).
+    #[napi]
+    pub fn records_by_identity_keys(
+        &self,
+        identity_keys: Vec<String>,
+        generation: u32,
+    ) -> Result<Vec<NativeOutputRecordRow>> {
+        let dicts = self.reader.dictionaries();
+        let mut out = Vec::with_capacity(identity_keys.len());
+        for identity_key in identity_keys {
+            let uce_digest = urdira_native_core::uce_text_digest_bytes(&identity_key);
+            let view = self
+                .reader
+                .by_identity_key(&uce_digest, generation as u64)
+                .or_else(|| {
+                    let plain_digest = sha256_32(identity_key.as_bytes());
+                    self.reader
+                        .by_identity_key(&plain_digest, generation as u64)
+                });
+            if let Some(view) = view {
+                out.push(self.to_output(&view, &dicts));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Frente Q-4 (2026-09-08): indexed counterpart of `records_by_ids`
+    /// for the `identity_id` form (TS `entity_id`/`relation_id`/
+    /// `diagnostic_id` -- always exactly `record.identity_id` re-exposed
+    /// under a subject-type-specific field name). Two sources, tried in
+    /// order, matching `to_output`'s own "sidecar first" priority for this
+    /// exact field (see this file's `to_output`):
+    /// 1. `self.sidecar.identity_ids` (the v3-conversion path's only
+    ///    source of truth for `identity_id` -- a free-form TEXT value with
+    ///    no enforced shape, e.g. a test fixture's `"identity:" + hex`,
+    ///    NOT necessarily `"{entity|relation|diagnostic}:<64-hex>"`).
+    ///    Reversed into a `identity_id -> record_id_hex` map ONCE per call
+    ///    (O(sidecar size), not the corpus -- `identity_ids` is EMPTY for
+    ///    every real v4-pipeline store, so this costs nothing on the
+    ///    production-scale path this frente's own evidence measured).
+    /// 2. The native-pipeline shape `"{entity|relation|diagnostic}:<64-hex>"`
+    ///    -- `identity_id` there IS the digest, hex-encoded (no re-hashing
+    ///    needed), looked up via `StoreReader::identity_id_index`
+    ///    (`StoreReader::by_identity_id`).
+    /// An id resolved by neither is silently skipped (never found), same
+    /// "absent, not thrown" contract `records_by_ids` already has for an
+    /// unresolvable id.
+    #[napi]
+    pub fn records_by_identity_ids(
+        &self,
+        identity_ids: Vec<String>,
+        generation: u32,
+    ) -> Result<Vec<NativeOutputRecordRow>> {
+        let dicts = self.reader.dictionaries();
+        let sidecar_reverse: HashMap<&str, &str> = self
+            .sidecar
+            .identity_ids
+            .iter()
+            .map(|(record_id_hex, identity_id)| (identity_id.as_str(), record_id_hex.as_str()))
+            .collect();
+        let mut out = Vec::with_capacity(identity_ids.len());
+        for identity_id in identity_ids {
+            if let Some(&record_id_hex) = sidecar_reverse.get(identity_id.as_str())
+                && let Some(key) = parse_hex32(record_id_hex)
+                && let Some(view) = self.reader.get_visible(&key, generation as u64)
+            {
+                out.push(self.to_output(&view, &dicts));
+                continue;
+            }
+            let Some((_category, hex)) = identity_id.split_once(':') else {
+                continue;
+            };
+            let Some(digest) = parse_hex32(hex) else {
+                continue;
+            };
+            if let Some(view) = self.reader.by_identity_id(&digest, generation as u64) {
+                out.push(self.to_output(&view, &dicts));
+            }
+        }
+        Ok(out)
+    }
+
     #[napi]
     pub fn records_by_name(
         &self,

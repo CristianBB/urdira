@@ -938,6 +938,28 @@ pub(crate) struct StoreInner {
     /// total hub-edit scan before this fix (`docs/evidence/
     /// 2026-09-03-v4-p3-2-incremental-residuals.md`).
     pub dep_owner_index: HashMap<u32, Vec<(usize, usize)>>,
+    /// Frente Q-4 (2026-09-08): `identity_id -> [(segment_index, ordinal)]`,
+    /// built ONCE per load/reopen (same additive, in-memory-only pattern as
+    /// `subject_index`/`dep_owner_index` above -- no new on-disk file, no
+    /// format change). `identity_id` (`digests::IDENTITY_ID`, TS-visible as
+    /// `entity_id`/`relation_id`/`diagnostic_id` -- always exactly
+    /// `record.identity_id` re-exposed under a subject-type-specific field
+    /// name) is a DIFFERENT digest than `identity_key_digest` (compare
+    /// `urdira-native-core`'s `uce_text_object_digest_bytes` vs.
+    /// `uce_text_digest_bytes` -- one wraps the identity_key text in a
+    /// labeled UCE object, the other digests it directly), so the existing
+    /// on-disk `by_identity` range index (keyed by `identity_key_digest`)
+    /// cannot answer an `identity_id` lookup; `identity_id` cannot be
+    /// recomputed FROM `identity_key` either without redoing that exact
+    /// hash, so a caller-supplied `identity_id` string can only ever be
+    /// resolved by an index keyed on ITS OWN bytes. Fixes the gap decision
+    /// 25's Q1/Q-3 amendments diagnosed live: `analyze_impact`/
+    /// `find_related_tests`'s `entity_id`-shaped target/subject selector
+    /// used to fall into `records_by_ids`'s `otherIds` linear `scanAll`
+    /// fallback on EVERY call (`docs/evidence/2026-09-08-v4-full-pushdown-
+    /// catalog.md` §5.3). See `StoreReader::by_identity_id` for the
+    /// visibility-filtered read.
+    pub identity_id_index: HashMap<[u8; 32], Vec<(usize, usize)>>,
     pub record_closures: Arc<HashMap<[u8; 32], u32>>,
     /// F1 1.2: mirrors `record_closures` -- the SAME merged `Arc` every
     /// segment's own `dep_closures` field holds (see `load`'s `Arc::
@@ -1179,6 +1201,31 @@ impl StoreInner {
             }
         }
 
+        // Frente Q-4 (2026-09-08): see `StoreInner::identity_id_index`'s own
+        // doc comment. Built directly off each segment's raw `records.
+        // digests` bytes (`digests_row`/slice), same no-`RecordView`-
+        // construction discipline `dep_owner_index` above already
+        // establishes for `records.deps_meta`. A zero digest means "this
+        // row has no identity_id at all" (a RAW-layout row with no
+        // identity, or an artifact-subject/fact/evidence record) -- never
+        // indexed, matching `structural_store_napi.rs`'s own `(digest !=
+        // [0u8; 32]).then(..)` convention for the SAME field.
+        let mut identity_id_index: HashMap<[u8; 32], Vec<(usize, usize)>> = HashMap::new();
+        for (segment_index, seg) in segments.iter().enumerate() {
+            for ordinal in 0..seg.n {
+                let row = seg.digests_row(ordinal);
+                let identity_id: [u8; 32] = row[digests::IDENTITY_ID..digests::IDENTITY_ID + 32]
+                    .try_into()
+                    .unwrap();
+                if identity_id != [0u8; 32] {
+                    identity_id_index
+                        .entry(identity_id)
+                        .or_default()
+                        .push((segment_index, ordinal));
+                }
+            }
+        }
+
         let mut closure_valid_to_sorted: Vec<u32> = record_closures.values().copied().collect();
         closure_valid_to_sorted.sort_unstable();
         // Adversarial review fix: `dep_closures.values()` is now `Vec<u32>`
@@ -1207,6 +1254,7 @@ impl StoreInner {
             dicts,
             subject_index,
             dep_owner_index,
+            identity_id_index,
             record_closures,
             dep_closures,
             pending_closures,
@@ -1413,6 +1461,37 @@ impl StoreInner {
             }
         }
 
+        // 6b. `identity_id_index`: same shift-then-extend shape as
+        //     `dep_owner_index` just above -- see `StoreInner::
+        //     identity_id_index`'s own doc comment.
+        let mut identity_id_index: HashMap<[u8; 32], Vec<(usize, usize)>> = prev
+            .identity_id_index
+            .iter()
+            .map(|(&identity_id, entries)| {
+                (
+                    identity_id,
+                    entries
+                        .iter()
+                        .map(|&(idx, ord)| (idx + new_segment_count, ord))
+                        .collect(),
+                )
+            })
+            .collect();
+        for (segment_index, seg) in segments[..new_segment_count].iter().enumerate() {
+            for ordinal in 0..seg.n {
+                let row = seg.digests_row(ordinal);
+                let identity_id: [u8; 32] = row[digests::IDENTITY_ID..digests::IDENTITY_ID + 32]
+                    .try_into()
+                    .unwrap();
+                if identity_id != [0u8; 32] {
+                    identity_id_index
+                        .entry(identity_id)
+                        .or_default()
+                        .push((segment_index, ordinal));
+                }
+            }
+        }
+
         // 7. `closure_valid_to_sorted`/`dep_closure_valid_to_sorted`:
         //    re-derived from the (small, closures-only) fused maps -- cheap
         //    relative to everything else here, plan §1.2 step 2. Adversarial
@@ -1443,6 +1522,7 @@ impl StoreInner {
             dicts,
             subject_index,
             dep_owner_index,
+            identity_id_index,
             record_closures,
             dep_closures,
             pending_closures,
@@ -1831,6 +1911,84 @@ impl StoreReader {
                 if better {
                     best = Some(view);
                 }
+            }
+        }
+        best
+    }
+
+    /// Frente Q-4 (2026-09-08): visibility-filtered counterpart of
+    /// [`Self::by_identity_last`] -- that method is `writer.rs`'s own
+    /// diffing primitive ("the most recent version of this identity_key,
+    /// period", used to compute a delta against, `is_visible` deliberately
+    /// NOT checked there) and is unsafe to reuse for a live query: it can
+    /// return a row that has since been superseded or tombstoned. This
+    /// reuses the SAME on-disk `by_identity` range (`identity_key_digest`
+    /// -> candidates, `by_identity_range`/`by_identity_ordinal_at`, no new
+    /// section) but only ever returns a candidate `is_visible(generation)`
+    /// at the REQUESTED generation, picking the highest `valid_from` among
+    /// those -- the same "visible candidates, newest wins" shape every
+    /// other generation-aware lookup in this file already uses (`by_kind`,
+    /// `deps_by_owner`, `by_identity_id` below).
+    pub fn by_identity_key(
+        &self,
+        identity_key_digest: &[u8; 32],
+        generation: u64,
+    ) -> Option<RecordView> {
+        let inner = self.snapshot();
+        let mut best: Option<RecordView> = None;
+        for seg in &inner.segments {
+            let data = &seg.by_identity[HEADER_LEN..];
+            let (lo, hi) = by_identity_range(data, identity_key_digest);
+            for i in lo..hi {
+                let ord = by_identity_ordinal_at(data, i) as usize;
+                let view = RecordView {
+                    segment: Arc::clone(seg),
+                    store: Arc::clone(&inner),
+                    ordinal: ord,
+                };
+                if !view.is_visible(generation) {
+                    continue;
+                }
+                let better = match &best {
+                    None => true,
+                    Some(b) => view.valid_from() > b.valid_from(),
+                };
+                if better {
+                    best = Some(view);
+                }
+            }
+        }
+        best
+    }
+
+    /// Frente Q-4 (2026-09-08): O(1) amortized via `StoreInner::
+    /// identity_id_index` -- see that field's own doc comment for why
+    /// `identity_id` (TS `entity_id`/`relation_id`/`diagnostic_id`) needs
+    /// its OWN index rather than reusing `by_identity_key`/`by_identity_last`
+    /// (a different digest of the same underlying `identity_key` text, not
+    /// invertible from one to the other). Same "visible candidates, newest
+    /// wins" shape as `by_identity_key` just above, sourced from the
+    /// in-memory candidate list instead of a re-scanned on-disk range.
+    pub fn by_identity_id(&self, identity_id: &[u8; 32], generation: u64) -> Option<RecordView> {
+        let inner = self.snapshot();
+        let candidates = inner.identity_id_index.get(identity_id)?;
+        let mut best: Option<RecordView> = None;
+        for &(segment_index, ordinal) in candidates {
+            let seg = &inner.segments[segment_index];
+            let view = RecordView {
+                segment: Arc::clone(seg),
+                store: Arc::clone(&inner),
+                ordinal,
+            };
+            if !view.is_visible(generation) {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some(b) => view.valid_from() > b.valid_from(),
+            };
+            if better {
+                best = Some(view);
             }
         }
         best

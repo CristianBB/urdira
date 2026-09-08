@@ -195,6 +195,21 @@ export declare class NativeStructuralStoreHandle {
    * out-of-range ordinal. */
   subjectText(ordinal: number): string;
   recordsByIds(keysHex: readonly string[], generation: number): readonly NativeOutputRecordRow[];
+  /** Frente Q-4 (2026-09-08): indexed `identity_key` (raw text) lookup --
+   * digests each value with the same hash used at ingestion
+   * (`identity_key_digest`) and reads the on-disk `by_identity` range
+   * index (`StoreReader::by_identity_key`), visibility-filtered by
+   * `generation`. See `NativeCanonicalQuerySnapshotPort.records_by_ids`
+   * for why this retires that method's `otherIds`/`scanAll` fallback for
+   * this identity form. */
+  recordsByIdentityKeys(identityKeys: readonly string[], generation: number): readonly NativeOutputRecordRow[];
+  /** Frente Q-4 (2026-09-08): indexed `identity_id` lookup (TS
+   * `entity_id`/`relation_id`/`diagnostic_id`, shaped
+   * `"{entity|relation|diagnostic}:<64-hex>"`) via the in-memory
+   * `StoreReader::identity_id_index` (`StoreReader::by_identity_id`) --
+   * NOT the same digest as `identity_key`'s, so this is a separate index,
+   * not a derivation of `recordsByIdentityKeys`. */
+  recordsByIdentityIds(identityIds: readonly string[], generation: number): readonly NativeOutputRecordRow[];
   recordsByName(name: string, generation: number): readonly NativeOutputRecordRow[];
   recordsByKindExact(universalKind: string, category: string, kind: string, generation: number, limit: number, afterKeyHex?: string): readonly NativeOutputRecordRow[];
   /** Frente Q-3 (2026-09-08): every `kind` under one `(universal_kind,

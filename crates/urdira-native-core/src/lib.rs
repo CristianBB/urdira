@@ -455,7 +455,14 @@ fn uce_text_digest(value: &str) -> String {
 }
 
 /// P2-2f bytes-native counterpart of [`uce_text_digest`].
-fn uce_text_digest_bytes(value: &str) -> [u8; 32] {
+///
+/// Frente Q-4 (2026-09-08): made `pub` so `urdira-native-node`'s
+/// `records_by_identity_keys` can digest a caller-supplied `identity_key`
+/// TEXT with the EXACT SAME function used to build `identity_key_digest`
+/// at ingestion time (`structural_kernel_batch_parts_with_records`, this
+/// file), a prerequisite for looking it up in the structural store's
+/// on-disk `by_identity` range index (`StoreReader::by_identity_key`).
+pub fn uce_text_digest_bytes(value: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
     update_uce_text(&mut hash, value);
     sha256_bytes(hash)

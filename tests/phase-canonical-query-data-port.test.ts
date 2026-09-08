@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
-import type { QueryScope } from "@urdira/contracts";
+import type { QueryParticipant, QueryScope } from "@urdira/contracts";
 import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type SqliteCommand, type SqliteDatabase, type SqliteRunResult, type SqliteValue } from "../packages/storage/src/index.js";
 import {
   CanonicalRecordQueryDataPort,
@@ -13,6 +13,7 @@ import {
   createLocalHashProvider,
   type CanonicalQueryRecord,
   type CanonicalQuerySnapshotPort,
+  type ComparisonParticipantResolver,
   type ResolvedSemanticProvider,
 } from "../packages/engine/src/index.js";
 
@@ -3571,6 +3572,251 @@ describe("RecordBodyInterner cross-workspace body sharing", () => {
       const recordsB = await portB.records({ scope_type: "single_workspace", workspace_id: "ws-interner-b" });
       expect(recordsA[0]!.facets).toEqual(["facet-one", "facet-two"]);
       expect(recordsB[0]!.facets).toEqual(["facet-one", "facet-two"]);
+    });
+  });
+});
+
+/**
+ * Frente Q-4 (2026-09-08): `core:compare` -- see `canonical-query-data-port.ts`'s
+ * `executeCompare`/`resolveComparisonParticipant`/`recordsForComparisonParticipant`/
+ * `diffComparisonRecordSets` doc comments and `docs/evidence/2026-09-08-v4-
+ * identity-lookup-and-compare.md` for the design writeup this exercises.
+ */
+describe("CanonicalRecordQueryDataPort core:compare (Frente Q-4)", () => {
+  function compareRecord(recordId: string, identityKey: string, ownerArtifactVersionId: string, body: Readonly<Record<string, unknown>>, overrides: Partial<CanonicalQueryRecord> = {}): CanonicalQueryRecord {
+    return {
+      record_id: recordId,
+      workspace_id: "ws-compare-stub",
+      category: "entity",
+      kind: "function_declaration",
+      universal_kind: "core:function",
+      owner_artifact_id: "art-1",
+      owner_artifact_version_id: ownerArtifactVersionId,
+      identity_id: `entity:${identityKey}`,
+      identity_key: identityKey,
+      body,
+      ...overrides,
+    };
+  }
+
+  function compareScope(baseId: string, targetId: string, roleMode: "base_target" | "none" = "base_target"): { readonly scope_type: "comparison"; readonly participants: readonly QueryParticipant[] } {
+    return {
+      scope_type: "comparison",
+      participants: roleMode === "none"
+        ? [{ workspace_id: baseId, role: "left" }, { workspace_id: targetId, role: "right" }]
+        : [{ workspace_id: baseId, role: "base" }, { workspace_id: targetId, role: "target" }],
+    };
+  }
+
+  function comparePort(basePort: CanonicalQuerySnapshotPort, targetPort: CanonicalQuerySnapshotPort, baseId = "ws-compare-base", targetId = "ws-compare-target", homePort: CanonicalQuerySnapshotPort = targetPort): CanonicalRecordQueryDataPort {
+    const resolver: ComparisonParticipantResolver = async (workspaceId) => {
+      if (workspaceId === baseId) return basePort;
+      if (workspaceId === targetId) return targetPort;
+      const error = new Error(`Workspace ${workspaceId} is not registered.`) as Error & { code: string; details: Record<string, unknown> };
+      error.code = "core:workspace_not_found";
+      error.details = { workspace_id: workspaceId };
+      throw error;
+    };
+    return new CanonicalRecordQueryDataPort(homePort, { comparison_participants: resolver });
+  }
+
+  function compareOperation(scopeValue: { readonly scope_type: "comparison"; readonly participants: readonly QueryParticipant[] }, comparisonKinds: readonly string[], extraArguments: Readonly<Record<string, unknown>> = {}) {
+    return {
+      operation_id: "core:compare",
+      result_streams: comparisonKinds,
+      arguments: { comparison_kinds: comparisonKinds, ...extraArguments },
+      scope: scopeValue,
+    };
+  }
+
+  it("classifies added/removed/changed/moved/correlated by identity_key, excluding non-structural categories", async () => {
+    const baseRecords: readonly CanonicalQueryRecord[] = [
+      compareRecord("rec-base-alpha", "sym:alpha", "artv-base-1", { name: "alpha", value: 1 }),
+      compareRecord("rec-base-beta", "sym:beta", "artv-base-1", { name: "beta", value: 1 }),
+      compareRecord("rec-base-gamma", "sym:gamma", "artv-base-1", { name: "gamma", value: 1 }),
+      compareRecord("rec-base-diagnostic", "sym:diagnostic", "artv-base-1", { message: "unused" }, { category: "diagnostic" }),
+    ];
+    const targetRecords: readonly CanonicalQueryRecord[] = [
+      compareRecord("rec-target-alpha", "sym:alpha", "artv-target-1", { name: "alpha", value: 2 }),
+      compareRecord("rec-target-gamma", "sym:gamma", "artv-target-2", { name: "gamma", value: 1 }),
+      compareRecord("rec-target-delta", "sym:delta", "artv-target-1", { name: "delta", value: 1 }),
+      compareRecord("rec-target-diagnostic", "sym:diagnostic-2", "artv-target-1", { message: "unused" }, { category: "diagnostic" }),
+    ];
+    const port = comparePort(stubPort({ records_for_query: async () => baseRecords }), stubPort({ records_for_query: async () => targetRecords }));
+    const evaluation = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["added", "removed", "changed", "moved", "correlated"]));
+
+    const values = (streamName: string): readonly Record<string, unknown>[] => (evaluation.streams[streamName] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
+    expect(values("added").map((value) => value["identity_key"])).toEqual(["sym:delta"]);
+    expect(values("added")[0]!["participant"]).toBe("target");
+    expect(values("removed").map((value) => value["identity_key"])).toEqual(["sym:beta"]);
+    expect(values("removed")[0]!["participant"]).toBe("base");
+    expect(values("changed").map((value) => value["identity_key"])).toEqual(["sym:alpha"]);
+    expect((values("changed")[0]!["change"] as { before: { body: unknown }; after: { body: unknown } }).before.body).toEqual({ name: "alpha", value: 1 });
+    expect((values("changed")[0]!["change"] as { before: { body: unknown }; after: { body: unknown } }).after.body).toEqual({ name: "alpha", value: 2 });
+    expect(values("moved").map((value) => value["identity_key"])).toEqual(["sym:gamma"]);
+    expect((values("moved")[0]!["move"] as { before: { artifact_version_id: string }; after: { artifact_version_id: string } }).before.artifact_version_id).toBe("artv-base-1");
+    expect((values("moved")[0]!["move"] as { before: { artifact_version_id: string }; after: { artifact_version_id: string } }).after.artifact_version_id).toBe("artv-target-2");
+    // correlated = every identity_key present on both sides (alpha, gamma) -- diagnostics never participate (no shared identity_key across the stub bodies above, and excluded from the structural record set regardless).
+    expect(values("correlated").map((value) => value["identity_key"]).sort()).toEqual(["sym:alpha", "sym:gamma"]);
+    for (const value of values("correlated")) expect((value["correlation"] as { correlation_class: string }).correlation_class).toBe("identity_key");
+  });
+
+  it("only computes the requested comparison_kinds streams", async () => {
+    const port = comparePort(
+      stubPort({ records_for_query: async () => [compareRecord("rec-base-1", "sym:one", "artv-1", { name: "one" })] }),
+      stubPort({ records_for_query: async () => [] }),
+    );
+    const evaluation = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["removed"]));
+    expect(Object.keys(evaluation.streams)).toEqual(["removed"]);
+  });
+
+  it("correlation_policy include_possible correlates a rename (different identity_key, identical content) only in the correlated stream, without changing added/removed", async () => {
+    const baseRecords: readonly CanonicalQueryRecord[] = [compareRecord("rec-base-old-name", "sym:old-name", "artv-1", { name: "same body", value: 9 })];
+    const targetRecords: readonly CanonicalQueryRecord[] = [compareRecord("rec-target-new-name", "sym:new-name", "artv-1", { name: "same body", value: 9 })];
+    const port = comparePort(stubPort({ records_for_query: async () => baseRecords }), stubPort({ records_for_query: async () => targetRecords }));
+
+    const strict = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["added", "removed", "correlated"], { correlation_policy: "strict" }));
+    const strictValues = (streamName: string): readonly unknown[] => strict.streams[streamName] ?? [];
+    expect(strictValues("added")).toHaveLength(1);
+    expect(strictValues("removed")).toHaveLength(1);
+    expect(strictValues("correlated")).toHaveLength(0);
+
+    const possible = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["added", "removed", "correlated"], { correlation_policy: "include_possible" }));
+    const possibleValues = (streamName: string): readonly Record<string, unknown>[] => (possible.streams[streamName] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
+    // added/removed are an unconditional identity_key set difference -- include_possible never removes members from them.
+    expect(possibleValues("added")).toHaveLength(1);
+    expect(possibleValues("removed")).toHaveLength(1);
+    expect(possibleValues("correlated")).toHaveLength(1);
+    expect(possibleValues("correlated")[0]!["classification"]).toBe("possible");
+    expect((possibleValues("correlated")[0]!["correlation"] as { correlation_class: string }).correlation_class).toBe("content_digest");
+  });
+
+  it("narrows both sides through a non-empty selection instead of fetching the full corpus", async () => {
+    const alpha = compareRecord("rec-base-alpha", "sym:alpha", "artv-1", { name: "alpha" });
+    const targetAlpha = compareRecord("rec-target-alpha", "sym:alpha", "artv-1", { name: "alpha" });
+    const beta = compareRecord("rec-base-beta", "sym:beta", "artv-1", { name: "beta" });
+    const port = comparePort(
+      stubPort({ records_by_ids: async (_scope, ids) => [alpha, beta].filter((record) => ids.includes(record.record_id)), records_for_query: async () => { throw new Error("selection must not fetch the full corpus"); } }),
+      stubPort({ records_by_ids: async (_scope, ids) => [targetAlpha].filter((record) => ids.includes(record.record_id)), records_for_query: async () => { throw new Error("selection must not fetch the full corpus"); } }),
+    );
+    const evaluation = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["correlated"], { selection: [{ subject_type: "entity", entity_id: "rec-base-alpha" }, { subject_type: "entity", entity_id: "rec-target-alpha" }] }));
+    const values = (evaluation.streams["correlated"] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
+    expect(values.map((value) => value["identity_key"])).toEqual(["sym:alpha"]);
+  });
+
+  it("with no explicit base/target roles, falls back to participant order (decision 03)", async () => {
+    const leftRecords: readonly CanonicalQueryRecord[] = [compareRecord("rec-left", "sym:left-only", "artv-1", { name: "left" })];
+    const rightRecords: readonly CanonicalQueryRecord[] = [compareRecord("rec-right", "sym:right-only", "artv-1", { name: "right" })];
+    const port = comparePort(stubPort({ records_for_query: async () => leftRecords }), stubPort({ records_for_query: async () => rightRecords }));
+    const evaluation = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target", "none"), ["added", "removed"]));
+    const values = (streamName: string): readonly Record<string, unknown>[] => (evaluation.streams[streamName] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
+    expect(values("added")[0]!["identity_key"]).toBe("sym:right-only");
+    expect(values("added")[0]!["participant"]).toBe("right");
+    expect(values("removed")[0]!["identity_key"]).toBe("sym:left-only");
+    expect(values("removed")[0]!["participant"]).toBe("left");
+  });
+
+  it.each([
+    { participants: [{ workspace_id: "ws-compare-base", role: "base" }], code: "core:participant_role_invalid" },
+    { participants: [{ workspace_id: "ws-compare-base", role: "base" }, { workspace_id: "ws-compare-target", role: "target" }, { workspace_id: "ws-compare-third", role: "third" }], code: "core:participant_role_invalid" },
+    { participants: [{ workspace_id: "ws-compare-base", role: "base" }, { workspace_id: "ws-compare-target", role: "right" }], code: "core:participant_role_invalid" },
+  ])("rejects an invalid participant shape ($participants.length participants) with $code", async ({ participants, code }) => {
+    const port = comparePort(stubPort({ records_for_query: async () => [] }), stubPort({ records_for_query: async () => [] }));
+    await expect(port.execute(compareOperation({ scope_type: "comparison", participants }, ["added"]))).rejects.toMatchObject({ code });
+  });
+
+  it("propagates a typed error for an unknown participant workspace instead of a raw TypeError", async () => {
+    const port = comparePort(stubPort({ records_for_query: async () => [] }), stubPort({ records_for_query: async () => [] }), "ws-compare-base", "ws-compare-target");
+    const evaluationPromise = port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-missing"), ["added"]));
+    await expect(evaluationPromise).rejects.toMatchObject({ code: "core:workspace_not_found" });
+  });
+
+  it("surfaces core:required_capability_unsupported when no comparison-participant resolver is wired", async () => {
+    const port = new CanonicalRecordQueryDataPort(stubPort({ records_for_query: async () => [] }));
+    await expect(port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["added"]))).rejects.toMatchObject({ code: "core:required_capability_unsupported" });
+  });
+
+  it("surfaces a typed core:coverage_incomplete for a participant with an unsupported capability state, never a raw TypeError", async () => {
+    const port = comparePort(
+      stubPort({ records_for_query: async () => [], capability_states: async () => [{ capability: "core:symbol_resolution", capability_contract_version: "1", provider_id: "test", provider_version: "1", status: "unsupported", reason_codes: [], affected_artifact_ids: [], diagnostic_record_ids: [] }] }),
+      stubPort({ records_for_query: async () => [] }),
+    );
+    await expect(port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["added"]))).rejects.toMatchObject({ code: "core:coverage_incomplete" });
+  });
+
+  describe("real two-workspace end-to-end (fixture before/after an edit)", () => {
+    type OpenedWorkspace = Awaited<ReturnType<Awaited<ReturnType<typeof createDurableStorage>>["openWorkspace"]>>;
+
+    async function withCompareWorkspaces(test: (baseOpened: OpenedWorkspace, targetOpened: OpenedWorkspace) => Promise<void>): Promise<void> {
+      const rootBase = await mkdtemp(join(tmpdir(), "urdira-compare-base-"));
+      const rootTarget = await mkdtemp(join(tmpdir(), "urdira-compare-target-"));
+      const storageBase = await createDurableStorage({ rootDir: rootBase });
+      const storageTarget = await createDurableStorage({ rootDir: rootTarget });
+      try {
+        const baseWorkspace = { ...workspace, workspace_id: "ws-compare-e2e-base" };
+        const targetWorkspace = { ...workspace, workspace_id: "ws-compare-e2e-target" };
+        await storageBase.catalog.registerWorkspace(baseWorkspace);
+        await storageTarget.catalog.registerWorkspace(targetWorkspace);
+        const baseOpened = await storageBase.openWorkspace(baseWorkspace.workspace_id);
+        const targetOpened = await storageTarget.openWorkspace(targetWorkspace.workspace_id);
+        try { await test(baseOpened, targetOpened); }
+        finally { await baseOpened.close(); await targetOpened.close(); }
+      } finally {
+        await storageBase.close();
+        await storageTarget.close();
+        await rm(rootBase, { recursive: true, force: true });
+        await rm(rootTarget, { recursive: true, force: true });
+      }
+    }
+
+    async function seedCompareWorkspace(opened: OpenedWorkspace, workspaceId: string, records: ReadonlyArray<{ readonly recordId: string; readonly identityKey: string; readonly ownerArtifactVersionId: string; readonly body: Readonly<Record<string, unknown>> }>): Promise<void> {
+      const db = opened.database;
+      await db.exec("PRAGMA foreign_keys = OFF");
+      await db.run("INSERT INTO registry_snapshots (registry_snapshot_id, workspace_id, registry_contract_version, core_registry_digest, resolution_lock_id, registry_digest) VALUES (?, ?, ?, ?, ?, ?)", [`registry:${workspaceId}`, workspaceId, "1", "core-digest", "lock-1", "registry-digest-1"]);
+      await db.run("INSERT INTO snapshots (snapshot_id, workspace_id, generation, parent_snapshot_id, generation_manifest_id, registry_snapshot_id, resolution_lock_id, configuration_revision_id, source_state_digest, source_observation_watermarks, canonical_record_set_digest, projection_set_digests, capability_state_digest, published_at, snapshot_digest) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [`snapshot:${workspaceId}`, workspaceId, 1, `manifest:${workspaceId}`, `registry:${workspaceId}`, "lock-1", "configuration-1", "source-digest", "[]", "records-digest", "projections-digest", "capabilities-digest", now, `snapshot-digest:${workspaceId}`]);
+      await db.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspaceId, `snapshot:${workspaceId}`, 1, `registry:${workspaceId}`, "lock-1", "configuration-1", "freshness-1", 1, now]);
+      for (const ownerArtifactVersionId of new Set(records.map((record) => record.ownerArtifactVersionId))) {
+        await db.run("INSERT INTO content_blobs (content_blob_id, content_hash, byte_length, storage_reference) VALUES (?, ?, ?, ?)", [`blob:${ownerArtifactVersionId}`, `sha256:${ownerArtifactVersionId}`, 0, "inline"]);
+        await db.run("INSERT INTO artifact_versions (artifact_version_id, workspace_id, artifact_id, content_blob_id, content_hash, byte_length, encoding, language_hint, analysis_metadata_digest, created_from_observation_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'art-1', ?, ?, 0, 'utf-8', NULL, 'metadata-digest', 'observation-1', 0, NULL)", [ownerArtifactVersionId, workspaceId, `blob:${ownerArtifactVersionId}`, `sha256:${ownerArtifactVersionId}`]);
+      }
+      for (const record of records) {
+        const payload = recordPayload(record.body);
+        await db.run(
+          "INSERT INTO record_occurrences (record_id, workspace_id, category, kind, universal_kind, schema_version, producer_id, producer_version, owner_artifact_id, owner_artifact_version_id, primary_source_span_artifact_version_id, primary_source_span_start_byte, primary_source_span_end_byte, primary_source_span_start_line, primary_source_span_end_line, valid_from_generation, valid_to_generation, record_digest, body_digest, body_byte_length, analysis_digest, analysis_configuration_digest, artifact_dependency_digest) VALUES (?, ?, 'entity', 'function_declaration', 'core:function', 1, 'test', '1', 'art-1', ?, NULL, NULL, NULL, NULL, NULL, 1, NULL, ?, ?, ?, 'analysis', 'configuration', 'dependencies')",
+          [record.recordId, workspaceId, record.ownerArtifactVersionId, `digest-${record.recordId}`, digestBytes(payload), payload.byteLength],
+        );
+        await db.transaction(relationalValueCommands(flattenRelationalValue(workspaceId, record.recordId, 1, record.body)));
+        await db.run(
+          "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'entity', ?, 'created', ?, ?, ?, NULL, 'art-1', ?, 1, NULL)",
+          [`identity:${record.recordId}`, workspaceId, `entity:${record.identityKey}`, record.identityKey, `digest-${record.identityKey}`, record.recordId, record.ownerArtifactVersionId],
+        );
+      }
+    }
+
+    it("diffs a real before/after edit of the SAME logical codebase across two SQLite-backed workspaces", async () => {
+      await withCompareWorkspaces(async (baseOpened, targetOpened) => {
+        await seedCompareWorkspace(baseOpened, "ws-compare-e2e-base", [
+          { recordId: "rec-base-unchanged", identityKey: "fn:unchanged", ownerArtifactVersionId: "artv-base-1", body: { name: "unchanged", returns: "void" } },
+          { recordId: "rec-base-removed", identityKey: "fn:removedFn", ownerArtifactVersionId: "artv-base-1", body: { name: "removedFn", returns: "void" } },
+          { recordId: "rec-base-edited", identityKey: "fn:editedFn", ownerArtifactVersionId: "artv-base-1", body: { name: "editedFn", returns: "void" } },
+        ]);
+        await seedCompareWorkspace(targetOpened, "ws-compare-e2e-target", [
+          { recordId: "rec-target-unchanged", identityKey: "fn:unchanged", ownerArtifactVersionId: "artv-target-1", body: { name: "unchanged", returns: "void" } },
+          { recordId: "rec-target-edited", identityKey: "fn:editedFn", ownerArtifactVersionId: "artv-target-1", body: { name: "editedFn", returns: "string" } },
+          { recordId: "rec-target-added", identityKey: "fn:addedFn", ownerArtifactVersionId: "artv-target-1", body: { name: "addedFn", returns: "void" } },
+        ]);
+
+        const baseSnapshot = new SqliteCanonicalQuerySnapshotPort(baseOpened.database);
+        const targetSnapshot = new SqliteCanonicalQuerySnapshotPort(targetOpened.database);
+        const port = comparePort(baseSnapshot, targetSnapshot, "ws-compare-e2e-base", "ws-compare-e2e-target");
+
+        const evaluation = await port.execute(compareOperation(compareScope("ws-compare-e2e-base", "ws-compare-e2e-target"), ["added", "removed", "changed", "correlated"]));
+        const values = (streamName: string): readonly Record<string, unknown>[] => (evaluation.streams[streamName] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
+        expect(values("added").map((value) => value["identity_key"])).toEqual(["fn:addedFn"]);
+        expect(values("removed").map((value) => value["identity_key"])).toEqual(["fn:removedFn"]);
+        expect(values("changed").map((value) => value["identity_key"])).toEqual(["fn:editedFn"]);
+        expect(values("correlated").map((value) => value["identity_key"]).sort()).toEqual(["fn:editedFn", "fn:unchanged"]);
+      });
     });
   });
 });

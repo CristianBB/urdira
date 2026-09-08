@@ -15,7 +15,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
 import type { QueryScope } from "@urdira/contracts";
 import { createDurableStorage } from "../packages/storage/src/index.js";
@@ -343,18 +343,67 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       // Frente Q-2 (2026-09-08, docs/evidence/2026-09-08-v4-query-gaps-vscode.md
       // item 1(a)): investigated and REJECTED rejecting `identity_id`/
       // `identity_key` forms outright -- `indexedGraphRecords`'s `hydrate()`
-      // (`canonical-query-data-port.ts`) depends on exactly this bounded
-      // linear-scan resolution for every native find_references/get_outline/
-      // expand_relations/find_paths pushdown call (the adjacency index's own
-      // edge-endpoint subject ids come back as identity_key text). The
-      // native port therefore still resolves all three id forms identically
-      // to SQLite -- only the WORST-CASE per-call scan cost is now bounded
-      // (`OTHER_IDS_COUNT_CAP`/`OTHER_IDS_SCAN_ROW_BUDGET`, see below).
+      // (`canonical-query-data-port.ts`) depends on exactly this resolution
+      // for every native find_references/get_outline/expand_relations/
+      // find_paths pushdown call (the adjacency index's own edge-endpoint
+      // subject ids come back as identity_key text). The native port
+      // therefore still resolves all three id forms identically to SQLite.
+      // Frente Q-4 (2026-09-08): each form is now resolved through its own
+      // indexed native lookup (`recordsByIdentityIds`/`recordsByIdentityKeys`,
+      // `StoreReader::by_identity_id`/`by_identity_key`) rather than the
+      // linear `scanAll` this test's own name once implied -- see the test
+      // below for the direct "never scans" proof (a spy on the native
+      // handle's `iterVisibleBatch`, `scanAll`'s only FFI call).
       for (const id of ["record:" + "a".repeat(64), "identity:" + "2".repeat(64), "jsts:function:src/index.ts:10:myFunc"]) {
         const sqliteResult = await sqlite.records_by_ids!(scope, [id]);
         const nativeResult = await native.records_by_ids(scope, [id]);
         expectSameRecords(nativeResult, sqliteResult);
         expect(nativeResult.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  /**
+   * Frente Q-4 (2026-09-08): the direct "never scans" proof task item 4
+   * asks for -- a spy/counter on `scanAll`'s only FFI call
+   * (`this.handle.iterVisibleBatch`, `native-query-snapshot-port.ts`),
+   * asserting it is NEVER invoked while `records_by_ids` resolves every id
+   * form (`record_id`, the v3-sidecar `identity_id` text, the native-
+   * pipeline `identity_id` shape reconstructed from `identity_type:hex`,
+   * and `identity_key` text) -- closing the gap decision 25's Q1/Q-3
+   * amendments diagnosed (`docs/evidence/2026-09-08-v4-full-pushdown-
+   * catalog.md` §5.3): before this frente, EVERY one of these forms except
+   * `record_id` fell into `scanAll(generation)`, a full linear decode of
+   * the entire visible generation, on every single call.
+   */
+  it("records_by_ids resolves every id form without ever calling scanAll's underlying iterVisibleBatch", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const addon = loadNativeStructuralStoreAddon();
+      const iterVisibleBatchSpy = vi.spyOn(addon.NativeStructuralStoreHandle.prototype, "iterVisibleBatch");
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      try {
+        const ids = [
+          "record:" + "a".repeat(64),
+          "identity:" + "1".repeat(64), // v3-sidecar `identity_id` text (record "a")
+          "jsts:function:src/other.ts:5:otherFunc", // `identity_key` text (record "b")
+        ];
+        const result = await native.records_by_ids(scope, ids);
+        expect(result.map((record) => record.record_id).sort()).toEqual(["record:" + "a".repeat(64), "record:" + "b".repeat(64)]);
+        expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
+
+        // An id that resolves to neither an identity_id nor an identity_key
+        // (genuinely unknown) is simply absent from the result -- and still
+        // never triggers a scan (the whole point of item 1's index-by-form
+        // fix: an unresolvable id used to force scanning the ENTIRE visible
+        // generation before giving up).
+        const withUnknown = await native.records_by_ids(scope, [...ids, "jsts:function:src/unknown.ts:1:neverExisted"]);
+        expect(withUnknown).toHaveLength(2);
+        expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
+      } finally {
+        iterVisibleBatchSpy.mockRestore();
       }
     });
   });
