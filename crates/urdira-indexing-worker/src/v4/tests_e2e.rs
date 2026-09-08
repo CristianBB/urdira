@@ -6128,7 +6128,25 @@ fn reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
     assert_eq!(summary.added, 0);
     assert_eq!(summary.changed, 0);
     assert_eq!(summary.deleted, 1);
-    assert_eq!(touched, Some(vec![deleted_relative.to_string()]));
+    // E-P0n: `src/index.ts` imports the deleted file through a literal
+    // `./repository/in-memory-task-repository.js` specifier -- the
+    // extension-substitution fix (`resolver.rs`'s `js_to_ts_extension_
+    // substitutes`) now correctly resolves that edge, so the delete
+    // cascades to the barrel AND every one of the barrel's own real
+    // importers (previously invisible only because the edge silently
+    // never resolved -- this expectation was calibrated against that bug,
+    // per `docs/evidence/2026-09-07-v4-vscode-campaign.md` §13.1).
+    let mut touched = touched.expect("Delta mode reports touched owner paths");
+    touched.sort();
+    assert_eq!(
+        touched,
+        vec![
+            "src/index.ts".to_string(),
+            "src/main.ts".to_string(),
+            deleted_relative.to_string(),
+            "test/task-service.spec.ts".to_string(),
+        ]
+    );
 
     let oracle_root = scratch_dir("reconcile-delete-oracle");
     let oracle_database = oracle_root.join("workspace.sqlite");
@@ -6217,9 +6235,22 @@ fn reconcile_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
     assert_eq!(summary.deleted, 1);
     let mut touched = touched.expect("Delta mode reports touched owner paths");
     touched.sort();
+    // E-P0n: several fixture files import `src/domain/errors.ts` through a
+    // literal `.js` specifier (`./domain/errors.js`) -- now that the
+    // extension-substitution fix resolves that edge, the rename cascades
+    // to those real importers too, not just the renamed file's own old/
+    // new paths (calibrated against the same pre-fix bug as the delete
+    // test above).
     assert_eq!(
         touched,
-        vec![new_relative.to_string(), old_relative.to_string()]
+        vec![
+            new_relative.to_string(),
+            old_relative.to_string(),
+            "src/index.ts".to_string(),
+            "src/main.ts".to_string(),
+            "src/services/task-service.ts".to_string(),
+            "test/task-service.spec.ts".to_string(),
+        ]
     );
 
     let oracle_root = scratch_dir("reconcile-rename-oracle");
@@ -6258,6 +6289,372 @@ fn reconcile_rename_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
         "workspace:v4-e2e-reconcile-rename-oracle",
     );
     assert_eq!(reconciled_pending, oracle_pending);
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// E-P0n (2026-09-08): the extension-substitution mechanism's own
+/// incremental-consistency guarantee, case 1 of 3 -- creating a `.ts`
+/// sibling next to an already-resolved `.js` file must reresolve every
+/// importer of the shared `./domain/dual-target.js` specifier onto the new
+/// `.ts` (TS's own `moduleResolution` precedence: a co-located `.ts` source
+/// always shadows a `.js` build artifact), matching an independent
+/// from-scratch oracle of the identical final tree.
+#[test]
+fn creating_a_ts_sibling_next_to_a_resolved_js_file_reresolves_its_importer_and_matches_an_independent_oracle()
+ {
+    let scratch_root = scratch_dir("ext-create-ts-sibling");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let js_relative = "src/domain/dual-target.js";
+    std::fs::write(
+        workspace_root.join(js_relative),
+        "export class DualTarget {\n  origin() {\n    return \"js\";\n  }\n}\n",
+    )
+    .expect("write dual-target.js (seed)");
+
+    let consumer_relative = "src/dual-ext-consumer.ts";
+    std::fs::write(
+        workspace_root.join(consumer_relative),
+        "import { DualTarget } from \"./domain/dual-target.js\";\n\nexport class DualExtConsumer {\n  constructor(private readonly target: DualTarget) {}\n  run(): string {\n    return this.target.origin();\n  }\n}\n",
+    )
+    .expect("write dual-ext-consumer.ts (seed)");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-ext-create-ts-sibling";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let ts_relative = "src/domain/dual-target.ts";
+    std::fs::write(
+        workspace_root.join(ts_relative),
+        "export class DualTarget {\n  origin() {\n    return \"ts\";\n  }\n}\n",
+    )
+    .expect("write dual-target.ts (the new sibling)");
+
+    let incremental = run_scan(
+        "request:create-ts-sibling",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: ts_relative.to_string(),
+                kind: ChangeKind::Created,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    let incremental_roots = roots_of(&incremental);
+
+    let oracle_root = scratch_dir("ext-create-ts-sibling-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-ext-create-ts-sibling-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if incremental_roots.dependency != oracle_roots.dependency
+        || incremental_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&incremental),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+        dump_graph_set_diff(
+            &structural_root,
+            generation_of(&incremental),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        incremental_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after creating a .ts \
+         sibling next to an already-resolved .js file"
+    );
+    assert_eq!(
+        incremental_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- the consumer's own \
+         reference/call must reresolve onto the new .ts, not stay pinned to the old .js"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// E-P0n, case 2 of 3 -- the inverse of the create test above: deleting the
+/// `.ts` sibling must fall the importer BACK to the `.js` file, matching an
+/// independent from-scratch oracle of the identical final tree.
+#[test]
+fn deleting_a_ts_sibling_falls_its_importer_back_to_the_js_file_and_matches_an_independent_oracle()
+{
+    let scratch_root = scratch_dir("ext-delete-ts-sibling");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let js_relative = "src/domain/dual-target.js";
+    std::fs::write(
+        workspace_root.join(js_relative),
+        "export class DualTarget {\n  origin() {\n    return \"js\";\n  }\n}\n",
+    )
+    .expect("write dual-target.js (seed)");
+
+    let ts_relative = "src/domain/dual-target.ts";
+    std::fs::write(
+        workspace_root.join(ts_relative),
+        "export class DualTarget {\n  origin() {\n    return \"ts\";\n  }\n}\n",
+    )
+    .expect("write dual-target.ts (seed, shadows the .js from the start)");
+
+    let consumer_relative = "src/dual-ext-consumer.ts";
+    std::fs::write(
+        workspace_root.join(consumer_relative),
+        "import { DualTarget } from \"./domain/dual-target.js\";\n\nexport class DualExtConsumer {\n  constructor(private readonly target: DualTarget) {}\n  run(): string {\n    return this.target.origin();\n  }\n}\n",
+    )
+    .expect("write dual-ext-consumer.ts (seed)");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-ext-delete-ts-sibling";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    std::fs::remove_file(workspace_root.join(ts_relative)).expect("delete dual-target.ts");
+
+    let incremental = run_scan(
+        "request:delete-ts-sibling",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: ts_relative.to_string(),
+                kind: ChangeKind::Deleted,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+    let incremental_roots = roots_of(&incremental);
+
+    let oracle_root = scratch_dir("ext-delete-ts-sibling-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-ext-delete-ts-sibling-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if incremental_roots.dependency != oracle_roots.dependency
+        || incremental_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&incremental),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+        dump_graph_set_diff(
+            &structural_root,
+            generation_of(&incremental),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        incremental_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after deleting the .ts \
+         sibling"
+    );
+    assert_eq!(
+        incremental_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- the consumer's own \
+         reference/call must fall back onto the surviving .js file"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let _ = std::fs::remove_dir_all(&oracle_root);
+}
+
+/// E-P0n, case 3 of 3 -- renaming a `.js` file to `.ts` (a same-generation
+/// delete+create pair, forced through `Delta` via `ScanScope::Reconcile`,
+/// same convention as `reconcile_rename_roots_match_a_from_scratch_scan_
+/// of_the_mutated_tree` above) must reresolve the importer onto the renamed
+/// `.ts` path, matching an independent from-scratch oracle.
+#[test]
+fn renaming_a_js_file_to_ts_reresolves_its_importer_and_matches_an_independent_oracle() {
+    let scratch_root = scratch_dir("ext-rename-js-to-ts");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+
+    let js_relative = "src/domain/dual-target.js";
+    std::fs::write(
+        workspace_root.join(js_relative),
+        "export class DualTarget {\n  origin() {\n    return \"js\";\n  }\n}\n",
+    )
+    .expect("write dual-target.js (seed, no .ts sibling yet)");
+
+    let consumer_relative = "src/dual-ext-consumer.ts";
+    std::fs::write(
+        workspace_root.join(consumer_relative),
+        "import { DualTarget } from \"./domain/dual-target.js\";\n\nexport class DualExtConsumer {\n  constructor(private readonly target: DualTarget) {}\n  run(): string {\n    return this.target.origin();\n  }\n}\n",
+    )
+    .expect("write dual-ext-consumer.ts (seed)");
+
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let workspace_id = "workspace:v4-e2e-ext-rename-js-to-ts";
+
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    assert_eq!(generation_of(&cold), 1);
+
+    let ts_relative = "src/domain/dual-target.ts";
+    std::fs::rename(
+        workspace_root.join(js_relative),
+        workspace_root.join(ts_relative),
+    )
+    .expect("rename dual-target.js -> dual-target.ts");
+
+    let (reconciled, _touched) = run_reconcile_scan(
+        "request:rename-js-to-ts",
+        workspace_id,
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        1.0,
+        false,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let reconciled_roots = roots_of(&reconciled);
+
+    let oracle_root = scratch_dir("ext-rename-js-to-ts-oracle");
+    let oracle_database = oracle_root.join("workspace.sqlite");
+    let oracle_structural = oracle_root.join("structural");
+    let oracle_cas = oracle_root.join("cas");
+    let mut oracle_syntax = SyntaxWorkerState::default();
+    let mut oracle_state: super::state::WorkerState = std::collections::HashMap::new();
+    let oracle = run_scan(
+        "request:oracle",
+        "workspace:v4-e2e-ext-rename-js-to-ts-oracle",
+        &workspace_root,
+        &oracle_database,
+        &oracle_structural,
+        &oracle_cas,
+        ScanScope::Full,
+        &mut oracle_syntax,
+        &mut oracle_state,
+    );
+    assert_eq!(generation_of(&oracle), 1);
+    let oracle_roots = roots_of(&oracle);
+
+    if reconciled_roots.dependency != oracle_roots.dependency
+        || reconciled_roots.graph != oracle_roots.graph
+    {
+        dump_dependency_set_diff(
+            &structural_root,
+            generation_of(&reconciled),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+        dump_graph_set_diff(
+            &structural_root,
+            generation_of(&reconciled),
+            &oracle_structural,
+            generation_of(&oracle),
+        );
+    }
+    assert_eq!(
+        reconciled_roots.dependency, oracle_roots.dependency,
+        "dependency root must match an independent from-scratch oracle after renaming \
+         dual-target.js to dual-target.ts"
+    );
+    assert_eq!(
+        reconciled_roots.graph, oracle_roots.graph,
+        "graph root must match an independent from-scratch oracle -- the consumer's own \
+         reference/call must reresolve onto the renamed .ts path"
+    );
 
     let _ = std::fs::remove_dir_all(&scratch_root);
     let _ = std::fs::remove_dir_all(&oracle_root);
@@ -9554,14 +9951,42 @@ fn barrel_hub_leaf_rename_widens_to_the_barrel_and_all_its_direct_importers_but_
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// Frente E-P0g adversarial review, attack #1, scenario C: adding a brand
-/// new named re-export to the barrel (nobody could already import a name
-/// that did not exist before this edit) is a pure ADDITION to the
-/// barrel's own `exported_surface` -- `prior.is_subset(&next)` holds, so
-/// `surface_changed` must stay `false` and narrow `owners` down to
-/// EXACTLY the barrel itself, none of its 50 importers swept in.
+/// Frente E-P0g adversarial review, attack #1, scenario C -- REVISED by
+/// E-P0n (2026-09-08): this test used to assert that adding a brand new
+/// named re-export to the barrel narrows `owners` down to EXACTLY the
+/// barrel itself, on the theory that "nobody could already import a name
+/// that did not exist before this edit". That theory is UNSOUND in
+/// general: a file added in an EARLIER generation (or, after this task's
+/// `.js`->`.ts` extension-substitution fix, any file at all importing
+/// through a literal `.js` specifier) can carry a PENDING import naming
+/// EXACTLY the soon-to-be-added export -- typeflow's own `pending_
+/// importers_of` already tracks this, but narrowing `affected_paths` away
+/// here dropped that importer from the hybrid lane's own reprocessing
+/// entirely, leaving its `jsts:call`/`jsts:references` rows wrongly
+/// pending forever. Root-caused live, this session, via `brand_new_
+/// declarer_and_consumer_linked_through_a_same_batch_edited_barrel_
+/// matches_an_independent_oracle` (a barrel edited to re-export a
+/// brand-new declarer, consumed by a brand-new consumer created in an
+/// EARLIER generation of the SAME mixed batch) -- fixed in `run_scoped`'s
+/// own `surface_changed` check (`is_importable_surface_entry`): an
+/// addition now counts as "changed" whenever it adds a real top-level
+/// EXPORTED NAME or a bare `"*"` barrel entry (either COULD satisfy a
+/// pending import elsewhere), even though a `member:`/`param:`/`type:`/
+/// `member_type:` synthetic addition still does not (see the sibling test
+/// below, which still pins the narrow behavior for exactly that case).
+/// This test's own 50 importers do not actually reference the new
+/// `leaf008Alias` name, so widening here costs a few extra (harmless)
+/// `facts_for_paths`/hybrid-lane calls, not a correctness fix by itself --
+/// but the general rule this test now pins IS the one closing the real gap
+/// above, and a real n8n/VS Code corpus adding a genuinely NEW named
+/// export to a widely-imported barrel is rare relative to body-only edits
+/// (the case `barrel_hub_leaf_body_only_edit_keeps_owners_to_the_literal_
+/// edit` above still keeps narrow), so this is the same bounded "barrel +
+/// its direct importers, no further" cost class `barrel_hub_leaf_rename_
+/// widens_to_the_barrel_and_all_its_direct_importers_but_no_further`
+/// already accepts for a rename.
 #[test]
-fn barrel_hub_adding_a_named_reexport_keeps_owners_to_the_barrel_itself() {
+fn barrel_hub_adding_a_named_reexport_widens_to_the_barrel_and_all_its_direct_importers() {
     let scratch = scratch_dir("barrel-hub-add-named-reexport");
     let workspace_root = scratch.join("workspace");
     write_large_barrel_workspace(&workspace_root, 300, 50);
@@ -9574,12 +9999,29 @@ fn barrel_hub_adding_a_named_reexport_keeps_owners_to_the_barrel_itself() {
         "barrel-hub-add-named-reexport",
         &[("barrel.ts", barrel_body.as_str())],
     );
+    let mut expected: Vec<String> = (0..50)
+        .map(|i| format!("importers/importer{i:03}.ts"))
+        .chain(["barrel.ts".to_string()])
+        .collect();
+    expected.sort();
     assert_eq!(
         owners,
-        vec!["barrel.ts".to_string()],
-        "adding a NEW named re-export to a 300-module barrel (a pure surface addition) must \
-         narrow to EXACTLY the barrel itself -- none of its 50 importers may be swept in; got \
-         {owners:?}"
+        expected,
+        "adding a NEW named re-export to a 300-module barrel must widen to EXACTLY the barrel \
+         + its 50 direct importers (a pending import elsewhere COULD name exactly the new \
+         export -- see this test's own doc comment) -- the 300 leaves must never appear; got {} \
+         owners, expected {} (symmetric diff: {:?})",
+        owners.len(),
+        expected.len(),
+        {
+            let owners_set: std::collections::BTreeSet<&String> = owners.iter().collect();
+            let expected_set: std::collections::BTreeSet<&String> = expected.iter().collect();
+            let diff: Vec<String> = owners_set
+                .symmetric_difference(&expected_set)
+                .map(|s| (*s).clone())
+                .collect();
+            diff
+        }
     );
     let _ = std::fs::remove_dir_all(&scratch);
 }

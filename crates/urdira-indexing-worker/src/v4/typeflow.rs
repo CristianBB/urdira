@@ -219,6 +219,50 @@ impl TypeflowCache {
         }
     }
 
+    /// E-P0n (2026-09-08): marks `path` for a REFLOW-ONLY pass on the next
+    /// `build_index` call -- unlike `replace_file`/`add`, this does NOT
+    /// touch `self.summaries` at all: `path`'s own declaration shape is
+    /// unchanged (it was neither added, edited, nor removed THIS batch),
+    /// only its OWN import-target resolution might now differ because a
+    /// DIFFERENT path this same batch added/removed changed which concrete
+    /// file `path`'s specifier resolves to -- the exact "higher-resolution-
+    /// priority path shadows/unshadows a specifier's previous target" case
+    /// `urdira-jsts-syntax-worker::lib.rs`'s own T1 comment already
+    /// describes and its `CandidateIndex`/`reresolved` mechanism already
+    /// handles at the SYNTAX layer (`SyntaxFileResult.direct_imports[].
+    /// target_path`). `TypeflowCache`'s own reflow, by contrast, re-derives
+    /// resolution independently (`resolve_import_targets_for` calls
+    /// `resolver.resolve` itself, never reading syntax-worker's already-
+    /// resolved `target_path`) and has NO reverse index for "a path whose
+    /// specifier was already successfully resolved, unrelated to any
+    /// pending/barrel chain, needs revisiting because of who else showed up
+    /// or left this batch" -- `importers_of`/`pending_importers_of`/
+    /// `chain_watchers` all key off files ALREADY reachable from the
+    /// changed path, which a BRAND-NEW higher-priority sibling (created
+    /// `.ts` next to an already-resolved `.js`, or vice versa on delete)
+    /// never is. Root-caused live (`creating_a_ts_sibling_next_to_a_
+    /// resolved_js_file_reresolves_its_importer_and_matches_an_independent_
+    /// oracle`, `tests_e2e.rs`): the consumer's OWN syntax-level `target_
+    /// path` correctly reresolved onto the new `.ts` file, and the hybrid
+    /// lane correctly reprocessed it (it IS in `affected_paths`), but the
+    /// `typeflow_index` it queried for `this.target.origin()` still held
+    /// the consumer's STALE import-target entry (pointing at the OLD `.js`
+    /// method) -- a phantom-vs-lost pair of `jsts:call`/`jsts:references`
+    /// rows vs an independent from-scratch oracle. Fixed by `analyze.rs`'s
+    /// `run_scoped` calling this for every path in its own (already
+    /// computed, already bounded) `affected_paths` set right before
+    /// `build_index` -- a no-op for a path with no cached summary (nothing
+    /// to reflow: a non-JS/TS file, or a brand-new path already covered by
+    /// its own `add`/`replace_file` call), and idempotent alongside an
+    /// already-pending `replace_file`/`add`/`remove` call for the same path
+    /// in the same batch (`build_index`'s own `refresh_seed` only ever
+    /// needs `path` to appear once).
+    pub fn mark_reflow(&mut self, path: &str) {
+        if self.summaries.contains_key(path) {
+            self.pending_upserted.insert(path.to_string());
+        }
+    }
+
     /// `add`, reading `owner`'s text from its blob (mirrors
     /// [`Self::replace_file_from_owner`] for a brand-new path -- SAME
     /// operation as `replace_file`/`replace_file_from_owner`, see that
