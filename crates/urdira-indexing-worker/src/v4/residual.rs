@@ -5604,6 +5604,19 @@ mod tests {
             "[n8n_residual_pass_debug_histogram] cold scan wall={:.3}s generation={base_generation}",
             cold_started.elapsed().as_secs_f64()
         );
+        // E-P0l (2026-09-08), Task 2 coverage-recovery diagnostic: how many
+        // `collect_members` calls during THIS cold scan gave up as
+        // "uncertain" because of item A's own guard (an unresolved
+        // `extends` ancestor) versus item C's own guard (a known-subclass
+        // override) -- see `urdira_jsts_typeflow::take_demotion_reason_
+        // counts`'s own doc comment. Printed as a `REASON_*`-shaped
+        // histogram line, consulted only by a human/script reading this
+        // diagnostic's stderr -- never affects any resolution outcome.
+        let (demoted_unresolved_extends, demoted_known_subclass_override) =
+            urdira_jsts_typeflow::take_demotion_reason_counts();
+        println!("=== cold-scan member-lookup demotion reason histogram ===");
+        println!("  REASON_UNRESOLVED_EXTENDS           {demoted_unresolved_extends:>8}");
+        println!("  REASON_KNOWN_SUBCLASS_OVERRIDE       {demoted_known_subclass_override:>8}");
         print_confirmed_possible_histogram("COLD", &structural_root, base_generation);
         let cold_mismatches =
             print_classification_mismatch_count("COLD", &structural_root, base_generation);

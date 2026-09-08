@@ -913,24 +913,35 @@ fn property_key_name<'a>(key: &PropertyKey<'a>) -> Option<(u32, String)> {
     }
 }
 
-/// P2-2j: whether `ty` is one of the constituent shapes a union receiver
-/// drops silently rather than treating as a real member-lookup candidate --
-/// mirrors `urdira_jsts_typeflow::is_dropped_union_constituent` exactly
-/// (that crate's own private helper; duplicated here rather than shared,
-/// since the two crates each parse with their own separate oxc allocator --
-/// see this file's own `TypeflowValue`/`urdira_jsts_typeflow::RawTypeRef`
-/// doc comments for why the two type-shape enums are parallel, not shared).
-/// `null`/`undefined` (TypeScript's own nullability convention) and a
-/// literal/primitive keyword type are dropped; every other constituent
-/// (including `any`/`unknown`/`void`/`never`/`object`) is classified
-/// normally and, if unclassifiable, contaminates the whole union via the
-/// caller's own `TSUnionType` arm.
-fn is_dropped_union_constituent(ty: &TSType) -> bool {
+/// P2-2j: whether `ty` is one of the NULLISH constituent shapes a union
+/// receiver drops silently and unconditionally -- mirrors `urdira_jsts_
+/// typeflow::is_dropped_nullish_union_constituent` exactly (that crate's
+/// own private helper; duplicated here rather than shared, since the two
+/// crates each parse with their own separate oxc allocator -- see this
+/// file's own `TypeflowValue`/`urdira_jsts_typeflow::RawTypeRef` doc
+/// comments for why the two type-shape enums are parallel, not shared).
+/// `null`/`undefined` (TypeScript's own nullability convention) never have
+/// class/interface members of their own to collide with anything. See
+/// `is_real_primitive_union_constituent` for the DIFFERENT (never fully
+/// silent) treatment a literal/primitive keyword type gets (F, E-P0l).
+fn is_dropped_nullish_union_constituent(ty: &TSType) -> bool {
+    matches!(ty, TSType::TSNullKeyword(_) | TSType::TSUndefinedKeyword(_))
+}
+
+/// F (E-P0l, 2026-09-08): mirrors `urdira_jsts_typeflow::is_real_primitive_
+/// union_constituent` exactly -- whether `ty` is a literal/primitive
+/// keyword type (`"a" | "b"`, `string`, `number`, `boolean`, `bigint`,
+/// `symbol`). Unlike `null`/`undefined`, these have their own real member
+/// table that can genuinely collide with a sibling class constituent's
+/// same-named member (found live: `base: string | TestId; base.toString()`
+/// used to silently resolve to `TestId.toString`, wrong). Callers never
+/// resolve the constituent to anything -- only use its presence to block
+/// the union-collapse shortcut in the `TSUnionType` arm below, never to
+/// guess a target.
+fn is_real_primitive_union_constituent(ty: &TSType) -> bool {
     matches!(
         ty,
-        TSType::TSNullKeyword(_)
-            | TSType::TSUndefinedKeyword(_)
-            | TSType::TSLiteralType(_)
+        TSType::TSLiteralType(_)
             | TSType::TSStringKeyword(_)
             | TSType::TSNumberKeyword(_)
             | TSType::TSBooleanKeyword(_)
@@ -2099,6 +2110,23 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 )),
             };
         };
+        // H (E-P0l, 2026-09-08): INVESTIGATED, NOT FIXED -- see docs/
+        // evidence/2026-09-07-v4-vscode-campaign.md §12. The found sample
+        // (`marked`, `walkThroughContentProvider.ts`) is a NAMESPACE
+        // import (`import * as marked from '.../marked.js'`) used as a
+        // bare CALLABLE value via CommonJS interop, which never reaches
+        // this function at all (`resolve_named_binding_via_specifier`
+        // only handles a NAMED import's own specifier) -- the real
+        // mechanism lives in `visit_import_namespace_specifier`/
+        // `resolve_namespace_member`'s own callable-value handling
+        // instead. A same-shaped fix attempted HERE (prefer a `.d.ts`
+        // sibling over the resolved implementation file) fixed nothing
+        // (dead code for this sample) and, when tried unconditionally,
+        // broke 4 OTHER samples (`generate-protocol.mjs`/`.d.mts`,
+        // `check-protocol-sync.ts`) whose own explicit `.mjs`-suffixed
+        // specifier must resolve EXACTLY as written, never redirected to
+        // a sibling declaration file -- reverted. Left pending rather
+        // than a guess: no safe, general rule found this session.
         match resolver::resolve_named_export(self.ctx.files, &target_path, name, policy) {
             resolver::ExportResolution::Resolved(target_id) => {
                 // The declaration was reached through an import/re-export
@@ -2779,8 +2807,13 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // `RawTypeRef::Union` doc comment for the full rationale.
             TSType::TSUnionType(union) => {
                 let mut constituents: Vec<TypeflowValue> = Vec::new();
+                let mut has_real_primitive_constituent = false;
                 for member in &union.types {
-                    if is_dropped_union_constituent(member) {
+                    if is_dropped_nullish_union_constituent(member) {
+                        continue;
+                    }
+                    if is_real_primitive_union_constituent(member) {
+                        has_real_primitive_constituent = true;
                         continue;
                     }
                     let value = self.type_ref_of_ts_type(member)?;
@@ -2790,7 +2823,13 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 }
                 match constituents.len() {
                     0 => None,
-                    1 => constituents.into_iter().next(),
+                    // F (E-P0l): a real primitive/literal constituent
+                    // (`string | TestId`) must never let the sole
+                    // remaining entity constituent collapse to a bare,
+                    // confirmed receiver -- see `urdira_jsts_typeflow`'s
+                    // mirrored `TSUnionType` arm doc comment for the full
+                    // rationale. A pure class union is unaffected.
+                    1 if !has_real_primitive_constituent => constituents.into_iter().next(),
                     _ => Some(TypeflowValue::Union(constituents)),
                 }
             }
@@ -2875,6 +2914,15 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 }
                 Some(TypeflowValue::Union(resolved))
             }
+            // G (E-P0l, 2026-09-08): a `typeof <expr>`-typed member has no
+            // `TypeflowValue` shape of its own to propagate through a
+            // FLUENT CHAIN (`this.x.foo()` after `x: typeof f`) -- this
+            // crate does not attempt that (out of scope, no sample found
+            // live); its own entity id, when known, is consulted directly
+            // by `resolve_call_target_typeflow`'s member branch via
+            // `ProgramIndex::member_type_ref` instead, never through this
+            // relative-chain path.
+            urdira_jsts_typeflow::ResolvedTypeRef::TypeQuery(_) => None,
         }
     }
 
@@ -3824,6 +3872,39 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                         match index.members(&base_entity, member.property.name.as_str(), is_static)
                         {
                             urdira_jsts_typeflow::MemberLookup::One(target) => {
+                                // G (E-P0l, 2026-09-08): a NAME-based member
+                                // match is not enough on its own -- when the
+                                // member's OWN declared type is a bare
+                                // `typeof <expr>` type query (`x: typeof
+                                // console.log` called as `this.x(...)`),
+                                // v3's real call-target resolution follows
+                                // the signature through to `<expr>`'s own
+                                // declaration, NEVER the member's own (`x`'s)
+                                // declaration -- see `RawTypeRef::TypeQuery`'s
+                                // doc comment; found live: `_fetchFn`/`log`/
+                                // `_now`/`spawnRipgrepCmd`/`matchQuery`, each
+                                // a `typeof`-typed field called through
+                                // `this`. `member_type_ref` returning any
+                                // OTHER `ResolvedTypeRef` (or `None`) leaves
+                                // this exact same `target` untouched below --
+                                // this check only ever REDIRECTS or
+                                // DOWNGRADES the naive name match, never
+                                // upgrades it.
+                                if let Some(urdira_jsts_typeflow::ResolvedTypeRef::TypeQuery(
+                                    query_target,
+                                )) = index.member_type_ref(
+                                    &base_entity,
+                                    member.property.name.as_str(),
+                                    is_static,
+                                ) {
+                                    return match query_target {
+                                        Some(entity_id) => TypeflowCallResolution::Resolved(
+                                            entity_id,
+                                            "member_type_query_target",
+                                        ),
+                                        None => TypeflowCallResolution::Unresolved,
+                                    };
+                                }
                                 return TypeflowCallResolution::Resolved(target, rule);
                             }
                             urdira_jsts_typeflow::MemberLookup::Many(targets) => {

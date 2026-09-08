@@ -919,6 +919,14 @@ fn collect_type_ref_import<'s>(
         RawTypeRef::ArrayOf(inner) | RawTypeRef::PromiseOf(inner) => {
             collect_type_ref_import(owning_path, inner, out);
         }
+        // G (E-P0l, 2026-09-08): byte-identical addition to `main.rs`'s own
+        // `collect_type_ref_import` -- see that copy's doc comment.
+        RawTypeRef::TypeQuery(Some(ReturnEntityRef::Imported {
+            specifier,
+            imported_name: Some(imported_name),
+        })) => {
+            out.insert((owning_path, specifier.as_str(), imported_name.as_str()));
+        }
         _ => {}
     }
 }

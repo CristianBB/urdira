@@ -1007,6 +1007,17 @@ fn collect_type_ref_import<'s>(
         RawTypeRef::ArrayOf(inner) | RawTypeRef::PromiseOf(inner) => {
             collect_type_ref_import(owning_path, inner, out);
         }
+        // G (E-P0l, 2026-09-08): `x: typeof ImportedFn` -- the SAME import
+        // need as a plain `RawTypeRef::Imported` leaf (see `RawTypeRef::
+        // TypeQuery`'s own doc comment); without this, `typeof ImportedFn`
+        // would stay pending forever even when the import itself closes
+        // cleanly.
+        RawTypeRef::TypeQuery(Some(urdira_jsts_typeflow::ReturnEntityRef::Imported {
+            specifier,
+            imported_name: Some(imported_name),
+        })) => {
+            out.insert((owning_path, specifier.as_str(), imported_name.as_str()));
+        }
         _ => {}
     }
 }
