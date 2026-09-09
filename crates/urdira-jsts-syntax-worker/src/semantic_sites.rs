@@ -3592,39 +3592,66 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// ids`. See `resolve_static_member_reference`'s/`resolve_call_target_
     /// typeflow`'s own call sites for the `own_member_ids` gate's removal.
     ///
-    /// The task's own three named "reliable" shapes -- "a parameter
-    /// annotated with a concrete interface", "`this` in a concrete class",
-    /// "a variable with a resolved annotation" -- collapse to exactly TWO
-    /// rule strings here: `"this"` (`class_stack`'s own frame is always the
-    /// syntactically enclosing, necessarily concrete, class -- never
-    /// inferred or propagated) and `"member_declared_type"` (`record_local_
-    /// type`'s explicit-annotation branch, used identically for a
-    /// parameter's own annotation and a local variable's own annotation --
-    /// see that function's doc comment: the untyped-initializer fallback
-    /// only ever runs when NO annotation exists at all). Four more are
-    /// reliable for the SAME reason (a literal, unambiguous name/proof,
-    /// never a guess) even though the task's own examples do not name them
-    /// individually: `"super"` (`super.m` bypasses any subclass override by
-    /// JS's own runtime semantics -- there is no "which sibling" question at
-    /// all), `"instanceof_narrowed"` (a PROVEN control-flow fact about this
-    /// exact position, not an inferred/propagated type -- see `narrowed_
-    /// target_is_a_callable_kind`'s own doc comment for the one place this
-    /// crate already treats it as authoritative), `"type_predicate_
-    /// narrowed"` (E-P0p, 2026-09-09: the SAME kind of proven control-flow
-    /// fact as `instanceof_narrowed`, just reached through a user-defined
-    /// `this is T` predicate call instead of a literal `instanceof` check
-    /// -- see `type_predicate_narrowings`'s own doc comment), `"member_
-    /// class_static"` and `"member_new_expression"` (`ClassName.member`/
-    /// `new ClassName()` name one concrete declaration directly, by literal
-    /// syntax, exactly like an explicit annotation does). Every OTHER rule
-    /// (`"member_declared_type_chain"`, `"call_return_type"`, `"object_
-    /// shape_static"`, `"array_element"`, `"record_element"`, `"await"`,
-    /// `"parenthesized"`, `"non_null"`, `"as_expression"`, `"type_
-    /// assertion"`, `"inline_type_literal_member"`, ...) is some form of
+    /// E-P0r (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §17.4 pattern 1, the DOMINANT VS Code residual left after E-P0q: 28
+    /// of 34 distinct reference pairs, 22 of ~27 distinct call pairs)
+    /// REMOVES `"member_declared_type"` from this allow-list. E-P0o/E-P0p
+    /// treated it as reliable on the theory that an explicit annotation
+    /// (`x: I`) pins the receiver "by literal syntax" the same way `this`/
+    /// `super`/`new C()`/`ClassName.static` do -- live VS Code samples
+    /// disprove that for THIS one rule specifically: a parameter/local
+    /// annotated `: I` is v3's real STATIC type for `x` only until flow
+    /// narrows it further (assignment tracking, a generic instantiation, a
+    /// narrowing shape this crate does not itself model) -- if a known
+    /// subtype of `I` ALSO redeclares the member, v3's own per-call-site
+    /// answer sometimes lands on that narrower declaration instead of
+    /// `I.m` (`editorBrowser.ts`/`model.ts`/`actions.ts`/... samples,
+    /// `IAction`/`Action` structurally representative). `"this"`/`"super"`/
+    /// `"member_class_static"`/`"member_new_expression"` are NOT affected
+    /// by this change and stay reliable: unlike an annotation, none of them
+    /// is EVER subject to that kind of flow narrowing -- `this`/`super`
+    /// bind to the syntactically enclosing (or immediate parent) class by
+    /// JS's own runtime semantics, `ClassName.member`/`new ClassName()`
+    /// name one concrete declaration directly, by literal syntax, with no
+    /// annotation-vs-actual-value gap to narrow at all. `"instanceof_
+    /// narrowed"`/`"type_predicate_narrowed"` also stay reliable for the
+    /// SAME reason decision 28 already carves out (see the block comment on
+    /// `type_predicate_narrowing_confirms_the_narrowed_descendants_own_
+    /// declaration_for_read_and_call`): a PROVEN control-flow fact about
+    /// THIS exact position, not the declared/annotated type -- when the
+    /// narrowed class itself redeclares the member, `resolve_static_member_
+    /// reference`/`resolve_call_target_typeflow`'s own `instanceof_narrowed_
+    /// class`/narrowing-specific branches (run BEFORE this allow-list is
+    /// even consulted) already demote those separately; this allow-list
+    /// entry only ever matters for a receiver reached with NO active
+    /// narrowing at all.
+    ///
+    /// Once `"member_declared_type"` is removed here, dropping through to
+    /// `ProgramIndex::sibling_conformance_overrides` produces EXACTLY the
+    /// rule decision 28 (E-P0r amendment) specifies: `I`'s own declaration
+    /// stays the resolved `target` when NO known subtype of `I` redeclares
+    /// the member (`candidates` empty -- the common, zero-cost case, e.g.
+    /// `explicitly_annotated_parameter_of_the_narrower_sibling_interface_
+    /// still_confirms`'s own `IDerived` receiver, which has no further
+    /// redeclaring descendant); a bounded (`<= MAX_CANDIDATE_TARGETS`) set
+    /// demotes to `possible` with `{I.m} ∪ {S.m : S redeclares}`, never a
+    /// guessed-down subset; an unbounded set stays pending with NO list at
+    /// all (`REASON_SIBLING_CONFORMANCE_UNBOUNDED`) -- identical cost/
+    /// correctness discipline to the `implements`-conformance case E-P0q
+    /// already shipped, since this is the exact same call site, now simply
+    /// reached for one more rule string.
+    ///
+    /// Every OTHER rule (`"member_declared_type_chain"`, `"variable_
+    /// declared_type"`, `"call_return_type"`, `"object_shape_static"`,
+    /// `"array_element"`, `"record_element"`, `"await"`, `"parenthesized"`,
+    /// `"non_null"`, `"as_expression"`, `"type_assertion"`, `"inline_type_
+    /// literal_member"`, ...) was ALREADY not on this list -- some form of
     /// INFERENCE or PROPAGATION through a chain this crate does not itself
-    /// narrow the way TypeScript's real checker does -- not reliable enough
-    /// to trust `members()`'s own match (own OR inherited) over a known
-    /// sibling override.
+    /// narrow the way TypeScript's real checker does, already sibling-
+    /// checked before this change (e.g. `this.x: I` reached via `"member_
+    /// declared_type_chain"`, a SEPARATE rule string from the direct-
+    /// identifier `"member_declared_type"` this change touches -- see
+    /// `type_of_static_member`'s own doc comment).
     fn rule_pins_receiver_uniquely(rule: &str) -> bool {
         matches!(
             rule,
@@ -3632,7 +3659,6 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 | "super"
                 | "instanceof_narrowed"
                 | "type_predicate_narrowed"
-                | "member_declared_type"
                 | "member_class_static"
                 | "member_new_expression"
         )
@@ -4820,9 +4846,12 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                                         member.property.name.as_str(),
                                         false,
                                     ) {
-                                        urdira_jsts_typeflow::MemberLookup::One(narrowed_target)
-                                            if narrowed_target == target => {}
-                                        urdira_jsts_typeflow::MemberLookup::One(narrowed_target) => {
+                                        urdira_jsts_typeflow::MemberLookup::One(
+                                            narrowed_target,
+                                        ) if narrowed_target == target => {}
+                                        urdira_jsts_typeflow::MemberLookup::One(
+                                            narrowed_target,
+                                        ) => {
                                             urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             let mut targets = vec![target, narrowed_target];
@@ -12231,11 +12260,15 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
 
     /// Control: when the receiver is instead a PARAMETER explicitly
     /// annotated with the NARROWER sibling interface directly (`host:
-    /// IDerived`, `member_declared_type` -- one of `rule_pins_receiver_
-    /// uniquely`'s reliable rules), the read must stay CONFIRMED to that
-    /// interface's own declaration, unaffected by the sibling relationship
-    /// -- decision 28's "confirmation stays when the receptor is typed
-    /// uniquely" carve-out.
+    /// IDerived`, `"member_declared_type"` -- E-P0r (2026-09-09) removed
+    /// this rule from `rule_pins_receiver_uniquely`'s allow-list, so this
+    /// now goes through `ProgramIndex::sibling_conformance_overrides` like
+    /// every other annotation-pinned receiver), the read must stay
+    /// CONFIRMED to that interface's own declaration, because `IDerived` has
+    /// no FURTHER known descendant that redeclares `getModel` -- the
+    /// "annotation with no known redeclaring subtype" half of decision 28's
+    /// E-P0r amendment (zero cost: `sibling_conformance_overrides` returns
+    /// an empty candidate set here).
     #[test]
     fn explicitly_annotated_parameter_of_the_narrower_sibling_interface_still_confirms() {
         let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IDerived extends IBase {\n  getModel(): string;\n}\nfunction use(host: IDerived) {\n  host.getModel;\n}\n";
@@ -12265,50 +12298,70 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         );
     }
 
-    /// E-P0p (2026-09-09) control case, formerly named `..._stays_
-    /// confirmed_not_generalized_to`: an EXPLICITLY annotated parameter
-    /// (`mid: IMid`, `member_declared_type` -- one of `rule_pins_receiver_
-    /// uniquely`'s reliable rules) whose entity does NOT itself declare the
+    /// E-P0r (2026-09-09) rewrite of E-P0p's own control case (formerly
+    /// `sibling_declaration_via_an_inherited_match_with_a_reliable_rule_
+    /// still_confirms`, which asserted the OPPOSITE outcome under the
+    /// pre-E-P0r rule): an EXPLICITLY annotated parameter (`mid: IMid`,
+    /// `"member_declared_type"`) whose entity does NOT itself declare the
     /// member (the match comes from its OWN ancestor, `IBase`, via ordinary
     /// inheritance) while a FURTHER descendant of `IMid` (`INarrow extends
-    /// IMid`) redeclares it. E-P0o originally left this CONFIRMED only
-    /// because it never even consulted the sibling-candidate mechanism for
-    /// an inherited match at all (`own_member_ids`-gated); E-P0p removed
-    /// that gate, so this test now demonstrates the SAME `rule_pins_
-    /// receiver_uniquely` control decision 28 already established for the
-    /// OWN-declaration shape (`explicitly_annotated_parameter_of_the_
-    /// narrower_sibling_interface_still_confirms`, right above) -- a
-    /// reliably-typed receiver's own resolution stands regardless of
-    /// whether the match is a direct or an inherited declaration. See
-    /// `sibling_declaration_ambiguous_inherited_match_produces_candidate_
-    /// reference_rows_when_the_receiver_is_not_reliably_typed` right below
-    /// for the shape that DOES now change (an inherited match reached
-    /// through a NON-reliable rule).
+    /// IMid`) redeclares it. E-P0r removed `"member_declared_type"` from
+    /// `rule_pins_receiver_uniquely`'s allow-list precisely because live VS
+    /// Code samples showed this exact shape (an interface-typed receiver
+    /// whose member is redeclared by a known descendant) sometimes has a v3
+    /// answer NARROWER than the annotated type's own declaration -- so this
+    /// now demotes to `possible` with both candidates, own-vs-inherited
+    /// making no difference (`ProgramIndex::sibling_conformance_overrides`
+    /// already only ever returns descendants of `IMid` regardless of
+    /// whether `IMid` declares the member directly or inherits it), exactly
+    /// like `sibling_declaration_ambiguous_inherited_match_produces_
+    /// candidate_reference_rows_when_the_receiver_is_not_reliably_typed`
+    /// right below already does for the `this.mid`-chain shape.
     #[test]
-    fn sibling_declaration_via_an_inherited_match_with_a_reliable_rule_still_confirms() {
+    fn sibling_declaration_via_an_inherited_match_now_demotes_to_possible() {
         let source = "interface IBase {\n  getModel(): unknown;\n}\ninterface IMid extends IBase {\n  other(): void;\n}\ninterface INarrow extends IMid {\n  getModel(): string;\n}\nfunction use(mid: IMid) {\n  mid.getModel;\n}\n";
         let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
         let semantics =
             analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
         let base_get_model_id = "jsts:method:a.ts:20:getModel";
+        let narrow_get_model_id = "jsts:method:a.ts:128:getModel";
         assert_eq!(
             source[20..].get(..8),
             Some("getModel"),
             "test's own assumed IBase::getModel offset drifted"
         );
+        assert_eq!(
+            source[128..].get(..8),
+            Some("getModel"),
+            "test's own assumed INarrow::getModel offset drifted"
+        );
         assert!(
             resolved(&semantics)
                 .iter()
-                .any(|row| row.3 == base_get_model_id),
-            "mid.getModel must stay confirmed to IMid's own inherited \
-             (IBase) declaration -- an explicitly annotated, reliably-typed \
-             receiver stands regardless of own vs. inherited: rows={:?}",
+                .all(|row| row.3 != base_get_model_id && row.3 != narrow_get_model_id),
+            "mid.getModel must NEVER confirm to either declaration once a \
+             known descendant of the annotated type redeclares the member: \
+             rows={:?}",
             resolved(&semantics)
         );
-        assert!(
-            semantics.candidate_reference_rows.is_empty(),
-            "a reliably-typed receiver must never produce a sibling \
-             candidate row, own or inherited: rows={:?}",
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([base_get_model_id.to_owned(), narrow_get_model_id.to_owned()]),
+            "both the inherited-from declaration and the descendant's own \
+             redeclaration must be present as candidates: rows={:?}",
             semantics.candidate_reference_rows
         );
     }
@@ -12463,22 +12516,23 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
     }
 
     /// E-P0p (2026-09-09) safety companion, mirroring `instanceof_
-    /// narrowing_never_leaks_past_its_own_guarded_region`: the SAME shape,
-    /// but the read is OUTSIDE the guarded region (after the whole `if`) --
-    /// `editor: IEditor` is an EXPLICIT parameter annotation naming
-    /// `IEditor` directly (`"member_declared_type"`, one of `rule_pins_
-    /// receiver_uniquely`'s reliable rules) and `IEditor` declares
-    /// `getModel` itself (an OWN declaration, not inherited) -- so once
-    /// OUTSIDE the guard, the receiver's ordinary (unnarrowed) resolution
-    /// correctly stays CONFIRMED to `IEditor`'s own declaration REGARDLESS
-    /// of `IActiveCodeEditor`'s own known redeclaration (decision 28's
-    /// established "a reliably-typed receiver's own resolution stands"
-    /// carve-out, unaffected by any sibling -- see `explicitly_annotated_
-    /// parameter_of_the_narrower_sibling_interface_still_confirms`'s
-    /// identical shape). The only thing this test proves is that the
+    /// narrowing_never_leaks_past_its_own_guarded_region`, REWRITTEN by
+    /// E-P0r (2026-09-09): the SAME shape, but the read is OUTSIDE the
+    /// guarded region (after the whole `if`) -- `editor: IEditor` is an
+    /// EXPLICIT parameter annotation naming `IEditor` directly
+    /// (`"member_declared_type"`, no longer one of `rule_pins_receiver_
+    /// uniquely`'s reliable rules as of E-P0r) and `IActiveCodeEditor
+    /// extends IEditor` redeclares `getModel` -- so once OUTSIDE the guard,
+    /// the receiver's ordinary (unnarrowed) resolution now correctly
+    /// demotes to `possible` with BOTH declarations as candidates, same as
+    /// `explicitly_annotated_parameter_of_the_narrower_sibling_interface_
+    /// still_confirms`'s sibling test class demonstrates for the
+    /// no-narrowing case in general. What this test still proves: the
     /// `hasModel()` narrowing itself does NOT leak past its own guarded
-    /// region -- `editor.getModel` after the `if` must never resolve to
-    /// `IActiveCodeEditor`'s own (narrowed) redeclaration.
+    /// region -- `editor.getModel` after the `if` must never CONFIRM to
+    /// `IActiveCodeEditor`'s own (narrowed) redeclaration ALONE (that would
+    /// mean the narrowing wrongly survived); it may only appear paired with
+    /// the base declaration inside the sibling-ambiguity candidate set.
     #[test]
     fn type_predicate_narrowing_never_leaks_past_its_own_guarded_region() {
         let source = "interface IEditor {\n  getModel(): unknown;\n  hasModel(): this is IActiveCodeEditor;\n}\ninterface IActiveCodeEditor extends IEditor {\n  getModel(): string;\n}\nfunction use(editor: IEditor) {\n  if (editor.hasModel()) {\n    // narrowed here only\n  }\n  editor.getModel;\n}\n";
@@ -12490,21 +12544,34 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         assert!(
             resolved(&semantics)
                 .iter()
-                .any(|row| row.3 == base_get_model_id),
-            "editor.getModel AFTER the guarded if-block must still resolve \
-             normally to IEditor's own (unnarrowed, reliably-typed) \
-             declaration: rows={:?}",
+                .all(|row| row.3 != base_get_model_id && row.3 != active_get_model_id),
+            "editor.getModel AFTER the guarded if-block must never CONFIRM \
+             to either declaration once IActiveCodeEditor is a known \
+             redeclaring conformer of IEditor -- and in particular must \
+             never confirm to IActiveCodeEditor's own declaration ALONE, \
+             which would mean the hasModel() narrowing leaked past its own \
+             guarded region: rows={:?}",
             resolved(&semantics)
         );
-        assert!(
-            resolved(&semantics)
-                .iter()
-                .all(|row| row.3 != active_get_model_id),
-            "editor.getModel AFTER the guarded if-block must never resolve \
-             to IActiveCodeEditor's own declaration -- the hasModel() \
-             narrowing must not leak past its own guarded region: \
-             rows={:?}",
-            resolved(&semantics)
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([base_get_model_id.to_owned(), active_get_model_id.to_owned()]),
+            "both IEditor's own declaration and IActiveCodeEditor's own \
+             redeclaration must be present as candidates: rows={:?}",
+            semantics.candidate_reference_rows
         );
     }
 
@@ -12585,12 +12652,17 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         );
     }
 
-    /// E-P0p (2026-09-09) safety companion: the SAME negated-guard shape,
-    /// but the consequent does NOT definitely exit (no `return`/`throw`/
-    /// `continue`/`break` at all) -- `statement_definitely_exits` must
-    /// refuse to narrow anything past this `if`, since reaching the
-    /// statement after it proves nothing about whether the guard's own
-    /// body ran to completion or fell through.
+    /// E-P0p (2026-09-09) safety companion, REWRITTEN by E-P0r (2026-09-09):
+    /// the SAME negated-guard shape, but the consequent does NOT definitely
+    /// exit (no `return`/`throw`/`continue`/`break` at all) --
+    /// `statement_definitely_exits` must refuse to narrow anything past
+    /// this `if`, since reaching the statement after it proves nothing
+    /// about whether the guard's own body ran to completion or fell
+    /// through. Since E-P0r, the "unnarrowed" resolution itself is now
+    /// `possible` (IActiveCodeEditor is a known redeclaring conformer of
+    /// IEditor) -- what this test still proves is that the negated guard
+    /// contributes NO extra narrowing on top of that: `editor.getModel`
+    /// must never CONFIRM to IActiveCodeEditor's declaration alone.
     #[test]
     fn negated_predicate_guard_without_a_definite_exit_never_narrows_what_follows() {
         let source = "interface IEditor {\n  getModel(): unknown;\n  hasModel(): this is IActiveCodeEditor;\n}\ninterface IActiveCodeEditor extends IEditor {\n  getModel(): string;\n}\nfunction use(editor: IEditor) {\n  if (!editor.hasModel()) {\n    console.log('no model');\n  }\n  editor.getModel;\n}\n";
@@ -12602,19 +12674,32 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         assert!(
             resolved(&semantics)
                 .iter()
-                .any(|row| row.3 == base_get_model_id),
-            "editor.getModel, after a guard that does not definitely exit, \
-             must still resolve normally to IEditor's own (unnarrowed) \
-             declaration: rows={:?}",
+                .all(|row| row.3 != active_get_model_id),
+            "editor.getModel must never be wrongly, confidently narrowed to \
+             IActiveCodeEditor's own declaration when the guard does not \
+             provably exit: rows={:?}",
             resolved(&semantics)
         );
-        assert!(
-            resolved(&semantics)
-                .iter()
-                .all(|row| row.3 != active_get_model_id),
-            "editor.getModel must never be wrongly narrowed when the guard \
-             does not provably exit: rows={:?}",
-            resolved(&semantics)
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([base_get_model_id.to_owned(), active_get_model_id.to_owned()]),
+            "the unnarrowed resolution (now `possible`, since IEditor is an \
+             annotation-pinned receiver with a known redeclaring conformer) \
+             must still list both declarations as candidates: rows={:?}",
+            semantics.candidate_reference_rows
         );
     }
 
@@ -12670,17 +12755,23 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         );
     }
 
-    /// E-P0q: decision 28's own "confirmation stays when the receiver is
-    /// typed uniquely" carve-out, verified for the NEW `implements` shape
-    /// specifically -- `a: IAction` is an explicit, reliable annotation, so
-    /// `a.run` must confirm to `IAction`'s OWN declaration, never `Action`'s
-    /// implementing override (`resolve_static_member_reference`'s own `One`
-    /// match already only ever sees `IAction`'s own resolved member; the
-    /// task's own instruction -- "para un receptor `: I` el destino es
-    /// `I.m`, no la implementación" -- is exactly this).
+    /// E-P0r (2026-09-09) rewrite: this used to be decision 28's own
+    /// "confirmation stays when the receiver is typed uniquely" carve-out
+    /// for the `implements` shape -- `a: IAction` was an explicit,
+    /// `rule_pins_receiver_uniquely`-reliable annotation, so `a.run`
+    /// confirmed to `IAction`'s own declaration unconditionally. This is
+    /// EXACTLY `docs/evidence/2026-09-07-v4-vscode-campaign.md` §17.4
+    /// pattern 1, the dominant VS Code residual E-P0r closes:
+    /// `"member_declared_type"` is no longer in `rule_pins_receiver_
+    /// uniquely`'s allow-list (a live v3 sample sometimes resolves an
+    /// annotation-pinned receiver to a redeclaring conformer instead of the
+    /// interface's own declaration, a flow-narrowing precision this crate
+    /// does not model), so `a.run` must now demote to `possible` with BOTH
+    /// `IAction.run` and `Action.run`, matching `implements_sibling_
+    /// ambiguity_demotes_to_candidate_reference_rows_when_the_receiver_is_
+    /// not_reliably_typed`'s own `this.action`-chain shape exactly.
     #[test]
-    fn implements_sibling_candidate_set_reliably_typed_receiver_still_confirms_to_the_interfaces_own_declaration()
-     {
+    fn implements_sibling_candidate_set_annotated_parameter_now_demotes_to_possible() {
         let source = "interface IAction {\n  run(): void;\n}\nclass Action implements IAction {\n  run(): void {}\n}\nfunction use(a: IAction) {\n  a.run;\n}\n";
         let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
         let semantics =
@@ -12690,23 +12781,74 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         assert!(
             resolved(&semantics)
                 .iter()
-                .any(|row| row.3 == iaction_run_id),
-            "a.run must confirm to IAction's own declaration: rows={:?}",
+                .all(|row| row.3 != iaction_run_id && row.3 != action_run_id),
+            "a.run must NEVER confirm to either declaration once a known \
+             conformer redeclares the member: rows={:?}",
             resolved(&semantics)
         );
-        assert!(
-            resolved(&semantics)
-                .iter()
-                .all(|row| row.3 != action_run_id),
-            "a.run must NEVER confirm to Action's implementing override: \
-             rows={:?}",
-            resolved(&semantics)
-        );
-        assert!(
-            semantics.candidate_reference_rows.is_empty(),
-            "a reliably-typed receiver must never produce a sibling \
-             candidate row: rows={:?}",
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([iaction_run_id.to_owned(), action_run_id.to_owned()]),
+            "both IAction's own declaration and Action's own implementing \
+             override must be present as candidates: rows={:?}",
             semantics.candidate_reference_rows
+        );
+    }
+
+    /// E-P0r (2026-09-09): unlike an explicit annotation (right above),
+    /// `new C()` pins the receiver by LITERAL construction syntax -- the
+    /// constructed value literally IS a `C`, there is no "declared vs
+    /// actual" gap flow-narrowing could ever widen away from.
+    /// `"member_new_expression"` stays in `rule_pins_receiver_uniquely`'s
+    /// allow-list unconditionally: the CALL through a fresh `new Base()`
+    /// stays CONFIRMED to `Base`'s own declaration even though `Sub extends
+    /// Base` redeclares the member.
+    #[test]
+    fn new_expression_receiver_stays_confirmed_even_when_a_known_subclass_overrides_the_member() {
+        let source = "class Base {\n  run(): void {}\n}\nclass Sub extends Base {\n  run(): void {}\n}\nfunction use() {\n  new Base().run();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_run_id = "jsts:method:a.ts:15:run";
+        assert_eq!(
+            source[15..].get(..3),
+            Some("run"),
+            "test's own assumed Base::run offset drifted"
+        );
+        let call_targets: Vec<String> = semantics
+            .typeflow_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            call_targets,
+            vec![base_run_id.to_owned()],
+            "new Base().run() must stay confirmed to Base's own declaration \
+             even though Sub redeclares run: {call_targets:?}"
+        );
+        assert!(
+            semantics.candidate_call_rows.is_empty(),
+            "a `new`-constructed receiver must never produce a sibling \
+             candidate row: rows={:?}",
+            semantics.candidate_call_rows
         );
     }
 
@@ -12790,9 +12932,11 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
     }
 
     /// E-P0q safety companion, mirroring `negated_predicate_guard_without_
-    /// a_definite_exit_never_narrows_what_follows`: the SAME negated-
-    /// `instanceof` guard, but the consequent does not definitely exit --
-    /// must narrow nothing.
+    /// a_definite_exit_never_narrows_what_follows`, REWRITTEN by E-P0r
+    /// (2026-09-09): the SAME negated-`instanceof` guard, but the
+    /// consequent does not definitely exit -- must narrow nothing on top of
+    /// the (now `possible`, since `GithubSlug implements ISlug` redeclares
+    /// `value` and `ISlug` is only annotation-pinned) baseline resolution.
     #[test]
     fn negated_instanceof_guard_without_a_definite_exit_never_narrows_what_follows() {
         let source = "interface ISlug {\n  readonly value: string;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n}\nfunction use(other: ISlug): string {\n  if (!(other instanceof GithubSlug)) {\n    console.log('not a github slug');\n  }\n  return other.value;\n}\n";
@@ -12803,15 +12947,33 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         let github_slug_value_id = "jsts:parameter:a.ts:112:value";
         let rows = resolved(&semantics);
         assert!(
-            rows.iter().any(|row| row.3 == interface_value_id),
-            "other.value, after a guard that does not definitely exit, must \
-             still resolve normally to ISlug's own (unnarrowed) interface \
-             property: rows={rows:?}"
-        );
-        assert!(
             rows.iter().all(|row| row.3 != github_slug_value_id),
-            "other.value must never be wrongly narrowed when the guard does \
-             not provably exit: rows={rows:?}"
+            "other.value must never be wrongly, confidently narrowed to \
+             GithubSlug's own parameter property when the guard does not \
+             provably exit: rows={rows:?}"
+        );
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([
+                interface_value_id.to_owned(),
+                github_slug_value_id.to_owned()
+            ]),
+            "the unnarrowed resolution must still list both declarations as \
+             candidates: rows={:?}",
+            semantics.candidate_reference_rows
         );
     }
 
@@ -15264,10 +15426,17 @@ declare module \"mymod\" {
         );
     }
 
-    /// E-P0k safety companion: the SAME shape, but the member read is
-    /// OUTSIDE the guarded region (after the `if`, or on the `else` side) --
-    /// must NOT be narrowed (this mechanism never proves anything about a
-    /// negative `instanceof` case or anything past the guarded region).
+    /// E-P0k safety companion, REWRITTEN by E-P0r (2026-09-09): the SAME
+    /// shape, but the member read is OUTSIDE the guarded region (after the
+    /// `if`, or on the `else` side) -- must NOT be narrowed (this mechanism
+    /// never proves anything about a negative `instanceof` case or anything
+    /// past the guarded region). Since E-P0r, the baseline (unnarrowed)
+    /// resolution of an annotation-pinned `ISlug` receiver is itself
+    /// `possible` (`GithubSlug implements ISlug` redeclares `value`) -- what
+    /// this test still proves is that the `instanceof` narrowing inside the
+    /// `if` contributes NOTHING extra outside it: `other.value` after the
+    /// guard must never CONFIRM to `GithubSlug`'s own parameter property
+    /// alone.
     #[test]
     fn instanceof_narrowing_never_leaks_past_its_own_guarded_region() {
         let source = "interface ISlug {\n  readonly value: string;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n}\nfunction use(other: ISlug): string {\n  if (other instanceof GithubSlug) {\n    // narrowed here only\n  }\n  return other.value;\n}\n";
@@ -15279,14 +15448,33 @@ declare module \"mymod\" {
         let rows = resolved(&semantics);
         assert!(
             rows.iter().all(|row| row.3 != github_slug_value_id),
-            "other.value AFTER the guarded if-block must never resolve to \
-             GithubSlug's own parameter property: rows={rows:?}"
-        );
-        assert!(
-            rows.iter().any(|row| row.3 == interface_value_id),
-            "other.value AFTER the guarded if-block must still resolve \
-             normally to ISlug's own (unnarrowed) interface property: \
+            "other.value AFTER the guarded if-block must never CONFIRM to \
+             GithubSlug's own parameter property ALONE -- that would mean \
+             the instanceof narrowing leaked past its own guarded region: \
              rows={rows:?}"
+        );
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([
+                interface_value_id.to_owned(),
+                github_slug_value_id.to_owned()
+            ]),
+            "the unnarrowed resolution must still list both declarations as \
+             candidates: rows={:?}",
+            semantics.candidate_reference_rows
         );
     }
 
@@ -15397,7 +15585,10 @@ declare module \"mymod\" {
             .collect();
         candidate_targets.sort();
         candidate_targets.dedup();
-        let mut expected = vec![base_get_control_id.to_owned(), sub_get_control_id.to_owned()];
+        let mut expected = vec![
+            base_get_control_id.to_owned(),
+            sub_get_control_id.to_owned(),
+        ];
         expected.sort();
         assert_eq!(
             candidate_targets, expected,

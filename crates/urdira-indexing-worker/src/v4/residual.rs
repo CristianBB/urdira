@@ -6299,7 +6299,33 @@ mod tests {
         // that same section for the exact before/after figures). Not a
         // regression to chase down. The +-4 tolerance itself is unchanged;
         // only the live target moved.
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_843;
+        //
+        // Refreshed AGAIN 2026-09-09 (E-P0r, `docs/evidence/2026-09-07-v4-
+        // vscode-campaign.md` §18): `"member_declared_type"` removed from
+        // `semantic_sites.rs`'s `rule_pins_receiver_uniquely` allow-list --
+        // an annotation-pinned receiver (`x: I` parameter/local, no active
+        // narrowing) now ALSO goes through `sibling_conformance_overrides`
+        // like every other unreliable-rule receiver, closing the DOMINANT
+        // VS Code residual (`docs/evidence/2026-09-07-v4-vscode-campaign.md`
+        // §17.4 pattern 1). On n8n this correctly demotes a further handful
+        // of previously confident-but-occasionally-wrong call confirmations
+        // to `possible`/pending (live cold-scan counts:
+        // `sibling_declaration_ambiguous` 731 -> 2,369 pending IdentifierRef
+        // sites, `sibling_conformance_unbounded` 18 -> 37).
+        // `confirmed_combined` drops by 41 (161,843 -> **161,802**, this
+        // session's own measurement, `URDIRA_V4_RESIDUAL_BUDGET_MS=15000`:
+        // core:call confirmed 159,934 + possible 669, heritage confirmed
+        // 1,868 -- `confirmed_combined` itself sums only the two CONFIRMED
+        // buckets, 159,934 + 1,868 = 161,802). Same "intended, safety-
+        // improving direction" every prior refresh above documents (fewer
+        // confirmed sites, never a wrong one) -- `different == 0` still
+        // holds in n8n's own references/calls parity for this exact build
+        // (see the evidence doc's own §18: references `v4_different_target=
+        // 0`, calls `v4_confirmed_different_target=0`); VS Code's own
+        // `different` count also dropped (see that same section). Not a
+        // regression to chase down. The +-4 tolerance itself is unchanged;
+        // only the live target moved.
+        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_802;
         const CONFIRMED_COMBINED_TOLERANCE: u64 = 4;
         let confirmed_combined_diff =
             final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);

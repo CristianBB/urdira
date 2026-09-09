@@ -944,7 +944,9 @@ fn summarize_function(
     let return_type = patch_predicate_parameter_position(return_type, &function.params);
     // E-P0q: annotation-present-but-unclassified must never fall through to
     // body inference -- see `member_entry_of_class_element`'s own comment.
-    let pending_return = function.return_type.is_none()
+    let pending_return = function
+        .return_type
+        .is_none()
         .then(|| {
             collect_pending_return_shapes(
                 function.body.as_deref(),
@@ -1081,7 +1083,9 @@ fn object_shape_members_of(
                     import_specifiers,
                     synthetic_interfaces,
                 );
-                let pending_return = function.return_type.is_none()
+                let pending_return = function
+                    .return_type
+                    .is_none()
                     .then(|| {
                         if function.expression {
                             collect_pending_return_shapes_concise(
@@ -1112,7 +1116,9 @@ fn object_shape_members_of(
                     import_specifiers,
                     synthetic_interfaces,
                 );
-                let pending_return = function.return_type.is_none()
+                let pending_return = function
+                    .return_type
+                    .is_none()
                     .then(|| {
                         collect_pending_return_shapes(
                             function.body.as_deref(),
