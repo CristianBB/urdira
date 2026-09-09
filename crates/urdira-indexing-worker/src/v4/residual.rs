@@ -6269,7 +6269,37 @@ mod tests {
         // dropped (461->281 references, 317->153 calls) rather than grew.
         // Not a regression to chase down. The +-4 tolerance itself is
         // unchanged; only the live target moved.
-        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_903;
+        //
+        // Refreshed AGAIN 2026-09-09 (E-P0q, `docs/evidence/2026-09-07-v4-
+        // vscode-campaign.md` §17): three new decision-28 rules --
+        // `ProgramIndex::sibling_conformance_overrides` (the E-P0o/E-P0p
+        // sibling-candidate check generalized from `extends`-only to
+        // `implements` conformance too, capped at `MAX_CANDIDATE_TARGETS`
+        // candidates -- a set larger than the cap demotes to pending with NO
+        // candidate list, `REASON_SIBLING_CONFORMANCE_UNBOUNDED`, rather than
+        // a guessed-down `possible` subset), a negated-`instanceof`-early-
+        // return narrowing (`extract_negated_instanceof_narrowings_from_
+        // early_exit_test`, the literal-`instanceof` sibling of E-P0p's own
+        // negated type-predicate idiom), and a standalone-function `param is
+        // T` type-predicate narrowing (`ProgramIndex::function_predicate_
+        // parameter_narrowing`, closing the `isFoo(x)`-as-a-bare-function-
+        // call shape `PredicateSubject::Parameter` was represented but never
+        // consulted for) -- each correctly demotes a further handful of n8n
+        // sites from a confident-looking confirmed target to `possible`/
+        // pending (the `implements`-conformance generalization is the
+        // dominant contributor, matching its own VS Code dominance, `docs/
+        // evidence/2026-09-07-v4-vscode-campaign.md` §16.4 pattern 1).
+        // `confirmed_combined` drops by 60 (161,903 -> **161,843**, this
+        // session's own measurement, `URDIRA_V4_RESIDUAL_BUDGET_MS=15000`).
+        // Same "intended, safety-improving direction" every prior refresh
+        // above documents (fewer confirmed sites, never a wrong one) --
+        // `different == 0` still holds in n8n's own references/calls parity
+        // for this same build (see the evidence doc's own §17); VS Code's
+        // own residual `different` count also dropped rather than grew (see
+        // that same section for the exact before/after figures). Not a
+        // regression to chase down. The +-4 tolerance itself is unchanged;
+        // only the live target moved.
+        const REFERENCE_CONFIRMED_COMBINED: u64 = 161_843;
         const CONFIRMED_COMBINED_TOLERANCE: u64 = 4;
         let confirmed_combined_diff =
             final_confirmed_combined.abs_diff(REFERENCE_CONFIRMED_COMBINED);

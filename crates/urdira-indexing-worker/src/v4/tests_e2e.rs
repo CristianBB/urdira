@@ -6136,6 +6136,32 @@ fn reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
     // importers (previously invisible only because the edge silently
     // never resolved -- this expectation was calibrated against that bug,
     // per `docs/evidence/2026-09-07-v4-vscode-campaign.md` §13.1).
+    //
+    // E-P0q (2026-09-09, sibling-conformance-dependents integrity fix):
+    // `src/services/task-service.ts` now ALSO appears here -- it only ever
+    // imports the `TaskRepository` INTERFACE (`src/repository/task-
+    // repository.ts`), never `InMemoryTaskRepository` directly, so the
+    // ordinary import-graph cascade above never reaches it. But
+    // `TaskService`'s own constructor-injected `this.repository: TaskRepository`
+    // reads (`create`/`findById`/`listByStatus`/`save`) are exactly the
+    // `implements`-sibling-conformance-ambiguous shape this task's own
+    // `sibling_conformance_overrides` generalization detects: `TaskRepository`
+    // declares each method itself AND `InMemoryTaskRepository implements
+    // TaskRepository` redeclares every one of them, so at generation 1
+    // (before the delete) each of those 4 reads/calls demoted to a
+    // `possible` candidate pair citing BOTH declarations, recording a
+    // `sibling_conformance_dependencies` edge from `task-service.ts` to
+    // `in-memory-task-repository.ts` (`OwnerSemantics::sibling_conformance_
+    // dependencies`'s own doc comment has the full root-cause writeup).
+    // Deleting the ONLY conformer resolves the previous ambiguity (the
+    // reads become directly confirmed to `TaskRepository`'s own
+    // declaration) -- WITHOUT the reverse-dependent widening this task
+    // added, `task-service.ts` would never be reanalyzed and its stale
+    // `possible` rows (still citing the now-deleted `InMemoryTaskRepository`
+    // methods) would diverge from a from-scratch scan of the same final
+    // tree forever, exactly the regression `reconcile_delete_roots_match_
+    // a_from_scratch_scan_of_the_mutated_tree` (right below) caught live
+    // this session.
     let mut touched = touched.expect("Delta mode reports touched owner paths");
     touched.sort();
     assert_eq!(
@@ -6144,6 +6170,7 @@ fn reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
             "src/index.ts".to_string(),
             "src/main.ts".to_string(),
             deleted_relative.to_string(),
+            "src/services/task-service.ts".to_string(),
             "test/task-service.spec.ts".to_string(),
         ]
     );
@@ -6169,9 +6196,93 @@ fn reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree() {
 
     let reconciled_roots = roots_of(&reconciled);
     let oracle_roots = roots_of(&oracle);
-    assert_eq!(reconciled_roots.records, oracle_roots.records);
-    assert_eq!(reconciled_roots.dependency, oracle_roots.dependency);
-    assert_eq!(reconciled_roots.graph, oracle_roots.graph);
+    // E-P0q (2026-09-09, sibling-conformance-dependents integrity fix):
+    // `records` root raw equality is NOT the right comparator against an
+    // independent oracle once a TOUCHED owner's own identity can legitimately
+    // CHAIN (decision 11, `docs/decisions/11-content-derived-record-
+    // identity.md`; `records_logical_set_diff`'s own doc comment) --
+    // `reconcile_modify_produces_a_self_consistent_incremental_merkle_update`
+    // already uses this exact comparator for precisely this reason.  Before
+    // this task, this delete scenario never happened to touch an identity
+    // whose CLASSIFICATION itself changed across the delete (every reflowed
+    // file's own confirmed/pending shape was unaffected by the deletion, so
+    // raw root equality held by coincidence) -- this task's own `implements`-
+    // conformance generalization now correctly detects that `TaskService`'s
+    // `this.repository.create()`/`findById`/`listByStatus`/`save` calls were
+    // `possible` (ambiguous between `TaskRepository`'s own declaration and
+    // `InMemoryTaskRepository`'s conforming override) at generation 1, then
+    // reflows `task-service.ts` (via the new `sibling_conformance_
+    // dependencies` reverse-dependent edge, `touched`'s own assertion above)
+    // once the ONLY conformer is deleted, correctly RE-CONFIRMING those same
+    // 4 call/reference identities directly to `TaskRepository`'s own
+    // declaration at generation 2 -- a genuine possible -> confirmed content
+    // transition for an identity that PERSISTS across the delete, which
+    // `chained_record_id` (`diff.rs`) legitimately chains from its own
+    // generation-1 predecessor. A from-scratch oracle of the FINAL tree alone
+    // never goes through the generation-1 `possible` phase at all, so it
+    // always mints the kernel-cold `sha256(record_digest)` for that identity
+    // instead -- same final CONTENT (verified below via `record_digest`),
+    // different (both legitimate) `record_id` lineage.
+    let touched_owners: std::collections::HashSet<String> = touched.iter().cloned().collect();
+    let records_report = records_logical_set_diff(
+        &structural_root,
+        generation_of(&reconciled),
+        &oracle_structural,
+        generation_of(&oracle),
+        &touched_owners,
+    );
+    records_report.assert_matches_oracle("reconcile_delete vs independent oracle");
+    assert!(
+        records_report.chained_legit_touched >= 4,
+        "task-service.ts's own 4 possible->confirmed sibling-conformance \
+         identities (create/findById/listByStatus/save) should show up in \
+         the expected decision-11 chained bucket (got {} -- comparator or \
+         fixture wiring is wrong, or this task's own dependency-widening \
+         fix regressed)",
+        records_report.chained_legit_touched
+    );
+    assert_eq!(
+        reconciled_roots.dependency, oracle_roots.dependency,
+        "a delete must not disturb the dependency root vs an independent \
+         oracle: dependency identity carries no record_id chaining"
+    );
+    // E-P0q: the SAME decision-11 chaining that legitimately moved `records`
+    // off raw root equality above ALSO reaches `graph` here -- a `core:call`/
+    // `core:references` relation IS a `CATEGORY_RELATION` row, and 4 of
+    // `task-service.ts`'s own relations (the `possible` candidate targeting
+    // `TaskRepository`'s own declaration, one of the TWO ambiguous
+    // candidates `CandidateCallRow`/`CandidateReferenceRow` always publishes
+    // -- see those structs' own doc comments) are EXACTLY the persisting-
+    // identity, possible -> confirmed transition `records_logical_set_diff`
+    // already validated above (its own `iter_visible` has no category
+    // filter, so it already covers these 8 relation rows' CONTENT
+    // correctness too -- `chained_legit_touched=10` covers 2 non-relation
+    // identities per call plus these, confirmed live). What raw `graph` root
+    // equality does NOT tolerate is exactly this legitimate chaining, so
+    // this asserts the TOPOLOGY instead (mirroring `dump_graph_set_diff`'s
+    // own identity-key-set comparison, promoted from a diagnostic print to a
+    // real assertion): the relation SET (by `identity_key`, workspace/
+    // history-independent) must match exactly, with NO phantom or lost
+    // edges either way.
+    let relation_identities = |structural_root: &Path, generation: u64| {
+        StoreReader::open(structural_root)
+            .expect("diagnostic store reader opens")
+            .iter_visible(generation)
+            .filter(|view| view.category() == urdira_structural_store::row::CATEGORY_RELATION)
+            .map(|view| view.identity_key().to_vec())
+            .collect::<std::collections::HashSet<Vec<u8>>>()
+    };
+    let reconciled_relations = relation_identities(&structural_root, generation_of(&reconciled));
+    let oracle_relations = relation_identities(&oracle_structural, generation_of(&oracle));
+    assert_eq!(
+        reconciled_relations, oracle_relations,
+        "a delete must not disturb the SET of live relation identities vs \
+         an independent oracle, even though the raw `graph` root may \
+         legitimately differ from decision-11 record_id chaining (see this \
+         block's own comment above) -- a real topology difference (a \
+         phantom or lost `core:call`/`core:references`/... edge) would show \
+         up here regardless"
+    );
 
     let _ = std::fs::remove_dir_all(&scratch_root);
     let _ = std::fs::remove_dir_all(&oracle_root);

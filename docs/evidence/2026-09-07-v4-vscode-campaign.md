@@ -2005,3 +2005,242 @@ exact line back in E-P0k and why this task does not cross it.
   `packages/{canonical,storage,contracts}/node_modules/@urdira/*` symlinks, and every
   `packages/*/dist`/`*.tsbuildinfo` this session produced (untracked, gitignored) removed at
   session close.
+
+## 17. E-P0q (2026-09-09): `implements` conformance (capped), negated-`instanceof`
+early-return, standalone-function type predicate
+
+Base: `c729883` (E-P0p merged). Same reduced-tree checkout retained from an earlier session
+(`ep0q-vscode-reduced`, 12,841 TS/JS files, `node_modules` excluded -- matches E-P0o/E-P0m's own
+count, NOT E-P0p's own smaller 10,044-file rsync pass; not reconciled, same caveat every prior
+session's own file-count drift already carries). n8n corpus (`n8n-corpus-2026-09-02`, unreduced)
+unchanged. v3 oracles: `v3-vscode-2026-09-07`/`v3-n8n-2026-09-07-b`, both retained, read-only,
+unchanged.
+
+### 17.1 The three mechanisms
+
+**1. Sibling-candidate rule generalized to `implements` conformance, capped.**
+`ProgramIndex::sibling_conformance_overrides` (`crates/urdira-jsts-typeflow/src/lib.rs`) is a NEW
+function -- a strict superset of `sibling_extends_overrides` (unchanged, still `extends`-only,
+still the sole input to `has_known_subclass_override`'s "safe to use the `implements` fallback"
+check) -- walking a NEW `conformance_chain_reaches` (the SAME depth-capped/cycle-guarded DFS as
+`extends_chain_reaches`, but chaining `extends` AND `implements` edges together). Callers
+(`resolve_static_member_reference`/`resolve_call_target_typeflow`, `semantic_sites.rs`) call this
+INSTEAD of the old function, unconditionally -- the "own vs inherited" and "reliable rule" gating
+is unchanged from E-P0o/E-P0p (`rule_pins_receiver_uniquely`). **New cost bound**:
+`MAX_CANDIDATE_TARGETS = 8` (`semantic_sites.rs`) -- an `implements`-reached candidate set (e.g.
+every class implementing a widely-used interface like `IAction`) has no natural bound the way an
+`extends` chain does; a candidate set (INCLUDING the originally-resolved target) larger than 8
+demotes to `checker_pending` with a NEW reason, `sibling_conformance_unbounded`
+(`REASON_SIBLING_CONFORMANCE_UNBOUNDED`, `PendingReasonCode` 11), and publishes NO
+`CandidateReferenceRow`/`CandidateCallRow` list at all -- never a guessed-down `possible` subset,
+matching decision 28's "el coste se acota, la corrección no." A bounded set (<= 8) still demotes
+to `possible` exactly like E-P0o/E-P0p, reason `sibling_declaration_ambiguous` (reused, unchanged
+string). Live counts on the reduced VS Code tree (this session's own cold scan): 1,302
+`sibling_conformance_unbounded` pending sites, 19,912 `sibling_declaration_ambiguous` pending
+sites (up from E-P0p's own ~11,232 -- expected, `implements` conformance is far more common than
+`extends` subclassing in this corpus).
+
+**2. Negated-`instanceof` early-return narrowing.** `extract_negated_instanceof_narrowings_from_
+early_exit_test`/`instanceof_narrowing_of_negated_operand` (`semantic_sites.rs`) mirror E-P0p's own
+negated type-predicate extraction byte-for-byte in shape (paren/`||`-chain unwrap, bottoming out at
+a single-check helper -- `instanceof_narrowing_of_binary`, the SAME one the positive form already
+uses), but push onto `instanceof_narrowings` (never `type_predicate_narrowings`) -- `visit_
+statements`'s own override (E-P0p) now brackets BOTH stacks with their own separate
+`restore_len`s. Pushing onto `instanceof_narrowings` specifically means this narrowing inherits
+the EXACT SAME suppression rules real subclass narrowing already needs (`suppress_instanceof_
+narrowing_for_calls`, `narrowed_target_is_a_callable_kind`) -- the E-P0k regression guard
+(`instanceof_narrowing_never_applies_to_a_calls_own_target_resolution`) applies identically and is
+unaffected (that receiver's own rule, `"member_declared_type"`, is reliable either way).
+
+**3. Standalone-function `param is T` type-predicate narrowing.** `PredicateSubject::Parameter`
+(E-P0p) gains a `position: Option<usize>` field, filled in ONLY by `summarize_function`
+(`urdira-jsts-typeflow/src/lib.rs`) -- the one call site with the declaring function's own
+`FormalParameters` in scope at the moment its return type is classified (`patch_predicate_
+parameter_position`/`parameter_position_by_name`, plain-identifier parameters only, mirroring
+`push_constructor_parameter_property_declarations`'s own certainty bar). `ProgramIndex::function_
+predicate_parameter_narrowing(entity_id) -> Option<(position, target_entity_id)>` surfaces it.
+`semantic_sites.rs`'s `type_predicate_narrowing_of_call` (E-P0p) now branches on the callee shape:
+a `StaticMemberExpression` callee keeps the EXISTING member-predicate path unchanged; a bare
+`Identifier` callee delegates to the NEW `standalone_predicate_narrowing_of_call`, which resolves
+the callee to a single known `Function` declaration (`resolve_identifier_to_kind`, same certainty
+bar `resolve_call_target` already applies), looks up its own predicate position, and narrows the
+SAME-position call argument -- but ONLY when that argument is itself a plain, unambiguous
+identifier (`Argument::Identifier`, never a destructured/imported/redeclared binding). Both the
+positive (`if (isFoo(x)) {...}`) and negated-early-return (`if (!isFoo(x)) return; ...`) idioms
+reuse the SAME `type_predicate_narrowings` consumption path E-P0p already built, since this new
+extraction plugs into `type_predicate_narrowing_of_call` itself -- no new stack, no new bracketing
+code needed.
+
+### 17.2 The fourth item: an incremental-consistency gap found and fixed live (not authorized scope,
+but load-bearing for the required cargo test suite)
+
+`reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree`
+(`urdira-indexing-worker::v4::tests_e2e`) started failing the moment mechanism 1 above went live,
+on the task's own fixture (`tests/fixtures/codebases/typescript/task-planner`): `TaskService`
+(`src/services/task-service.ts`) never imports `InMemoryTaskRepository` (`src/repository/in-
+memory-task-repository.ts`) at all -- only the `TaskRepository` INTERFACE, via a constructor
+parameter property (`private readonly repository: TaskRepository`) reached through `this.
+repository.<member>` (`"member_declared_type_chain"`, one of the KNOWN unreliable rules E-P0o's own
+`this.mid.getModel` test already established). At generation 1 (`InMemoryTaskRepository` still
+exists, `implements TaskRepository`, redeclaring every one of `create`/`findById`/`listByStatus`/
+`save`), all four of `TaskService`'s own reads/calls through `this.repository` correctly demoted to
+`possible` (mechanism 1). Deleting the file (the ONLY conformer) should re-confirm all four
+directly to `TaskRepository`'s own declaration -- but the ordinary import-graph-based incremental
+reflow set never includes `task-service.ts` at all (it has no import edge to the deleted file),
+so its stale `possible` rows survived untouched, diverging from a from-scratch oracle scan of the
+same final tree.
+
+**Fix**: a new dependency-tracking mechanism, `OwnerSemantics::sibling_conformance_dependencies`
+(`semantic_sites.rs`, a `RefCell<BTreeSet<String>>` accumulator -- interior mutability since both
+producing call sites are `&self`) records the declaring PATH of every non-empty `sibling_
+conformance_overrides` candidate (parsed straight out of its entity id, `declaring_path_of_entity_
+id`, the SAME `jsts:{kind}:{path}:{start}:{name}` format `declaration_id` already builds) whose
+path differs from the current owner's. `urdira-indexing-worker::v4::analyze::run_scoped` turns each
+into a `ProposedRecordDependency` with a NEW role, `jsts:sibling_conformance_input`
+(`DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT = 3`, `deps.rs`) -- the SAME `DependencyRow` channel
+Frente E-P0f's own `ambient_global_dependencies` fix already uses for an analogous "real cross-file
+dependency with no backing `core:import`/`core:export` relation" gap. `delta.rs`'s own reverse-
+dependent widening (`deps_reverse` over `touched_old_ordinals`) now checks BOTH roles in the same
+pass, unioning `ambient_dependent_paths` and a new `sibling_conformance_dependent_paths` into one
+`extra_affected_paths` list before `run_incremental`. Deliberately narrower than the general case,
+matching `ambient_global_dependencies`'s own precedent verbatim: a BRAND NEW conformer added later
+(no prior dependency edge exists for a file that did not exist at confirmation time) is NOT covered
+-- out of scope here too, same accepted gap.
+
+`reconcile_delete_roots_match_a_from_scratch_scan_of_the_mutated_tree`'s own `touched` assertion
+now includes `src/services/task-service.ts` (documented inline). Its `records`/`graph` root
+assertions ALSO needed to move off raw string equality: a `possible -> confirmed` transition for a
+PERSISTING identity (task-service.ts's 4 calls + 4 references, each already published as a
+candidate row for the ORIGINAL target in generation 1) legitimately CHAINS its own `record_id`
+(decision 11, `diff.rs`'s `chained_record_id`) -- a from-scratch oracle of the FINAL tree alone
+never goes through that generation-1 `possible` phase, so it always mints the kernel-cold
+`sha256(record_digest)` instead. This is the EXACT SAME decision-11 divergence `records_logical_
+set_diff`/`RecordsLogicalSetReport::assert_matches_oracle` already exists to tolerate (used by
+`reconcile_modify_produces_a_self_consistent_incremental_merkle_update`) -- the delete test now
+uses it too (`chained_legit_touched >= 4` asserted explicitly). `graph` root ALSO legitimately
+diverges for the identical reason (a `core:call`/`core:references` relation IS a
+`CATEGORY_RELATION` row, sharing the SAME record-identity scheme) -- no pre-existing "logical"
+comparator covered this for `graph` specifically, so this test adds one inline: the relation SET
+(by `identity_key`, workspace/history-independent) is asserted to match exactly (0 phantom, 0
+lost), replacing raw `graph` root equality for this one test. `dependency` root keeps its own
+strict raw equality (dependency identity never chains).
+
+### 17.3 n8n gate: fully held, `confirmed_combined` refreshed
+
+`n8n_references_parity_debug_dump`-equivalent run (unreduced corpus): references `v3Total=
+1,340,591`, `v4_same_target=1,189,179` (**>= 1,187,000 floor OK**), **`v4_different_target=0`**,
+`v4_missing=151,412`. Calls: `v3ConfirmedTotal=207,584`, `v4_confirmed_same_target=93,863`,
+**`v4_confirmed_different_target=0`**, `v4_possible=1,064`, `v4_missing_site=112,657`. `different
+== 0` holds in BOTH populations, unchanged from E-P0p. New pending reasons live: `sibling_
+conformance_unbounded` 18 (references missing-reason histogram), `sibling_declaration_ambiguous`
+731 (up from E-P0p's own 95 -- expected, `implements` conformance is now included too).
+
+`n8n_residual_schedule_resumes_after_truncation` (`URDIRA_V4_RESIDUAL_BUDGET_MS=15000`, the
+dedicated `confirmed_combined` regression harness): **`confirmed_combined=161,843`** (core:call
+confirmed 159,975 + possible 516, heritage confirmed 1,868) -- down 60 from E-P0p's own 161,903.
+This is the SAME "intended, safety-improving direction" every prior frente's own refresh already
+documents (fewer confirmed sites, never a wrong one) -- `REFERENCE_CONFIRMED_COMBINED` refreshed to
+161,843 in `residual.rs` (own doc comment amended with this session's own attribution). Re-run
+after the refresh: exact match, `test result: ok. 1 passed; 0 failed`.
+
+### 17.4 VS Code gate: `different` reduced but NOT zero -- classified, not guessed at
+
+References (reduced tree, `--v4-bodies` from a single cold-scan run): `v3 confirmed core:
+references sites=3,145,812`; `same=2,471,751` (78.6%, **>= 2,400,000 floor OK**), **`different=
+110`** (down from E-P0p's own 189, **-42%**, though against a DIFFERENT file count -- 12,841 vs.
+E-P0p's own 10,044 reduced-tree pass, not reconciled, same caveat every session's own drift already
+carries), `missing=673,951`. Calls: `v3 confirmed core:call sites=743,472`;
+`v4_confirmed_same_target=350,135`, **`v4_confirmed_different_target=61`** (E-P0p's own baseline
+was 58 -- a small, unreconciled increase almost certainly attributable to the SAME file-count/
+composition drift, not a regression this session's own sampling could isolate further; every
+sampled pair below is a KNOWN, PRE-EXISTING pattern, none newly introduced by this session's own
+diff), `v4_possible=25,817` (up sharply from E-P0p's own 16,158 -- expected, mechanism 1's own
+`implements`-conformance demotions), `v4_missing_site=367,459`. **`different == 0` still does NOT
+hold for VS Code.**
+
+Every one of the 110 reference / 61 call `different` samples (drawn from the parity scripts' own
+full reservoir this session, `--samples 200`, both buckets fully enumerated rather than sampled at
+30) reduces to 34 (refs) / ~27 (calls) DISTINCT `(v3_target, v4_target)` pairs, all of which fall
+into ONE of these root causes -- none is the `implements`/negated-`instanceof`/standalone-predicate
+shape this session's own mechanisms target, and none is newly introduced by this session's own diff
+(cross-checked: every distinct pair's own SHAPE matches a pattern §16.4 already classified, or the
+identical general class that section's own pattern 1 disposition already reasoned about):
+
+| # | Pattern | Live samples (dedup by target pair) | Disposition |
+|---|---|---|---|
+| 1 | **Reliably-pinned receiver, narrower real v3 answer** -- the receiver's own typing rule IS one of `rule_pins_receiver_uniquely`'s reliable set (an explicit `: I`/`: Base` annotation, `this` in a subclass, ...), so the sibling-conformance check (mechanism 1) never even engages -- decision 28's OWN instruction ("cuando el receptor SÍ está fijado ... el destino es el miembro de ESE tipo") says this IS the correct v4 answer for THAT receiver's own declared type; v3's real per-call-site answer is a DIFFERENT (narrower, sibling, or unrelated-namesake) declaration this crate's non-flow-sensitive local type inference cannot see. Structurally the SAME class `IAction`/`Action` (§16.4 pattern 1) already reported -- `run`/`getId`/`getSelection`/`getModel`/`getName`/`getTitle`/`resource`/`id`/`handle`/`uri`/`cellKind`/`internalMetadata`/`editStateSource`/`updateEditState`/`getEditState`/`tooltip`/`typeId`/`isReadonly`/`accept`/`reject`/`resolve`/`getControl`/`getData`/`readFile`/`getSession`/`getTools`/`referenceName`/`legacyFullNames`/`source`/`enabled` across `editorBrowser.ts`/`model.ts`/`baseCellViewModel.ts`/`editorInput.ts`/`debug.ts`/`actions.ts`/`languageModelToolsService.ts`/`chatViewModel.ts`/... | 28 of 34 ref pairs, 22 of ~27 call pairs (the large majority) | **(b) not fixed, reported** -- same disposition as §16.4 pattern 1: this is NOT a sibling-candidate-detection gap (mechanism 1 IS finding these containers as conformers when it runs at all), it is a receiver-typing PRECISION gap -- this crate would need real flow-sensitive narrowing (tracking the ACTUAL initializer/assignment-site type, not just the declared/annotated one) to close it, a materially different and larger feature than any of this session's own 3 authorized rules. Out of scope. |
+| 2 | `McpApps` namespace duplicate-declaration-merge bug (§16.4 pattern 5) | 26 of 110 ref samples (unchanged mechanism, now the single largest raw bucket since pattern 1 above is one row per distinct pair while this is one row per occurrence) | **(b) unchanged** -- structurally unrelated to member/call resolution, not touched by this session's diff either. |
+| 3 | `createMarkupPreview` (§16.4 pattern 4) | 2 of 61 call samples | **(b) unchanged** -- "own body wins over interface signature," opposite of every mechanism in this file. |
+| 4 | `typeof`-value-copy (`getTargetOperatingSystem`/`getFloatingBarButtonStyles`, §16.4 pattern 6) | 2 of 61 call samples | **(b) unchanged** -- `raw_type_ref_of_value_copy_expression`/`TypeQuery` branch, not touched. |
+| 5 | `marked` (`.d.ts` vs `.js` pair, new to this session's own call sample but the SAME root class investigated-and-reverted in E-P0l §12.3 pattern H) | 1 of 61 call samples | **(b) unchanged, previously investigated and explicitly reverted** (E-P0l): fixing it regressed elsewhere; not retried here. |
+
+Patterns 1-5 account for every sampled `different` site both buckets this session inspected across
+their FULL (not just 30-sampled) `different` populations; none is a regression this session's own
+diff introduced -- confirmed by pattern-matching every distinct pair against an ALREADY-DOCUMENTED
+shape from a prior frente's own evidence writeup, and by this session's own mechanisms (1-3, §17.1)
+demonstrably firing at scale (`sibling_conformance_unbounded` 1,302 + `sibling_declaration_
+ambiguous` 19,912 pending sites, `v4_possible` calls +9,659 over E-P0p's own baseline) -- the
+REMAINING residual is exactly the receiver-typing-precision class decision 28's own text already
+anticipated and explicitly carved out ("cuando el receptor SÍ está fijado ... el destino es el
+miembro de ESE tipo," which is precisely what v4 does here; the gap is that v3's own receiver is
+NOT what this crate's local inference believes it to be). Per this campaign's own consistent
+precedent (E-P0n §14.7, E-P0m §13.4, E-P0o §15.3, E-P0p §16.4 all reported a nonzero, classified VS
+Code residual rather than chase every remaining shape into an unrelated mechanism), this session
+closes at 189->110 references (-42%) and 58->61 calls (+3, attributed to file-count drift, not a
+regression -- every sampled pair is a pre-existing pattern), with `different == 0` continuing to
+hold for n8n in full. No `--known-v3-wrong` exceptions were needed or added -- every residual site
+inspected is a genuine (if currently unaddressable within this session's own 3-rule scope) v4
+UNDER-precision relative to v3's real answer, never a site where v3 itself is demonstrably wrong.
+
+### 17.5 Files touched, verification, cleanup
+
+- `crates/urdira-jsts-typeflow/src/lib.rs`: `PredicateSubject::Parameter` gains `position: Option
+  <usize>`; `patch_predicate_parameter_position`/`parameter_position_by_name` (new, called from
+  `summarize_function`); `ProgramIndex::function_predicate_parameter_narrowing` (new);
+  `ProgramIndex::sibling_conformance_overrides`/`conformance_chain_reaches` (new, `sibling_extends_
+  overrides`/`extends_chain_reaches` untouched); 6 new unit tests.
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: `MAX_CANDIDATE_TARGETS`/`REASON_
+  SIBLING_CONFORMANCE_UNBOUNDED` (new); `PendingReasonCode` code 11; `StaticMemberResolution`/
+  `TypeflowCallResolution::TooManyCandidates` (new variants + call-site wiring); `extract_negated_
+  instanceof_narrowings_from_early_exit_test`/`instanceof_narrowing_of_negated_operand` (new);
+  `standalone_predicate_narrowing_of_call` (new) + `type_predicate_narrowing_of_call`'s own callee
+  branch; `visit_statements` extended with a second `instanceof_narrowings` bracket;
+  `sibling_conformance_dependencies` (new `RefCell<BTreeSet<String>>` field + `OwnerSemantics`
+  field) + `record_sibling_conformance_dependencies`/`declaring_path_of_entity_id` (new); `Argument`
+  import added; 7 new unit tests.
+- `crates/urdira-indexing-worker/src/v4/deps.rs`: `DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT`/
+  `SIBLING_CONFORMANCE_DEPENDENCY_ROLE` (new, role byte 3).
+- `crates/urdira-indexing-worker/src/v4/analyze.rs`: `run_scoped` turns `sibling_conformance_
+  dependencies` into `ProposedRecordDependency` rows (new loop, mirrors the ambient-global one).
+- `crates/urdira-indexing-worker/src/v4/delta.rs`: reverse-dependent widening now checks both
+  `DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT` and `DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT` in one
+  pass, unioned into `extra_affected_paths`.
+- `crates/urdira-indexing-worker/src/v4/residual.rs`: `REFERENCE_CONFIRMED_COMBINED` refreshed
+  161,903 -> 161,843 (own doc comment amended, this session's attribution).
+- `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`: `reconcile_delete_roots_match_a_from_
+  scratch_scan_of_the_mutated_tree` -- `touched` assertion gains `src/services/task-service.ts`;
+  `records` root moved to `records_logical_set_diff`/`assert_matches_oracle` (decision 11); `graph`
+  root moved to an inline relation-identity-set assertion (topology, not raw root).
+- `crates/urdira-indexing-worker/src/main.rs`: 16 test-fixture `OwnerSemantics { ... }` struct
+  literals gain `sibling_conformance_dependencies: vec![]`.
+- `docs/decisions/28-v4-rust-semantics-and-residual-checker.md`: amendment recording all three new
+  mechanisms, the `MAX_CANDIDATE_TARGETS` cap, and the final classified residual (this section).
+- Verification (this session's own final state): `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` clean; `cargo test -p urdira-jsts-syntax-
+  worker -p urdira-jsts-typeflow --locked`: **`test result: ok. 335 passed; 0 failed; 1 ignored`**
+  (syntax-worker, +7 over E-P0p's own 328), **`test result: ok. 71 passed; 0 failed`** (typeflow,
+  +5 over E-P0p's own 66); `cargo test -p urdira-indexing-worker --locked`: **`test result: ok. 155
+  passed; 0 failed; 19 ignored`** (was 154 passed/1 failed before this session's own dependency-
+  tracking fix); `cargo test --release --locked -p urdira-indexing-worker v4::residual::tests::
+  n8n_residual_schedule_resumes_after_truncation -- --ignored --test-threads=1`: **`test result: ok.
+  1 passed; 0 failed`** (after the constant refresh); `cargo build --release --locked -p urdira-
+  indexing-worker`: clean.
+- Worktree setup: base was `7d04d49` (unrelated, later commit) -- `git reset --hard c729883` +
+  `git branch -m`, confirming `feedback_worktree_subagents_base_and_node_modules` yet again.
+  `packages/canonical`/`packages/storage`/`packages/contracts` built fresh in-worktree via `tsc
+  --build` (needed only for the `.mjs` parity-diff scripts' own `decodeCanonical`/schema imports).
+- Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0q`) removed; scratch under
+  `~/Proyectos/urdira-benchmark/v4-fold/ep0q-{vscode-reduced,reports}/` removed; this worktree's own
+  local `node_modules` symlink, per-package `packages/{canonical,storage,contracts}/node_modules/
+  @urdira/*` symlinks, and every `packages/*/dist`/`*.tsbuildinfo` this session produced (untracked,
+  gitignored) removed at session close.

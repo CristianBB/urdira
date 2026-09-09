@@ -609,6 +609,16 @@ fn run_one(
     // `AmbientModuleIndex::rebuild`'s own "ambient declarations are rare"
     // cost rationale.
     let mut ambient_dependent_paths: Vec<String> = Vec::new();
+    // E-P0q (2026-09-09, sibling-conformance-dependents integrity fix): the
+    // SAME reverse-dependent widening as `ambient_dependent_paths` right
+    // below, for `DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT` edges instead
+    // (`urdira_jsts_syntax_worker::OwnerSemantics::sibling_conformance_
+    // dependencies`'s own doc comment has the root-cause writeup) --
+    // computed over the exact SAME `touched_old_ordinals`/`path_by_pair`
+    // this block already builds for the ambient case, just filtered by a
+    // different role, so both widenings share one pass over `changed_paths`
+    // and one `deps_reverse` query per touched ordinal.
+    let mut sibling_conformance_dependent_paths: Vec<String> = Vec::new();
     {
         let touched_old_ordinals: Vec<u32> = if changed_paths
             .iter()
@@ -648,28 +658,36 @@ fn run_one(
             }
             let mut dependent_paths: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
+            let mut sibling_conformance_paths: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             for &dep_ordinal in &touched_old_ordinals {
                 for dep in store_reader.deps_reverse(dep_ordinal, prev_generation) {
-                    if dep.role() != super::deps::DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT {
-                        continue;
-                    }
                     let Some(owner_pair) = early_dicts.artifacts.get(dep.owner_artifact() as usize)
                     else {
                         continue;
                     };
-                    if let Some(path) = path_by_pair.get(owner_pair) {
+                    let Some(path) = path_by_pair.get(owner_pair) else {
+                        continue;
+                    };
+                    if dep.role() == super::deps::DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT {
                         dependent_paths.insert(path.clone());
+                    } else if dep.role() == super::deps::DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT {
+                        sibling_conformance_paths.insert(path.clone());
                     }
                 }
             }
             ambient_dependent_paths = dependent_paths.iter().cloned().collect();
+            sibling_conformance_dependent_paths =
+                sibling_conformance_paths.iter().cloned().collect();
             if std::env::var_os("URDIRA_DEBUG_TIMING").is_some()
-                && !ambient_dependent_paths.is_empty()
+                && (!ambient_dependent_paths.is_empty()
+                    || !sibling_conformance_dependent_paths.is_empty())
             {
                 eprintln!(
-                    "[urdira-indexing-worker] v4 delta DEBUG: ambient-global reverse-dependents widened this batch: touched_old_ordinals={} dependents={:?}",
+                    "[urdira-indexing-worker] v4 delta DEBUG: reverse-dependents widened this batch: touched_old_ordinals={} ambient_dependents={:?} sibling_conformance_dependents={:?}",
                     touched_old_ordinals.len(),
                     dependent_paths,
+                    sibling_conformance_paths,
                 );
             }
         }
@@ -909,6 +927,17 @@ fn run_one(
         .typeflow_cache
         .as_mut()
         .expect("populated just above (either updated in place or built fresh)");
+    // E-P0q: `run_incremental`'s own `extra_affected_paths` takes a single
+    // flat widening list -- union both reverse-dependent kinds (ambient
+    // global + sibling conformance) into one `BTreeSet` so a path named by
+    // both never gets reflowed twice.
+    let extra_affected_paths: Vec<String> = ambient_dependent_paths
+        .iter()
+        .cloned()
+        .chain(sibling_conformance_dependent_paths.iter().cloned())
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect();
     let analysis = super::analyze::run_incremental(
         source_cache.files_vec(),
         source_cache.config_assets_vec(),
@@ -917,7 +946,7 @@ fn run_one(
         changed_artifact_ids,
         clock,
         typeflow_cache,
-        &ambient_dependent_paths,
+        &extra_affected_paths,
     )?;
     let affected_owner_paths: Vec<String> = analysis
         .owners
