@@ -1,9 +1,28 @@
-# Decision 29: v4 Rust-owned worker scan pipeline (cold and incremental)
+# Decision 29: v4 Rust-owned worker scan pipeline (cold, incremental, and reconcile)
 
-Status: **Approved; cold, `Full`↔`Changed` incremental, typeflow, possible rows, and the background residual-checker generation are implemented and daemon-wired; v4 is the default for newly added workspaces since 2026-09-04 (opt out with `URDIRA_V4=0`). Cold numeric gates (Queryable ≤ 8 s, ScanCompleted ≤ 12 s, RSS ≤ 3 GiB) are NOT met; the worker-only incremental gate is met for every mutation kind; the daemon-observed edit gate ("durable < 1 s") is NOT met. One open critical data-integrity bug (identity_key zeroing, P2-2m).**
-Last updated: 2026-09-07 (Frente E-P0f: ambient-global dependency tracking, see new section below)
+Status: **Accepted**
+Last updated: 2026-09-09
 Depends on: [v4 structural store](26-v4-structural-store.md), [v4 merkle bucket digests](27-v4-merkle-bucket-digests.md), [v4 Rust semantics and residual checker](28-v4-rust-semantics-and-residual-checker.md), [Native pipeline and relational storage](21-native-pipeline-relational-storage.md), [Content-derived record identity](11-content-derived-record-identity.md)
-Campaign summary (Spanish, non-normative): `docs/evidence/2026-09-05-v4-campaign-summary.md`
+Campaign summary (Spanish, non-normative): `docs/evidence/2026-09-05-v4-campaign-summary.md`, `docs/evidence/2026-09-06-v4-reconcile-threshold.md`
+
+## Current state (2026-09-09)
+
+Cold (`Full`), incremental (`Changed`), git-aware catch-up (`Reconcile`,
+added 2026-09-06), typeflow, pending sites with candidate discipline, and
+the background residual-checker generation are all implemented and
+daemon-wired. v4 is the default for newly added workspaces since
+2026-09-04 (opt out with `URDIRA_V4=0`). Cold numeric gates (`Queryable` ≤
+8 s, `ScanCompleted` ≤ 12 s, RSS ≤ 3 GiB) are **not met**: the current n8n
+figure is `total_ms` median 23.4 s / wall 25.2 s / RSS median 6.11 GiB
+(`docs/evidence/2026-09-07-v4-f3-cold-incremental-floors-parity-threshold.md`
+§1.3, superseding the older 27-32 s / 6.56-8.16 GiB figure in "Measured
+cold performance" below). The worker-only incremental gate is met for
+every mutation kind; the daemon-observed edit gate ("durable < 1 s") is
+**not met**. The P2-2m `identity_key`-zeroing
+corruption reported as an open critical bug through 2026-09-05 is **fixed**
+— see decision 26's changelog. `RECONCILE_DELTA_THRESHOLD` (below) is
+**0.01**, not the 0.25 default the scope first shipped with — measured and
+lowered the same week it landed (see "Historial de cambios").
 
 ## Decision
 
@@ -25,7 +44,7 @@ unchanged SQLite catalog/lexical/semantic sidecars.
 IndexingCommand::WorkspaceScan {
   request_id, workspace_id, workspace_root, database_path,
   structural_root, cas_root, sidecar_root,
-  scope: ScanScope,  // Full | Changed { paths: Vec<{ path, kind: Created|Modified|Deleted }> }
+  scope: ScanScope,  // Full | Changed { paths: Vec<{ path, kind: Created|Modified|Deleted }> } | Reconcile
   registry_snapshot_id, configuration_revision_id, resolution_lock_id,
   deadline_ms: Option<u64>, priority: Interactive | Background,
 }
@@ -38,10 +57,15 @@ IndexingEvent::UpgradeCompleted { ... }   // residual-checker generation (decisi
 `write_ms`/`fsync_ms`/`snapshot_ms`/`lexical_ms`, all optional integers, plus
 `total_ms`) and `ScanRoots` (`records`/`dependency`/`graph`/`metric`,
 `sha256:`-prefixed hex) round-trip through a shared JSON fixture asserted
-identical in Rust and TypeScript. **Deviation from the plan's own protocol
-sketch**: `workspace_root` was added — neither the plan nor the task brief
-named a field for the source checkout the `Walker` must scan. `request_id`
-doubles as `operation_id`. The v3 commands (`IndexGeneration`, `AcceptGroup`,
+identical in Rust and TypeScript. A third `ScanScope` variant, `Reconcile`
+(added 2026-09-06, Frente E — see "Reconcile: git-aware catch-up" below),
+carries no path data at all: it always performs a fresh authoritative walk
+before deciding anything, unlike `Changed`, which trusts the caller's own
+path list. `Queryable`/`ScanCompleted` gain an optional `reconcile:
+ReconcileSummary` field, present only for that scope. **Deviation from the
+plan's own protocol sketch**: `workspace_root` was added — neither the plan
+nor the task brief named a field for the source checkout the `Walker` must
+scan. `request_id` doubles as `operation_id`. The v3 commands (`IndexGeneration`, `AcceptGroup`,
 `AnalyzeSemanticGroup`, `InvokeSemantic`, `FinalizeGeneration`,
 `SourceIndexCommit`/`Rollback`) are untouched and still serve v3 workspaces;
 nothing in this decision removes them (that is the pending P4 deletion —
@@ -77,13 +101,14 @@ found and fixed in `docs/evidence/2026-09-03-v4-p3-5-daemon-latency.md` §4.1.
    `ProposedRecord`s; the E1a-E3 hybrid resolver; and, since P2-2e,
    **typeflow unconditionally** (`v4/typeflow.rs`'s `TypeflowCache`, one
    `DeclSummary` per file, `ProgramIndex` built once cold and maintained
-   incrementally since P3-8a). Sites neither lane resolves are emitted as
-   `possible` `core:call`/`core:inherits`/`core:implements` rows paired 1:1
-   with a `jsts:unresolved_call` diagnostic carrying a `reason`
-   (`call_deferred_to_e3` | `call_target_uncertain`) — P2-2i,
-   `docs/evidence/2026-09-04-v4-p2-2i-possible-rows-and-pending-sites.md`.
-   The old `resolve_pending_sites` stub is gone. Decision 28 owns the
-   semantics.
+   incrementally since P3-8a). Sites neither lane resolves are recorded in
+   the store's `pending.sites` table with a reason code, and any candidate
+   target(s) are emitted as `possible` `core:call`/`core:inherits`/
+   `core:implements`/`core:references` rows (always carrying a real
+   `target_id`) bounded by `MAX_CANDIDATE_TARGETS = 8` — decision 28 owns
+   the full contract and its history (the original P2-2i shape, a bare
+   `possible` row with no target paired with a `jsts:unresolved_call`
+   diagnostic, is superseded).
 4. **Materialize**: `ProposedRecord` → `structural_kernel_rows_typed`
    (`urdira-native-core`; the same identity/digest recipe as v3's hybrid
    lane, plus P2-2k/P2-2l kernel work — §"Measured cold performance") →
@@ -151,21 +176,33 @@ roots across its own runs (decision 27 keeps the root history).
 | P2-2k (§17) | 2,831,264 | kernel hot path: direct BTreeMap iteration, fused span parse, scratch buffers, LUT hex — pass 1 9.70→5.03 s (34.3→17.8 µs/record) | 28.0-28.9 s |
 | P2-2l (§18) | 2,831,264 | `rayon::join` bisection + LPT owner order; typed `facets_list` (skips a provably-no-op JSON round trip); fused digest/body traversal; parallel `build_full` (1.31→0.27-0.37 s); write path profiled (decision 26) | 29.0 / 30.5 / 34.0 s |
 | **P1-D-h final (final §4.1, production path `scripts/v4-scan.mjs`)** | **2,831,264** | cold-producer classification repair (0.13-0.16 s) | **27.27 / 27.70 / 29.42 s** (`total_ms`); `queryable_at` 27.3-30.0 s; `completed_at` 29.6 / 29.9 / 32.3 s |
+| **F.3 re-measurement (`docs/evidence/2026-09-07-v4-f3-cold-incremental-floors-parity-threshold.md` §1, HEAD `d71669a`)** | 2,197,882 (NODIAG-set count changed with intervening entity/dependency work; not a regression — see §2's population floors) | catalog dropped 5.3 s → 2.9 s median from intervening pending-importer/type-alias work; no other stage regressed | **22,380-23,856 ms** (`total_ms`, median 23,369 ms); wall 23.90-25.85 s (median 25.22 s); RSS max 5.10-6.54 GiB (median 6.11 GiB) — the current authoritative n8n cold figure, superseding the P1-D-h final row above |
 
 Final phase breakdown (final §4.1, min/median): catalog 5.04/5.27 s, parse
 1.54/1.67 s, resolve 2.68/3.01 s, materialize 8.45/9.80 s, write
 5.83/6.56 s, fsync 0.17/0.18 s, snapshot 4 ms. Max RSS 6.56 / 6.86 / 8.16 GB.
+**Superseded by F.3** (same evidence, §1.2-1.3): catalog 2.89-2.99 s, parse
+1.74-1.80 s, resolve 2.57-3.09 s, materialize 5.15-6.04 s, write
+5.70-6.29 s, fsync 0.16-0.22 s — `total_ms` median 23,369 ms, RSS median
+6.11 GiB (5.10-6.54 GiB across 3 runs).
 
-**Cold gate table (plan targets vs final §4.1):**
+**Cold gate table (plan targets vs the current F.3 figures):**
 
 | gate | target | measured | met? |
 |---|---:|---:|---|
-| catalog | ≤ 1.5 s | 5.04-5.59 s | **no** |
-| materialize | ≤ 4 s | 8.45-11.37 s | **no** |
-| `Queryable` | ≤ 8 s | 27.3-30.0 s | **no** (3.4-3.7x) |
-| `ScanCompleted` | ≤ 12 s | 29.6-32.3 s | **no** (2.5-2.7x) |
-| RSS | ≤ 3 GiB | 6.56-8.16 GB | **no** (2.2-2.7x) |
+| catalog | ≤ 1.5 s | 2.89-2.99 s | **no** |
+| materialize | ≤ 4 s | 5.15-6.04 s | **no** |
+| `Queryable` / `ScanCompleted` (`total_ms` as a proxy — F.3 measured `total_ms`, not the daemon-observed event pair) | ≤ 8 s / ≤ 12 s | 22.4-23.9 s | **no** (~1.9-3x) |
+| RSS | ≤ 3 GiB | 5.10-6.54 GiB (median 6.11 GiB) | **no** (~1.7-2.2x) |
 | determinism / thread-count independence | identical roots | identical across 3 runs (and dozens per round in §16-§18) | **met** |
+
+None of the gates newly passes at the F.3 figures — the ~4-6 s improvement
+since the P1-D-h final measurement (catalog work, mostly) narrows the
+`Queryable`/`ScanCompleted` gap from 3.4-3.7x/2.5-2.7x to roughly 1.9-3x
+and 3 GiB RSS makes VS Code diagnostic (2.0-2.3x n8n at the F.3 corpus size)
+essentially the same 6-14 GiB range on the larger corpus that continued
+tracking through the 2026-09-07 VS Code campaign (decision 26's "Current
+state"). It does not change the pass/fail verdict.
 
 The remaining cold cost is priced in the kernel rounds: pass 1 kernel
 canonicalization (5.7-6.5 s, floor bounded by rayon tail on the single
@@ -265,6 +302,48 @@ changed_paths,timings,timeline}`, `search_text_ready`, `search_semantic_ready`;
   directory path inside what is now a single `.seg` file, silently seeing
   only the base generation — the only cause of the "rename 50 vs 4 records"
   failure (P3-8a §1).
+
+### Reconcile: git-aware catch-up (`ScanScope::Reconcile`)
+
+A third `ScanScope`, alongside `Full` and `Changed` (added 2026-09-06,
+Frente E; full mechanism and bug history in "Historial de cambios" below).
+Where `Changed` trusts the caller's own path list, `Reconcile` carries no
+data at all: `scan.rs::run_reconcile` always performs a fresh authoritative
+walk (the same `catalog::enumerate`/`catalog::diff` primitives `Full`
+itself composes from) before deciding anything. This is the event-driven
+counterpart to a `git pull`/branch switch, a lost or coalesced watcher
+batch, or a periodic reconciliation sweep — every signal the daemon cannot
+attribute to a specific set of changed paths now triggers `Reconcile`
+instead of an unconditional `Full`.
+
+- The authoritative delta's measured size (`added + changed + deleted`
+  against the frontier's total present count) decides only which pipeline
+  republishes it: the cheaper `Changed`-shaped path (`delta::run`) below
+  threshold `T` (`RECONCILE_DELTA_THRESHOLD = 0.01`, override
+  `URDIRA_V4_RECONCILE_THRESHOLD`), the `Full`-shaped path (`run_full_from`,
+  reusing the same walk, no second one) at or above it. `T = 0.01` was
+  measured, not assumed: a fraction-sweep on n8n found the `Delta`/`Cold`
+  crossover at p≈0.0164 of the frontier, and `T` is set to 80% of that
+  crossover for a conservative margin (`docs/evidence/2026-09-06-v4-reconcile-threshold.md`
+  §5) — n8n's own git history routinely touches more than 1.6% of the
+  repository in one pull, so `T = 0.01` means most real `git pull`/branch
+  switches route through the `Full`-shaped path, not the `Changed`-shaped
+  one; both branches produce Merkle roots byte-identical to a from-scratch
+  cold scan of the same mutated tree for create/delete/rename, at every
+  measured fraction.
+- An empty delta is a no-op: no new generation; `reconcile.mode == "noop"`.
+- A failed `Delta` attempt falls back to `Cold` in-line (never a partial
+  generation), re-walking rather than reusing a possibly-stale enumeration;
+  `reconcile.fell_back_to_cold` distinguishes this from a size-driven `Cold`
+  decision.
+- **Content-hash equivalence** (2026-09-06 fix, in "Historial de cambios"):
+  a uri is `equivalent` (never `changed`) based on `content_hash` alone,
+  not also a metadata digest (mtime/ctime/inode/...) — a `touch`, a `git
+  stash` round trip, or an index-pack import that copies an already-indexed
+  tree onto a fresh filesystem all leave content-identical files with
+  different metadata, and previously forced reconcile to treat the whole
+  corpus as changed. `ReconcileSummary` reports `metadata_refreshed` for
+  this case, which never counts toward the `Delta`-vs-`Cold` threshold.
 
 ### Central correctness finding: CREATE/DELETE/RENAME match a from-scratch oracle exactly; EDIT cannot, by design
 
@@ -380,19 +459,14 @@ be the corruption's cause (see "Open items").
 
 ## Open items (reported, not resolved)
 
-1. **CRITICAL — `identity_key` zeroing corruption (P2-2m, being
-   root-caused).** A rare (2 of 9 in-process n8n cold scans; ~1 in 1.4M
-   records), non-deterministic, silent corruption writes an all-zero
-   `identity_key` of the right length while `record_digest` stays intact;
-   observed on `core:call` and `core:references` rows, so it is not caused
-   by the classification-repair code. Most likely site: `kernel_rows_batches`'s
-   `rayon::join` bisection (P2-2l item 1). Only the strict classification
-   invariant and a new full-store diagnostic scan detect it
-   (`dump_remaining_classification_mismatches`,
-   `scan_for_any_all_zero_identity_or_digest`, both `#[ignore]`d in
-   `residual.rs`). The 3 production-path cold runs used for the final
-   numbers were clean (final §2.4-§2.5). Merkle verification cannot catch
-   it (decision 27).
+1. ~~**CRITICAL — `identity_key` zeroing corruption (P2-2m).**~~ **FIXED**
+   2026-09-05 — see decision 26's changelog for the two root causes (a
+   short `write_at` and a concurrent sparse-file allocation race) and the
+   fix (`write_all_at` + up-front `materialize_real` allocation). Neither
+   the classification invariant nor Merkle verification are needed to
+   detect it any more, but neither would catch a future writer-level
+   corruption of the same shape (decision 27's own limitation is
+   unchanged).
 2. **Harness `spawn EBADF`.** `scripts/v4-mutation-harness.mjs`'s
    `oracleVerify` crashed 2/2 at the final from-scratch oracle spawn, so
    `roots_equal` was not verified through that harness in the final run
@@ -430,364 +504,11 @@ be the corruption's cause (see "Open items").
     the final session's own workspace `clippy` run is reported clean (final
     §5), so this may already be resolved.
 
-## Amendment 2026-09-05 (see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`)
+## Historial de cambios
 
-The cold pipeline materializes more than module-level declarations (members, referenced
-parameters, catch/rest bindings, ambient module namespaces, external package/symbol entities) and
-writes unresolved call/heritage sites to the `pending.sites` side table instead of relation
-records; the P1-D-h "classification mismatch repair" became a drop-to-pending-site rule
-(`target_not_interned`). Stage-4 numbers in this document predate that change; the current n8n
-composition and timings are in the evidence page above (§3, §5, §9, §10).
-
-## Amendment 2026-09-06 (Frente E, plan `generic-waddling-hartmanis.md` §2): `ScanScope::Reconcile`
-
-A third `ScanScope` variant, alongside `Full` and `Changed`. Where `Changed`
-trusts the caller's own path list, `Reconcile` carries no data at all and
-never does: `crates/urdira-indexing-worker/src/v4/scan.rs::run_reconcile`
-ALWAYS performs a fresh authoritative walk (`catalog::enumerate` +
-`catalog::diff`, the same primitives `Full` itself now composes from) before
-deciding anything — never the watcher's own hint about what changed. This is
-the event-driven counterpart to a git branch switch, a lost/coalesced
-watcher batch, or a periodic reconciliation-sweep tick: every one of those
-signals the daemon as "requestedUris === undefined" (`watchers.ts`'s own
-diagnostic: `branch_changed`/`events_lost`/`provider_reset` all set
-`changedUris = undefined`), which used to mean "send `Full`" unconditionally
-and now means "send `Reconcile`" unless the caller explicitly forces `Full`
-(`packages/daemon/src/runtime.ts`'s `forceFullScans`, populated by
-`core:reindex` and the outdated-workspace-format recovery sweep).
-
-**Invariants** (held by `crates/urdira-indexing-worker/src/v4/tests_e2e.rs`'s
-`reconcile_*` test family, same paridad-Merkle-bloqueante bar the
-`incremental_*` family already holds `Changed` to):
-
-- The authoritative delta's measured size (`added + changed + deleted` vs.
-  the frontier's total present count) decides ONLY which pipeline
-  republishes it — the cheaper `Changed`-shaped one (`delta::run`) below a
-  threshold `T` (`RECONCILE_DELTA_THRESHOLD = 0.25`, override
-  `URDIRA_V4_RECONCILE_THRESHOLD`), the `Full`-shaped one
-  (`run_full_from`, sharing the SAME enumeration already walked — no second
-  walk) at or above it. Both branches, and a from-scratch cold scan of the
-  identically mutated tree, produce byte-identical `records`/`dependency`/
-  `graph` Merkle roots for any create/delete/rename mutation. A content
-  EDIT's `Delta` branch is the one documented exception, inherited
-  unchanged from `Changed`/decision 11: a "replacement" identity legitimately
-  chains its `record_id`, which by design never matches an independent
-  from-scratch oracle — this was already true of `Changed` and is NOT a
-  reconcile-specific gap (verified directly: the SAME edit through the
-  `Cold` pipeline instead matches oracle exactly, since cold materialize has
-  no notion of a prior generation to chain against at all).
-- An empty delta (`n == 0`) is a no-op: no new generation, `ScanCompleted`
-  reports the CURRENT generation's own roots (read back from `merkle_roots`),
-  `reconcile.mode == "noop"`.
-- If the `Delta` attempt fails, the SAME request falls back to `Cold`
-  in-line — never a partial generation. The fallback re-walks (the SQLite
-  frontier may have advanced past what this call's own earlier walk saw, if
-  `delta::run`'s own `Catalog::apply` committed before failing deeper in its
-  pipeline) rather than reusing a possibly-stale enumeration.
-  `reconcile.fell_back_to_cold` distinguishes this from a size-driven `Cold`
-  decision. Test hook: `URDIRA_V4_RECONCILE_FAIL_DELTA` (read once at
-  `scan::run_with_residual`'s single production call site and passed to
-  `run_reconcile` as a plain parameter — this crate is `#![forbid(unsafe_
-  code)]`, and `std::env::set_var` is `unsafe`, so a test cannot toggle it
-  itself; same reasoning applies to the `threshold` parameter).
-- `ScanCompleted`/`Queryable` gain an optional `reconcile: ReconcileSummary`
-  field (`mode`, `added`/`changed`/`deleted`/`frontier_size`, the effective
-  `threshold`, `fell_back_to_cold`) — absent for `Full`/`Changed`,
-  `#[serde(default, skip_serializing_if = "Option::is_none")]` so an older
-  binary on either side of the wire still round-trips. Surfaced at
-  `core:index_status.last_scan.reconcile` and rendered by the MCP
-  `urdira_index_status` text renderer as `reconcile/<mode> (+added ~changed
-  -deleted of frontier_size)`.
-
-**Bug found and fixed as a direct consequence of writing this front's own
-`Cold`-branch parity tests** (not a reconcile-specific defect: it affects
-`ScanScope::Full` on its own, whenever the SAME long-lived worker process
-runs a second `Full` scan of an already-published workspace — exactly what
-`core:reindex` against a `ready` v4 workspace has always sent, and what
-`reconcile`'s own `Cold` branch — both the "large delta" and R2-fallback
-cases — now also sends): `analyze::run_scoped`'s `AuthoritativeChangeSet::
-Full` case built `ColdAnalysis.owners` from `syntax.analyze`'s own
-`affected_files`, which that shared syntax-worker's internal incremental/
-membership fast path can narrow to just the genuinely new/changed paths on
-a WARM `syntax` project, regardless of the caller having asked for `Full` —
-harmless for `run_incremental` (an untouched owner's existing rows are left
-alone, correct for a diff publish) but silently wrong for `run_cold`,
-whose `materialize_cold_partitioned`/`write_base_partitioned` publish a
-COMPLETE replacement base snapshot from exactly that owner list: every
-owner narrowed away was dropped from the new generation outright, not left
-untouched. Reproduced live before the fix (a lone new file's own 3 records
-republished a generation whose `records` root reflected only those,
-silently discarding the other ~280 pre-existing records) and fixed by
-forcing full path coverage whenever `change_set` was `Full`, independent of
-what `analyze()`'s own fast path decided — regression-tested by
-`tests_e2e.rs::full_scan_twice_in_the_same_process_matches_a_from_scratch_
-oracle` (and its content-edit sibling, confirming the `Cold` pipeline never
-chains). This closes part of Open item 8 above ("existing-workspace
-migration is unaddressed") for the specific "repeated `Full` on a live
-worker" sub-case; the broader migration story is unchanged.
-
-## Amendment (2026-09-06): content-hash equivalence in the frontier delta
-
-**Bug (found live by the Frente P-1 index-pack import work):** `reconcile`
-(and every other scope, since all three funnel through the same
-`urdira-source-frontier::Delta::compute`/`compute_partial`) required BOTH
-`content_hash` AND `metadata_digest` (`walker.rs`'s per-file stat digest —
-`byte_length`/`ctime_ms`/`device`/`inode`/`mode`/`mtime_ms`) to match the
-frontier's stored entry for a uri to count as unchanged — a straight port
-of the TS oracle's `isEquivalentObservation`
-(`packages/engine/src/source-indexer.ts:342`). Confirmed live: the walker
-(`walker.rs::hash_and_include`) has no metadata-based shortcut at all — it
-`std::fs::read`s and SHA-256-hashes every observed file's content
-unconditionally on every walk (`content_hash = sha256_hex_prefixed(&bytes)`,
-computed before `metadata_digest` and never gated on it), so a stale
-`metadata_digest` was never a proxy for "this file needs rehashing"; it was
-purely stored/compared data. That made every mutation that changes a
-file's inode/ctime/mtime without touching a single byte of its content — a
-bare `touch`, a `git stash`/checkout round trip, or exactly what triggered
-this: copying an already-indexed tree plus its `workspace.sqlite`/
-`.structural/` onto a fresh filesystem (an index-pack import) — look
-identical to a full-corpus content edit. `scan::run_reconcile`'s
-authoritative walk came back `mode: "cold"` with `changed == frontier_size`
-on a byte-identical import, re-parsing/re-materializing/re-publishing the
-entire corpus for nothing. The owner's standing criterion (maximum
-throughput without compromising integrity) singles this out: content-hash
-equivalence is itself a content-addressed guarantee, strictly no weaker
-than the old rule, so removing the metadata half of the check costs
-nothing in correctness.
-
-**Fix — `urdira-source-frontier`:**
-- `Delta::compute`/`compute_partial`'s shared `classify` (`delta.rs`) now
-  keys equivalence on `content_hash`/`byte_length` alone. A uri whose
-  content matches the frontier but whose `metadata_digest` differs is
-  still `equivalent` (never `changed`, never re-analyzed) and is recorded
-  in a new `Delta::metadata_refreshed: Vec<(normalized_uri,
-  new_metadata_digest)>` instead.
-- `Catalog::apply` applies `delta.metadata_refreshed` inside its existing
-  transaction: an `UPDATE artifact_versions SET analysis_metadata_digest =
-  ?` for the uri's current (`valid_to_generation IS NULL`) row, mirrored
-  onto the in-memory `Frontier` entry. No new `artifact_version_id`, no
-  `source_observations` row (a metadata-only refresh is not a new
-  observed fact about the artifact), no change to `valid_from_generation`.
-- A new `Catalog::refresh_metadata(conn, workspace_id, frontier,
-  refreshed)` applies the SAME update outside of `apply` entirely, in one
-  short dedicated transaction that never touches
-  `source_index_state`/`source_observation_batches` — for
-  `scan::run_reconcile`'s `Noop` branch, which never calls `apply` at all
-  (nothing added/changed/deleted to publish) but must still persist the
-  refresh so the NEXT reconcile of the same settled tree does not
-  rediscover it. No-ops without opening a transaction when the list is
-  empty.
-- `walker.rs`'s `Observation::metadata_digest` field doc now states the
-  hashing invariant explicitly (see the bug description above) so a future
-  reader does not assume a metadata-gated hashing shortcut that was never
-  implemented.
-
-**Effect on `reconcile` (`scan.rs::run_reconcile`):** `metadata_refreshed`
-entries are never counted in `added`/`changed`/`deleted`/`touched_count`
-and never affect the `Delta`-vs-`Cold` threshold decision. A byte-identical
-tree (touch, checkout, or import) now reports `mode: "noop"` with
-`metadata_refreshed == N`; the `Noop` branch calls `Catalog::
-refresh_metadata` directly (plus mirrors the refresh onto this process's
-cached `WorkerState` frontier, if one exists for the workspace) so a
-second reconcile of the same tree reports `metadata_refreshed == 0`. The
-`Delta`/`Cold` branches get the refresh for free through their own
-`Catalog::apply` call. `ReconcileSummary` gains `metadata_refreshed: u64`
-(mirrored in `rust-indexing-core-port.ts`,
-`indexing-core-process-transport.ts`, and rendered by the MCP
-`urdira_index_status` text renderer as a conditional `, refreshed=N`
-suffix — omitted when absent or zero, so an older worker's summary and a
-fully-settled tree both render exactly as before).
-
-**Integrity preserved:** two observations of the same `byte_length` but
-different `content_hash` are still `changed` unconditionally — the
-equivalence rule never falls back to `byte_length` alone as a cheaper
-proxy for content equality (`delta.rs`'s
-`same_byte_length_different_content_stays_changed` test, and
-`tests_e2e.rs`'s `reconcile_same_byte_length_different_content_is_never_
-equivalent`).
-
-**Tests added:** `urdira-source-frontier::delta` unit tests
-(`metadata_only_difference_is_equivalent_with_refresh_full_scan`,
-`identical_metadata_and_content_yields_no_refresh`,
-`same_byte_length_different_content_stays_changed`,
-`compute_partial_also_refreshes_metadata_for_a_present_observation`);
-`urdira-source-frontier::catalog` unit tests
-(`apply_with_only_metadata_refreshed_does_not_open_a_new_version`,
-`refresh_metadata_updates_digest_without_a_new_generation`,
-`refresh_metadata_with_empty_slice_is_a_true_no_op`);
-`urdira-indexing-worker::v4::tests_e2e` end-to-end tests
-(`reconcile_touch_all_files_is_noop_with_metadata_refresh_then_settles`,
-`reconcile_after_a_full_data_dir_copy_is_noop` — the literal index-pack
-import reproduction, copying the whole data dir onto a fresh location and
-reconciling from a brand-new `WorkerState` — and
-`reconcile_same_byte_length_different_content_is_never_equivalent`). Every
-pre-existing `incremental_*`/`reconcile_*` test stays green unmodified.
-
-## Ambient global dependencies (Frente E-P0f, 2026-09-07)
-
-**Problem** (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §14.3): a TypeScript SCRIPT file
-(no top-level `import`/`export` of its own) makes every one of its top-level declarations an
-AMBIENT GLOBAL, visible workspace-wide with no import statement anywhere. `resolver::
-AmbientModuleIndex::resolve_global` already resolves a cross-file reference to one correctly, but
-`deps.rs`'s dependency-edge derivation only ever reads `core:import`/`core:export` relations — there
-is no import statement to derive an edge from, so deleting or editing the declaring script left
-every consumer's `core:references` rows to it dangling: the incremental pipeline's own reverse-
-dependent scheduling had no edge to walk to rediscover the consumer.
-
-**Fix**: `resolve_ambient_global` (`urdira-jsts-syntax-worker::semantic_sites.rs`) now records the
-cross-file dependency it just proved onto a new `OwnerSemantics::ambient_global_dependencies: Vec
-<String>` field (declaring paths, deduped, never populated for a same-file or ambiguous
-resolution). `analyze::run_scoped` turns each entry into a `ProposedRecordDependency` with a NEW
-role, `jsts:ambient_global_input` (`deps::DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT = 2`, `DependencyRow.
-role` byte) — the SAME channel ordinary import-derived dependencies use, so `StoreReader::deps_by_
-owner`/`deps_reverse` and any dependency-graph consumer (`residual.rs::expand_with_dependency_
-closure` included) see it for free. `delta.rs::run_one` uses `deps_reverse` (keyed by the touched
-path's OLD ordinal, from the store's own `prev_generation` dictionaries) to find every ambient
-dependent of a deleted/edited path, and passes that set to `analyze::run_incremental`/`run_scoped`
-via a NEW `extra_affected_paths` parameter — unioned into `affected_paths` AFTER `syntax.analyze()`
-returns, deliberately NOT folded into `changed_artifact_ids` (that channel is validated byte-for-
-byte against the manifest's own content diff by `authoritative_changed_paths` and rejects an
-unchanged file's id outright — a real bug this fix's first draft hit and fixed live).
-
-**Scope boundary, explicitly not fixed**: `resolve_root_namespace`'s separate ambient-namespace
-fallback (a qualified name's root, `jest.Foo`-shaped) does not record a dependency — narrower,
-flagged in that field's own doc comment, not reproduced at corpus scale. A SECOND, unrelated root
-cause (a cross-file METHOD CALL/reference resolution gap, all three files real modules with real
-imports — nothing to do with ambient globals) was found live re-measuring at N=2015 on n8n; not
-fixed here, flagged for the owner's queue (`docs/evidence/2026-09-06-v4-reconcile-threshold.md`
-§15.4).
-
-**Verified**: n8n re-measurement at N=1008 (§14.3's own repro scale) — `graph`/`dependency` roots
-now match an independent oracle exactly, non-external `extra_untouched` phantom-row count `0` (was
-non-zero via `graph=false` before this fix). Two new e2e tests (`tests_e2e.rs`) confirmed to FAIL
-without the fix and pass with it; three new unit tests (`semantic_sites.rs`) cover cross-file/
-same-file/ambiguous resolution's dependency-recording contract, including decision 28's own
-"never guess under ambiguity" invariant (an ambiguous ambient global records no dependency).
-
-## Cross-module method-call reference resolution + owner surface criterion (Frente E-P0g, 2026-09-07)
-
-**Problem** (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §15.4/§16): the SECOND root
-cause E-P0f's own §15.4 flagged and left open, closed here at real n8n scale (N=2015 and N=5037,
-25% of the frontier) plus two deeper, distinct root causes the same investigation surfaced along
-the way. All three share one symptom: an untouched owner keeps a stale `jsts:call`/`jsts:
-references` row a from-scratch oracle scan of the identically mutated tree never re-derives
-(`extra_untouched` in `records_logical_set_diff`'s own vocabulary).
-
-**Root cause 1 — a re-exporting barrel is never watched as a structural dependency.**
-`urdira-indexing-worker::v4::typeflow.rs::resolve_import_targets_for` resolves a needed type
-import's specifier to a `target_path` (`WorkspaceResolver::resolve`), then chases named/star
-re-exports through it via `resolve_named_export` to the FINAL declaring entity. `import_targets`'
-own value only ever stores that flattened final entity id, so `urdira_jsts_typeflow::ProgramIndex::
-link_importer` (keyed by `entity_owner[target_id]`) only ever registers the importer against the
-FINAL declaring file — never against a re-exporting barrel it went through on the way there.
-Removing/renaming ONLY the barrel (the declaring file itself untouched) therefore left nothing
-pointing back at the importer to reflow.
-
-**Root cause 2 — `apply_import_target_updates` could not detect "this owning path now resolves
-NOTHING".** `urdira-jsts-typeflow::ProgramIndex::apply_import_target_updates` derived which owning
-paths to clear/replace SOLELY from the fresh `import_targets` snapshot's own keys — correct as
-long as an owning path keeps at least one resolved import, silently wrong the moment its entire
-needed-import set stops resolving (the snapshot then has no key for it at all, so its stale,
-still-pointing-at-the-old-target entry survived forever). Fixed by passing the caller's own full
-`owning_paths_considered` set explicitly (`pending_target_updates`'s keys already reliably name
-every owning path re-resolved this call, per that map's own "one entry per queried path, even if
-empty" contract) instead of inferring it from `import_targets`' keys alone.
-
-**Root cause 3 — the reverse-import graph ignored re-export/barrel edges entirely.**
-`urdira-jsts-syntax-worker`'s `ImportReverseIndex::insert_file` and its from-scratch fallback
-`reverse_affected_closure` only ever read a file's `direct_imports` — a NAMED re-export
-(`export { X } from "./y"`) or a bare barrel (`export * from "./y"`) is exactly as much of a
-"this file depends on that path" edge, and a content edit at the far end of such a chain (e.g. a
-class member renamed) needs the SAME transitive reverse-BFS to reach every real caller through it.
-Both now also fold in `export_bindings`' `source_target_path` and `export_star_specifiers`'
-`target_path` — purely additive (widens the affected-closure BFS, never narrows it).
-
-**Owner surface criterion, widened** (the plan's own brief for this frente): `analyze.rs::
-exported_surface` used to track only a module's own top-level `export_bindings`/`export_star_
-specifiers` — a locally-exported CLASS/INTERFACE's member names (methods/getters/setters/
-properties/constructor) and a locally-exported FUNCTION's parameter names were invisible to it, so
-renaming/removing a member never counted as a "surface changed" edit and `run_scoped`'s P3-3
-narrowing (§ "Content-edit closure narrowing" above) incorrectly dropped every transitive importer
-back down to the literal edited path. Each member/parameter's identity in the surface set is
-`(container_name, member_name, kind)` — DELIBERATELY POSITION-INDEPENDENT (never the member's own
-span-keyed entity id): editing one method's BODY can shift a LATER sibling's `start` purely from
-byte-length growth, with no signature change at all, and using a span-keyed id there would make
-that a false "surface changed" positive, breaking the standing hub-edit memory gate ("editing a
-method's body without changing its signature must keep `owners == 1`"). No `EntityKind` carries a
-visibility modifier (confirmed by reading `SyntaxEntity`'s own field list), so this is deliberately
-every member kind a class/interface can declare, not only the ones that happen to be `public` --
-conservative by construction, matching every other unresolvable-precisely case in this module.
-
-**Also fixed along the way**: a multi-hop re-export chain (barrel re-exporting a barrel, e.g. a
-package-root `index.ts` re-exporting a nested `event-bus/index.ts` re-exporting the declaring
-file) needs EVERY hop watched, not just the specifier's own direct resolution target --
-`resolve_import_targets_for` walks the full chain (`collect_reexport_chain_paths`, mirroring
-`resolve_named_export_inner`'s own named-reexport/star-fallback rule, cycle-guarded and depth-capped
-the same way) and registers a watch for each hop. Kept as `TypeflowCache`'s OWN reverse index
-(`chain_watchers`/`owning_chain_targets`, `crates/urdira-indexing-worker/src/v4/typeflow.rs`) --
-deliberately NOT folded into `ProgramIndex`'s `pending_importers_of` (that field's own "still
-failing" contract is asserted empty once a need resolves cleanly by an existing test,
-`urdira-jsts-typeflow`'s `member_access_through_a_reexporting_barrel_edited_in_a_later_separate_
-build_index_call`; an earlier draft of this fix broke it by reusing that field for a genuinely
-resolved-through-a-chain edge instead of keeping the two concepts separate).
-
-**Tests added** (`urdira-indexing-worker::v4::tests_e2e`, new fixtures under `tests/fixtures/
-codebases/typescript/barrel-method-call/` and `.../multi-hop-barrel-rename/`):
-`barrel_rename_closes_a_method_call_relation_through_the_old_barrel_path` (root cause 1+2, single
-hop), `method_rename_reanalyzes_the_caller_and_closes_the_old_call_relation` (root cause 3 + the
-surface criterion, a plain same-file method rename with no barrel involved),
-`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched` (the hub-edit memory gate,
-explicit regression coverage: record-id-set equality proof for both the barrel and the caller
-across a body-only edit), `nested_barrel_rename_in_a_mixed_batch_closes_a_transitive_property_
-reference` (the multi-hop fix, exercised through `delta.rs::run`'s own structural/content
-generation split for a mixed batch). Every pre-existing test in
-`urdira-jsts-syntax-worker`/`urdira-indexing-worker`/`urdira-jsts-typeflow` stays green unmodified.
-
-**Verified at real n8n scale** (`scripts/v4-reconcile-threshold.mjs --files N --keep-data`,
-corpus `~/Proyectos/urdira-benchmark/n8n-corpus-2026-09-02`): N=2015 (this frente's own original
-target scale) and N=5037 (25% of the 20,148-file frontier, the task's own upper bound) both reach
-`extra_untouched=0`/`missing_untouched=0` (non-external) and `roots_ok.delta_all=true`
-(`dependency`+`graph` roots exactly match an independent oracle scan, `records` compared by the
-same logical-set invariant `deltaAllOk` always has, decision-11 chaining excepted) -- full delta-
-path logical parity against an independent oracle at both scales, closing E-P0f's own §15.4 finding
-and every further root cause this session's own re-investigation of it surfaced.
-
-## Owner surface criterion, widened again: a declaration's own TYPE (Frente E-P0h, 2026-09-07)
-
-**Problem** (`docs/evidence/2026-09-06-v4-reconcile-threshold.md` §16.5's own adversarial-review
-finding, `#[ignore]`d there): the surface criterion the previous amendment describes (a locally-
-exported container's member/parameter NAMES) still had no TYPE-level signal at all -- an exported
-function's return type, an exported class member's declared/return type, an exported function's
-parameter's type, or an exported type alias's own RHS changing, with the declaration's own name/
-parameter-NAMES/member-list untouched, left `surface_changed` `false` and incorrectly narrowed away
-every caller whose typeflow-mediated resolution (a member-chain call resolved through `ProgramIndex::
-function_return_types`/`member_type_ref`, entirely orthogonal to this syntax-level gate) depended on
-that exact type.
-
-**Fix, minimal cross-crate surface** (the plan's own brief: expose the minimum, not `DeclSummary`/
-`RawTypeRef` wholesale): `urdira-jsts-syntax-worker`'s `SyntaxEntity` gains `type_surface_digest:
-Option<String>` -- a normalized (comments/whitespace outside a string/template literal stripped),
-POSITION-INDEPENDENT fingerprint of a declaration's own WRITTEN type, computed ENTIRELY from this
-crate's own already-parsed AST spans (a new `Utf16ByteMap` translates the UTF-16 offsets this
-crate's `Visit` walk always sees back to UTF-8 byte offsets into the file's own source text, so the
-type annotation's raw text can be sliced and normalized without any semantic type resolution at
-all). `urdira-jsts-typeflow`'s `MemberDeclaration` (already threaded to this crate's own member-
-entity producer for the prior amendment's member-identity work) gains two plain fields --
-`type_surface_params`/`type_surface_return`, RAW UTF-16 spans, never a resolved `RawTypeRef` -- the
-entire cross-crate addition. `analyze.rs::exported_surface` folds in a `("type:{name}", digest, ..)`
-entry for a directly-exported function/variable/type-alias and a `("member_type:{container}.
-{member}", digest, ..)` entry per typed class/interface member, reusing the SAME subset-comparison
-`surface_changed` check already applies -- a digest change removes the old tuple and inserts a
-different one, correctly widening the affected set exactly like a member rename already does.
-
-**Tests**: the reviewer's own `#[ignore]`d repro (`exported_function_return_type_change_should_
-reanalyze_a_type_dependent_caller`) is now green, plus four new variants (exported function
-parameter type, exported class property type, exported class method return type, exported type
-alias RHS) -- all confirm `owners` widens to the type-dependent caller. The standing hub-edit cost
-gate (`method_body_edit_keeps_owners_at_one_barrel_and_caller_untouched`) stays green unmodified.
-
-**Verified at real n8n scale**: N=1008 (`add=50 changed=908 deleted=100`) and N=2015 (§16's own
-repro scale, `add=100 changed=1813 deleted=201`) both reach `extra_untouched=0`/`missing_
-untouched=0` (non-external) and `roots_ok.delta_all=true`/`roots_ok.cold_all=true` -- see `docs/
-evidence/2026-09-06-v4-reconcile-threshold.md` §17 for the full numbers and every non-zero bucket's
-`external_*` accounting.
+- **2026-09-05** (`docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`): the cold pipeline began materializing members, referenced parameters, catch/rest bindings, ambient-namespace and external entities directly, and unresolved call/heritage sites moved from a bare relation-plus-diagnostic pair into the `pending.sites` side table (decision 28 owns the semantics).
+- **2026-09-06** (Frente E, plan `generic-waddling-hartmanis.md` §2, `docs/evidence/2026-09-06-v4-reconcile-threshold.md`): added the third `ScanScope::Reconcile` mode — an always-authoritative walk that routes to the cheaper `Changed`-shaped path below a measured delta threshold (shipped at `RECONCILE_DELTA_THRESHOLD = 0.25`) or to `Full` at or above it, with an in-line `Cold` fallback on a failed `Delta` attempt; verified byte-identical roots to a from-scratch scan at every measured fraction. The threshold was re-measured and lowered to the current `0.01` the same week (§5 of the same evidence) — see "Reconcile" above for the current mechanism and value.
+- **2026-09-06** (same evidence, content-hash equivalence): fixed a reconcile false-positive where a `touch`, a `git stash` round trip, or an index-pack import onto a fresh filesystem — content-identical files with different metadata — forced a whole-corpus "changed" verdict; equivalence is now decided by `content_hash` alone, with a new `Catalog::refresh_metadata` path that persists the metadata refresh even on a `Noop` reconcile (no rows added/changed/deleted) so a second reconcile of the same tree reports zero refreshes.
+- **2026-09-07** (Frente E-P0f, `docs/evidence/2026-09-06-v4-reconcile-threshold.md` §14.3): fixed a real dependency gap — a TypeScript script's top-level declarations are ambient globals with no `import`/`export` edge to derive a dependency from, so deleting/editing the declaring file left consumers' stale `core:references` rows undetected. `resolve_ambient_global` now records the proven cross-file dependency onto a new `jsts:ambient_global_input` role on the same `DependencyRow` channel ordinary imports use, so `deps_reverse`/the residual pass's dependency closure see it for free. Verified at n8n scale: `extra_untouched` phantom-row count 0 (was non-zero).
+- **2026-09-07** (Frente E-P0g, same evidence §15.4/§16): closed three further stale-row root causes found at n8n scale (N=2015, N=5037) — a re-exporting barrel was never watched as a structural dependency (`link_importer` only registered the FINAL declaring file); `apply_import_target_updates` could not detect an owning path whose entire import set stopped resolving; and the reverse-import graph ignored re-export/barrel edges entirely. Also widened the owner-surface reflow criterion (`analyze.rs::exported_surface`) to a class/interface's own member and parameter names (position-independent, so a body-only edit that shifts a later sibling's byte offset never falsely trips it), and extended barrel-watching to multi-hop re-export chains. Verified: `extra_untouched=0`/`missing_untouched=0` at both N=2015 and N=5037 (25% of the frontier), full delta-path parity against an independent oracle.
+- **2026-09-07** (Frente E-P0h, same evidence §16.5): widened the owner-surface criterion again to a declaration's own WRITTEN type — a normalized, position-independent `type_surface_digest` fingerprint (comments/whitespace stripped, sliced from the file's own source text with no semantic resolution) folded into `exported_surface` for a function/variable/type-alias's own type and each typed class/interface member, so a return-type or parameter-type edit with the declaration's name/parameter-names/member-list unchanged now correctly widens the reflow set for a typeflow-mediated caller. Verified at N=1008 and N=2015: `extra_untouched=0`/`missing_untouched=0`, roots match both the delta and cold oracles.

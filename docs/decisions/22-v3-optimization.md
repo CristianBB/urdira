@@ -1,6 +1,14 @@
 # Decision 22: Urdira v3 bounded pipelines, digests and migration
 
-Status: approved and implemented
+Status: Accepted
+
+Current scope: this decision governs the v3 bounded-pipeline and digest
+optimizations. Since 2026-09-04 the v4 immutable segment structural store
+([decision 26](26-v4-structural-store.md)) is the default for newly added
+workspaces; this decision remains normative for workspaces opted out with
+`URDIRA_V4=0` and for the compatibility/oracle route. Decision 27 owns the
+v4-specific digest mechanism (Merkle bucket digests) that replaces the
+canonical-digest behavior described here for v4 workspaces.
 
 Structural cutover note: the TypeScript command/materialization paths described
 in this decision remain compatibility and differential-oracle implementations
@@ -236,7 +244,7 @@ complete for a generation, the
 query falls back to an exact selected-scope scan and reports the corresponding
 freshness/completeness state; it never returns an approximate result.
 
-## 2026-08-29 cutover amendment
+## Rust-owned bounded pipeline
 
 The bounded pipeline is executed by the Rust indexing core rather than by the
 TypeScript owner loop. Cold and incremental generations use the same SQLite
@@ -250,3 +258,14 @@ The same Rust transaction owns candidate identity and work-manifest lifecycle
 metadata. The application passes those immutable values in the generation
 envelope; it does not insert candidate rows or receipts before the worker
 publishes.
+
+## Historial de cambios
+
+- **2026-08-29** (Rust cutover): the bounded pipeline, digest writers, and
+  candidate publication moved from the TypeScript owner loop to the Rust
+  indexing core; TypeScript retained as a compatibility/differential-oracle
+  implementation only.
+- **2026-09-04** (v4 default): the v4 structural store ([decision 26](26-v4-structural-store.md))
+  became the default for newly added workspaces; this decision's own scope
+  narrowed to the v3/`URDIRA_V4=0` path, with decision 27 owning the v4
+  digest mechanism.

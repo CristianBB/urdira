@@ -1,6 +1,6 @@
 # Local web interface
 
-Status: **Approved and implemented**
+Status: Accepted
 Last updated: 2026-08-26
 Depends on: [Daemon, MCP integration, and packaging](10-daemon-mcp-packaging.md), [Workspace, snapshot, and incremental indexing](04-workspace-snapshot-incremental-indexing.md), and [Configuration, security, and lifecycle](09-configuration-security-lifecycle.md)
 

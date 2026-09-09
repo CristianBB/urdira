@@ -1,6 +1,15 @@
 # Decision 21: Native pipeline and relational storage
 
-Status: Approved and implemented in Urdira v3
+Status: Accepted
+
+Current scope: this decision governs the v3 structural pipeline (SQLite
+relational tables as the structural authority). Since 2026-09-04 the v4
+immutable segment structural store (`crates/urdira-structural-store`,
+[decision 26](26-v4-structural-store.md)) is the default for newly added
+workspaces; the v3 pipeline described below remains the implementation for
+workspaces opted out with `URDIRA_V4=0` and for the compatibility/oracle
+route. Decisions 27-29 own the v4-specific digest, semantic, and scan
+mechanisms that replace the corresponding v3 behavior described here.
 
 Current cutover authority: the historical TypeScript analyzer/SQLite worker
 description below is retained for wire and compatibility context only. In the
@@ -214,7 +223,7 @@ mode-restricted, removed after publication or failure, and never participates
 in a public digest. A resumed initial progressive publication preserves this
 mode through its durable checkpoint.
 
-## 2026-08-29 cutover amendment: Rust owns structural mutation
+## Rust-owned structural mutation
 
 The structural coordination described above is now owned by the
 `urdira-indexing-core` Rust runtime. TypeScript remains the source/CAS snapshot
@@ -241,3 +250,13 @@ application may construct their immutable values for the generation envelope,
 but the Rust core inserts them and records the `analyzing` to `published` (or
 `failed`) lifecycle on its writer connection. TypeScript does not insert
 candidate rows or receipts on the cutover route.
+
+## Historial de cambios
+
+- **2026-08-29** (Rust cutover): structural mutation ownership moved from the
+  TypeScript owner loop to the persistent `urdira-indexing-core` Rust
+  composition worker; TypeScript retained only as source/CAS and query shell
+  plus a compatibility/oracle route.
+- **2026-09-04** (v4 default): the v4 structural store ([decision 26](26-v4-structural-store.md))
+  became the default for newly added workspaces; this decision's own scope
+  narrowed to the v3/`URDIRA_V4=0` path.

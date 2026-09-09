@@ -1,7 +1,7 @@
 # Durable JavaScript/TypeScript Analysis Cache
 
-Status: **Approved and implemented**
-Last updated: 2026-08-24
+Status: Accepted
+Last updated: 2026-09-09
 Depends on: [JavaScript/TypeScript support](07-javascript-typescript-mvp.md) and [plugin resolution continuity](14-plugin-upgrade-relock.md)
 
 ## Current contract
@@ -63,3 +63,15 @@ entry across those boundaries.
   synchronized, or published as workspace state.
 - There is no proactive warming: an entry exists only after a successful real
   analysis of the exact key.
+
+## Scope note: v4 workspaces do not use this cache
+
+This decision governs the JavaScript/TypeScript plugin's own TypeScript
+checker-backed analyzer/worker (`packages/plugin-javascript-typescript/src/worker.ts`,
+still live and used by non-v4 workspaces). A v4 workspace
+([v4 structural store](26-v4-structural-store.md), [v4 Rust-owned scan pipeline](29-v4-rust-owned-scan-pipeline.md))
+never routes through that analyzer: the Rust `urdira-indexing-worker` owns
+catalog, parse, and materialize as one pass, with its own incremental
+mechanism (`Full`/`Changed`/`reconcile` scopes, and an incremental
+`ProgramIndex` for typeflow) that this durable, gzip-JSON, per-daemon-data-root
+cache plays no part in.

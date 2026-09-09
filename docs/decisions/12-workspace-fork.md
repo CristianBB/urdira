@@ -1,7 +1,7 @@
 # Workspace Fork
 
-Status: **Approved and implemented**
-Last updated: 2026-08-24
+Status: Accepted
+Last updated: 2026-09-09
 Depends on: [Content-derived record identity](11-content-derived-record-identity.md), [workspace indexing](04-workspace-snapshot-incremental-indexing.md), and [storage](05-storage-projection-architecture.md)
 
 ## Current contract
@@ -11,6 +11,27 @@ the same installation when both represent exactly the same visible source and
 resolve the same plugin analysis contract. Fork is an automatic first-scan
 optimization. It never changes source identity, workspace isolation,
 publication semantics, or the full-scan fallback.
+
+**Current reachability**: `attemptWorkspaceFork`'s donor bulk-copy writes
+target structural rows through the TypeScript storage adapter
+(`packages/engine/src/workspace-fork.ts`), so the daemon only enters it when
+the resolved plugin carries no Rust indexing-core generation port
+(`plugin.indexing_core === undefined`, `packages/daemon/src/runtime.ts`).
+Since the Rust cutover ([Rust native acceleration](25-rust-native-acceleration.md))
+is the default production route for the JavaScript/TypeScript plugin, and v4
+([v4 structural store](26-v4-structural-store.md)) is the default for newly
+added workspaces, this predicate is false in ordinary production use today:
+production falls through to the ordinary Rust-backed full or incremental
+scan instead of forking. The mechanism below remains live for a
+non-Rust-core plugin resolution (compatibility/test route) and documents the
+byte and publication contract a future Rust-native donor-copy command would
+have to preserve; no such command exists yet (confirmed: no donor/fork
+copier in `crates/urdira-indexing-worker`). v4's own answer to "an existing
+tree already has published bytes on disk" is the `reconcile` scope
+described in [v4 Rust-owned scan pipeline](29-v4-rust-owned-scan-pipeline.md),
+which is a different mechanism (git-checkout/pull equivalence on an
+ALREADY-registered workspace) from this decision's donor-to-new-workspace
+bootstrap.
 
 ## Donor selection
 
@@ -116,13 +137,15 @@ mints a new lock/configuration identity and forces complete reanalysis.
 - Disabling the optimization changes performance only; the progressive scan
   remains authoritative.
 
-## Rust cutover amendment (2026-08-31)
+## Historial de cambios
 
-The donor-row bulk copier described above remains a compatibility/oracle
-implementation because it writes target structural rows through the
-TypeScript storage adapter. When a persistent `urdira-indexing-worker` is
-available, the daemon does not enter this copier (and the engine rejects an
-injected Rust writer at its boundary); it falls through to the ordinary Rust
-generation. This keeps one production structural SQLite writer. A future
-Rust-native donor-copy command may re-enable the optimization without
-changing the fork's byte or publication contracts.
+- **2026-08-31** (Rust cutover): the donor-row bulk copier became
+  compatibility/oracle-only once a persistent `urdira-indexing-worker` was
+  available in production — the daemon stopped entering it (and the engine
+  rejects an injected Rust writer at its boundary) so exactly one production
+  structural SQLite writer remains; folded into "Current reachability" above.
+- **2026-09-06/09** (v4 structural store campaign): v4 became the default
+  for newly added workspaces, widening the set of installations for which
+  this decision's copier is unreachable; the analogous "already-published
+  tree" optimization for v4 workspaces is the `reconcile` scope in
+  [decision 29](29-v4-rust-owned-scan-pipeline.md), not this mechanism.

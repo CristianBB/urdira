@@ -1,6 +1,6 @@
 # Decision 20: Source-First Readiness and Layered Publication
 
-Status: **Approved**
+Status: **Accepted**
 
 ## Decision
 

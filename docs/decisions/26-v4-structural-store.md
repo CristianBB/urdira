@@ -1,9 +1,23 @@
 # Decision 26: v4 immutable segment structural store
 
-Status: **Approved; implemented, and the default for newly added workspaces since 2026-09-04 (opt out with `URDIRA_V4=0`; see `versioning.md`). Cold base write is partitioned (P2-2j), delta generations are single-file containers (P3-6), facet names and subject text live in the store's dictionaries (P2-2e). RSS gate (≤ 3 GiB) NOT met: 6.56-8.16 GB at n8n. One open critical data-integrity bug (P2-2m, decision 29).**
-Last updated: 2026-09-05
+Status: **Accepted**
+Last updated: 2026-09-09
 Depends on: [Storage and projection architecture](05-storage-projection-architecture.md), [Content-derived record identity](11-content-derived-record-identity.md), [Transactional projection digests](13-transactional-projection-digests.md), [Native pipeline and relational storage](21-native-pipeline-relational-storage.md), [v3 optimization](22-v3-optimization.md), [Index pack](23-index-pack.md), [Rust native acceleration](25-rust-native-acceleration.md)
-Superseded by decisions [27](27-v4-merkle-bucket-digests.md), [28](28-v4-rust-semantics-and-residual-checker.md), [29](29-v4-rust-owned-scan-pipeline.md) for the parts of this system they own (digests, semantics, scan orchestration)
+Related: decisions [27](27-v4-merkle-bucket-digests.md), [28](28-v4-rust-semantics-and-residual-checker.md), [29](29-v4-rust-owned-scan-pipeline.md) own the parts of this system they specify (digests, semantics, scan orchestration)
+
+## Current state (2026-09-09)
+
+Implemented and the default for newly added workspaces since 2026-09-04
+(opt out with `URDIRA_V4=0`; see `versioning.md`). Cold base write is
+partitioned (P2-2j), delta generations are single-file containers (P3-6),
+facet names and subject text live in the store's dictionaries (P2-2e),
+`entities.index` is a persisted, mandatory section since format 6 (F4 4.3).
+RSS gate (≤ 3 GiB) is **not met**: median 6.11 GiB at n8n, 14.18 GiB at VS
+Code (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §1.1 — RSS scales
+close to linearly with corpus size in this range). The writer's own ≤ 2.5 s
+target is also not met (final `write_ms` 5.83-8.41 s at n8n). The P2-2m
+`identity_key`-zeroing corruption reported as an open critical bug through
+2026-09-05 is **fixed** — see "Open items" below.
 
 ## Context
 
@@ -571,15 +585,6 @@ so even the smallest fixture's pack is ~140 MB before compression.
 
 ## Open items (reported, not resolved)
 
-- **CRITICAL — P2-2m `identity_key` zeroing.** A rare, non-deterministic,
-  silent corruption (2 of 9 in-process n8n cold scans, ~1 in 1.4M records)
-  writes an all-zero `identity_key` of the right length into `records.ident`
-  while `record_digest` stays intact, on `core:call` and `core:references`
-  rows. Not a store-format defect — the bytes are produced upstream, most
-  likely in `kernel_rows_batches`'s `rayon::join` bisection — but the store
-  persists and serves them, and neither the header `xxh3` nor the Merkle
-  roots can detect it (`docs/evidence/2026-09-05-v4-final-measurements.md`
-  §2.4-§2.5; decision 29, open item 1).
 - **RSS ≤ 3 GiB not met** — see "RSS status" above; the remaining levers
   are architectural (streaming vs sorted-key dictionaries) or an owner
   decision on record volume.
@@ -620,7 +625,12 @@ so even the smallest fixture's pack is ~140 MB before compression.
 - **The `dependency` incremental-diff gap is CLOSED** (P3-2 §3 — a
   `dependency_id` recipe leak, not a store defect; decision 29).
 
-## Amendment (2026-09-07, Frente E-P0j): entity span fidelity, `entities.index` re-keyed off identity text
+## Historial de cambios
+
+- **2026-09-05** (P2-2m, `docs/evidence/2026-09-05-v4-p2-2m-identity-key-corruption.md`): root-caused and fixed the `identity_key`-zeroing corruption reported as an open critical bug above. Two real bugs in `crates/urdira-structural-store/src/segment_io.rs`'s hot-file writer: (1) every `records.*` write used a single-shot `write_at`, which POSIX permits to short-write silently — replaced with `write_all_at` (12 call sites, both the flat and partitioned writer); (2) fixing (1) alone did not close the corruption — a concurrent sparse-file allocation race on macOS/APFS could still silently revert one writer's already-`write_all_at`-confirmed bytes to the pre-allocation zero value when up to 16 partition writers extended the SAME sparse file's allocated-extent metadata concurrently. Fixed by `create_sized_hot_files`, which forces real block allocation across a hot file's entire length (`materialize_real`, single-threaded per file, in parallel across the five files) strictly before any concurrent writer touches it, so every later write only overwrites already-allocated blocks. Verified clean across 5 production-path cold runs + 2 in-process diagnostic runs + 1 incremental-oracle run, plus a new `#[ignore]`d stress test (`materialize_write_read_roundtrip_never_loses_an_identity_key`, 200k synthetic records × 200 iterations). This corruption was invisible to the header `xxh3` and to the Merkle roots (both computed from in-memory data before the writer ran) — only the classification invariant (decision 28) and a full-store diagnostic scan could detect it; that gap in the store's own integrity story is unchanged by this fix (a future verify extension would need to re-read persisted bytes, not trust in-memory roots).
+- **2026-09-07** (Frente E-P0j, `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md` §1.3): entity span fidelity fix — see below (folded from the former standalone amendment).
+
+### Detail: entity span fidelity, `entities.index` re-keyed off identity text
 
 Confirmed live (`docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
 §1.3): every entity producer in `urdira-jsts-syntax-worker` (`push_entity`/

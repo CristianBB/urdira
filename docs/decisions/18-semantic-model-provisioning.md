@@ -1,6 +1,6 @@
 # Semantic Model Provisioning
 
-Status: **Approved and implemented**
+Status: **Accepted** (2026-08-13 — replaces a preinstalled, release-bundled data-only model pack, which was **Rejected** the same day: acceptance required always downloading at explicit configure time with a visible download notice, which a bundled pack cannot provide; the contract below is what shipped instead)
 Last updated: 2026-08-24
 Depends on: [Semantic search and ranking](06-semantic-search-ranking.md) and [semantic runtime](16-semantic-search-wiring.md)
 
@@ -51,3 +51,7 @@ There is no distributed semantic model-pack artifact, automatic model
 selection harness, or implicit model upgrade. Introducing any of those changes
 requires updating this current contract and the release/package acceptance
 rules in the same change.
+
+## Historial de cambios
+
+- **2026-08-13**: rejected a release-bundled, preinstalled data-only model pack in favor of the always-download-at-configure contract documented above, with a visible "downloading" notice in the configuration response. `docs/decisions/06-semantic-search-ranking.md`'s "Release-bound semantic registries" section was updated to stop requiring a preinstalled pack.

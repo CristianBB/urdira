@@ -1,7 +1,7 @@
 # Plugin Resolution Continuity
 
-Status: **Approved and implemented**
-Last updated: 2026-08-24
+Status: Accepted
+Last updated: 2026-09-09
 Depends on: [Configuration and lifecycle](09-configuration-security-lifecycle.md) and [plugin contract](02-language-plugin-contract.md)
 
 ## Current contract
@@ -55,3 +55,20 @@ published snapshot and resolution queryable.
   earlier analysis contract.
 - Immutable control rows retain exact historical meaning without being used as
   current configuration after a relock.
+
+## Scope note: this decision does not apply to v4 workspaces
+
+This decision governs the JavaScript/TypeScript plugin's `resolve_plugin_provider`
+resolution lock (a real fingerprint over resolver version, supported
+contracts, requirements, pins, and package identities/versions/digests). A
+v4 workspace ([v4 structural store](26-v4-structural-store.md)) has no
+plugin registry/configuration/lock concept in this sense: the Rust
+`urdira-indexing-worker` owns catalog, parse, and materialize as one pass
+with no external plugin-configuration surface yet, so `registry_snapshot_id`,
+`configuration_revision_id`, and `resolution_lock_id` are fixed, per-workspace
+placeholder strings (`registry:{workspace_id}:v4`, `configuration:{workspace_id}:v4`,
+`resolution:{workspace_id}:v4`, `packages/daemon/src/runtime.ts`) that exist
+only to satisfy the protocol's `registry_snapshots`/foreign-key placeholder
+rows, never classified `preserved`/`stale`/`invalid`. This decision's
+continuity contract remains normative for the v3 (non-v4) JS/TS plugin
+resolution path.

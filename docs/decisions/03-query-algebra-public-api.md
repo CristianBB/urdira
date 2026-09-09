@@ -1,7 +1,7 @@
 # Query Algebra and Public API
 
-Status: **Approved**  
-Last updated: 2026-08-08  
+Status: Accepted  
+Last updated: 2026-09-09  
 Depends on: Universal data model and capability contract
 
 ## Decision objective
@@ -208,8 +208,8 @@ The core registry defines closed codes in these families:
 
 - request: malformed request, unsupported API version, unknown field, invalid option interaction, budget invalid;
 - scope: workspace not found, duplicate participant, invalid participant role, snapshot not found, snapshot expired, scope mismatch;
-- planning: operation unknown, recipe unknown or unsupported, stage reference invalid, stage type mismatch, selector invalid, registry definition unavailable, required capability unsupported;
-- freshness and coverage: wait timeout, required coverage incomplete, semantic coverage incomplete;
+- planning: operation unknown, recipe unknown or unsupported, stage reference invalid, stage type mismatch, selector invalid, registry definition unavailable, required capability unsupported, a record-scoped selector's `identity_id`/`identity_key` form with no dedicated index in the native structural store (`core:selector_unresolvable`), a status/administrative operation named as a pipeline or recipe stage even though it never emits `ResultSubject`-shaped stream items (`core:non_subject_operation`);
+- freshness and coverage: wait timeout, required coverage incomplete, semantic coverage incomplete, affected semantic result set stale (`core:affected_set_stale`, raised when a `core:semantic_affected_page` request's set id no longer matches the workspace's current affected-artifact set — see [Semantic search and ranking](06-semantic-search-ranking.md));
 - execution: exact execution resource limit, cancelled, internal execution failure;
 - index: unavailable, contract unsupported, integrity failed;
 - pagination: cursor invalid, expired, execution evicted, scope mismatch, stream mismatch, projection mismatch;
@@ -220,9 +220,10 @@ Every exact code, trigger, non-meaning, retryability, recovery action, and close
 
 ## MCP surface
 
-The adapter exposes exactly four intelligence tools:
+The adapter exposes exactly five read-only tools:
 
 - `urdira_query`: accepts `QueryRequest` or `ContinuationRequest` and covers operations, pipelines, recipes, and every cursor stream.
+- `urdira_context`: a task-oriented entry point that lowers to `core:build_context` with a bounded structural-readiness wait by default (see [Agent search integration](19-agent-search-integration.md)); it adds no second context semantic beyond `core:build_context`.
 - `urdira_analyze_change`: a concise wrapper over `core:analyze_impact`; it requires explicit scope, target, change descriptor, options, and budget.
 - `urdira_build_context`: a concise wrapper over `core:build_context`; it requires explicit scope, task, optional seeds, desired context facets, options, and budget.
 - `urdira_index_status`: lists discoverable workspaces when unscoped or returns pinned freshness, capability, plugin, activation, and repair-status views for explicit workspace IDs.
@@ -242,3 +243,7 @@ Adding registry definitions, plugin knowledge, or newly indexed source can chang
 ## Completion criteria
 
 Representative discovery, impact, testing, architecture, semantic, and pagination workflows are expressible in one typed request with deterministic response semantics. Implementation acceptance requires public-schema conformance fixtures for every operation, operator, recipe, cursor stream, and error code.
+
+## Historial de cambios
+
+- **2026-09-09**: added the `core:selector_unresolvable` and `core:non_subject_operation` planning errors and the `core:affected_set_stale` freshness/coverage error (with its `core:semantic_affected_page` trigger) to the operation-error families above, verified against `packages/contracts/src/registries.ts` (Frente Q-2, 2026-09-08, and Frente S-A, 2026-09-06); `core:compare` and `core:execution_resource_limit` were already accurate and needed no change, confirmed against `packages/contracts/src/registries.ts` and the `core:compare` implementation in `packages/daemon/src/runtime.ts` (Frente Q-4, 2026-09-08).

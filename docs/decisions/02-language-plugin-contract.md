@@ -1,6 +1,6 @@
 # Language Plugin and Capability Contract
 
-Status: **Approved**  
+Status: Accepted  
 Last updated: 2026-08-08  
 Depends on: Universal data model
 

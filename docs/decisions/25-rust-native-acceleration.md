@@ -1,7 +1,7 @@
 # Rust Native Acceleration
 
-Status: **Approved**
-Last updated: 2026-08-30
+Status: Accepted
+Last updated: 2026-09-08
 Depends on: Language plugin contract, JavaScript/TypeScript MVP, performance evaluation, packaging, native pipeline, and v3 optimization
 
 ## Decision objective
@@ -333,11 +333,20 @@ replace process-local estimates with host or process-tree measurements.
 
 The exact vector top-k native kernel is active whenever the verified production
 native closure is selected. Core retains filtering, canonical vector encoding,
-limits, ranking integration, and result validation; Rust receives call-owned
-packed buffers and returns only exact ordered identifiers and ranks. A selected
-kernel never falls back silently to the TypeScript oracle after a native error
-or malformed result. Development and tests without a selected native closure
-may use the behaviorally equivalent TypeScript oracle.
+limits, ranking integration, and result validation. For a v4 workspace scanned
+with a plain `float32` profile and no `paths` filter, `crates/urdira-native-core`
+registers one contiguous `f32` buffer per generation
+(`register_vector_buffer`) and scans it directly on each query
+(`exact_top_k_contiguous`, partial selection plus `rayon` parallelism above
+50,000 candidates) instead of re-marshaling a fresh candidate buffer per call
+— see [decision 06](06-semantic-search-ranking.md)'s own amendment for the
+exactness argument and measured latency. Every other case (a `paths` filter,
+a non-`float32` profile, or any native failure) uses the call-owned
+packed-buffer kernel described above, unchanged: Rust receives call-owned
+packed buffers and returns only exact ordered identifiers and ranks. A
+selected kernel never falls back silently to the TypeScript oracle after a
+native error or malformed result. Development and tests without a selected
+native closure may use the behaviorally equivalent TypeScript oracle.
 
 Activation requires a real target-matched addon, fixed-scale samples, exact
 ordered-result and UTF-8 tie equivalence, at least fifteen percent large
@@ -406,7 +415,7 @@ final path directly with exclusive creation. Harness-induced temporary siblings
 or delete/create lifecycles must not replace the intended workload or force a
 conservative native/semantic reset.
 
-## 2026-08-29 cutover amendment: indexing-core and composition worker
+## Indexing-core and composition worker
 
 Rust is now the production owner of structural indexing mutation. The closed
 `LanguageEngine` port (`describe`, `prepare`, `analyze_group`, `acknowledge`,
@@ -453,7 +462,7 @@ workspace imported from a legacy index pack) acquires the same
 It therefore cannot overlap a Rust structural or lexical mutation; it is not
 an alternative structural publication route.
 
-## 2026-08-31 source frontier handoff amendment
+## Source frontier handoff
 
 The production `index_generation` envelope carries engine configuration and
 verified coordinates, but no owner-sized JS/TS `files` or `root_names` arrays.
@@ -463,7 +472,7 @@ JSTS engine derives verified CAS paths inside Rust. The private array fields
 remain available only to differential/oracle tests; they are not part of the
 production composition path.
 
-## 2026-09-08 Q1 amendment: a query-plan-layer bug, not a pushdown-boundary gap
+## Query-plan-layer identity fix (not a pushdown-boundary gap)
 
 `docs/evidence/2026-09-08-v4-vscode-query-latency.md` traces a P0 (`core:
 resolve_symbol -> core:find_references` measured at 116-160s on VS Code's
@@ -517,7 +526,7 @@ even when `search_text_ready` reports true; `core:get_outline`'s
 multi-second variance traced to native-store mmap page-fault warm-up, not
 an algorithmic full scan).
 
-## 2026-09-08 Q-3 amendment: full-catalog pushdown, and one new index
+## Full-catalog pushdown, and the by_kind_universal index
 
 `docs/evidence/2026-09-08-v4-full-pushdown-catalog.md` closes the last
 operations reachable only through `CanonicalRecordQueryDataPort.execute()`'s
@@ -560,7 +569,7 @@ N-API method a `records_by_ids`-shaped caller can use) -- comparable in
 scope to this amendment's own `by_kind_universal` addition, not a quick
 follow-up.
 
-## 2026-09-08 Q-4 amendment: identity-by-index, and `core:compare` implemented
+## Identity-by-index lookups, and core:compare
 
 `docs/evidence/2026-09-08-v4-identity-lookup-and-compare.md` closes the two
 items the Q1/Q-3 amendments above left open: the `identity_key`/`identity_id`
@@ -677,3 +686,32 @@ never reaching the engine at all.
 See the evidence doc for the full before/after latency table (both
 corpora), the `core:compare` diff design's worked example, and literal
 test/verification counts.
+
+## Historial de cambios
+
+- **2026-08-29** (Rust cutover): `urdira-indexing-core`/`urdira-indexing-worker`
+  became the sole production structural/lexical writer and publication
+  authority; TypeScript retained only as a differential-test oracle.
+- **2026-08-31** (source frontier handoff): the production `index_generation`
+  envelope stopped carrying owner-sized `files`/`root_names` arrays; the JSTS
+  engine derives verified CAS paths from the current artifact/version
+  frontier inside Rust instead.
+- **2026-09-08** (Frente Q1, `docs/evidence/2026-09-08-v4-vscode-query-latency.md`):
+  fixed a query-plan-layer selector bug (`recipe-executor.ts`'s `toSubjectSelector`)
+  that mislabeled `entity_id` under `record_id` for bound pipeline stages,
+  causing `records_by_ids`'s `otherIds` fallback to scan the entire visible
+  generation on the native port; `find_references` VS Code p50 116-160s → ~416ms cold.
+- **2026-09-08** (Frente Q-3, `docs/evidence/2026-09-08-v4-full-pushdown-catalog.md`):
+  added `by_kind_universal` pushdown for `core:analyze_impact`,
+  `core:find_related_tests`, and `core:inspect_architecture`, closing the last
+  operations that fell through to the generic `records_for_query` fallback at
+  n8n/VS Code scale.
+- **2026-09-08** (Frente Q-4, `docs/evidence/2026-09-08-v4-identity-lookup-and-compare.md`):
+  added `identity_id_index`/`by_identity_key` native indexes (removing the
+  `records_by_ids` `otherIds` corpus scan for `analyze_impact`/`find_related_tests`)
+  and implemented `core:compare` across two workspace participants.
+- **2026-09-08** (Frente S-I, cross-referenced from [decision 06](06-semantic-search-ranking.md)):
+  the exact vector top-k kernel gained a resident, per-generation contiguous
+  buffer (`register_vector_buffer`/`exact_top_k_contiguous`) for the common
+  `float32`/no-`paths`-filter case, replacing per-call buffer re-marshaling
+  for that case.

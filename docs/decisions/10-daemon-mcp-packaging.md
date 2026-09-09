@@ -1,7 +1,7 @@
 # Daemon, MCP Integration, and Packaging
 
-Status: **Approved**  
-Last updated: 2026-08-26
+Status: Accepted  
+Last updated: 2026-09-09
 Depends on: Query API, workspace model, storage architecture, and lifecycle configuration
 
 ## Decision objective
@@ -84,6 +84,8 @@ If a different live engine build owns the data root, automatic replacement is pe
 The daemon interface is intentionally not a public Urdira protocol. Its framing, encoding, transport, handshake, and message layout are implementation details that may change with the engine build and are not part of plugin, MCP, query, storage, or compatibility contracts.
 
 Every implementation must nevertheless preserve these invariants: the channel is local and owner-restricted; peer, engine build, data root, and compatibility are verified before domain payloads; requests and responses are typed, bounded, correlated, cancellable, and explicitly workspace-scoped; unknown versions and fields fail closed; progress and operation errors remain distinct; the MCP boundary never opens storage or runs plugins; and daemon restart recovery preserves committed snapshots and ready cursor executions. Cross-user and remote daemon access are unsupported.
+
+The channel's fixed-size IPC frame (256 KiB by default) bounds every response independently of any caller-declared budget: a `core:query`/`core:query_continue` response's effective `response_budget.max_characters` is clamped to at most half the frame size before the engine builds a page, and the page builder additionally truncates by cumulative serialized size, always keeping at least one item so a page never regresses to zero progress. A generous or oversized declared budget therefore degrades to a smaller bounded page and a continuation cursor for the remainder instead of failing the whole request against the transport ceiling.
 
 ## MCP server
 
@@ -237,3 +239,7 @@ The worker owns the workspace writer connection; structural rows and
 per-owner callbacks never cross the application Node-API boundary. Archives
 must checksum these binaries alongside the existing addon, syntax worker and
 launcher, and startup fails closed on a missing or mismatched worker digest.
+
+## Historial de cambios
+
+- **2026-09-09** (`7a29869`): documented the IPC frame's fixed size and the `response_budget.max_characters` clamp (half the frame) plus size-based page truncation in "Private daemon boundary" above -- a declared budget can no longer overflow the transport into `core:ipc_frame_too_large`.

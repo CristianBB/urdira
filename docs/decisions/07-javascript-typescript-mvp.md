@@ -1,6 +1,6 @@
 # JavaScript and TypeScript MVP
 
-Status: **Approved**  
+Status: Accepted  
 Last updated: 2026-08-21
 Depends on: Universal data model and plugin contract
 

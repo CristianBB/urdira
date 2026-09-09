@@ -1,7 +1,7 @@
 # Semantic Search and Ranking
 
-Status: **Approved**  
-Last updated: 2026-08-08  
+Status: Accepted  
+Last updated: 2026-09-09  
 Depends on: Universal data model, query algebra, and storage architecture
 
 ## Decision objective
@@ -39,6 +39,8 @@ They remain derived or control-plane state. None is a canonical entity, relation
 Every public semantic operation evaluates similarity exactly over the complete vector set declared queryable by its snapshot-pinned `SemanticIndexMaterialization`, after applying its exact scope and structural filters. The initial public contract has no `approximate` or `auto` retrieval mode and never silently replaces exact retrieval with approximate nearest-neighbor search, sampling, or a bounded best-effort candidate scan.
 
 Physical indexes, caches, pruning strategies, and parallel execution are implementation details. They may be used only when they preserve the same selected candidates, scores, deterministic tie-breaking, and final order as the normative exact evaluation. If Urdira cannot execute that contract within an applicable resource limit, it returns a structured operation error rather than an approximate candidate set.
+
+At v4 scale, the exact scan is executed by a native resident kernel: one contiguous `f32` candidate buffer is registered once per generation (`crates/urdira-native-core`'s `register_vector_buffer`) and scanned directly on each query (`exact_top_k_contiguous`, partial selection plus `rayon` parallelism above 50,000 candidates) instead of re-marshaling candidates from scratch on every call. `canonical-query-data-port.ts`'s `trySemanticSearch` takes this path (`residentLaneScan`) whenever no `paths` filter is present and the profile is plain `float32`, and falls back to the pre-existing full re-marshaling scan otherwise, including on any native failure -- never a silent approximation. This is a pure execution-strategy change: candidates, scores, and order are identical on the resident and fallback paths (n8n, 2026-09-08: two-lane scan cost 581-1,999.9ms -> 5-6ms; end-to-end `core:search_semantic`/`core:search_hybrid` p99 1,722.2ms/2,192.7ms -> 134.99ms/178.33ms; `docs/evidence/2026-09-08-v4-semantic-native-scan-latency.md`).
 
 Exact retrieval is distinct from semantic coverage and evidentiary certainty. When embeddings are pending, unsupported, or failed, an accepted partial-coverage query evaluates exactly over the vectors that the pinned materialization declares available and reports the missing scope through `SemanticCoverageView` and `CompletenessReport`. It must not imply that the candidate set is exhaustive for the intended source scope. A request requiring complete semantic coverage follows the approved wait-and-error behavior. Semantic similarity remains candidate discovery even when both retrieval and coverage are complete; structural claims still require independent evidence.
 
@@ -192,7 +194,7 @@ Unsupported languages or content inside query scope produce explicit semantic co
 
 ## Core-owned embedding infrastructure and plugin semantic preparation
 
-Urdira owns every `EmbeddingProfile` and every component capable of changing vector bytes: model and tokenizer assets, document and query renderers, segmenters, generators, inference runtimes, vector encoding, normalization, and distance semantics. The distribution ships with at least one complete generic local code profile and may offer additional core-owned profiles through integrity-verified data-only Urdira model packs. A pack may contain immutable weights, tokenizer data, templates, declarative configuration, profile definitions, provenance, licenses, and evaluation metadata, but no executable code, bytecode, native library, script, command hook, callback, or runtime implementation. It references platform-neutral behavior releases; compatible executable builds are supplied and verified separately by the exact local Urdira installation. Supporting a new model architecture therefore requires an Urdira engine update rather than execution of pack-provided code. Language and framework plugins cannot register, package, replace, or execute embedding infrastructure.
+Urdira owns every `EmbeddingProfile` and every component capable of changing vector bytes: model and tokenizer assets, document and query renderers, segmenters, generators, inference runtimes, vector encoding, normalization, and distance semantics. The distribution designates at least one complete generic local code profile, acquired into the local model cache only through the explicit configuration operation defined by `docs/decisions/18-semantic-model-provisioning.md`, and may designate additional core-owned profiles the same way. An acquired asset set may contain immutable weights, tokenizer data, templates, declarative configuration, profile definitions, provenance, licenses, and evaluation metadata, but no executable code, bytecode, native library, script, command hook, callback, or runtime implementation. It references platform-neutral behavior releases; compatible executable builds are supplied and verified separately by the exact local Urdira installation. Supporting a new model architecture therefore requires an Urdira engine update rather than execution of downloaded assets. Language and framework plugins cannot register, package, replace, or execute embedding infrastructure.
 
 The logical pack is a deterministic canonical manifest plus its complete digest-addressed asset set. Offline bundles and explicit online installation are alternate delivery paths to the same local content. Delivery locators and transport packaging do not affect pack identity. A pack becomes selectable only after every required asset and engine-component reference verifies locally and the installation publishes atomically. Semantic document generation, vector generation, retrieval, and query replay never fetch missing assets from the network.
 
@@ -263,7 +265,9 @@ States are:
 
 An artifact is `covered`, `pending`, `excluded`, `unsupported`, or `failed`. Explicit exclusions are outside the effective semantic scope. Pending, unsupported, and failed entries are affected artifacts.
 
-Every semantic query response always repeats a compact coverage view. It includes counts and an initial bounded page of affected artifact paths. Large affected sets are immutable, bidirectionally pageable, and share the query execution lifetime.
+Coverage status is materialized, not inferred from the vector set: a per-document status table (`semantic_document_status`, one row per `(workspace_id, profile_id, executable_binding_id, document_grain, document_id)`) is written by the semantic reconciler (`packages/engine/src/semantic-reconciler.ts`) in the same enumeration pass that visits every candidate document for embedding -- `covered` lands in the same transaction as the vector commit, `pending`/`excluded`/`unsupported`/`failed` are written as each document is classified, and a document whose underlying artifact version or entity record stops being visible has its status row deleted rather than left stale. An artifact is `affected` exactly when `status <> 'covered'`. `buildSemanticCoverageView` (`packages/engine/src/canonical-query-data-port.ts`) reads `unsupported_artifact_count`/`failed_artifact_count` and the entity counts from `semantic_coverage_summary`, one row materialized per `(workspace_id, profile_id, executable_binding_id, generation)` by the reconciler in the same pass that writes its `semantic_index_state` completion marker -- a single indexed point lookup (`ORDER BY generation DESC LIMIT 1` over the table's own primary key) rather than a live aggregate on every query. A workspace whose first reconcile pass has not yet completed, or one predating this materialization, has no summary row yet; `buildSemanticCoverageView` then falls back to computing the same `GROUP BY document_grain, status` aggregate and the same affected-row scan live over `semantic_document_status`, byte-for-byte identical to what the materialized row would hold.
+
+Every semantic query response always repeats a compact coverage view. It includes exact counts and an initial bounded page of affected artifact paths (`limit = min(response_budget.max_items, 20)`), so an agent can act on the affected page without an extra round trip. The complete affected set is identified by an `affected_artifact_set_id` (a digest over the binding, generation, and the affected set's own paths in sort order) that changes if, and only if, the affected population or its order changes. The full set is bidirectionally pageable beyond the embedded first page through `core:semantic_affected_page` (`affected_artifact_set_id`, optional `cursor`, optional `limit`), which returns exactly one result-stream item holding the complete page (artifacts, `total`, `next_cursor`/`previous_cursor`, `has_next`/`has_previous`). Its cursor is a stateless, self-contained, base64url-encoded JSON object tied only to the affected data -- never the generic execution-scoped continuation mechanism that is tied to a `query_execution_id` and a time-limited manifest-store entry. A request whose `affected_artifact_set_id` argument, or whose cursor's own embedded set id, disagrees with the currently computed set id is rejected with `core:affected_set_stale{current_set_id}` before any page is sliced -- never a mixed or partial page. Both the embedded first page and every `core:semantic_affected_page` page are immutable and share the query execution lifetime.
 
 The query `CompletenessReport` includes `core:semantic_retrieval`. Updating coverage is `partial`, not an empty complete result. The report and coverage views remain unchanged through result pagination.
 
@@ -277,6 +281,7 @@ Local privacy policy may retain query embeddings for less time than the query ex
 
 - A hybrid query may continue with lexical or structural lanes while clearly reporting semantic degradation.
 - A required semantic-only stage with no usable index returns `core:semantic_index_unavailable`.
+- A stale `core:semantic_affected_page` request (an `affected_artifact_set_id` argument, or a cursor's own embedded set id, that disagrees with the currently computed affected set) returns `core:affected_set_stale{current_set_id}` rather than a mixed or partial page.
 - Invalid profile identifiers or incompatible profile selections in configuration and administrative validation return their specific stable errors. Normal semantic and hybrid query operations have no profile selector and therefore cannot require an agent to discover model identifiers first.
 - A query requiring complete semantic coverage may wait up to its explicit limit. If coverage remains incomplete, it returns `core:semantic_coverage_incomplete` rather than silently relaxing the requirement.
 - Persistent artifact-specific document, segmentation, or embedding failures publish explicitly produced source diagnostics.
@@ -342,7 +347,7 @@ The initial projection, section, semantic reason, and completeness definitions a
 
 The architecture deliberately does not hard-code one model asset or learned weight set into this decision. Those are immutable release data selected by the evaluation policy, represented through the already approved registries, and pinned by every workspace configuration and execution.
 
-Every Urdira release must ship one active generic profile through a preinstalled data-only model pack. Its acceptance contract requires local CPU execution, the four structural query classes, source-code and prose content, the MVP language set, deterministic vector bytes under each shipped runtime build, and the quality and resource gates in the performance specification. The release manifest publishes the exact pack coordinate, profile digest, model and tokenizer digests, runtime requirements, configurations, supported languages/content classes, and evaluation-report digest. Changing any of those values creates another pack/profile definition and never mutates retained materializations.
+Every Urdira release designates one active generic profile, acquired into the daemon-owned model cache only through an explicit configuration operation rather than shipped inside the release artifact (`docs/decisions/18-semantic-model-provisioning.md` is authoritative on acquisition, network boundary, and the visible-download contract). Its acceptance contract requires local CPU execution, the four structural query classes, source-code and prose content, the MVP language set, deterministic vector bytes under each shipped runtime build, and the quality and resource gates in the performance specification. The release manifest publishes the exact profile digest, model and tokenizer digests, runtime requirements, configurations, supported languages/content classes, and evaluation-report digest. Changing any of those values creates another profile definition and never mutates retained materializations.
 
 The initial ranking feature codes are `core:exact_identity_match`, `core:retrieval_match`, `core:relationship_role`, `core:structural_distance`, `core:scope_proximity`, `core:universal_semantic_fit`, `core:architectural_role`, `core:evidence_directness`, and `core:result_subject_preference`. Their value domains are respectively boolean, ordered lane rank, registered relation-role class, non-negative hop count, registered scope-distance class, registered universal-fit class, registered architectural-role class, registered evidence-derivation class, and registered result-subject class.
 
@@ -352,95 +357,11 @@ Evaluation datasets, metrics, acceptance thresholds, performance budgets, and pr
 
 ## Completion criteria
 
-This decision is architecturally complete. A concrete release is acceptable only when its immutable model pack and ranking-profile registry pass the semantic, deterministic, resource, and privacy gates defined by the dependent specifications.
+This decision is architecturally complete. A concrete release is acceptable only when its resolved semantic profile and ranking-profile registry pass the semantic, deterministic, resource, and privacy gates defined by the dependent specifications.
 
-## Amendment (2026-09-08, Frente S-H): resident vector cache does not change ranking semantics
+## Historial de cambios
 
-`SqliteCanonicalQuerySnapshotPort.semantic_vectors` now caches its own
-fully-decoded result per `(workspace_id, profile_id, executable_binding_id,
-generation)` (see `docs/decisions/16-semantic-search-wiring.md`'s own
-amendment for the mechanism and the measured latency numbers). This is a
-pure caching/memory-layout change: the exact same set of vectors, the same
-ranking, and the same top-K guarantee this decision's own "exact, never
-approximate" architecture requires are returned whether the cache is warm
-or cold -- a generation bump always invalidates it (verified live), and no
-scan's own exactness is traded for the speedup. Recorded here only as a
-cross-reference; the substantive amendment lives in decision 16.
-
-## Amendment 2026-09-06 (Frente S-A): affected-artifact pagination implementation
-
-§"Materialization and coverage" above pins the SHAPE (`SemanticCoverageView`'s
-counts and page, bidirectional pagination) but left the concrete mechanism
-open. This amendment documents what shipped:
-
-- **Source of truth**: a per-document status table (`semantic_document_status`,
-  one row per `(workspace_id, profile_id, executable_binding_id,
-  document_grain, document_id)`) that the semantic reconciler
-  (`packages/engine/src/semantic-reconciler.ts`) writes in the SAME
-  enumeration that already visits every candidate document for embedding --
-  `covered` lands in the same transaction as the vector commit
-  (`putVectors`'s `extraCommands`); `pending`/`excluded`/`unsupported`/`failed`
-  are written as each document is classified. A document whose underlying
-  artifact version or entity record stops being visible has its status row
-  deleted, never left stale. `affected` is exactly `status <> 'covered'`.
-- **Real counts**: `buildSemanticCoverageView` (`packages/engine/src/canonical-query-data-port.ts`)
-  reads `unsupported_artifact_count`/`failed_artifact_count` and the entity
-  counts from a `GROUP BY document_grain, status` aggregate over this table
-  (`semantic_document_status_counts`) instead of inferring them from the
-  vector set; `artifact_count`/`covered_artifact_count`/`pending_artifact_count`/
-  `excluded_artifact_count` keep their pre-existing inferred arithmetic
-  unchanged.
-- **`affected_artifact_set_id`**: `sha256` over `{binding_id, generation,
-  profile_id, executable_binding_id, total, keys_digest}`, where `keys_digest`
-  is a streamed digest (`digestCanonicalArray`, `@urdira/canonical`) over the
-  affected set's `(display_path, artifact_id, document_id)` keys in their own
-  sort order -- one pass over `semantic_document_status WHERE status <>
-  'covered' ORDER BY display_path, artifact_id, document_id`. The set id
-  changes if, and only if, the affected population or its order changes.
-- **Cursor (R11)**: a stateless, self-contained, base64url-encoded JSON object
-  `{set, k: [display_path, artifact_id, document_id], dir: "next"|"prev"}` --
-  never the generic execution-scoped `request_type: continuation` mechanism
-  (that cursor is tied to a `query_execution_id` and a 15-minute manifest
-  store entry; this one is tied only to the data). A request whose
-  `affected_artifact_set_id` argument, or whose cursor's own embedded `set`,
-  disagrees with the CURRENTLY computed set id is rejected with
-  `core:affected_set_stale{current_set_id}` before any page is sliced --
-  never a mixed or partial page.
-- **Continuation operation**: `core:semantic_affected_page` (`affected_artifact_set_id`,
-  optional `cursor`, optional `limit`) returns exactly ONE result-stream item
-  whose value is the complete `SemanticAffectedArtifactPage` (artifacts,
-  `total`, `next_cursor`/`previous_cursor`, `has_next`/`has_previous`) --
-  deliberately not one item per artifact, precisely because its cursor lives
-  in this operation's own argument, not in the generic per-stream page
-  metadata the engine would otherwise attach.
-- **Embedded first page**: `core:search_semantic`/`core:search_hybrid`'s own
-  `semantic_coverage` view embeds the first page (`limit = min(response_budget.max_items,
-  20)`, using the plan's own upper bound directly since `response_budget`
-  does not reach the canonical query port layer) so an agent can act on
-  `affected_artifact_page` without an extra round trip, then page further
-  with `core:semantic_affected_page`.
-
-## Amendment (2026-09-08, Frente S-I): resident-buffer native kernel
-
-`exactVectorScan`'s native path (`nativeTopKChunked`) re-packed a fresh
-candidate byte buffer and decoded every candidate to `f64` on EVERY query,
-even though the underlying vector data does not change between queries at
-an unchanged generation -- at n8n scale (72,922 entity-grain candidates)
-this cost 581-1,416ms per query by itself, dominating end-to-end latency.
-A new native kernel (`crates/urdira-native-core`'s `register_vector_buffer`/
-`exact_top_k_contiguous`) registers one contiguous `f32` buffer ONCE per
-generation and scans it directly on each query with no re-marshaling,
-partial selection (`select_nth_unstable_by`), and `rayon` parallelism
-above 50,000 candidates. `canonical-query-data-port.ts`'s `trySemanticSearch`
-uses it via `residentLaneScan` whenever no `paths` filter is present and
-the profile is plain `float32`, falling back to the pre-existing
-`exactVectorScan` path unchanged otherwise (including on ANY native
-failure -- no silent approximation, decision 06's exactness is unchanged).
-Measured live: the two-lane scan cost dropped from 581-1,999.9ms to 5-6ms
-at n8n scale; end-to-end `core:search_semantic`/`core:search_hybrid` p99
-dropped 1,722.2ms/2,192.7ms -> 134.99ms/178.33ms (12.8x/12.3x), meeting the
-plan's 250ms n8n-scale target. See `docs/evidence/2026-09-08-v4-semantic-native-scan-latency.md`
-for the full phase decomposition, the `packages/cli`/100-file scale
-results, and a live measurement-methodology bug found and fixed mid-session
-(a module-instance duplication trap in the throwaway benchmark harness,
-unrelated to the shipped implementation).
+- **2026-09-06** (`1abf127`, Frente S-A): implemented the affected-artifact pagination mechanism (`semantic_document_status` table, `affected_artifact_set_id`, stateless cursor, `core:semantic_affected_page`, `core:affected_set_stale`) folded into "Materialization and coverage" and "Error behavior" above.
+- **2026-09-08** (`5bfd3a4`, Frente S-H): `SqliteCanonicalQuerySnapshotPort.semantic_vectors` caches its fully-decoded result per `(workspace_id, profile_id, executable_binding_id, generation)`; a generation bump always invalidates it. Pure caching change, no effect on ranking semantics or exactness (mechanism owned by `docs/decisions/16-semantic-search-wiring.md`).
+- **2026-09-08** (`ec6b4a5`+`ef838e3`, Frente S-F): materialized one `semantic_coverage_summary` row per `(workspace_id, profile_id, executable_binding_id, generation)`, written by the reconciler alongside its `semantic_index_state` completion marker, so `buildSemanticCoverageView` reads one indexed point lookup instead of a live `GROUP BY` aggregate on every semantic/hybrid query, with the live aggregate kept as a correctness fallback for a workspace with no summary row yet; folded into "Materialization and coverage" above (mechanism also cross-referenced from `docs/decisions/16-semantic-search-wiring.md`/`17-entity-grain-semantic-documents.md`).
+- **2026-09-08** (`9c1f7f0`, Frente S-I): added the resident-buffer native scan kernel folded into "Exact retrieval and explicit incompleteness" above; n8n end-to-end `core:search_semantic`/`core:search_hybrid` p99 1,722.2ms/2,192.7ms -> 134.99ms/178.33ms.

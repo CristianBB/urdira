@@ -1,7 +1,7 @@
 # Transactional Projection Digests
 
-Status: **Approved and implemented**
-Last updated: 2026-08-24
+Status: Accepted
+Last updated: 2026-09-09
 Depends on: [Storage architecture](05-storage-projection-architecture.md) and [workspace fork](12-workspace-fork.md)
 
 ## Current contract
@@ -34,3 +34,18 @@ published snapshot anchor.
 - Ordering and digest output are deterministic across host locales.
 - No query or publication path may treat an asynchronous cache as part of an
   immutable snapshot digest.
+
+## Scope note: v4 computes the same field differently
+
+This decision documents the SQL storage backend's computation of
+`Snapshot.projection_set_digests` (a relational scan over
+`record_occurrences` and the other projection tables). A v4 workspace's
+structural corpus lives in the native segment store
+(`crates/urdira-structural-store`) instead of SQLite, so it cannot recompute
+this same field the SQL way; it populates the identically-shaped
+`projection_set_digests` field from its own native Merkle bucket digests
+instead (`packages/engine/src/v4-verify.ts`, `crates/urdira-structural-store/src/merkle.rs`
+via `iterVisibleDigests`/`iterVisibleGraphDigests`/`iterVisibleDependencyDigests`).
+See [v4 Merkle bucket digests](27-v4-merkle-bucket-digests.md) for that
+mechanism; this decision's SQL recipe still governs every SQL-backed
+(non-v4) workspace.

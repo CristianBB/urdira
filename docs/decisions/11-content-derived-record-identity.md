@@ -1,7 +1,7 @@
 # Content-Derived Record Identity
 
-Status: **Approved and implemented**
-Last updated: 2026-08-24
+Status: Accepted
+Last updated: 2026-09-09
 Depends on: Universal data model, incremental indexing semantics, and storage architecture
 
 ## Current contract
@@ -154,6 +154,35 @@ exactly one representative row per `record_id` (the lowest `row_ordinal`/
 every OTHER row for that `record_id` is content-identical by construction,
 so keeping any one of them loses nothing.
 
+## Entity span widening does not change identity (Frente E-P0j, 2026-09-07)
+
+JS/TS plugin `0.5.0` widened a published entity's `start`/`end` to cover the
+WHOLE DECLARATION (modifiers, decorators, and the `export` keyword through the
+closing token) instead of only its name token, for byte-slice fidelity
+(`SyntaxEntity::start`/`end` doc comment,
+`crates/urdira-jsts-syntax-worker/src/lib.rs`). This decision's identity
+recipe is unaffected by that widening: an entity's `identity_key` was never
+derived from `start`/`end` in the first place, only from the declaring
+identifier's own byte offset. That offset is now published explicitly as a
+separate `name_start`/`name_end` pair (plus, since `0.6.0`, `name_start_line`)
+alongside the wider span, and `stable_entity_id`/`declaration_id` still build
+every entity's and parameter's `identity_key` as `jsts:{kind}:{path}:
+{name_start}:{name}` from that same identifier position (`crates/
+urdira-jsts-syntax-worker/src/lib.rs`, `crates/urdira-jsts-syntax-worker/src/
+semantic_sites.rs`). `urdira-structural-store` recovers this position from the
+stored identity-key text rather than from the wider `start`/`end`
+(`identity_codec::entity_identity_name_start`, `crates/
+urdira-structural-store/src/identity_codec.rs`). Upgrading a workspace across
+this boundary changes `record_digest` for every JS/TS entity (the digest
+covers the payload, which now includes the wider span) but preserves
+`identity_key`/`record_id` continuity, because identity itself never read
+`start`/`end`.
+
+This is what "content-derived" means for an entity record with a
+`name_start`: identity covers logical identity content (kind, path, name, and
+the anchoring identifier position), never the full stored byte range of the
+declaration.
+
 ## Consequences
 
 - Content-identical workspaces may share portable canonical identities while
@@ -163,3 +192,10 @@ so keeping any one of them loses nothing.
   implicit cross-workspace lookup.
 - Source observations, provider watermarks, snapshots, registries, candidates,
   and journals remain workspace-specific.
+
+## Historial de cambios
+
+- **2026-09-09**: clarified that the E-P0j/0.5.0 entity span widening
+  (`start`/`end` now the whole declaration) does not change identity, which
+  keys off the identifier position now published as `name_start`/`name_end`;
+  normalized the `Status`/`Last updated` header.

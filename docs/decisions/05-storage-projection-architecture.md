@@ -1,8 +1,10 @@
 # Storage and Projection Architecture
 
-Status: **Approved and implemented for Urdira v3**
-Last updated: 2026-08-20
+Status: Accepted
+Last updated: 2026-09-09
 Depends on: Universal data model, incremental indexing semantics, and [Decision 21](21-native-pipeline-relational-storage.md)
+
+This is the v3 relational storage architecture. v4 is now the default storage format for newly added workspaces (`isV4Enabled()`, opt out with `URDIRA_V4=0`; see `docs/versioning.md`); its native structural store, Merkle bucket digests, and Rust-owned scan pipeline are specified separately in [decision 26](26-v4-structural-store.md), [decision 27](27-v4-merkle-bucket-digests.md), and [decision 29](29-v4-rust-owned-scan-pipeline.md). This decision remains authoritative for v3 workspaces and for the parts of the query-execution cache, CAS, and GC layers that both versions share unless a v4 decision states otherwise.
 
 ## Decision objective
 
@@ -168,3 +170,7 @@ Acceptance requires crash injection before and after every publication step, byt
 ## Completion criteria
 
 The architecture satisfies incremental update, deterministic query, snapshot retention, pagination, and local deployment requirements with a defined migration and recovery strategy. Implementation acceptance requires the storage conformance suite above.
+
+## Historial de cambios
+
+- **2026-09-09**: noted that v4 (decisions [26](26-v4-structural-store.md), [27](27-v4-merkle-bucket-digests.md), [29](29-v4-rust-owned-scan-pipeline.md)) is now the default storage format for newly added workspaces since 2026-09-04, verified against `isV4Enabled()`/`URDIRA_V4` in `packages/daemon/src/runtime.ts` and `docs/versioning.md`'s "v4 index-contract bump" section; this decision stays `Accepted` and authoritative because migrating already-registered v3 workspaces onto v4 remains unaddressed (`docs/versioning.md`), so the v3 stack this decision describes is still a live, supported path, not merely historical.

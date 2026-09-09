@@ -1,6 +1,6 @@
 # Coding-agent search integration and context isolation
 
-Status: **Approved and implemented**
+Status: **Accepted**
 
 Urdira remains a read-only, explicitly scoped intelligence surface. The first
 native search adapters are Claude Code, Codex, OpenCode, Cursor, and VS Code

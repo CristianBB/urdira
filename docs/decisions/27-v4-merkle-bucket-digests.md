@@ -1,8 +1,23 @@
 # Decision 27: v4 bucketed Merkle digest contract
 
-Status: **Approved and implemented for v4 (`index_contract 0x34`). Leaf-level from-scratch verification via napi digest iterators is in place for `records`/`dependency`/`graph`; incremental roots for create/delete/rename match a from-scratch oracle at n8n scale (the `dependency` gap is closed, P3-2). The authoritative roots changed three times during the campaign as the record contract changed (history below). Merkle verification cannot detect the open P2-2m `identity_key` corruption (decision 29).**
-Last updated: 2026-09-05
+Status: **Accepted**
+Last updated: 2026-09-09
 Depends on: [Content-derived record identity](11-content-derived-record-identity.md), [Transactional projection digests](13-transactional-projection-digests.md), [v3 optimization](22-v3-optimization.md) (v3's incremental digest writers, unchanged), [v4 structural store](26-v4-structural-store.md)
+
+## Current state (2026-09-09)
+
+Implemented for v4 (`index_contract 0x34`). Leaf-level from-scratch
+verification via napi digest iterators is in place for `records`/
+`dependency`/`graph`; incremental roots for create/delete/rename match a
+from-scratch oracle at n8n scale (the `dependency` gap is closed, P3-2). The
+authoritative roots changed several times during the campaign as the record
+contract changed (see "Authoritative roots history" below). The P2-2m
+`identity_key` corruption this decision's own verification could not
+detect is now **fixed** at the store-writer level (decision 26's changelog)
+— a Merkle leaf is still `(record_id, record_digest)`, never `identity_key`
+text, so this decision's own leaf-recompute verification still cannot see
+an `identity_key`-only corruption directly; it no longer needs to, since
+the corruption's root cause is closed.
 
 ## Context
 
@@ -231,11 +246,15 @@ branches, which need a corruption that survives the base segment's own
 `xxh3` (`docs/evidence/2026-09-04-v4-p4-b-prep-health.md`).
 
 **What this verification cannot see.** A Merkle leaf is `(record_id,
-record_digest)`; `identity_key` text is not a leaf input. The open P2-2m
-corruption zeroes `identity_key` bytes while leaving `record_digest`
-intact, so every check above passes on a corrupted store — only the
+record_digest)`; `identity_key` text is not a leaf input. The P2-2m
+corruption (fixed 2026-09-05, see decision 26's changelog) zeroed
+`identity_key` bytes while leaving `record_digest` intact, so every check
+above passed on a corrupted store while the bug was live — only the
 classification invariant (decision 28) and a full-store diagnostic scan
-detect it (`docs/evidence/2026-09-05-v4-final-measurements.md` §2.5).
+could detect it (`docs/evidence/2026-09-05-v4-final-measurements.md` §2.5).
+This structural gap in what a Merkle check can see is unchanged by the
+fix — a future writer-level regression of the same shape would again be
+invisible to this decision's own verification.
 
 **Incremental == from-scratch, as verified.** Create, delete, and rename
 mutations at full n8n scale produce `records`, `dependency`, and `graph`
@@ -311,9 +330,10 @@ byte-identical in both languages
   identity-recipe leak (scan-salted artifact ids), not a diff-scope gap; the
   root now matches a from-scratch oracle at n8n scale for create and
   delete.
-- **P2-2m `identity_key` corruption is invisible to every digest check**
-  (see "What this verification cannot see") — a verify extension would need
-  an identity-text-level invariant, not a Merkle one.
+- **A P2-2m-shaped `identity_key` corruption would be invisible to every
+  digest check** (see "What this verification cannot see") even now that
+  the specific 2026-09-05 bug is fixed — a verify extension would need an
+  identity-text-level invariant, not a Merkle one.
 - **The current authoritative roots are not recorded** after the P1-D-h
   classification repair (see the roots history) — the next cold run should
   print and pin them.

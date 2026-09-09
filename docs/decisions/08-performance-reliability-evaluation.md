@@ -1,6 +1,6 @@
 # Performance, Reliability, and Evaluation
 
-Status: **Approved**  
+Status: Accepted  
 Last updated: 2026-08-31
 Depends on: Query, indexing, storage, and JavaScript/TypeScript MVP specifications
 

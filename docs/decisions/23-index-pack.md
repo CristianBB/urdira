@@ -1,7 +1,20 @@
 # Decision 23: Index pack bootstrap
 
-Status: approved and implemented
-Last updated: 2026-08-24
+Status: Accepted
+Last updated: 2026-09-08
+Related: [decision 30](30-index-pack-distribution.md) evaluates and closes the
+separate question of a cross-machine pack distribution/sharing layer on top
+of the mechanism below; this decision stays scoped to the pack format and
+its local export/import mechanism.
+
+Two independent pack containers exist today, gated on the workspace's
+structural store: the v3 pack (schema version 1, gzip/NDJSON row replay,
+"## Carrier and manifest" through "## Known limitations" below) for a
+workspace on the legacy SQLite structural tables, and the v4 pack
+("## v4 pack format" below) for a workspace on the native structural store
+(`crates/urdira-structural-store`). They share the same bootstrap contract
+(first-generation only, untrusted input, rollback-to-scan on any failure)
+but are structurally unrelated file formats with independent code paths.
 
 ## Decision
 
@@ -152,7 +165,7 @@ gate. Current non-normative performance and live corruption evidence is in
 and
 [`../evidence/2026-08-24-readiness-queue-implementation.md`](../evidence/2026-08-24-readiness-queue-implementation.md).
 
-## Rust cutover amendment (2026-08-31)
+## Rust-owned pack copy on the v3 path
 
 Pack bulk-copy and its target publication transaction remain a
 compatibility/oracle implementation. A daemon with the persistent Rust
@@ -163,7 +176,7 @@ can open a second TypeScript structural writer. A Rust-native pack-copy
 command can restore this optimization later while retaining the same
 verification and publication contracts.
 
-## v4 index pack amendment (2026-09-06, plan `generic-waddling-hartmanis.md` §7.1, Frente P-1)
+## v4 pack format
 
 Everything above this section describes the v3 pack (schema version 1,
 tagged-NDJSON row replay). A workspace with a native structural store
@@ -285,7 +298,7 @@ symbol (absent from the donor's own snapshot), proving the `cold` fallback
 never silently serves stale donor data; and a corrupt pack falls back to a
 `full` scan and still reaches `ready`.
 
-## Amendment 2026-09-08 (Frente D-1: export RPC timeout, and `import_wall_ms`)
+## Export timeout and progress reporting
 
 Live evidence (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §6.0/§9 item 3): `core:index_pack
 _export` on a 3.6GB VS Code-scale store measured 63.5s (clean) to 109s (under concurrent load) --
@@ -368,3 +381,18 @@ NEW caller via an `operation_id`. Today's mechanism (an effectively unbounded de
 progress on the SAME connection) closes the P0 this task authorized fixing; a detached/resumable
 export is a materially larger feature (a server-side operation registry with its own
 lifecycle/cleanup policy) that was out of this task's own time budget.
+
+## Historial de cambios
+
+- **2026-08-24** (feat: index pack + campaign-2 readiness levers): initial v3 pack decision (schema
+  version 1, gzip/NDJSON carrier, `workspace-add --index-pack`).
+- **2026-08-31** (Rust cutover): pack bulk-copy on the v3 path stays a compatibility/oracle
+  implementation; a daemon running the persistent Rust composition worker falls through to an
+  ordinary Rust generation instead of opening a second structural writer.
+- **2026-09-06** (plan `generic-waddling-hartmanis.md` §7.1, Frente P-1): added the v4 pack format
+  for workspaces on the native structural store — a distinct container, `workspace_id` re-pinning,
+  and a `reconcile` follow-up scan instead of `full` after import.
+- **2026-09-08** (Frente D-1, `docs/evidence/2026-09-07-v4-vscode-campaign.md`): `core:index_pack
+  _export` given a caller-controlled deadline (`INDEX_PACK_EXPORT_DEFAULT_TIMEOUT_MS`, 24h default,
+  `--timeout`) instead of the transport's hardcoded 30s, live progress reporting, and
+  `export_wall_ms`/`import_wall_ms` metrics.

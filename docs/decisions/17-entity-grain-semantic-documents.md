@@ -1,7 +1,7 @@
 # Entity-Grain Semantic Documents
 
-Status: **Approved and implemented**
-Last updated: 2026-08-24
+Status: **Accepted**
+Last updated: 2026-09-08
 Depends on: [Semantic search and ranking](06-semantic-search-ranking.md) and [semantic runtime](16-semantic-search-wiring.md)
 
 ## Current contract
@@ -54,6 +54,20 @@ Embedding failure leaves the affected row absent and withholds the completion
 marker. It never publishes a partial row under `complete` coverage and never
 invalidates the structural snapshot.
 
+A per-document ledger, `semantic_document_status` (one row per
+`(workspace_id, profile_id, executable_binding_id, document_grain,
+document_id)`), backs the coverage totals above with `status` (`covered |
+pending | excluded | unsupported | failed`) and a sorted `reason_codes` array
+from a fixed vocabulary (`binary`, `oversized`, `below_min_length`,
+`unsupported_kind`, `provider_error:*`, `segments_truncated`,
+`pending_embed`). The reconciler writes it in the same per-document
+enumeration it already runs for embedding; an orphan sweep deletes a
+document's row once its underlying artifact version or entity record stops
+being visible. `core:search_semantic`/`core:search_hybrid`'s coverage view
+and `core:semantic_affected_page` read this table exclusively for
+`unsupported`/`failed`/entity counts and the affected-document list (see
+[Semantic search and ranking](06-semantic-search-ranking.md)).
+
 ## Query behavior
 
 `core:search_semantic` filters artifact and entity candidates through
@@ -67,339 +81,57 @@ identity domains; an entity result is not collapsed into its owner artifact.
 Coverage reports artifact and entity totals separately. A missing entity lane
 cannot be represented as complete merely because artifact vectors are current.
 
-## Current boundary
+## Segmentation and per-segment entity vectors
 
-Primary retrieval scans document vectors. Urdira does not currently publish a
-separate persisted per-window segment-vector lane, and it does not use an ANN
-index. Long-document windowing remains an internal provider operation whose
-pooled document vector participates in exact scan.
+Every provider segments a document's rendered text into 256-token windows
+(MiniLM's own trained `max_seq_length`) with a 32-token overlap, so a match
+spanning a window boundary is never split into two half-strength vectors, up
+to `max_segments` (default 64, `DEFAULT_MAX_SEGMENTS`; exceeding it sets
+`truncated: true`, surfaced as the `segments_truncated` reason code, never
+silent). The entity lane writes one `vector_projection_rows` row PER SEGMENT,
+uncapped; `semantic_document_status` still holds exactly one row per
+document, aggregated from every segment's own outcome (`covered` only once
+every segment settles clean; a `failed` aggregate closes every sibling
+segment so the whole document retries from scratch). The artifact-grain lane
+stays one vector per document: when a file's entities were embedded in the
+same reconcile pass, the artifact vector is composed from the mean of those
+entity vectors plus the embedding of the file's remaining ("gap") text —
+never a fresh whole-file embed when entity coverage already exists — and
+otherwise falls back to embedding the whole file directly.
+
+A segmenter-parameter change folds into every provider's
+`executable_binding_digest` (`segmenter:v2:w<N>:o<N>:max<N>`) and mints a new
+binding identity, forcing one full re-embed. Retrieval's entity lane runs its
+exact scan over every visible segment row and reduces the result to one
+candidate per `document_ref` by keeping the highest-similarity occurrence
+(max-similarity aggregation), attaching the winning segment's own
+`(index, start_char, end_char)` as `semantic_evidence.matched_segment` before
+applying the existing 100-candidate cap. At real-corpus scale the entity
+lane's exact scan first attempts a bounded top-K pass and escalates to the
+same full uncapped scan only when that shortfalls (fewer than 100 distinct
+documents recovered and more candidates existed); the escalation branch is
+byte-identical to the unbounded scan, so this can never change a result,
+only how fast the common case reaches it. Urdira does not use an ANN index;
+every scan above remains exact per [Semantic search and ranking](06-semantic-search-ranking.md).
+
+A `semantic_segment_cache` table lets the reconciler skip re-embedding any
+segment whose exact rendered text was already embedded under the same
+provider identity, by any document, in any prior generation or concurrent
+shard; it is pruned to the current binding after every clean pass. Semantic
+maintenance may run as several concurrent reconciler shards
+(`URDIRA_SEMANTIC_WORKERS`, default 2), each deterministically assigned a
+disjoint set of owning artifacts so an artifact and its entities always land
+in the same shard; one unsharded finalize pass closes out bulk/status work
+and self-heals any shard's failures.
 
 Cross-workspace vector sharing is unsupported. Content-identical documents
 under different workspace/provider bindings are reconciled independently.
 
-## Amendment 2026-09-06 (Frente S-A): per-document status table
+## Historial de cambios
 
-"Coverage reports artifact and entity totals separately" (above) is now
-backed by a real per-document ledger, `semantic_document_status`
-(`packages/storage/sql/workspace-v4-semantic.sql`, mirrored additively into
-`workspace-v3.sql` so the one shared reconciler implementation works
-unmodified against either schema). One row per `(workspace_id, profile_id,
-executable_binding_id, document_grain, document_id)` -- `document_id` is the
-artifact version id for an artifact-grain row, the owning entity record id
-for an entity-grain row -- carrying `status` (`covered | pending | excluded |
-unsupported | failed`) and a sorted JSON `reason_codes` array from a fixed
-vocabulary: `binary`, `oversized`, `below_min_length`, `unsupported_kind`,
-`provider_error:*`, `segments_truncated` (segmentation is a later increment;
-no row uses this code yet), `pending_embed`.
-
-The reconciler writes this table in the SAME per-document enumeration it
-already runs for embedding (steps 3/5 of `reconcileSemanticProjection`):
-`covered` commits in the same transaction as the vector write; permanent
-skips (oversized, undecodable/binary content, empty rendering, ineligible
-entity kind/span) are written as `excluded` or `unsupported` at the exact
-point they are classified; a provider throw or a post-generation digest
-mismatch is written `failed` with a `provider_error:*` reason. Two
-bulk-classification passes (binary artifact versions and whole-file/module
-"container" entity records -- both excluded from the reconciler's own
-missing-document queries by their `WHERE` clauses, so they would otherwise
-never reach the ledger at all) and a backfill pass (covering a sidecar that
-predates this table, populated from `vector_projection_rows` directly) run
-once per reconcile pass, each scoped by a `NOT EXISTS` against the status
-table itself so they cost nothing once the corpus has been classified. An
-orphan sweep deletes a document's row when its underlying artifact
-version/entity record stops being visible, closing the gap the ordinary
-stale-close joins (scoped to documents that had an OPEN vector) cannot
-cover: a `pending`/`excluded`/`unsupported`/`failed` document that never had
-a vector at all.
-
-`core:search_semantic`/`core:search_hybrid`'s coverage view and the new
-`core:semantic_affected_page` operation both read this table exclusively for
-`unsupported`/`failed`/entity counts and the affected-document list -- see
-[Semantic search and ranking](06-semantic-search-ranking.md)'s own 2026-09-06
-amendment for the pagination mechanism built on top of it.
-
-## Amendment 2026-09-06 (Frente S-B): per-segment entity vectors
-
-R7 (plan `generic-waddling-hartmanis.md` §0): the "model window" is 256
-tokens (MiniLM's own trained `max_seq_length`), never characters or 512,
-segmented with a 32-token overlap so a match spanning a window boundary is
-never split into two half-strength vectors. All three shipped providers
-(local neural, hash, HTTP) now expose `SemanticRuntimeBinding.segment?(text):
-Promise<{segments: SegmentSpan[]; truncated: boolean}>`: the local provider
-segments by real tokenizer offsets when available, falling back to a
-deterministic line-based accumulation using real per-line token counts
-(empirically, the bundled `Xenova/all-MiniLM-L6-v2` tokenizer never reports
-offsets, so this fallback is the actual path in production today); the hash
-and HTTP providers approximate a token as 4 UTF-16 code units (chars/4) over
-the identical window/overlap shape. `max_segments` defaults to 64 (R8) --
-exceeding it sets `truncated: true`, surfaced as the `segments_truncated`
-reason code (never silent) alongside a `covered` status. Every provider's
-`executable_binding_digest` now folds in a `segmenter:v2:w<N>:o<N>:max<N>`
-identity string (R10): a segmenter-parameter change (including ola 3 raising
-`max_segments` from its own n8n measurement) mints a new binding identity
-and forces one full re-embed, the accepted cost.
-
-The entity pass (step 5) calls `.segment()` once per eligible candidate's
-rendered text and writes ONE `vector_projection_rows` row per segment
-(`segment_index`/`segment_start`/`segment_end` columns, additive
-`ALTER TABLE` migration by `PRAGMA table_info`, applied to both the v4
-semantic sidecar and the v3 mirror -- R22) -- `projection_record_id` folds
-`segment_index` into its hash so segments of one document never collide.
-`semantic_document_status` still holds exactly ONE row per document (its
-schema is unchanged): every segment's own embed/write outcome is aggregated
-in memory before the single status write lands, `covered` only once every
-segment of that document has settled clean, `failed` (union of every failed
-segment's own reason codes) the instant any one segment does not. A
-`failed` aggregate self-heals by closing every OTHER segment of that SAME
-document that DID succeed, so the next pass finds the whole document
-missing again and retries every segment from scratch, rather than leaving a
-partially-embedded document permanently stuck with one un-embedded segment
-a future pass's "does an open row already exist for this document" check
-would otherwise never revisit. The artifact-grain lane is unchanged by this
-amendment: it stays ONE vector per document (mean of segments, R9), the
-same lane-level shape it already had before segmentation existed.
-
-Retrieval's entity lane now runs its exact scan over every visible SEGMENT
-row (keyed by each row's own unique `projection_record_id`, uncapped),
-then reduces the already best-first-sorted result to one candidate per
-`document_ref` by keeping the FIRST (= highest-similarity) occurrence --
-the max-similarity aggregation the plan calls for, expressed as a plain
-sorted-order walk rather than a second comparison pass -- capping the
-final, aggregated list at the existing 100-candidate cap. The winning
-segment's own `(index, start_char, end_char)` is attached to that
-candidate's emitted value as `semantic_evidence.matched_segment`, letting a
-future snippet renderer point at the segment that actually matched instead
-of the whole entity's span.
-
-### Amendment 2026-09-07 (Frente S-C): embed performance measurements
-
-Profiled the local neural provider's real throughput on this reference
-machine (Apple Silicon, 10 physical/logical cores) before touching anything,
-per plan §4's own "perfila primero" instruction. Findings, each measured with
-a real batch of code segments extracted from this repo's own TypeScript
-sources (not synthetic text):
-
-- **Batching (R12) was already real**, not a regression to fix:
-  `createLocalNeuralProvider`'s `generateVectors` (`packages/embedding-local/src/index.ts`)
-  already flattens every input's segments into ONE ordered list and issues
-  real multi-item `extractor(chunk)` calls (chunked at `max_segments`), never
-  one `extractor` call per document. No change needed here.
-- **`intraOpNumThreads` explicit override: measured, REJECTED.** Default
-  (unconfigured) throughput: ~75 segs/s. Forced `intraOpNumThreads: 10`
-  (all physical cores): ~72-76 segs/s -- statistically indistinguishable from
-  default. Forced `intraOpNumThreads: 1`: ~19 segs/s (confirms onnxruntime's
-  own default already parallelizes internally, to roughly the same ceiling
-  10 explicit threads reaches). Shipping an explicit thread-count override
-  would bump `executable_binding_digest` (forcing a full re-embed for every
-  existing installation) for a measured ~0% throughput gain -- not shipped.
-- **CoreML execution provider: measured, REJECTED on both counts.**
-  `executionProviders: ["coreml", "cpu"]` measured ~7 segs/s -- roughly 10x
-  SLOWER than the CPU default, not faster (per-call marshaling/compilation
-  overhead for this small, dynamically-shaped quantized model swamps any ANE/GPU
-  benefit). It also fails the plan's own "same vector, tolerance 1e-4 cosine"
-  acceptance bar: measured cosine similarity between CPU-default and CoreML
-  vectors for the SAME text was ~0.994-0.995 (correlated but not the same
-  vector) -- a real accuracy divergence, not just noise. Not shipped, either
-  reason alone would have been disqualifying.
-- **Process-level parallelism (running several embedding processes at
-  once, each on its own shard of documents): measured, real but NOT shipped
-  this session.** 1 process: ~75 segs/s. 2 concurrent processes (default
-  internal threading each): ~108 segs/s combined (~1.44x). 4 concurrent
-  processes: ~100 segs/s combined -- WORSE than 2, from thread oversubscription
-  (each process's own internal thread pool competes with the others' once
-  process-count x per-process-threads exceeds the physical core count).
-  A real, moderate win exists at 2 concurrent processes on this machine, but
-  realizing it inside `reconcileSemanticProjection` means sharding ONE pass's
-  embedding work across multiple child processes and merging their counts/
-  abort/generation bookkeeping back into one result -- a real architectural
-  change to `semantic-process.ts`/`semantic-maintenance-process.ts`, not a
-  parameter tweak, and out of this session's remaining safe-change budget.
-  Documented here as a real, measured, ~1.44x lever for a future frente,
-  not silently dropped.
-- **Artifact-vector reuse from entity segments (R9's own suggested biggest
-  lever): designed, NOT implemented.** Reusing an already-embedded entity's
-  segment vectors for its owning artifact's mean vector (embedding only the
-  text NOT covered by any entity) requires the entity pass (step 5) to run
-  BEFORE the artifact pass (step 3) for the same file, and changes what an
-  artifact vector functionally IS (a function of entity vectors PLUS
-  uncovered-span vectors, not a fresh embed of the whole file) -- a real
-  redefinition of the artifact-grain document's own computation, needing its
-  own re-embed generation bump, its own eligibility/coverage-status edge
-  cases (a file with zero eligible entities still embeds exactly as today;
-  a file fully covered by entities needs an "empty uncovered span" fast
-  path), and dedicated tests before it can safely ship. Out of this session's
-  scope given the risk of a subtle correctness regression in the artifact
-  lane every workspace already depends on; reported as the single largest
-  designed-but-undone lever for a follow-up frente.
-- **`max_segments`: unchanged.** No new evidence in this session moved R8's
-  own already-measured decision (p99=31 segments, default cap 64 stays).
-
-Net effect on the embed-throughput ceiling on THIS machine: unchanged from
-before this session (~75 segs/s single-process) -- every lever measured
-either gave ~0% (threads), a regression (CoreML), or a real-but-unshipped
-gain requiring more architecture work than this session's risk budget
-allowed (process sharding, artifact-vector reuse). A full n8n-scale re-embed
-was NOT re-attempted in this session (the prior evidence doc's own 3h44m/
-10-27h-ETA measurement already established the order of magnitude on this
-same class of hardware, and no lever here changes that order of magnitude);
-see `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`
-for the full numbers and reasoning.
-
-## Amendment (2026-09-07, Frente S-D): the two designed-but-undone levers, shipped
-
-Both levers this decision's own §"designed, NOT implemented" section flagged
-are now implemented and tested, in `packages/engine/src/semantic-reconciler.ts`:
-
-- **Artifact-vector reuse from entity segments (Lever 1)**: step 5 (entity
-  insert) now runs BEFORE step 3 (artifact insert) within one reconcile
-  pass. As step 5 commits a fresh entity's segments, it also records that
-  entity's file-absolute span and packed vectors into an in-memory
-  `entityCoverageByOwner` map, keyed by owning `artifact_version_id`. Step
-  3, for a document with a non-empty coverage entry, computes the complement
-  of the (merged) covered spans over the file's own text ("gap" text,
-  typically imports/exports/comments), embeds only that gap (capped, an
-  `entity_policy.max_gap_segments` knob, unused by default -- R8's own
-  segment cap already bounds it in practice), and combines (mean +
-  L2-renormalize, `combineVectorsMeanNormalized`) the entity vectors and gap
-  vectors into ONE composed artifact vector -- the SAME primitive
-  (`canonicalVectorBytes`, `@urdira/engine`'s `semantic-runtime.ts`) every
-  other vector in this codebase is normalized through. A file with zero
-  fresh-this-pass entity coverage (no eligible entities, or every one of
-  them reopened rather than freshly inserted -- see the map's own doc
-  comment for that narrow, documented fallback) embeds exactly as before
-  (byte-for-byte the pre-Lever-1 whole-file path). `segmenterIdentity`
-  (`semantic-provider.ts`) bumped `v2` -> `v3` to force the one-time
-  re-embed this changes the meaning of, uniformly across all three shipped
-  providers. `semantic_document_status.segment_count` for a composed
-  artifact now reflects the REAL component count (entities + gap segments),
-  with `reason_codes: ["segments_truncated"]` folded in when a gap was
-  capped -- never silent, per R8.
-- **Parallel reconciler sharding (Lever 2)**: `runSemanticReconcileSharded`
-  (`packages/daemon/src/semantic-process.ts`) runs `N` concurrent semantic
-  maintenance child processes, each given `reconcileSemanticProjection`'s
-  new `shard: {index, count}` field -- deterministic assignment by owning
-  `artifact_id` (`shardIndexFor`, SHA-256-based, so a file and every one of
-  its own entities always land in the SAME shard, preserving Lever 1's
-  composition inside a sharded pass). Steps 1/2/4 (workspace-wide,
-  grain-agnostic-or-stale-close) run only in shard 0; every sharded call
-  skips bulk status maintenance and the completion marker entirely. Once
-  every shard resolves, ONE MORE unsharded "finalize" call runs -- finds
-  nothing left to embed in the common case, reaches the marker-write logic
-  naturally, and self-heals any single shard's `failed`/`entity_failed`
-  rows as a side effect of retrying them unsharded. Default 2 workers
-  (`URDIRA_SEMANTIC_WORKERS`, capped at `cpuCount / 4`), matching this
-  decision's own measured ~1.44x at 2 concurrent processes.
-- **Segment cache (Lever 3, new -- not previously designed in this
-  decision)**: a new additive table, `semantic_segment_cache(workspace_id,
-  executable_binding_id, segment_digest, vector, dimensions, element_type,
-  created_at)`, lets the reconciler skip re-embedding any segment whose
-  exact rendered text was already embedded under the SAME vector space, by
-  ANY document, in ANY prior generation (or by another concurrent shard
-  process) -- `embedAndCommitBatch`/`embedPlainTexts` check it before every
-  provider call and populate it after every fresh embed.
-
-Two real, PRE-EXISTING bugs were found live while measuring these levers
-against the real n8n corpus, neither caused by this amendment's own levers
-(both reproduce with `URDIRA_SEMANTIC_WORKERS=1`): a `child_process.fork()`
-`EBADF` failure under the daemon's own large-corpus fd load, and the v4
-entity-candidate enumeration (`semantic-entity-source-v4.ts`) OOMing a
-default-heap Node child. Both are mitigated (bounded retry;
-`--max-old-space-size`) but NOT root-fixed in this session -- see
-`docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`
-Part 0 for the full diagnosis, reported there as separate P0s for the
-owner's queue.
-
-A genuine full-n8n-scale (20,281-file) embed could not be completed within
-this session given the `EBADF` finding above recurring even at a widened
-retry budget; measurements instead use a real, substantial n8n subset
-(`packages/cli`, 2,492 files) -- see
-`docs/evidence/2026-09-07-v4-semantic-embed-performance-and-latency.md`
-Parts 1-3 for the full numbers (embed throughput per lever on that subset,
-cache hit-rate on an edit, latency before/after) and §0.5 for why a subset,
-not the full corpus, was used.
-
-## Amendment (2026-09-07, Frente S-E): both P0s from the prior amendment
-## root-fixed, not just mitigated; segment cache gained pruning
-
-**`spawn EBADF`** is fixed at the daemon-fd-count level, not just retried
-around: see decision 16's own S-E amendment -- the real root cause was
-`@parcel/watcher`'s kqueue backend holding one fd per corpus file, now
-bounded (`KQUEUE_FILE_WATCH_BUDGET`, falls back to fs-events above 2,000
-files). The bounded-retry wrapper (`runSemanticReconcileInProcessWithRetry`)
-is KEPT as defense in depth, not removed.
-
-**Entity-candidate enumeration OOM** is fixed at the source, not just
-mitigated with a raised heap ceiling. `SemanticEntityRecordSource.entityCandidates()`
-(`packages/engine/src/semantic-reconciler.ts`) is no longer
-`Promise<readonly SemanticEntityCandidateRow[]>` (one array holding every
-candidate, confirmed to OOM at n8n scale: 326,817 candidates materialized
-at once) -- it is now a page-callback:
-`entityCandidates(onPage: (page) => Promise<void>): Promise<void>`.
-`createNativeSemanticEntityRecordSource` (`semantic-entity-source-v4.ts`)
-streams `ENTITY_CANDIDATE_PAGE_SIZE`-row (2,000) pages from the native
-port's own `records_for_query_batches` (itself already internally
-keyset-paginated), resolving each page's OWN owner-CAS metadata rather than
-a corpus-wide owner-id set, so this source's own peak memory is O(page),
-never O(corpus). The reconciler's two consumers (the container backfill in
-`syncDocumentStatusBulk` and the entity missing-insert loop, step 5) each
-call `entityCandidates` separately and process pages incrementally -- a
-streaming source cannot be replayed from a single cached call the way the
-old memoized-array shape allowed, so this trades one extra full corpus scan
-for O(page) memory, accepted as a fair trade against an unconditional OOM.
-Owning-file text caching for the entity missing-insert loop's "one CAS read
-per file" optimization moved from a single-slot "current owner" pointer to
-a bounded (64-entry) LRU, since a streaming source can no longer guarantee
-cross-page owner adjacency the way a full `ORDER BY owner_artifact_version_id`
-sort could. `SEMANTIC_CHILD_MAX_OLD_SPACE_MB`'s raised ceiling
-(`packages/daemon/src/semantic-process.ts`) is KEPT as defense in depth for
-the rest of a semantic child's own memory footprint, not because the
-eager-materialization bug it was sized against is still present.
-
-**Segment cache (Lever 3) gained pruning.** Its own DDL comment previously
-admitted "no LRU yet ... pruned only by a future retention pass" -- it now
-never grows past one active vector space's worth of distinct segment
-content: `reconcileSemanticProjection` prunes every `semantic_segment_cache`
-row whose `executable_binding_id` is not the CURRENT one, immediately after
-a clean pass writes the completion marker (a retired vector space's cached
-segments can never be a cache hit again, since every lookup/write is scoped
-to the current binding alone).
-
-See `docs/evidence/2026-09-07-v4-semantic-close.md` for the adversarial
-review of every other S-D lever (sharding row-for-row parity extended to
-`semantic_document_status`/the segment cache, artifact/entity composition
-edge cases, `nativeTopKChunked` tie-breaking under ties spanning chunk
-boundaries) and the final embed/latency/incremental-edit measurements.
-
-## Amendment (2026-09-08, Frente S-F): entity-lane exact scan bounded; coverage view materialized; a production-only bug found and fixed
-
-The entity lane's own `exactVectorScan` call (deliberately uncapped per
-this decision's own "cap 100 tras agregar" -- see the S-D amendment above)
-was measured at 286ms for 10,964 segment candidates. Now attempts a bounded
-top-K scan first (`SEMANTIC_ENTITY_CANDIDATE_CAP * ENTITY_SEGMENT_FANOUT_BOUND`
-= 800) and escalates to the SAME full uncapped scan only when that
-shortfalls (fewer than 100 distinct documents recovered and more candidates
-existed) -- a performance-only fast path: the escalation branch is
-byte-identical to this decision's own pre-existing behavior, so this can
-never change a result, only how fast the common case reaches it.
-`vector_shards`' packed bytes (read via CAS, content-hash keyed) are now
-cached on `SqliteCanonicalQuerySnapshotPort`, replacing a full CAS re-read
-of every distinct shard on every call (~147ms at 6,396 shards).
-
-`buildSemanticCoverageView`'s own real-counts/affected-page inputs
-(`semantic_document_status_counts`/`semantic_affected_documents`, this
-decision's own §4.1/4.2 machinery) are now read from a materialized
-`semantic_coverage_summary` row the reconciler writes once per clean pass,
-not recomputed live on every call -- see decision 16's own S-F amendment
-for the full latency story (5,978.6ms -> 308.1ms p99 at `packages/cli`
-scale) and a SECOND bug this exposed: `NativeCanonicalQuerySnapshotPort`
-(every real v4 workspace's actual port) never delegated the new method,
-silently disabling the fix in production until caught by live measurement
--- fixed in the same session (`ef838e3`).
-
-A full n8n-scale embed attempt (both `URDIRA_SEMANTIC_WORKERS=2` and `=3`)
-did not complete this session -- see
-`docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md` Part 4 for
-the literal counts (72,922 entity vectors, 366,059 `semantic_document_status`
-rows classified) and the observed processing-rate floor
-(~0.03 status-rows/second, independent of worker count), reported for the
-next frente rather than root-caused here.
+- **2026-09-06** (`8497e9c`, Frente S-A): added the `semantic_document_status` per-document ledger, folded into "Maintenance" above.
+- **2026-09-06** (`4404e6b`, Frente S-B): added the 256-token/32-token-overlap segmenter and per-segment entity vectors, folded into "Segmentation and per-segment entity vectors" above.
+- **2026-09-07** (`docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md`, Frente S-C): profiled local-provider embed throughput; rejected an explicit `intraOpNumThreads` override and the CoreML execution provider (both measured with no real gain, CoreML also diverged numerically); found process-level sharding (~1.44x at 2 processes) and artifact-vector reuse from entity segments as real, unshipped levers — both shipped the next day (Frente S-D).
+- **2026-09-07** (`6546997`/`cfd5a6b`, Frente S-D): shipped artifact-vector composition from entity segments plus gap text, parallel reconciler sharding (`URDIRA_SEMANTIC_WORKERS`), and the segment cache — folded into "Segmentation and per-segment entity vectors" above. Found two pre-existing bugs (a `spawn EBADF` under fd load; entity-candidate enumeration OOMing at n8n scale), mitigated but not yet root-fixed.
+- **2026-09-07** (`d244d07`, Frente S-E): root-fixed both bugs found by S-D — the fd budget (decision 16's `KQUEUE_FILE_WATCH_BUDGET`) and entity-candidate enumeration, converted from one materialized array to paged streaming (`entityCandidates`, 2,000-row pages); added segment-cache pruning to the current binding only.
+- **2026-09-08** (`9b20fbb`, Frente S-F): bounded the entity lane's exact scan with an escalate-on-shortfall fast path and cached `vector_shards` CAS reads, folded into "Segmentation and per-segment entity vectors" above; materialized the coverage-summary row this decision's status table backs (see decision 16).

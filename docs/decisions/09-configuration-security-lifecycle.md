@@ -1,7 +1,7 @@
 # Configuration, Security, and Lifecycle
 
-Status: **Approved**  
-Last updated: 2026-08-19
+Status: Accepted  
+Last updated: 2026-09-08
 
 Depends on: Workspace, storage, and semantic-search specifications
 
@@ -57,6 +57,8 @@ Environment variables may select the Urdira data root and administrative config 
 The exact immutable control record is `WorkspaceConfigurationRevision` in the universal data model. It preserves the normalized effective Schema-IR value, contributing layer digests, analysis and query subset digests, resolved embedding bindings, ancestry, cause, and complete revision digest without storing secret bytes.
 
 Changing output-affecting workspace configuration creates a candidate generation. Query-only defaults create a control revision without reindexing. Installation-policy changes that invalidate an active configuration leave the last valid snapshot readable, mark the workspace degraded, and require an explicit compliant replacement configuration.
+
+A workspace's very first scan can fail before any snapshot ever publishes. In that case the workspace also settles into `degraded` rather than remaining `indexing` forever: `status` and `last_scan_error`/`last_scan_error_at` are set together so the failure is visible to `core:index_status` and `core:workspace_admin_show` immediately, and `core:reindex` (or the next matching watcher event) relaunches the scan from that state exactly as it would from an ordinary degraded workspace with a prior snapshot. The two `degraded` cases -- "a prior snapshot exists and is still served, but the latest scan attempt failed" and "the only scan attempt ever made failed, and there has never been a usable index" -- are distinguished by whether `current_snapshot_id` is present, not by a separate status value; every consumer that gates on workspace status already treats `degraded` uniformly regardless.
 
 ## Inclusion and exclusion policy
 
@@ -137,6 +139,8 @@ Removing a workspace immediately stops providers, rejects new queries, expires i
 
 Physical deletion still uses the global reachability collector so shared blobs and model assets survive while another root needs them. Urdira reports logical removal, pending collection, and verified absence separately. Backups are independent roots and are listed to the administrator; workspace purge cannot pretend to erase them.
 
+Purge deletes a workspace's complete on-disk footprint from one centralized list: every sidecar (the native structural store directory, the Rust scan sidecar directory, and the lexical/semantic sidecar databases) first, then the catalog database and its SQLite siblings, and only then the catalog tombstone row -- so a crash mid-purge always leaves a state shaped like "still a registered/tombstoned workspace," never a tombstoned workspace whose files silently survive with nothing left to name them. A daemon-side orphan sweep runs once at every startup, before crash recovery, and on demand, to surface and (on explicit confirmation) delete whatever a crashed operation already left behind under the workspaces root: `core:workspace_orphans_list` returns `{orphans, retained_stale, in_progress}` (a recovery move-aside directory is never a purge candidate; a fork's staging directory is excluded only while under an hour old), and `core:workspace_orphans_purge {safe_ids?, all?}` re-checks each requested id against the current known-id set immediately before deleting and returns `{purged, bytes_freed, remaining}`. Purging orphans is gated exactly like an ordinary workspace purge (explicit `--confirm` at the CLI, `urdira workspace orphans purge [--all | <safe_id>...]`); listing is read-only. `core:status` and `core:index_status` report an `orphaned_workspace_data: {count, bytes}` field from the most recently completed sweep.
+
 Best-effort overwrite is not offered as secure erasure because SSD wear leveling, copy-on-write filesystems, snapshots, journals, and backups can retain bytes. Strong deletion requires destruction of an externally managed encrypted volume or its key. Urdira documents this limitation and can verify only that its named live paths and catalog references no longer exist.
 
 ## Administrative operations
@@ -170,134 +174,8 @@ Release tests cover malicious repository configuration, path traversal, symlink 
 
 The defaults prevent accidental scope expansion or data disclosure while preserving predictable local indexing behavior. Implementation acceptance requires the security verification suite above on every supported platform.
 
-## Amendment 2026-09-06 (plan `generic-waddling-hartmanis.md` §6, Frente H: orphaned workspace data)
 
-`workspace purge`'s "physical deletion" (Removal and data deletion, above) previously deleted only
-the catalog `.sqlite` database and its exact `-wal`/`-shm`/`-journal` SQLite sidecars
-(`removeWorkspaceDatabaseFiles`, `packages/storage/src/storage.ts`) -- never the native
-`.structural/` store directory, the Rust scan `.sidecar/` directory, or the TypeScript lexical/
-semantic sidecar databases, even though every one of those can exist for a workspace that ever
-completed a scan. Every purge before this amendment therefore left a full set of these files
-behind, permanently: nothing in the catalog names them any more (the tombstone row is gone), so
-they were invisible to any query and undiscoverable without a manual filesystem audit.
+## Historial de cambios
 
-Fixed by centralizing the on-disk footprint into one list (`workspaceFootprintEntries`,
-`packages/storage/src/workspace-footprint.ts`) that `purgeWorkspace`, the outdated-database
-move-aside helper (`recreateOutdatedWorkspaceDatabase`, which had the same gap -- missing the
-rollback-journal file and the `.sidecar/` directory from its own hand-rolled candidate list -- now
-fixed the same way), and the daemon's new orphan sweep all read from. `purgeWorkspace`'s deletion
-order is now: every sidecar (`.structural/`, `.sidecar/`, the lexical/semantic sidecar databases)
-first, THEN the catalog database and its SQLite siblings, and only then (unchanged) the catalog
-tombstone row -- so a crash at any point during a purge always leaves a state shaped like "still a
-registered/tombstoned workspace" (sidecars-without-a-database, or a database-without-a-tombstone),
-never the reverse (a tombstoned workspace whose files silently survive with nothing left to name
-them). The workspace's own writer-lock marker is deliberately excluded from this sweep: the purge
-call itself holds that lock for its own duration, and `acquireWorkspaceMutationLock`'s existing
-`release()` step already unlinks it once every other step has finished -- unlinking it mid-hold
-would let a concurrent lock acquisition on the same path "succeed" against a lock this call still
-believes it owns.
-
-A new daemon-side orphan sweep (`sweepWorkspaceDataDir`, `packages/daemon/src/orphan-sweep.ts`)
-runs once at every daemon startup (right after durable storage opens, before crash recovery) and on
-demand via two new administrative RPCs, to surface -- and, on explicit confirmation, delete --
-whatever this gap (or any crashed operation) already left under `<data_root>/workspaces`:
-
-- `core:workspace_orphans_list`: re-sweeps and returns `{orphans, retained_stale, in_progress}`.
-  Every top-level entry under `workspaces/` is grouped by the footprint id its longest recognized
-  suffix implies. `retained_stale` (a `<id>.v3.stale-<timestamp>` move-aside directory) is never a
-  purge candidate, unconditionally -- it is deliberately preserved recovery evidence. `in_progress`
-  (a `<id>....fork-staging-<uuid>` copy-then-rename staging directory, `forkV4StructuralStore`) is
-  excluded only while under an hour old; older than that, it graduates to `orphans` regardless of
-  whether its id is otherwise "known" (a fork's target workspace is normally already registered
-  while the fork runs -- age, not registration, is what makes a staging leftover stale). Everything
-  else is an orphan unless its id is registered or removed-but-within-the-24-hour-grace-period
-  (`WorkspaceRegistry.listIncludingRemoved()`).
-- `core:workspace_orphans_purge {safe_ids?, all?}`: re-sweeps, defensively re-checks each requested
-  id against the current known-id set and against this process's own open-handle bookkeeping
-  (`isWorkspaceDatabaseFileOpen`) immediately before deleting, deletes with the same
-  `removeWorkspaceFootprint` primitive `purgeWorkspace` uses, re-sweeps again, and returns
-  `{purged, bytes_freed, remaining}`. Never deletes without an explicit `--confirm` at the CLI
-  layer (`urdira workspace orphans purge [--all | <safe_id>...]`, gated exactly like `workspace
-  purge`); `urdira workspace orphans` itself is read-only and needs neither `--dry-run` nor
-  `--confirm`.
-
-A sweep failure never blocks daemon startup (caught and logged); `core:status` and
-`core:index_status` both gain an `orphaned_workspace_data: {count, bytes}` field reflecting the
-most recently completed sweep (not a fresh one per status call), and the MCP `urdira_index_status`
-renderer adds one hint line when `count > 0`.
-
-## Amendment 2026-09-08 (Frente D-1: a failed scan must never leave `status: "indexing"` forever)
-
-Live evidence (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §4.0): a v3 scan against the full,
-unmodified VS Code monorepo failed at t=83.9s (`core:engine_failed: JS/TS facts are incomplete for
-...`), but `core:workspace_admin_show`/`core:index_status` kept reporting `workspace_status:
-"indexing"` for over 100 minutes afterward -- the daemon process was confirmed alive the whole time
-with only a few seconds of *total* CPU consumed, i.e. genuinely idle, not slow. Any real caller
-polling status the way the CLI/MCP tooling does (and the way this campaign's own harness did) would
-wait forever with no signal that anything went wrong.
-
-**Root cause**, exact and narrow: `packages/daemon/src/runtime.ts`'s scan job terminal-failure
-handler always called `WorkspaceRegistry#recordScanFailure` (sets `last_scan_error`/
-`last_scan_error_at`, `packages/engine/src/workspaces.ts`), then conditionally called `markReady
-(workspaceId, priorSnapshotId, "degraded")` -- but ONLY `if (priorSnapshotId !== undefined)`.
-`markReady` itself requires a non-empty snapshot id (`if (snapshotId.length === 0) throw`), so a
-workspace's very first-ever scan (`priorSnapshotId === undefined`, i.e. no prior generation to
-re-pin to) had no snapshot for that call to target at all -- the code simply skipped the re-pin and
-left `status` at whatever `beginReconciliation` had set it to earlier: `"indexing"`, permanently.
-This was a DELIBERATE prior design choice (`recordScanFailure`'s own doc comment literally said "or
-leave the workspace 'indexing' on a first-ever-scan failure"), not an oversight -- but the campaign
-showed it is a real usability defect: `last_scan_error`/`last_scan_error_at` WERE already being set
-correctly and were already visible in both RPCs' raw payloads (`core:index_status`'s
-`last_scan_error_code`/`last_scan_error_at`, `core:workspace_admin_show`'s raw
-`last_scan_error`/`last_scan_error_at` via `workspaceAdministrativeView`'s `...workspace` spread,
-and the MCP `urdira_index_status` renderer already had a `last_scan_error: <code> at <at>` line) --
-the ONLY gap was `workspace_status`/`freshness_status` themselves never leaving `"indexing"`, which
-made every one of those already-correct fields easy to miss for a caller keying off `status` alone.
-
-**Fix.** `WorkspaceRegistry#recordScanFailure` now flips `status` straight to `"degraded"` itself,
-in exactly the one case that previously had nowhere to go: `workspace.status === "indexing" &&
-workspace.current_snapshot_id === undefined` (no prior generation, AND no intermediate structural
-stage published this same failed attempt either -- `markStructuralStagePublished` can set
-`current_snapshot_id` mid-scan even on a workspace's first-ever attempt, before the whole scan later
-fails; that case is handled separately, see below). `last_scan_error`/`last_scan_error_at` are set
-unconditionally either way, matching the pre-existing contract every other consumer already relies
-on. `current_snapshot_id` is deliberately left untouched (stays `undefined`) -- `"degraded"` here
-means "the last (and, so far, only) scan attempt failed and there has never been a usable index," a
-distinct meaning from `"degraded"`'s pre-existing "a prior snapshot exists and is still being
-served, but the latest scan attempt failed" case; `WorkspaceStatus`'s own type
-(`packages/engine/src/workspaces.ts`) was deliberately NOT extended with a new enum member for this
--- the existing `"degraded"` value, `current_snapshot_id`'s presence/absence, and
-`last_scan_error`/`last_scan_error_at` together already fully and unambiguously describe both cases,
-and every downstream consumer that gates on `workspace.status` (readiness derivation, RPC admission,
-`beginReconciliation`/`core:reindex`, orphan-sweep classification) already treats `"degraded"`
-uniformly regardless of whether a snapshot exists, so no other call site needed to change.
-
-`packages/daemon/src/runtime.ts`'s own catch block was separately hardened to use the FRESHEST
-snapshot id (re-read from the registry after `recordScanFailure` runs), not just `priorSnapshotId`
-(captured before the scan started): a first-ever scan that got far enough to publish an
-intermediate structural stage (`markStructuralStagePublished`) before failing LATER already has a
-newer usable snapshot than `priorSnapshotId`'s stale `undefined`, and is now correctly re-pinned to
-`"degraded"` against that stage's own snapshot instead of falling through to the "no index at all"
-case above.
-
-**Recovery.** `core:reindex` (`packages/daemon/src/runtime.ts`) was already unconditional on the
-workspace's current status (`beginReconciliation` is idempotent against `"indexing"` and otherwise
-transitions from any other status, including the pre-fix stuck `"indexing"` and the post-fix
-`"degraded"` alike) -- no change was needed there. `core:reindex` (or the next matching watcher
-event) relaunches the scan from either state exactly as it already did from an ordinary `"degraded"`
-workspace.
-
-**CLI/MCP surfacing.** The MCP `urdira_index_status` renderer already showed `last_scan_error: <code>
-at <at>` (unaffected by this fix, verified still correct). `urdira workspace show` (CLI,
-`core:workspace_admin_show`) gained a small human-readable summary line (`workspace: <id> (<root>)`,
-`status: <status>`, `last_scan_error: <code> at <at>` when set) ahead of the raw JSON dump for
-non-`--json` output -- the raw JSON (with `status`/`last_scan_error`/`last_scan_error_at`, registry
-field names, no `_code` suffix) was already present before this fix, just unformatted.
-
-**Test.** `tests/phase-daemon-v4-scan.test.ts`'s existing `"records a diagnosable
-last_scan_error_code when URDIRA_V4=1 but no resolve_workspace_scan_transport is configured"` test
-previously asserted the OLD buggy behavior verbatim (`expect(payload?.workspace_status).toBe
-("indexing")`, with a comment explaining why) -- updated to assert `"degraded"` instead, and
-extended to call `core:reindex` afterward and confirm the workspace re-enters `"indexing"` and
-settles back to a FRESH `"degraded"` state (a new `last_scan_error_at`), proving the recovery path
-live rather than by inspection alone.
+- **2026-09-06** (`0bb42be`, Frente H): purge now deletes the complete workspace footprint (structural store, scan sidecar, lexical/semantic sidecars) instead of only the catalog database; added the daemon-side orphan sweep and `core:workspace_orphans_list`/`purge` RPCs. Folded into "Removal and data deletion" above.
+- **2026-09-08** (`e85c1e7`, Frente D-1): a workspace's first-ever scan failure now settles into `degraded` with `last_scan_error` visible, instead of leaving `status` at `indexing` forever. Folded into "Configuration domains and precedence" above.

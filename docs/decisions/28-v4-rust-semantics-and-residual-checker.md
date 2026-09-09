@@ -1,9 +1,42 @@
 # Decision 28: v4 Rust semantic model — typeflow and the residual tsgo pass
 
-Status: **Approved and implemented. Typeflow runs unconditionally in v4 (P2-2e) with an incremental `ProgramIndex` (P3-8a); unresolved sites are published as `possible` rows with reason-coded `jsts:unresolved_call` diagnostics (P2-2i); the residual tsgo pass is wired into the worker as a background `semantic_upgrade` generation (P1-D-c…h, opt-in via `URDIRA_V4_RESIDUAL`). Call parity vs v3 on n8n: 112,565 same target / 0 different / 0 missing of 205,468. Open: `rpc_error` 13,737; unions/overloads → `possible` not built; the P2-2m `identity_key` corruption (decision 29).**
-Last updated: 2026-09-05
+Status: **Accepted**
+Last updated: 2026-09-09
 Depends on: [JavaScript/TypeScript MVP](07-javascript-typescript-mvp.md), [Rust native acceleration](25-rust-native-acceleration.md), [v4 structural store](26-v4-structural-store.md), [v4 Rust-owned scan pipeline](29-v4-rust-owned-scan-pipeline.md)
 Reopens: E4 of `docs/evidence/2026-09-01-f5-hybrid-design.md` (see "Relation to E4")
+
+## Current state (2026-09-09)
+
+Typeflow runs unconditionally in v4 (P2-2e) with an incremental
+`ProgramIndex` (P3-8a). A site neither the hybrid resolver nor typeflow can
+resolve is no longer dropped and no longer bare-`possible`-with-no-target:
+it lives in the store's `pending.sites` table with a reason code, and a
+`possible` `core:call`/`core:inherits`/`core:implements`/`core:references`
+row always carries a real `target_id` (see "The uncertainty contract, as
+it stands" below — this superseded the original P2-2i "no `target_id`"
+contract on 2026-09-05). The residual tsgo pass is wired into the worker
+as a background `semantic_upgrade` generation (P1-D-c…h, opt-in via
+`URDIRA_V4_RESIDUAL`). Candidate ambiguity (union/overload receivers,
+sibling `extends`/`implements` overrides, unreliable receiver-typing rules)
+is bounded by `MAX_CANDIDATE_TARGETS = 8`
+(`crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`) — a candidate
+set above that cap demotes to `checker_pending` with no candidate list at
+all, never a guessed-down subset, never `confirmed` (see "Candidate
+discipline, as it stands" below). Final measured parity vs. v3 (last
+refreshed 2026-09-09, Frente E-P0r,
+`docs/evidence/2026-09-07-v4-vscode-campaign.md` §18): n8n (unreduced)
+`different == 0` in both the call and reference populations,
+`confirmed_combined = 161,802`; VS Code (reduced corpus)
+`different` = 80 references / 23 calls over roughly 2.46M / 0.36M
+confirmed sites (0.003% / 0.006%) — every remaining VS Code `different`
+sample is classified to an already-documented, out-of-scope root cause
+(flow-sensitive narrowing the checker performs and typeflow's local
+inference does not model, plus four small pre-existing unrelated
+residuals); accepted with this figure by the owner on 2026-09-09 rather
+than pursued further, since closing it needs real flow-sensitive type
+narrowing, out of this decision's scope. Open: `rpc_error` 13,737 raw
+sites; unions/overloads-as-per-candidate-possible-rows are built (2026-09-06
+amendment below, superseding the original "not built" status).
 
 ## Context
 
@@ -90,36 +123,98 @@ long tail; method overloads (`MemberLookup::Many`, deliberately not
 resolved); unions/bounded generics; a built-in member table for
 `lib.es5.d.ts` methods; transitive type aliases; `Parameters<typeof f>[i]`.
 
-### The uncertainty contract as built (P2-2i)
+### The uncertainty contract, as it stands
 
-A site neither E1-E3 nor typeflow resolves is no longer dropped: it is
-published as a `possible` `core:call`/`core:inherits`/`core:implements`
-relation (facets `core:reference_relation` + `core:indirect`, no
-`target_id`, mirroring v3's `relate(..., "possible")` shape byte for byte)
-paired 1:1 with a `jsts:unresolved_call` diagnostic carrying a new `reason`
-field. Only two reasons are produced today — `call_deferred_to_e3`
-(376,133 on n8n) and `call_target_uncertain` (261,397). On n8n this yields
-`core:call` 734,379 = 96,847 confirmed + 637,530 possible, exactly v3's
-historical `jsts:relation_call` total for the corpus — there is no site
-coverage gap between v3's checker walk and v4's enumeration
+A site neither E1-E3 nor typeflow resolves is never dropped. As first built
+(P2-2i), it was published as a `possible` relation with no `target_id` at
+all, paired with a `jsts:unresolved_call` diagnostic — that original
+contract is superseded (2026-09-05 amendment, folded in here): the cold
+producer now materializes class/interface members, referenced parameters,
+catch/rest bindings, ambient `declare module` namespaces, and external
+package/symbol entities directly, so an unresolved site's candidate
+target(s) usually already exist as real entities. The current contract:
+
+- An unresolved call/heritage/reference site lives in the store's
+  `pending.sites` table (reason codes 0-11, see "Candidate discipline,
+  as it stands" below for the two newest codes), not as a bare diagnostic.
+- A `possible` `core:call`/`core:inherits`/`core:implements`/`core:references`
+  relation record **always carries a real `target_id`** — one row per
+  candidate when there is more than one (facet `core:indirect`); the
+  `jsts:unresolved_call` diagnostic kind is gone, its `reason` moved onto
+  the pending site.
+- The residual pass reads `pending.sites` directly (not derived from
+  possible-row enumeration, superseding the P2-2i-era plan of deriving
+  pending sites from possible rows) and, when it confirms a target, closes
+  the site and every candidate row at the same span in the same
+  `semantic_upgrade` generation; it additionally publishes inferred types,
+  `type_of` relations, and compiler diagnostics in that generation.
+- The originally-reserved taxonomy (`union_ambiguous`, `overload_ambiguous`)
+  is now populated: an overloaded member (`MemberLookup::Many`) or a
+  union-typed receiver (`MemberLookup::UnionCandidates`) always stays
+  `possible` per candidate, never collapsed to one `confirmed` row
+  regardless of how unanimous the candidates are (2026-09-06 amendment).
+  Sibling-candidate ambiguity from `extends`/`implements` overrides is a
+  further, later-added mechanism — see "Candidate discipline, as it
+  stands".
+
+On the original P2-2i n8n measurement, only two reasons were produced
+(`call_deferred_to_e3` 376,133, `call_target_uncertain` 261,397), and
+`core:call` totaled 734,379 = 96,847 confirmed + 637,530 possible —
+exactly v3's historical `jsts:relation_call` total for the corpus, i.e. no
+site-coverage gap between v3's checker walk and v4's enumeration
 (`docs/evidence/2026-09-04-v4-p2-2i-possible-rows-and-pending-sites.md`).
-The plan's fuller taxonomy (`union_ambiguous`, `overload_ambiguous`,
-`external_module`, `generic`, `receiver_unknown`, `dynamic_property`) is
-reserved in `registry-contribution.ts`'s schema but **no emission channel
-populates it**: typeflow's `RawTypeRef`/`TypeflowValue` have no union
-variant at all, so per-candidate possible rows for unions/overloads are a
-new crate feature, not wiring (P2-2i, "deliberately not built"). The
-planned `pending.sites`/`entities.index` segment export was not built; the
-residual pass derives its pending sites from the possible rows instead
-(decision 29, open item 3).
+Later amendments (below) added further reasons and changed the confirmed/
+possible split; see "Current state" above for the final n8n/VS Code parity
+figures.
 
 **What the contract loses relative to the checker**: `EntityObservation.type`
 is populated only from explicit annotations, `new` expressions, literals, or
 resolved signatures; `jsts:compiler_diagnostic` records are never produced
-(no compiler runs on the critical path), reported via the completeness
-reason `jsts:compiler_diagnostics_unavailable`. `jsts:diagnostic` rows
-**are** produced again since P2-2i, but only the `jsts:unresolved_call`
-kind.
+on the critical path (no compiler runs there), reported via the
+completeness reason `jsts:compiler_diagnostics_unavailable` — the residual
+pass, when enabled, does publish them in its own generation (see above).
+
+### Candidate discipline, as it stands
+
+A member lookup that cannot be pinned to exactly one target never guesses:
+it either stays `possible` with an explicit, bounded candidate list, or
+demotes further to `checker_pending` with no list at all once that list
+would be too large to be useful. The mechanism (all in
+`crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`), assembled across
+five amendments between 2026-09-06 and 2026-09-09 below:
+
+- **Reliable-receiver rules** (`rule_pins_receiver_uniquely`): `this`,
+  `super`, `ClassName.member` (`member_class_static`), `new ClassName()`
+  (`member_new_expression`), a proven `instanceof` narrowing
+  (`instanceof_narrowed`, suppressed for a call's own target resolution),
+  and a proven `this is T`/`param is T` type-predicate narrowing
+  (`type_predicate_narrowed`, both an `if`/`&&` positive form and VS
+  Code's dominant `if (!x.hasModel()) return;` negated-early-return form).
+  An explicit type annotation (`member_declared_type`) is **not** in this
+  list as of the final (E-P0r) amendment — an annotation pins a receiver's
+  *declared* type, not necessarily its narrower *actual* type at every read
+  site, so it now goes through the same candidate check as any other
+  unreliable rule.
+- **Candidate collection**: when the receiver is pinned by a reliable rule
+  and that type declares the member directly, the site is `confirmed`
+  outright — no candidate check needed. Otherwise (an unreliable rule, or a
+  member reached only through inheritance/conformance),
+  `ProgramIndex::sibling_conformance_overrides` (the `extends`-only
+  `sibling_extends_overrides` widened to `extends` **and** `implements`
+  edges) finds every other known type that transitively conforms to the
+  resolved receiver type and redeclares the same member.
+- **The bound**: `MAX_CANDIDATE_TARGETS = 8`. A candidate set (including the
+  originally-resolved target) of 8 or fewer demotes the site to `possible`
+  with one row per candidate (reason `sibling_declaration_ambiguous` for an
+  `extends`-only set, code 10); a set larger than 8 demotes instead to
+  `checker_pending` with **no** candidate list at all (reason
+  `sibling_conformance_unbounded`, code 11) — cost is bounded, correctness
+  never is: an unbounded candidate set is never guessed down to a subset.
+- **Explicitly not covered**: an INHERITED match reached only through
+  control-flow narrowing this crate does not model (e.g. a `this is T`-typed
+  guard method whose narrowing shape isn't one of the reliable rules above)
+  is a distinct, unmodeled gap — reported, not silently misclassified as an
+  ambiguity.
 
 ### The residual tsgo pass as built (P1-D-a…h)
 
@@ -186,8 +281,8 @@ As built:
   29, stage 4): **0 mismatches** at both the cold and post-upgrade
   checkpoints, with the final resolved population unchanged
   (`docs/evidence/2026-09-05-v4-final-measurements.md` §2.6). The invariant
-  is asserted in the n8n residual test and is the only signal that detects
-  the open P2-2m corruption.
+  is asserted in the n8n residual test and was the only signal that
+  detected the (now-fixed, see decision 26's changelog) P2-2m corruption.
 - **Batched symbol fetch** (P1-D-e): one bad `NodeHandle` in a batched
   `getSymbolsAtLocations` poisoned the whole batch; `fetch_symbols_chunked`
   (≤ 2,000 locations, per-location isolation on failure) cut raw
@@ -275,11 +370,12 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   explained; three synthetic reproductions failed (P1-D-e §3, P1-D-g §3).
   The obvious fix (descending into a property-access callee's name) was
   tried and reverted after a live wrong-target regression (P1-D-g §3.2).
-- **Unions/overloads → `possible` not built**: no per-candidate emission
-  channel; the reserved reason codes stay unpopulated (P2-2i).
 - **`external_lib` policy** awaits the owner's definition of "confirmed".
-- **P2-2m `identity_key` corruption** — first seen while landing the
-  classification repair, proven unrelated to it (decision 29, open item 1).
+- **VS Code `different` does not reach 0** (80 references / 23 calls at the
+  final 2026-09-09 measurement) — accepted with this figure by the owner;
+  closing it needs real flow-sensitive type narrowing (tracking the actual
+  initializer/assignment-site type through control flow), out of this
+  decision's scope. See "Current state" above.
 - **Lane-count tuning** has no empirical production-scale default (5 on the
   measurement machine); tsgo child RSS during a pass was never measured.
 - **Overload-aware member resolution, transitive type aliases, a built-in
@@ -296,266 +392,13 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   externally-resolved sites was verified only against the schema's stated
   intent, not line by line (P1-D-g §4).
 
-## Amendment 2026-09-05 (see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`)
+## Historial de cambios
 
-- **Entity synthesis for members** is no longer the normal path: the cold producer now
-  materializes class/interface members (including constructor parameter properties), referenced
-  parameters, catch/rest bindings, ambient `declare module` namespaces and external
-  package/symbol entities, all with the identity recipes typeflow and v3 use. The residual pass
-  reuses the cold entity through its `(path, name_start)` index and only synthesizes when a
-  target is genuinely absent.
-- **Classification invariant** is replaced: no relation record without a target exists any more.
-  Unresolved call/heritage sites live in the store's `pending.sites` table (reason codes 0-9),
-  a `possible` relation record always carries a `target_id` (overload/union candidates, facet
-  `core:indirect`), and the `jsts:unresolved_call` diagnostic record is gone (its `reason` moved
-  to the pending site). The residual pass reads `pending.sites`, closes the site and any
-  candidate rows at the same span when it confirms a target, and additionally publishes
-  inferred types, `type_of` relations and compiler diagnostics in the same upgrade generation.
+- **2026-09-05** (`docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`): the cold producer began materializing class/interface members, referenced parameters, catch/rest bindings, ambient-namespace and external entities directly, and the classification invariant changed so every relation record carries a real `target_id` while an unresolved site lives in `pending.sites` instead of a bare `jsts:unresolved_call` diagnostic — see "The uncertainty contract, as it stands" above.
+- **2026-09-06** (Frente F, `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`): documented explicitly (no code change) that a union/overload receiver never promotes to `confirmed`, only to `possible` per candidate — see "The uncertainty contract" above; separately, `parameter_entity_rows` began materializing a `jsts:entity_parameter` entity for every declared parameter/catch-binding rather than only referenced ones (n8n count 74,769 → 79,764, floor re-pinned in `docs/evidence/2026-09-07-v4-f3-cold-incremental-floors-parity-threshold.md`), and `get_outline`'s child ordering was hardened to sort by span start rather than by `core:contains` relation-record order.
+- **2026-09-08** (Frente E-P0o, `docs/evidence/2026-09-07-v4-vscode-campaign.md` §15): added the sibling-candidate rule for an own-declaration member reached through an unreliable receiver rule with a known `extends`-descendant override (`sibling_declaration_ambiguous`), deliberately not generalized to an inherited match (a distinct, unmodeled control-flow-narrowing gap); VS Code residual 461/317 → 281/153 (references/calls).
+- **2026-09-09, Frente E-P0p** (same evidence §16): generalized the sibling-candidate rule to inherited matches; added `this is T`/`param is T` type-predicate narrowing (both the positive and the negated-early-return idiom) as a new reliable rule; VS Code residual 281/153 → 189/58; n8n `confirmed_combined` 161,903, `different == 0` in both populations (unchanged).
+- **2026-09-09, Frente E-P0q** (§17): generalized the sibling-candidate rule to `implements` conformance, introducing the `MAX_CANDIDATE_TARGETS = 8` cost bound (a larger set demotes to `checker_pending`/`sibling_conformance_unbounded` with no candidate list); added negated-`instanceof` early-return narrowing and standalone-function `param is T` narrowing; recorded a new `sibling_conformance_dependencies` incremental-consistency edge for a conformer reached with no backing import statement; VS Code residual 189/58 → 110/61; n8n `confirmed_combined` 161,903 → 161,843.
+- **2026-09-09, Frente E-P0r** (§18, final refresh cited in "Current state" above): removed `member_declared_type` (an explicit type annotation) from the reliable-rule allow-list, so an annotated receiver now falls through to the same sibling-conformance candidate check as any other unreliable rule; VS Code residual 110/61 → 80/23, the largest single-session drop of the campaign; n8n `confirmed_combined` 161,843 → 161,802.
 
-## Amendment 2026-09-06 (flecos v4 plan, Frente F, see `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`)
 
-- **Union/overload receivers never promote to confirmed, even when every candidate agrees — ACCEPTED as steady state.**
-  This invariant already lived in code (`semantic_sites.rs:170-178` and `:1085-1093`,
-  `OwnerSemantics::candidate_call_rows`'s own doc comment: "**Never** produces a `classification:
-  confirmed` row: a union/overload receiver is a genuine ambiguity in this round, never promoted
-  to a single target even when every candidate agrees") but was documented only at the code site,
-  not in this decision. It is now recorded here explicitly: an overloaded member (`MemberLookup::
-  Many`, reason `overload_ambiguous`) or a union-typed receiver (`MemberLookup::UnionCandidates`,
-  reason `union_ambiguous`) always stays a `possible` `core:call`/heritage row per candidate (with
-  a real `target_id`, facet `core:indirect`) plus its own `pending.sites` entry for a later
-  residual pass to confirm — it is **never** collapsed to one `confirmed` row by this crate's own
-  zero-wrong-target discipline, regardless of how many (or how unanimous) the candidates are. No
-  code change accompanies this amendment; it closes an open documentation gap flagged during the
-  2026-09-06 flecos-v4 review (plan `§3.0`/`§3.1`, decision 28 vs. 29 cross-reference: the
-  invariant's normative home is this decision, not 29).
-- **Parameter entities: every declaration, not only referenced ones.** `OwnerSemantics::
-  parameter_entity_rows`/`parameter_contains_rows` (`semantic_sites.rs`) now materialize a `jsts:
-  entity_parameter`/`core:value` (catch binding) entity and its `core:contains` row for EVERY
-  identifier-pattern parameter/rest-parameter/catch-binding declaration this crate's walk records
-  a fact for (`parameter_declarations`/`catch_declarations`, both `BTreeMap`s, iterated by
-  `.values()` in `finish()`), superseding the 2026-09-04 "referenced-only" cut (a parameter got an
-  entity only if some resolved reference in its own body targeted it). Motive: `core:get_outline`
-  (`packages/engine/src/canonical-query-data-port.ts`) is a BFS over `core:contains` — an agent
-  asking for a callable's signature must see every declared parameter, including one the body
-  never reads (a common, legitimate shape: an unused `error`/`event`/interface-conformance
-  parameter). Destructured/object-pattern parameters and catch bindings remain unsupported exactly
-  as before (`classify_symbol_declaration`'s `FormalParameter`/`CatchParameter` arms only resolve
-  a simple `BindingIdentifier`; this amendment does not change what counts as a candidate, only
-  whether a candidate needs a reference to materialize). A constructor parameter PROPERTY is still
-  excluded from this producer (`urdira_jsts_typeflow::member_declarations`/`push_member_entities`
-  owns it unconditionally instead, unchanged). `get_outline`'s own child ordering was hardened to
-  sort by `primary_source_span.start_byte` (`canonical-query-data-port.ts`'s `core:get_outline`
-  handler) rather than relying on `core:contains` relation-record order, which is NOT guaranteed
-  to be positional (a `BTreeMap<entity_id, _>`'s iteration order sorts the id STRING, and an
-  unpadded byte offset embedded in that id does not sort numerically past a digit-width boundary,
-  e.g. `"10"` before `"9"`). Population effect: n8n's `jsts:entity_parameter` count moves from
-  74,769 (referenced-only) to a new, larger figure re-measured by F.3 (plan §0 rule R5); the
-  regression floor in `scripts/v4-population-floors.json`/`crates/urdira-indexing-worker/src/v4/
-  tests_e2e.rs`'s `n8n_population_floors` starts at `74,021` (`0.99 x` the OLD figure) and is
-  expected to only move up once F.3's measurement lands.
-
-## Amendment 2026-09-08 (Frente E-P0o, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §15)
-
-- **Sibling-candidate rule (own-declaration shape only) — new candidate-ambiguity mechanism,
-  same discipline as the 2026-09-06 union/overload amendment above.** When a member lookup
-  (`obj.m`/`this.m`/`x.m()`) resolves the receiver to a single known entity that declares `m`
-  DIRECTLY on itself (`urdira_jsts_typeflow::ProgramIndex::own_member_ids` non-empty), but (a) the
-  receiver's own typing was NOT reached through one of the "reliable" rules (`semantic_sites.rs`'s
-  `rule_pins_receiver_uniquely`: `this`, `super`, a proven `instanceof` narrowing, an explicit
-  `: T` annotation, `ClassName.member`, or `new ClassName()`) and (b) at least one OTHER known
-  container that is a transitive `extends` DESCENDANT of the resolved entity ALSO redeclares `m`
-  (`ProgramIndex::sibling_extends_overrides` non-empty) — the site must stay `possible`, with ONE
-  candidate row per declaration (own's + every known sibling's), NEVER `confirmed` to either.
-  Reason `sibling_declaration_ambiguous` (`PendingReasonCode` code 10). Mirrors the union/overload
-  mechanism exactly, extended to a plain (non-call) member reference for the first time
-  (`CandidateReferenceRow`/`candidate_reference_record`, `core:references` classification
-  `possible`) — previously `core:references` had no `possible` bucket at all.
-- **Explicitly NOT generalized to an INHERITED match** (the receiver's resolved entity does NOT
-  declare `m` itself; the match comes from walking that entity's OWN `extends` chain up to an
-  ancestor). A live VS Code counter-example (`editor: ICodeEditor` in `coreCommands.ts`, guarded by
-  `if (!editor.hasModel()) return;` — `hasModel(): this is IActiveCodeEditor` narrows `editor` to a
-  DESCENDANT of `ICodeEditor` this crate does not model) proves the inherited shape is a distinct,
-  unmodeled CONTROL-FLOW-NARROWING gap (the same general class as `instanceof`, just a different
-  syntax), not a same-file candidate ambiguity — labeling it `possible` would misrepresent a
-  deterministic-but-unknown fact as a genuine ambiguity. A regression-tested adversarial guard
-  (`instanceof_narrowing_never_applies_to_a_calls_own_target_resolution`, E-P0k) additionally
-  proves the own-declaration and inherited shapes are NOT interchangeable: own-declaration wins
-  UNCONDITIONALLY for a call/read whose receiver type itself declares the member, even in the
-  presence of a known descendant override — matching TypeScript's real declared-type resolution.
-  This residual (~281 VS Code references, ~153 VS Code calls at this task's own measurement,
-  down from 461/317 pre-fix) is reported, not guessed at — implementing real type-predicate
-  narrowing (`x is T`) is a genuinely separate typeflow feature, out of this decision's scope.
-
-## Amendment 2026-09-09 (Frente E-P0p, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §16)
-
-- **Sibling-candidate rule generalized to an INHERITED match too.** `ProgramIndex::own_member_ids`
-  (the gate the 2026-09-08 amendment used to restrict the sibling check to an entity's OWN direct
-  declaration) is **removed**. `ProgramIndex::sibling_extends_overrides(entity_id, ...)` already
-  only ever returns transitive `extends` DESCENDANTS of `entity_id`, regardless of whether
-  `entity_id` declares the member directly or inherits it — so the only gate the sibling check
-  needs is `rule_pins_receiver_uniquely(rule)`, applied uniformly to both shapes. Re-examining the
-  2026-09-08 amendment's own regression guard (`instanceof_narrowing_never_applies_to_a_calls_own_
-  target_resolution`) directly showed why the ORIGINAL `own_member_ids` gate was never actually
-  load-bearing for it: `activePane: EditorPane`'s own rule for that test's CALL is
-  `"member_declared_type"` (an explicit parameter annotation, already one of `rule_pins_receiver_
-  uniquely`'s reliable rules, with `instanceof`-narrowing already suppressed for a call's own
-  target resolution) — reliable EITHER WAY, own-declaration or inherited, so the earlier, cruder
-  generalization attempt that broke this guard must have applied the sibling check WITHOUT also
-  consulting `rule_pins_receiver_uniquely` for the inherited branch, not because the two shapes are
-  inherently incompatible.
-- **New mechanism: `this is T` type-predicate narrowing (`PredicateSubject::Receiver`).**
-  `RawTypeRef`/`ResolvedTypeRef::TypePredicate` (`urdira-jsts-typeflow`) captures a method's own
-  declared return type when it is a user-defined type predicate; `ProgramIndex::member_predicate_
-  receiver_narrowing` exposes the resolved narrowed entity for a `this is T` predicate specifically
-  (`param is T`, `PredicateSubject::Parameter`, is represented but NOT yet consulted by any
-  resolver — narrowing a function's own ARGUMENT by parameter name/position needs a per-function
-  parameter table this index does not otherwise keep; no live sample forced this, scoped out).
-  `semantic_sites.rs`'s new `type_predicate_narrowings` stack mirrors `instanceof_narrowings`'
-  bracketing (an `if`'s own consequent, or the right-hand side of a `&&`) for a call shape instead
-  of a binary expression (`x.hasModel()`), tagging the receiver with a new reliable rule,
-  `"type_predicate_narrowed"` — added to `rule_pins_receiver_uniquely`. Unlike `instanceof_
-  narrowed`, this new rule is **never suppressed for a call's own target resolution**: a
-  type-predicate narrows the receiver to a DIFFERENT interface shape entirely (not a subclass
-  override reachable via virtual dispatch at the unnarrowed type), so v3's own real answer for a
-  CALL through a predicate-narrowed receiver DOES follow the narrowing — confirmed live: the
-  `ICodeEditor`/`IActiveCodeEditor`/`hasModel(): this is IActiveCodeEditor` counter-example the
-  2026-09-08 amendment reported as its own residual now resolves correctly to `IActiveCodeEditor`'s
-  own declaration for both a read and a call, in the positive `if (x.hasModel())`/`&&`-right-side
-  form.
-- **Second mechanism: the SAME predicate narrowing generalized to VS Code's own DOMINANT idiom for
-  it, `if (!x.hasModel()) return; ...narrowed for the rest of this block...`** (live count against
-  `vscode-corpus-2026-09-06`: 238 negated-early-return call sites for `hasModel` alone vs. a
-  smaller positive-form count) — `semantic_sites.rs`'s new `visit_statements` override (replacing
-  the default `walk_statements` loop for every statement-list context this visitor reaches: a
-  block body, a function/program top level, ...) extends `type_predicate_narrowings` across the
-  REST of the SAME statement list after an `if` with no `else` whose test is a negated predicate
-  call (through any number of `||`-joined disjuncts — reaching past an `A || B` early exit proves
-  BOTH false) AND whose consequent `statement_definitely_exits` (a bare/nested-block
-  `return`/`throw`/`continue`/`break` — deliberately narrow, never an `if`/`else`-both-exit or
-  `switch`-exhaustiveness proof). Reused, in-scope naming: this is the SAME kind of "proven,
-  bounded, syntax-local control-flow fact" `instanceof_narrowings` already established, not a new
-  discipline.
-- **Live measurement** (`vscode-corpus-2026-09-06` reduced tree, 10,044 TS/JS files this session's
-  own rsync pass produced — a smaller reduction than the 2026-09-08 amendment's own 12,841, not
-  reconciled further, see the evidence doc's own §16.1 for the exact recipe used): VS Code
-  references `different` 281 → 189 (-33%), calls `different` 153 → 58 (-62%). **`different == 0`
-  does NOT hold for VS Code** at this task's own final measurement — the classification in the
-  evidence doc's own §16.4 accounts for the remainder as SEPARATE, out-of-scope root causes (chiefly
-  an `implements`-not-`extends` sibling-conformance shape deliberately NOT generalized to, for the
-  same "real subclassing, not interface conformance" reason `extends_chain_reaches`'s own doc
-  comment already established — widening to `implements` would need to enumerate every known
-  implementer of a common interface, an effectively unbounded candidate set for a widely-implemented
-  shape like `IAction`, risking a large precision regression across confirmations this mechanism has
-  no way to bound; a negated-`instanceof`-early-return variant of the SAME gap `instanceof_
-  narrowings` itself still has, distinct from the type-predicate mechanism this amendment adds;
-  and several previously-reported, unrelated residuals — `createMarkupPreview`, the `McpApps`
-  namespace bug — unchanged). n8n (unreduced): `different == 0` in BOTH populations (unchanged from
-  2026-09-08); `confirmed_combined=161,903`, an EXACT match to `REFERENCE_CONFIRMED_COMBINED`
-  (no refresh needed).
-
-## Amendment 2026-09-09 (Frente E-P0q, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §17)
-
-- **Sibling-candidate rule generalized to `implements` conformance too, with a NEW cost bound.**
-  `ProgramIndex::sibling_conformance_overrides` (a strict superset of `sibling_extends_overrides`,
-  which stays `extends`-only and untouched) walks a new `conformance_chain_reaches` (`extends` AND
-  `implements` edges together) — the 2026-09-08 amendment's own stated reason for NOT generalizing
-  to `implements` was an unbounded candidate set for a widely-implemented interface; this amendment
-  closes that by bounding COST instead of refusing the rule entirely: `MAX_CANDIDATE_TARGETS = 8`
-  (`semantic_sites.rs`) — a candidate set (including the originally-resolved target) larger than 8
-  demotes to `checker_pending` with NO candidate list at all (`sibling_conformance_unbounded`,
-  `PendingReasonCode` 11), never a guessed-down `possible` subset, never `confirmed`. A bounded set
-  demotes to `possible` exactly like the `extends` case. This is decision 28's own "el coste se
-  acota, la corrección no" principle applied literally: the earlier amendment treated an unbounded
-  candidate set as a reason to skip the rule; this one treats it as a reason to skip the LIST while
-  keeping the rule.
-- **Negated-`instanceof` early-return narrowing** (`extract_negated_instanceof_narrowings_from_
-  early_exit_test`) — the literal-`instanceof` sibling of the 2026-09-08 amendment's own negated
-  type-predicate idiom, reusing the identical `visit_statements`/`statement_definitely_exits`
-  infrastructure that amendment built, but pushing onto `instanceof_narrowings` (inheriting its own
-  call-target suppression, `suppress_instanceof_narrowing_for_calls`) rather than `type_predicate_
-  narrowings`.
-- **Standalone-function `param is T` type-predicate narrowing.** The 2026-09-08 amendment
-  represented `PredicateSubject::Parameter` but explicitly declined to consult it ("needs a
-  per-function parameter-name/position table this index does not otherwise keep"). This amendment
-  builds that table minimally: `summarize_function` (the one call site with the declaring
-  function's own parameter LIST in scope) patches a `position: Option<usize>` onto `Predicate
-  Subject::Parameter` at declaration time (`patch_predicate_parameter_position`, plain-identifier
-  parameters only). A bare-function call (`isFoo(x)`, as opposed to a member call `x.isFoo()`)
-  narrows the SAME-position argument, when that argument is itself a plain, unambiguous identifier
-  — reusing the EXISTING `type_predicate_narrowings` stack/bracketing (positive and negated-early-
-  return forms both), since the new logic is a callee-shape branch inside the existing extraction
-  function, not a new mechanism.
-- **Incremental-consistency gap found and fixed** (not itself a decision-28 semantics change, but
-  necessary for the sibling-conformance generalization to be SOUND under incremental reconcile): a
-  member read/call demoted to `possible` by the sibling-conformance check can depend on a
-  conformer's file the reading owner never `import`s at all (an interface-typed constructor
-  parameter property, reached through `this.<field>`, with zero import edge to the concrete
-  conformer). `OwnerSemantics::sibling_conformance_dependencies` records this cross-file dependency
-  explicitly (the SAME `DependencyRow` channel/mechanism Frente E-P0f's `ambient_global_
-  dependencies` already established for an analogous "real dependency, no backing import/export
-  relation" gap), so deleting/editing the ONLY conformer correctly reflows the dependent owner on
-  the next incremental reconcile. Found live via a REQUIRED e2e test regression, not a corpus
-  sample.
-- **Live measurement**: VS Code (reduced tree, 12,841 files — a different reduction pass than the
-  2026-09-08 amendment's own 10,044, not reconciled): references `different` 189 → 110 (-42%),
-  calls `different` 58 → 61 (a small, unreconciled increase attributed to the file-count/
-  composition drift between sessions, not a regression — every sampled `different` pair this
-  session inspected, across the FULL population rather than a 30-sample reservoir, matches an
-  ALREADY-DOCUMENTED pattern: the dominant remaining class is a receiver reliably pinned by one of
-  `rule_pins_receiver_uniquely`'s own reliable rules to a WIDER type, where v3's real per-call-site
-  answer is a narrower/different type this crate's non-flow-sensitive local inference cannot see —
-  the SAME general class the 2026-09-08 amendment's own pattern 1 already reported, now the large
-  majority of what remains since the `implements`-conformance-detection gap itself is closed).
-  `different == 0` STILL does not hold for VS Code — see the evidence doc's own §17.4 for the full
-  classification table. n8n (unreduced): `different == 0` holds in BOTH populations (unchanged);
-  `confirmed_combined` 161,903 → **161,843** (−60, the SAME "intended, safety-improving direction"
-  every prior refresh documents — fewer confirmed sites, never a wrong one), `REFERENCE_CONFIRMED_
-  COMBINED` refreshed accordingly.
-
-## Amendment 2026-09-09 (Frente E-P0r, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §18)
-
-- **An annotation alone no longer pins a receiver uniquely.** `rule_pins_receiver_uniquely`
-  (`semantic_sites.rs`) removes `"member_declared_type"` — the rule string tagging a same-file
-  parameter/local/destructured binding typed by an explicit annotation (`x: I`) — from its
-  reliable-rule allow-list. E-P0o/E-P0p/E-P0q's own text ("cuando el receptor SÍ está fijado ... el
-  destino es el miembro de ESE tipo") is amended: an annotation pins the receiver's DECLARED type,
-  but not necessarily its ACTUAL one at every read site — live VS Code sampling (the dominant
-  residual class every session from E-P0n through E-P0q reported and left unfixed) shows v3's real
-  per-call-site answer sometimes lands on a narrower declaration a known `extends`/`implements`
-  conformer redeclares, reached by flow-sensitive analysis (assignment tracking, generic
-  instantiation, ...) this crate's local, non-checker inference does not model. `"this"`/`"super"`/
-  `"member_class_static"`/`"member_new_expression"` are UNCHANGED and remain reliable: none of them
-  carries a "declared vs. actual" gap the way an annotation does — `this`/`super` bind to the
-  syntactically enclosing/parent class by JS's own runtime semantics, `ClassName.member`/
-  `new ClassName()` name one concrete declaration directly, by literal construction syntax.
-  `"instanceof_narrowed"`/`"type_predicate_narrowed"` also remain reliable (a PROVEN control-flow
-  fact about the exact read position, handled by their own dedicated narrowing branches that run
-  BEFORE this allow-list is even consulted).
-- **Mechanism reused, not duplicated.** Once `"member_declared_type"` drops off the allow-list, an
-  annotation-pinned receiver falls through to the SAME `ProgramIndex::sibling_conformance_overrides`
-  check (and the SAME `MAX_CANDIDATE_TARGETS = 8` cap / `REASON_SIBLING_CONFORMANCE_UNBOUNDED`
-  demotion) every other unreliable-rule receiver already uses — no new cost bound, no new
-  candidate-collection code. `I`'s own declaration stays `confirmed` when no known conformer
-  redeclares the member (the common, zero-cost case); a bounded redeclaring set demotes to
-  `possible` with `{I.m} ∪ {S.m : S redeclares}`; an unbounded set stays `checker_pending` with no
-  list. Applies identically to references and calls.
-- **Live measurement**: n8n (unreduced): `different == 0` holds in BOTH populations (unchanged);
-  `confirmed_combined` 161,843 → **161,802** (−41, the SAME safety-improving direction every prior
-  refresh documents), `REFERENCE_CONFIRMED_COMBINED` refreshed accordingly. VS Code (reduced tree,
-  rebuilt fresh this session, 12,826 files — the SAME documented rsync-pass file-count drift every
-  session in the evidence doc carries, not reconciled further): references `different` 110 → **80**
-  (-27%), calls `different` 61 → **23** (-62%) — the LARGEST single-session reduction in this whole
-  campaign's own residual, confirming the annotation case was the dominant remaining shape of the
-  receiver-typing-precision gap E-P0n's own pattern 1 first identified. `different == 0` STILL does
-  not hold for VS Code — the evidence doc's own §18.5 classifies every remaining sample: the large
-  majority (54/80 refs, 17/23 calls) is the SAME residual-precision gap, now narrower (a receiver
-  pinned by construction/`this`/a narrowing rule, or an annotation with no `sibling_conformance_
-  overrides` hit at all) — decision 28's own carve-out anticipated this: "cuando el receptor SÍ está
-  fijado [por construcción, no solo por anotación] ... el destino es el miembro de ESE tipo" remains
-  correct and is what v4 does; closing the remainder needs real flow-sensitive narrowing (tracking
-  the actual initializer/assignment-site type), a materially larger feature, still out of scope. The
-  rest (26/80 refs, 6/23 calls) is the four PRE-EXISTING, structurally unrelated residuals this
-  amendment does NOT touch (`McpApps` namespace-merge bug, `createMarkupPreview`'s own-body-wins
-  preference, `typeof`-value-copy, `marked`'s `.d.ts`/`.js` pair) — each re-examined this session and
-  confirmed to have no safe rule available (E-P0l's own `marked` fix was investigated and explicitly
-  reverted; the other three require mechanisms this session's single-rule change does not touch).
