@@ -166,7 +166,7 @@ branch coverage and adversarial cases.
 `urdira-indexing-worker`'s residual tests need `URDIRA_TSGO_BINARY` pointing at
 the pinned `@typescript/typescript-<platform>` `tsc` binary inside
 `node_modules/.pnpm` (see `test:native` in `package.json` for the exact glob).
-After bumping `NATIVE_API_VERSION`, update all five literal sites listed in
+After bumping `NATIVE_API_VERSION`, update all six files listed in
 [docs/versioning.md](docs/versioning.md#checklist-for-bumping-native_api_version)
 and run `pnpm build:native` before `test:coverage` or `verify`; a stale
 prebuilt addon fails every native handshake closed instead of reporting a

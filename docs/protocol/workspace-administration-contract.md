@@ -98,3 +98,20 @@ periodic sweep runs the same detection at daemon startup. `workspace orphans
 purge` (`core:workspace_orphans_purge`, destructive) removes one or every
 listed orphan's complete on-disk footprint; it never touches a registered or
 tombstoned workspace's data.
+
+
+## Orphan-data detection and purge
+
+`core:workspace_orphans_list` (CLI `urdira workspace orphans`) refreshes the
+orphan report without deleting data. Startup performs the same detection.
+The report distinguishes `orphans`, `retained_stale`, and `in_progress`;
+normal status includes the cached orphan count/byte summary.
+
+`urdira workspace orphans purge <safe-id>... --dry-run` previews selected
+orphan groups; replace `--dry-run` with `--confirm` to apply it. Alternatively,
+`urdira workspace orphans purge --all --confirm` selects all currently eligible
+orphans. `--all` and explicit safe IDs are mutually exclusive; omitting both
+is invalid. Selection uses safe IDs returned by the listing, not guessed
+workspace IDs. Before removal, the daemon checks known workspace IDs and open
+database handles again, then refreshes the report. Startup detection itself
+never implies authorization to purge.

@@ -244,6 +244,6 @@ Adding registry definitions, plugin knowledge, or newly indexed source can chang
 
 Representative discovery, impact, testing, architecture, semantic, and pagination workflows are expressible in one typed request with deterministic response semantics. Implementation acceptance requires public-schema conformance fixtures for every operation, operator, recipe, cursor stream, and error code.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-09**: added the `core:selector_unresolvable` and `core:non_subject_operation` planning errors and the `core:affected_set_stale` freshness/coverage error (with its `core:semantic_affected_page` trigger) to the operation-error families above, verified against `packages/contracts/src/registries.ts` (Frente Q-2, 2026-09-08, and Frente S-A, 2026-09-06); `core:compare` and `core:execution_resource_limit` were already accurate and needed no change, confirmed against `packages/contracts/src/registries.ts` and the `core:compare` implementation in `packages/daemon/src/runtime.ts` (Frente Q-4, 2026-09-08).

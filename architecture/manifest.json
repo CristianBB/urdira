@@ -154,23 +154,107 @@
     {
       "name": "urdira-indexing-core",
       "path": "crates/urdira-indexing-core",
-      "layer": 2,
+      "layer": 1,
       "dependencies": ["urdira-native-core", "urdira-worker-protocol"],
-      "responsibilities": ["generation-validation", "canonical-sealing", "sqlite-staging", "set-based-publication", "receipts", "recovery", "cancellation", "metrics"]
-    },
-    {
-      "name": "urdira-jsts-indexing-engine",
-      "path": "crates/urdira-jsts-indexing-engine",
-      "layer": 2,
-      "dependencies": ["urdira-indexing-core", "urdira-jsts-syntax-worker", "urdira-jsts-native-projection"],
-      "responsibilities": ["javascript-typescript-language-engine", "bounded-checker-groups", "incremental-engine-state"]
+      "responsibilities": ["v3-generation-validation", "canonical-sealing", "sqlite-publication", "bucketed-merkle-kernel", "recovery"]
     },
     {
       "name": "urdira-indexing-worker",
       "path": "crates/urdira-indexing-worker",
       "layer": 3,
-      "dependencies": ["urdira-indexing-core", "urdira-jsts-indexing-engine", "urdira-jsts-syntax-worker", "urdira-worker-protocol"],
-      "responsibilities": ["persistent-composition-worker", "workspace-operation-boundary", "progress-and-cancellation"]
+      "dependencies": ["urdira-indexing-core", "urdira-jsts-indexing-engine", "urdira-jsts-syntax-worker", "urdira-jsts-typeflow", "urdira-native-core", "urdira-source-frontier", "urdira-structural-store", "urdira-tsgo-client", "urdira-worker-protocol"],
+      "responsibilities": ["persistent-composition-worker", "v3-generation-protocol", "v4-scan-orchestration", "v4-materialization-publication", "residual-scheduling"]
+    },
+    {
+      "name": "urdira-jsts-indexing-engine",
+      "path": "crates/urdira-jsts-indexing-engine",
+      "layer": 2,
+      "dependencies": ["urdira-indexing-core", "urdira-jsts-native-projection", "urdira-jsts-syntax-worker", "urdira-worker-protocol"],
+      "responsibilities": ["v3-javascript-typescript-engine", "bounded-checker-groups", "incremental-engine-state"]
+    },
+    {
+      "name": "urdira-launcher",
+      "path": "crates/urdira-launcher",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["platform-runtime-launcher"]
+    },
+    {
+      "name": "urdira-jsts-syntax-worker",
+      "path": "crates/urdira-jsts-syntax-worker",
+      "layer": 1,
+      "dependencies": ["urdira-jsts-typeflow", "urdira-native-core", "urdira-worker-protocol"],
+      "responsibilities": ["oxc-syntax-analysis", "hybrid-resolution", "source-owned-observations", "incremental-dependencies"]
+    },
+    {
+      "name": "urdira-jsts-typeflow",
+      "path": "crates/urdira-jsts-typeflow",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["declared-type-resolution", "incremental-program-index"]
+    },
+    {
+      "name": "urdira-jsts-native-projection",
+      "path": "crates/urdira-jsts-native-projection",
+      "layer": 1,
+      "dependencies": ["urdira-native-core"],
+      "responsibilities": ["javascript-typescript-observation-projection"]
+    },
+    {
+      "name": "urdira-native-core",
+      "path": "crates/urdira-native-core",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["logical-digest-kernels", "structural-kernel", "exact-vector-kernels"]
+    },
+    {
+      "name": "urdira-native-node",
+      "path": "crates/urdira-native-node",
+      "layer": 3,
+      "dependencies": ["urdira-jsts-native-projection", "urdira-native-core", "urdira-structural-store"],
+      "responsibilities": ["node-api-bindings", "native-structural-store-binding"]
+    },
+    {
+      "name": "urdira-worker-protocol",
+      "path": "crates/urdira-worker-protocol",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["private-worker-commands-events"]
+    },
+    {
+      "name": "urdira-v4-spike",
+      "path": "crates/urdira-v4-spike",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["experimental-store-and-typeflow-benchmarks-not-production-authority"]
+    },
+    {
+      "name": "urdira-fs-watch",
+      "path": "crates/urdira-fs-watch",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["filesystem-watch-adapter"]
+    },
+    {
+      "name": "urdira-structural-store",
+      "path": "crates/urdira-structural-store",
+      "layer": 2,
+      "dependencies": ["urdira-indexing-core"],
+      "responsibilities": ["immutable-segments", "indexed-reads", "generation-visibility", "compaction-mechanism"]
+    },
+    {
+      "name": "urdira-source-frontier",
+      "path": "crates/urdira-source-frontier",
+      "layer": 2,
+      "dependencies": ["urdira-indexing-core"],
+      "responsibilities": ["source-walk-hash-cas", "catalog-delta", "source-state-digest"]
+    },
+    {
+      "name": "urdira-tsgo-client",
+      "path": "crates/urdira-tsgo-client",
+      "layer": 0,
+      "dependencies": [],
+      "responsibilities": ["typescript-api-client", "residual-resolution", "windowed-checker-pass"]
     }
   ],
   "coverage": [

@@ -60,7 +60,8 @@ not introduce public API identifiers or workspace-specific Urdira IDs.
 | Canonical encoding, comparator, or digest | `docs/serialization/` and `@urdira/canonical` |
 | Closed diagnostic or issue code | Its owning registry under `docs/` and the contracts registry |
 | Workspace, watcher, or provider behavior | Workspace decision and `@urdira/engine` |
-| Durable storage, projection, or publication | Storage decision and `@urdira/storage` / `@urdira/engine` |
+| Durable storage, projection, or publication | Decisions 05/21–29; `@urdira/storage`, `urdira-indexing-core`, `urdira-structural-store`, and `urdira-indexing-worker` according to workspace format |
+| v4 capture, incremental closure, or checker scheduling | Decisions 28/29; `urdira-source-frontier`, syntax/typeflow crates, and `urdira-indexing-worker/src/v4/` |
 | Plugin protocol or worker supervision | Plugin decision and `@urdira/plugin-sdk` |
 | Semantic documents, vectors, or coverage | Semantic decision and core semantic engine |
 | Daemon, CLI, MCP transport, or release archive | Daemon/MCP decision and owning adapter package |
@@ -69,6 +70,12 @@ not introduce public API identifiers or workspace-specific Urdira IDs.
 Generated schemas, declaration files, build output, coverage output, release
 archives, private workflow reports, and raw benchmark transcripts are not
 authoritative source files and do not belong in the public repository.
+
+For current defaults, retained measurements and open limitations, consult
+[the implementation inventory](docs/current-state.md). Update its affected
+rows when a change closes an open item or invalidates a measurement. Native
+crate ownership and direct production dependencies are listed separately from
+TypeScript packages in `architecture/manifest.json`.
 
 ## Pull request or agent handoff checklist
 

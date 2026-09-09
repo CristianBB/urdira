@@ -1,7 +1,7 @@
 # Semantic Search Runtime
 
 Status: **Accepted**
-Last updated: 2026-09-08
+Last updated: 2026-09-09
 Depends on: [Semantic search and ranking](06-semantic-search-ranking.md) and [transactional projection digests](13-transactional-projection-digests.md)
 
 ## Current contract
@@ -42,7 +42,7 @@ snapshot.
 ## HTTP provider
 
 The opt-in HTTP embedding provider (`createHttpEmbeddingProvider`) is a
-complete, production-grade transport, not a single unbatched request.
+batched transport with bounded retries.
 `generateVectors` splits its inputs into sequential (concurrency 1, never
 parallel) requests, each capped at `max_batch_inputs` (default 64) items and
 an estimated `max_input_tokens` (default 8192, chars/4) total, always keeping
@@ -71,7 +71,7 @@ kind:
 | `URDIRA_EMBEDDINGS_API_KEY` | http | Optional bearer token; never persisted in any digest. |
 | `URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS` | http | Optional override for the per-request item cap (default 64). |
 | `URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS` | http | Optional override for the per-request token budget (default 8192), which also bounds the provider's `.segment()` `max_segments`. |
-| `URDIRA_LOCAL_EMBEDDINGS_MODEL` | neural (default) | Overrides the bundled model id (default `Xenova/all-MiniLM-L6-v2`). |
+| `URDIRA_LOCAL_EMBEDDINGS_MODEL` | neural (default) | Overrides the default model id (default `Xenova/all-MiniLM-L6-v2`). |
 | `URDIRA_LOCAL_EMBEDDINGS_DTYPE` | neural (default) | Overrides the ONNX quantization (default `q8`). |
 | `URDIRA_SEMANTIC_INDEX` | all | `0`/`false` disables semantic maintenance/search entirely. |
 | `URDIRA_SEMANTIC_PROCESS` (legacy alias `URDIRA_SEMANTIC_THREAD`) | all | Whether semantic embedding runs in a separate worker process/thread vs. inline. |
@@ -98,12 +98,12 @@ connection for both v3 and v4.
 Retrieval performs an exact scan over every visible vector that matches the
 provider identity and structural filters, then applies the registered semantic
 or hybrid ranking profile. It does not sample or silently narrow the corpus.
-At scale, the candidate set is chunked into native-sized batches
-(`nativeTopKChunked`) and merged losslessly (the same exact top-K guarantee,
-never an approximation) rather than evaluated in one native call, since a
-single real-corpus candidate set exceeds the native batch's byte/record
-bound; see [Semantic search and ranking](06-semantic-search-ranking.md) for
-the resident-buffer kernel that this chunking now reaches through. A
+For an unfiltered float32 lane, the resident-buffer kernel registers the
+ordered candidate buffer once per generation and evaluates exact top-K in
+one native call. Path-filtered or other unsupported resident-buffer shapes
+use `exactVectorScan`, including native-sized chunking and lossless top-K
+merging where applicable. Both paths preserve exact retrieval; see
+[Semantic search and ranking](06-semantic-search-ranking.md). A
 per-`(workspace_id, profile_id, executable_binding_id)` cache of the fully
 decoded `semantic_vectors` result, tagged by generation, avoids re-reading and
 re-decoding the vector set on every query; a generation bump always
@@ -147,7 +147,9 @@ only a scan that is actually about to publish a new generation does.
 
 ## Consequences
 
-- Semantic search is local and offline during normal operation.
+- The default local provider operates offline after explicit provisioning.
+  The opt-in HTTP provider sends document segments during maintenance and
+  query text during retrieval to the configured endpoint.
 - Model acquisition is explicit, bounded to administration, and visible to the
   user.
 - Structural readiness never depends on model availability.
@@ -162,7 +164,7 @@ only a scan that is actually about to publish a new generation does.
   documented above.
 
 
-## Historial de cambios
+## Change history
 
 - **2026-09-06** (`4404e6b`, Frente S-B): HTTP provider batching/retries/configuration surface, folded into "HTTP provider" above.
 - **2026-09-07** (`9b49e82`, Frente S-C): v4 (native structural store) semantic maintenance wiring — entity documents sourced from the native store instead of `record_occurrences`; folded into "Maintenance and retrieval" above. Found but not fixed this frente: `crates/urdira-jsts-syntax-worker` published an entity's span as its identifier span rather than the full declaration (fixed under decision 11/17).

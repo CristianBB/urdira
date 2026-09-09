@@ -3,6 +3,37 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
+## Unreleased
+
+Changes implemented after 0.3.3; no new publication/version is claimed here.
+See [current state](docs/current-state.md) for evidence and remaining limits.
+
+- Rust-owned v3 structural publication and incremental root add/remove,
+  priority and scan-aggregation improvements.
+- v4 default for new workspaces: native immutable structural segments,
+  bucketed Merkle roots, a Rust scan pipeline, and retained v3 compatibility
+  through a separate per-workspace route; no automatic format conversion.
+- Authoritative reconcile scans with content-hash equivalence, a measured
+  1% delta/cold threshold, and corrected import/barrel/ambient/type dependencies.
+- Expanded Rust JS/TS resolution, full declaration spans with stable identifier
+  positions, bounded possible-target candidates, and opt-in residual checker
+  generations with partial progress and continuation.
+- Native structural query pushdown, identity lookups and workspace comparison;
+  explicit rejection of status as a subject-producing query operation;
+  character-aware pages and daemon IPC budget clamping.
+- End-to-end v4 semantic maintenance, segmented entity/artifact documents,
+  coverage/affected-set pagination, sharded embedding, resumable enumeration,
+  segment caching and resident native exact-vector top-K (binding API 17).
+- Optional HTTP embeddings with batch limits and retries; local model assets
+  remain explicitly provisioned, not bundled or downloaded by queries.
+- Degraded scan-failure reporting, bounded watcher descriptor use, orphan
+  detection and explicit purge, and wired v4 pack export/import with destination
+  reconciliation and export progress/deadlines.
+- Compact MCP output keeps inline snippets opt-in (`snippet_lines=0` default).
+- Documentation reconciled across README, architecture, decisions, contracts,
+  release guidance and versioning; measured performance is separated from
+  unfulfilled cold/memory and release qualification targets.
+
 ## [0.3.3] - 2026-08-25 — Explicit destructive v3 preparation
 
 - `runtime prepare --dry-run` classifies the current data root and names the

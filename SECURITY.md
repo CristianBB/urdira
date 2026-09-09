@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest published `0.1.x` release. Before
-the first npm publication, the `main` branch is the only supported line.
+Security fixes target the latest published release. Report the exact package
+version and, for a development checkout, its commit; unreleased `main` changes
+are not a separately certified release line.
 
 ## Reporting a vulnerability
 
@@ -23,10 +24,17 @@ this initial community release.
 ## Security boundary
 
 Urdira's public MCP surface is read-only and local. It does not expose source
-editing, patch application, arbitrary command execution, or a network
-transport. Administrative CLI actions use explicit preview and confirmation.
+editing, patch application, arbitrary command execution, or remote access.
+The default MCP binding is local stdio; foreground `urdira web` also exposes
+MCP and administrative UI routes on token-free `127.0.0.1`, guarded by Host
+and Origin validation. Administrative CLI actions use explicit preview and confirmation.
 Language analyzers run behind the plugin supervision contract, and public
 queries require explicit workspace scope.
+
+The default embedding provider operates offline after explicit model
+provisioning. Configuring an HTTP embedding endpoint explicitly enables
+outbound document-segment and query-text requests to that provider. This
+does not expose a remote Urdira server or enable plugin network access.
 
 Security guarantees and adversarial acceptance criteria are defined in
 [configuration, security, and lifecycle](docs/decisions/09-configuration-security-lifecycle.md)

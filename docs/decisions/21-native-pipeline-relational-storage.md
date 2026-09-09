@@ -251,7 +251,7 @@ but the Rust core inserts them and records the `analyzing` to `published` (or
 `failed`) lifecycle on its writer connection. TypeScript does not insert
 candidate rows or receipts on the cutover route.
 
-## Historial de cambios
+## Change history
 
 - **2026-08-29** (Rust cutover): structural mutation ownership moved from the
   TypeScript owner loop to the persistent `urdira-indexing-core` Rust

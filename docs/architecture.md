@@ -19,8 +19,8 @@ The system has four invariants that explain most design choices:
   structural, and semantic readiness may advance independently;
 - query stages exchange bounded, sealed sets rather than retaining another
   in-memory copy of the indexed corpus; and
-- every performance shortcut has the same verified result and an explicit
-  fallback to the authoritative synchronous or from-source path.
+- optimizations must preserve exact results; unavailable indexed paths use
+  an exact fallback or return an explicit operation/resource error.
 
 A newly registered workspace gets the v4 format by default
 (`isV4Enabled()`, `packages/daemon/src/runtime.ts`); an existing v3 workspace
@@ -50,18 +50,19 @@ flowchart TD
   Daemon --> Engine["@urdira/engine"]
   Daemon --> Storage["@urdira/storage"]
   Engine --> Storage
-  Engine --> Embedding["@urdira/embedding-local"]
+  Daemon --> Embedding["@urdira/embedding-local"]
+  Embedding --> Engine
   Engine --> PluginSDK["@urdira/plugin-sdk"]
   Engine --> Contracts["@urdira/contracts"]
   Engine --> Canonical["@urdira/canonical"]
   Engine -. "bounded worker threads" .-> Workers["digest and pack-verification workers"]
   Engine -. "v4 only: direct addon require,\nnot the @urdira/native package boundary" .-> NativeAddon["compiled urdira-native-node addon"]
-  Storage --> Security["@urdira/security"]
+  Engine --> Security["@urdira/security"]
   Storage --> Contracts
   Storage --> Canonical
   PluginJS["@urdira/plugin-javascript-typescript"] --> PluginSDK
   PluginJS --> Contracts
-  PluginJS -. "v4: spawns the persistent\nurdira-indexing-worker process" .-> IndexingWorker["urdira-indexing-worker (Rust)"]
+  Runtime -. "per-workspace process transport" .-> IndexingWorker["urdira-indexing-worker (Rust)"]
   PluginSDK --> Contracts
   Canonical --> Contracts
 ```
@@ -71,11 +72,13 @@ flowchart TD
 The v4 route replaces the per-generation TypeScript/SQLite composition
 described further below with a persistent Rust worker process
 (`urdira-indexing-worker`, spawned and supervised from
-`packages/plugin-javascript-typescript/src/worker.ts`) that owns one
+`apps/urdira/src/index.ts` through the plugin package's
+`indexing-core-process-transport.ts`) that owns one
 workspace's structural store end to end. Its own `v4/scan.rs` module
 describes the pipeline as: **catalog -> parse/semantics -> facts ->
 materialize -> write -> Merkle -> snapshot -> events**, driven by three scan
-scopes carried over the worker JSON-RPC protocol
+scopes carried as JSON command/event payloads inside bounded, length-prefixed
+`urdira.ipc.v2` Protobuf frames
 (`crates/urdira-worker-protocol/src/lib.rs`): `Full` (from-scratch walk),
 `Changed` (an exact caller-supplied path set, for watcher-driven incremental
 scans), and `Reconcile` (below).
@@ -87,10 +90,10 @@ flowchart LR
   Analyze --> Deps["v4/deps.rs\ndependency and reference closure"]
   Deps --> Materialize["v4/materialize.rs\nrecord and dependency rows"]
   Materialize --> Write["urdira-structural-store\nimmutable mmap segments"]
-  Write --> Merkle["merkle_bucket.rs\nper-segment Merkle digests"]
+  Write --> Merkle["merkle_bucket.rs\ngeneration-visible set Merkle roots"]
   Merkle --> Snapshot["atomic current-pointer swap"]
-  Snapshot --> Events["IndexingEvent stream\nScanCompleted / Queryable"]
-  Events -. "background, off the scan critical path" .-> Residual["v4/residual.rs\nurdira-tsgo-client ResidualPass"]
+  Snapshot --> Events["IndexingEvent stream\nQueryable / ScanCompleted"]
+  Events -. "opt-in background, off the scan critical path" .-> Residual["v4/residual.rs\nurdira-tsgo-client ResidualPass"]
 ```
 
 Only JavaScript/TypeScript source ever reaches `analyze`; the pipeline itself
@@ -143,12 +146,13 @@ information allows. What typeflow cannot resolve locally is emitted as a
 against one or more candidates, with `pending.sites` recording the open
 question.
 
-`v4/residual.rs` runs a background pass, outside the critical path of any
-scan, that spawns the pinned `tsgo` (TypeScript 7) binary through
+`v4/residual.rs` runs an opt-in background pass (`URDIRA_V4_RESIDUAL=1`,
+default off), outside the critical path of any scan. It spawns the pinned
+`tsgo` (TypeScript 7) binary through
 `urdira-tsgo-client`'s JSON-RPC `--api --async` mode (decision 28,
 [`docs/decisions/28-v4-rust-semantics-and-residual-checker.md`](decisions/28-v4-rust-semantics-and-residual-checker.md))
 to run a real `ts.Program`/checker over the whole project and upgrade
-resolvable `possible` rows to `confirmed`. `core:references` and similar
+resolvable `possible` rows to `confirmed`. `core:find_references` and similar
 operations can therefore return `possible` results with a candidate list
 before the residual pass completes, and `confirmed` afterward, without
 changing the request shape.
@@ -157,9 +161,10 @@ changing the request shape.
 
 `urdira-structural-store` is the v4 production structural store: an
 immutable-per-segment, mmap-served, fixed-width-array store for structural
-records and artifact dependencies, with append-only segment writes and a
-Merkle digest per segment (used for the delta/cold equivalence check above
-and for cross-workspace/donor verification). The compiled addon
+records and artifact dependencies, with append-only segment writes and
+Merkle roots for the visible record/dependency/graph/metric sets of a
+generation (used for delta/cold equivalence and integrity verification).
+The compiled addon
 (`crates/urdira-native-node`, `structural_store_napi.rs`) exposes a
 `NativeStructuralStoreHandle` that `packages/engine/src/native-structural-store-binding.ts`
 loads directly (a raw `require()` of the built `.node` file, bypassing the
@@ -168,9 +173,10 @@ addon used elsewhere). Query operations that can be expressed as an index
 lookup over that store — `records_by_identity_ids`/`records_by_identity_keys`,
 `by_kind_universal`, and the full catalog of pushdown-eligible operations
 below — run natively in one call instead of a JavaScript scan over
-deserialized rows; a selector shape the native store has no dedicated index
-for is rejected outright (`core:selector_unresolvable`) rather than served by
-an O(corpus) linear scan.
+deserialized rows. Over-limit identity batches fail with
+`core:selector_unresolvable`; other unsupported pushdown shapes retain exact
+fallback evaluation subject to resource limits. A pushdown optimization
+does not change completeness or make every selector shape index-backed.
 
 ### Lexical and semantic sidecars
 
@@ -191,9 +197,9 @@ queries never wait on either sidecar to answer a structural request.
   (`semantic_coverage_summary`), and a segment cache
   (`semantic_segment_cache`); a document is split into token-bounded segments
   (256 tokens, 32-token overlap, capped at `MAX_SEGMENTS` per document) and
-  embedded per entity segment rather than per whole file. Maintenance runs on
-  a worker thread (`URDIRA_SEMANTIC_WORKERS` bounds its concurrency) so status
-  RPCs stay responsive during a full embedding pass. `core:semantic_affected_page`
+  embedded per entity segment rather than per whole file. Maintenance runs in
+  sharded child processes (`URDIRA_SEMANTIC_WORKERS` bounds concurrency
+  under the CPU-derived cap) so status RPCs stay responsive during a full embedding pass. `core:semantic_affected_page`
   pages through documents a materialization pass has not yet covered, keyed
   by an `affected_artifact_set_id`; `core:affected_set_stale` is returned
   instead of a mixed/partial page when that set no longer matches the
@@ -203,7 +209,14 @@ queries never wait on either sidecar to answer a structural request.
 
 ## v3 legacy pipeline (`URDIRA_V4=0`)
 
-A v3 workspace still runs the per-generation TypeScript-orchestrated pipeline
+A v3 workspace retains the TypeScript source/readiness composition and the
+Rust-owned indexing-core publication boundary. The following diagram shows
+logical phases; production structural rows are grouped, validated and
+published inside `urdira-indexing-core` / `urdira-indexing-worker`. The
+TypeScript owner loop is only a differential-test oracle, not a production
+fallback.
+
+The outer per-generation pipeline is the retained route
 this document previously described exclusively. `runFullWorkspaceScan`
 (`packages/engine/src/workspace-indexing-session.ts`) is the composition root
 for one scan: it captures a stable source observation, updates the source
@@ -221,10 +234,10 @@ flowchart LR
   Observe["Directory or Git provider\nnative batches and bounded byte hand-off"] --> Catalog["GenericSourceIndexer\nsource catalog and CAS"]
   Catalog --> SourceReady["source snapshot\nsource_ready"]
   Catalog --> Plan["candidate plan\nchanged owner closure"]
-  Plan --> Analyze["language plugin\nFactDelta"]
+  Plan --> Analyze["Rust JS/TS workers\nFactDelta"]
   Analyze --> Batch["bounded FactDeltaBatch\n4 MiB or 4096 rows"]
-  Batch --> Stage["SQLite candidate staging\nreceipt and sequence checks"]
-  Stage --> Seal["CandidateMaterializer.sealAsync\ncounts, digests, templates"]
+  Batch --> Stage["Rust-owned SQLite staging\nreceipt and sequence checks"]
+  Stage --> Seal["Rust validation and sealing\ncounts, digests, templates"]
   Seal --> Publish["atomic publication\nimmutable generation"]
   Publish --> StructuralReady["structural snapshot\nstructural_ready"]
   Publish --> Lexical["FTS5 reconciliation\nexact byte verification"]
@@ -378,9 +391,11 @@ Removing a workspace leaves a recoverable tombstone; purging it can still
 leave behind data outside the catalog's own bookkeeping (a structural
 directory, a sidecar database) if a prior operation was interrupted.
 `core:workspace_orphans_list`/`core:workspace_orphans_purge`
-(`urdira workspace orphans [purge]`) detect and remove that residue; a
-periodic sweep at daemon startup runs the same detection automatically
-without aborting an in-progress semantic maintenance pass.
+(`urdira workspace orphans [purge]`) detect and explicitly remove that residue;
+a sweep at daemon startup runs the detection automatically
+and reports it without automatic deletion. This startup orphan scan is
+distinct from the periodic source-reconciliation sweep, which does not abort
+in-flight semantic maintenance unless source work will publish a generation.
 
 `core:index_pack_export`/`workspace-add --index-pack` (decision 23) both use
 the v4 native structural store directly: export reports a deadline and
@@ -391,18 +406,28 @@ a `reconcile` scan afterward instead of trusting the pack's own frontier. See
 and [docs/evidence/2026-09-08-v4-daemon-robustness.md](evidence/2026-09-08-v4-daemon-robustness.md)
 for measured export/import timings.
 
+## Response budgeting
+
+`CursorCache.readPage` limits cumulative serialized item characters as well as
+item count. Multi-stream query execution shares the character allowance across
+streams. The daemon clamps the requested character allowance against its IPC
+frame limit before execution and continuation. The paginator always admits a
+first item for progress: this is not a guarantee that an individually oversized
+item or the complete encoded envelope fits the transport. Remaining framing
+failures stay explicit; no result is silently discarded.
+
 ## Code landmarks
 
 | Concern | Primary code | What to read there |
 |---|---|---|
-| v4 scan orchestration | `crates/urdira-indexing-worker/src/v4/scan.rs` | `run_full_scan`/`run_reconcile`: catalog -> parse/semantics -> facts -> materialize -> write -> Merkle -> snapshot -> events. |
-| v4 source catalog | `crates/urdira-source-frontier` | Walk, hash, CAS, catalog delta into SQLite, source-state digest, in `O(delta)`. |
-| v4 structural store | `crates/urdira-structural-store` | Immutable-per-segment, mmap-served, fixed-width-array store with append-only writes and per-segment Merkle digests. |
+| v4 scan orchestration | `crates/urdira-indexing-worker/src/v4/scan.rs` | `run_full`/`run_reconcile`: catalog -> parse/semantics -> facts -> materialize -> write -> Merkle -> snapshot -> events. |
+| v4 source catalog | `crates/urdira-source-frontier` | Walk, hash, CAS, catalog delta into SQLite and source-state digest. Full/reconcile walks visit the corpus; exact changed-path work narrows capture. |
+| v4 structural store | `crates/urdira-structural-store` | Immutable-per-segment, mmap-served, fixed-width-array store with append-only writes and generation-visible set Merkle roots. |
 | v4 JS/TS engine | `crates/urdira-jsts-syntax-worker`, `urdira-jsts-native-projection`, `urdira-jsts-typeflow` | Persistent content-keyed syntax analysis, native observation projection, and the local declared-type/lexical resolver. |
 | v4 residual checker | `crates/urdira-indexing-worker/src/v4/residual.rs`, `crates/urdira-tsgo-client` | Background `tsgo --api --async` pass that upgrades `possible` rows to `confirmed` outside the scan critical path. |
 | Native addon and pushdown | `crates/urdira-native-node/src/structural_store_napi.rs`, `packages/engine/src/native-structural-store-binding.ts` | `NativeStructuralStoreHandle` and the identity/kind pushdown surface used by `CanonicalRecordQueryDataPort`. |
 | Reconcile scope | `packages/engine/src/reconciliation.ts`, `watchers.ts`, `crates/urdira-indexing-worker/src/v4/scan.rs::run_reconcile` | Watcher reconcile reasons, `RECONCILE_DELTA_THRESHOLD`/`URDIRA_V4_RECONCILE_THRESHOLD`, delta-vs-cold republish decision. |
-| Semantic v4 wiring | `packages/daemon/src/semantic-v4-wiring.ts`, `packages/engine/src/semantic-entity-source-v4.ts`, `semantic-reconciler.ts` | Sidecar attachment, per-document status/coverage, segment cache, worker-thread maintenance. |
+| Semantic v4 wiring | `packages/daemon/src/semantic-v4-wiring.ts`, `packages/engine/src/semantic-entity-source-v4.ts`, `semantic-reconciler.ts` | Sidecar attachment, per-document status/coverage, segment cache, sharded child-process maintenance. |
 | Workspace orphans | `packages/daemon/src/runtime.ts` (`core:workspace_orphans_list`/`_purge`), `packages/cli/src/index.ts` | Startup sweep and CLI subcommand for residual workspace data. |
 | v3 scan composition | `packages/engine/src/workspace-indexing-session.ts` | `runFullWorkspaceScan`/`runProgressiveWorkspaceScan`, retained for `URDIRA_V4=0` workspaces. |
 | v3 digest scheduling | `packages/engine/src/materialization-record-digest-pipeline.ts` and `materialization-digest-offload.ts` | Fail-safe record-digest overlap and `MaterializationDigestOffload`'s ordered-set worker offload, with a synchronous in-process fallback for any skipped or failed batch. |
@@ -413,7 +438,7 @@ for measured export/import timings.
 | Pipeline execution | `packages/engine/src/pipeline-executor.ts` | `executePipeline` schedules ready frontiers and seals every output as a `StageSetHandle`. |
 | Canonical operations | `packages/engine/src/canonical-query-data-port.ts` | `CanonicalRecordQueryDataPort` implements language-neutral operations with indexed pushdown (v4) and bounded fallback paths. |
 | MCP surface | `packages/mcp/src/index.ts` | `createUrdiraToolDefinitions`, request lowering, IPC invocation, result dieting, and deterministic rendering. |
-| Local web surface | `packages/web/src/server/index.ts` and `packages/web/src/client/main.tsx` | Authenticated loopback CLI API, Streamable HTTP MCP composition, directory-only selection, and the bundled browser interface. |
+| Local web surface | `packages/web/src/server/index.ts` and `packages/web/src/client/main.tsx` | Host/Origin-validated, token-free loopback CLI API, Streamable HTTP MCP composition, directory-only selection, and the bundled browser interface. |
 | Daemon orchestration | `packages/daemon/src/runtime.ts` and `scheduler.ts` | Workspace lifecycle, readiness barriers, scan scheduling, query cancellation, reconcile dispatch, and maintenance. |
 | Physical schema (v3) | `packages/storage/src/schema.ts` and `packages/contracts/src/relational-schema.ts` | SQLite DDL derived from Schema IR and the v3 contract marker (`0x33`). |
 | Logical digests | `packages/canonical/src/logical-digest-writer.ts` | Incremental field, presence, type, length, sequence, and canonical-set framing. |

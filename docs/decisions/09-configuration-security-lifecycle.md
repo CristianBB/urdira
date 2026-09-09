@@ -107,7 +107,7 @@ The initial release provides no bespoke application-level database or CAS encryp
 
 ## Network and model-pack installation
 
-Indexing, plugins, query execution, embeddings, pagination, daemon startup, repair verification, and retained replay perform no network access. Network-capable core actions are limited to an explicit administrative model-pack download and the one-time preparation of the exact engine-matched npm runtime by the dependency-free bootstrap. Plugin installation uses an explicit local package or offline bundle in the initial release and never resolves dependencies online.
+With the default local provider, indexing, plugins, query execution, embeddings, pagination, daemon startup, repair verification, and retained replay perform no network access. Network-capable core actions include explicit administrative model-asset acquisition and one-time preparation of the exact engine-matched npm runtime by the dependency-free bootstrap. The separately configured HTTP embedding provider (Decisions 16/18) sends document segments during semantic maintenance and query text during semantic retrieval to its selected endpoint. That opt-in exception does not authorize plugin networking, implicit model downloads, or a remote Urdira listener. Plugin installation uses an explicit local package or offline bundle in the initial release and never resolves dependencies online.
 
 Runtime preparation is available only before the composed runtime starts. The bootstrap prints the exact target directory, package coordinate, registry, reviewed lifecycle scripts, known upstream deprecation notices, and network effect during dry-run. Interactive confirmation or the exact documented non-interactive confirmation flag authorizes that one plan. It invokes npm without user or workspace configuration, credentials, arbitrary environment-provided arguments, shell evaluation, or lifecycle-script wildcards. Output is captured and classified: a new or changed warning fails preparation, while the specifically disclosed upstream notice may be recorded without replaying npm's raw warning stream. Installation occurs in an unpredictable same-filesystem staging directory and becomes active through atomic rename only after the runtime entry point, package version, lockfile, and installed dependency tree validate. Failure leaves the previous runtime untouched and removes or quarantines staging for bounded cleanup.
 
@@ -175,7 +175,7 @@ Release tests cover malicious repository configuration, path traversal, symlink 
 The defaults prevent accidental scope expansion or data disclosure while preserving predictable local indexing behavior. Implementation acceptance requires the security verification suite above on every supported platform.
 
 
-## Historial de cambios
+## Change history
 
 - **2026-09-06** (`0bb42be`, Frente H): purge now deletes the complete workspace footprint (structural store, scan sidecar, lexical/semantic sidecars) instead of only the catalog database; added the daemon-side orphan sweep and `core:workspace_orphans_list`/`purge` RPCs. Folded into "Removal and data deletion" above.
 - **2026-09-08** (`e85c1e7`, Frente D-1): a workspace's first-ever scan failure now settles into `degraded` with `last_scan_error` visible, instead of leaving `status` at `indexing` forever. Folded into "Configuration domains and precedence" above.

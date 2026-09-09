@@ -26,8 +26,8 @@ Core properties:
 - changed-file watcher updates use a safe targeted capture when possible, with
   complete reconciliation retained as a fallback only for lost or ambiguous
   events;
-- macOS workspace watchers use the native `kqueue` backend to avoid FSEvents
-  client-queue drops while large repositories are being indexed;
+- macOS workspace watchers prefer `kqueue` for small workspaces and switch to
+  `fs-events` above the 2,000-file watch budget to avoid exhausting file descriptors;
 - registered physical delete events are applied directly; renames publish the
   absence and new presence in consecutive generations;
 - deterministic ordering with no hidden approximate fallback;
@@ -120,33 +120,44 @@ default. v4 adds, over the v3 pipeline documented later in this file:
   `URDIRA_V4_RECONCILE_THRESHOLD`) or through a full rescan otherwise.
   `core:index_status` reports the outcome in `last_scan.reconcile`;
   `urdira reindex` always forces a full rescan.
-- **A background residual type-checker pass.** The bundled JavaScript/TypeScript
+- **An opt-in background residual type-checker pass.** The bundled JavaScript/TypeScript
   engine resolves most call, inheritance, and implements relationships locally
   and unconditionally; what it cannot resolve without full type-flow analysis
-  is recorded as `possible` (with candidates) and later confirmed by a
-  background pass that runs the pinned TypeScript checker outside the
-  indexing critical path.
+  remains pending, with `possible` rows when bounded candidates exist.
+  An enabled pass runs the pinned TypeScript checker outside the indexing
+  critical path and can confirm resolvable targets. Enable it with `URDIRA_V4_RESIDUAL=1` before
+  starting the daemon; it is off by default. A pass may publish partial
+  progress and resume within its budget; unresolved sites can remain pending.
 - **Semantic search wired end to end.** Documents are split into token-bounded
   segments and embedded per matched entity segment, with per-document status,
   a coverage summary, and a segment cache exposed through `core:index_status`
   and dedicated coverage/affected-page operations. `URDIRA_SEMANTIC_WORKERS`
   bounds maintenance concurrency; an HTTP embedding provider is available
   through `URDIRA_EMBEDDINGS_ENDPOINT`/`_MODEL`/`_DIMENSIONS`/`_API_KEY` (and
-  batching/limit knobs) as an alternative to the bundled local model.
+  batching/limit knobs) as an alternative to the default local provider.
+  HTTP mode sends document segments and query text to the explicitly
+  configured endpoint; local model assets are downloaded only during confirmed configuration.
 - **Orphaned workspace data detection.** `urdira workspace orphans` lists
   structural or sidecar data left behind by an interrupted operation;
-  `urdira workspace orphans purge` (or `--all`) removes it. A sweep runs
-  automatically at daemon startup.
+  `urdira workspace orphans purge <safe-id> --confirm` or
+  `urdira workspace orphans purge --all --confirm` removes eligible residue.
+  The startup sweep detects residue; it does not automatically purge it.
 - **Native query pushdown.** Query operations that reduce to an index lookup
   over the structural store (identity lookups, kind-scoped listing, impact
   analysis, related-test discovery, architecture inspection, and more) are
   answered by the compiled Rust structural store directly instead of a
-  JavaScript scan; a record-scoped selector shape the store has no index for
-  is rejected explicitly (`core:selector_unresolvable`) rather than served by
-  an unbounded scan.
+  JavaScript scan. Record IDs, identity IDs and identity keys have indexed
+  lookups; over-limit identity batches fail with `core:selector_unresolvable`.
+  Other exact fallback paths retain resource limits. Status is a separate
+  top-level call, not a subject-producing query stage.
 - **A v4 index pack.** `core:index_pack_export`/`workspace-add --index-pack`
   operate on the native structural store directly, re-keying `workspace_id`
   on import and always running a `reconcile` scan afterward.
+
+The checkout still declares application version `0.3.3`; these later changes
+are listed under [Unreleased](CHANGELOG.md#unreleased), not claimed as a newly
+published npm release. The [current-state inventory](docs/current-state.md)
+consolidates implemented capabilities, measurements, and open limitations.
 
 Both formats share the same public MCP tools, CLI commands, and query
 contract. See [docs/architecture.md](docs/architecture.md) for the full v4
@@ -474,16 +485,16 @@ for the full flowchart and [v4 structural store](docs/decisions/26-v4-structural
 through [v4 Rust-owned scan pipeline](docs/decisions/29-v4-rust-owned-scan-pipeline.md)
 for the normative decisions.
 
-Reference measurements from one Apple-silicon development host on 2026-09-09
-(engineering evidence, not a release P95 claim): a cold index of the n8n
-repository reaches queryable in 23.4 seconds; a no-op `git pull` reconcile
-completes in about 1.0 second; a cold index of the VS Code repository
-(4.48M records) reaches queryable in 30.0 seconds, with `find_references`
-answering in 0.4 seconds once warm; a complete semantic materialization of
-n8n takes 35-37 minutes end to end, dominated by ONNX embedding rather than
-indexing, after which `search_semantic` answers at a 135 ms p99 and
-`search_hybrid` at a 178 ms p99. See `docs/evidence/2026-09-0{6,7,8}-*.md` for
-the full campaign.
+Retained measurements from the September 7–8 Apple-silicon campaigns are
+engineering evidence, not a fresh benchmark of this checkout or a release P95
+claim. n8n cold indexing measured **23.369 s worker `total_ms` / 25.22 s wall**;
+VS Code measured **27.588 s worker / 29.96 s wall**. These are distinct from
+daemon-observed readiness. After complete n8n semantic materialization,
+the native resident-vector path measured **135 ms semantic / 178 ms hybrid
+p99** over 20 requests per operation, with no path filter or snippets and an
+explicit three-shard harness configuration. Full local embedding took about
+35–37 minutes. See the [measurement table and qualifications](docs/current-state.md#retained-performance-evidence)
+for source reports, corpus sizes, memory observations, and unmet gates.
 
 ## CLI command reference
 
@@ -493,7 +504,7 @@ each requiring `--dry-run` or `--confirm` unless marked read-only or direct:
 | Category | Commands |
 |---|---|
 | Query (read-only) | `urdira status`, `urdira index`, `urdira query` |
-| Workspace | `urdira workspace list \| show <id> \| add <path> [--index-pack <file>] \| configure <id> \| remove <id> \| purge <id>`, `urdira workspace orphans` (read-only), `urdira workspace orphans purge [--all]` |
+| Workspace | `urdira workspace list \| show <id> \| add <path> [--index-pack <file>] \| configure <id> \| remove <id> \| purge <id>`, `urdira workspace orphans` (read-only), `urdira workspace orphans purge <safe-id>...` or `urdira workspace orphans purge --all` |
 | Codebase | `urdira codebase list \| create <name> \| rename <id> <name> \| assign <workspace> <codebase> \| unassign <workspace> \| remove <id>` |
 | Daemon (direct, no dry-run/confirm) | `urdira daemon start \| stop \| restart` |
 | Maintenance | `urdira config set [workspace] --value <json>`, `urdira repair [workspace]`, `urdira gc`, `urdira reindex [workspace]`, `urdira index-pack-export <workspace> [out] --out <file>` |
@@ -506,7 +517,7 @@ daemon also runs the same sweep automatically at startup and reports a count
 and byte total in `urdira status`'s `orphaned_workspace_data`. Every
 destructive command supports `--json` and `--debug-timing`; see
 [the workspace administration contract](docs/protocol/workspace-administration-contract.md)
-for the full request/response shape of each RPC these commands call.
+for the administration contract and orphan-purge selection rules.
 
 ## Environment variables
 
@@ -516,7 +527,7 @@ are not part of the public contract and may change without notice.
 | Group | Variables |
 |---|---|
 | Data root and runtime | `URDIRA_DATA_ROOT`, `URDIRA_ENDPOINT`, `URDIRA_ENGINE_BUILD_ID`, `URDIRA_WATCHER_BACKEND` |
-| v4 indexing | `URDIRA_V4` (`0` opts a new workspace into v3), `URDIRA_V4_RECONCILE_THRESHOLD`, `URDIRA_V4_RESIDUAL`, `URDIRA_V4_RESIDUAL_BUDGET_MS`, `URDIRA_TSGO_BINARY`, `URDIRA_INDEXING_CORE_WORKER_PATH`, `URDIRA_INDEXING_CORE_TIMEOUT_MS` |
+| v4 indexing | `URDIRA_V4` (`0` opts a new workspace into v3), `URDIRA_V4_RECONCILE_THRESHOLD` (default `0.01`), `URDIRA_V4_RESIDUAL` (default off; `1` enables), `URDIRA_V4_RESIDUAL_BUDGET_MS`, `URDIRA_TSGO_BINARY`, `URDIRA_INDEXING_CORE_WORKER_PATH`, `URDIRA_INDEXING_CORE_TIMEOUT_MS` |
 | Scan and analysis performance | `URDIRA_CAS_PUT_CONCURRENCY`, `URDIRA_SCAN_BUDGET_MS`, `URDIRA_SCAN_IO_CONCURRENCY`, `URDIRA_CATALOG_HANDOFF_BYTES`, `URDIRA_ANALYSIS_WORKERS`, `URDIRA_STRUCTURAL_CONCURRENCY`, `URDIRA_SEAL_DIGEST_WORKERS` |
 | Lexical and semantic sidecars | `URDIRA_LEXICAL_INDEX`, `URDIRA_LEXICAL_OWNED_BY_RUST`, `URDIRA_SEMANTIC_INDEX`, `URDIRA_SEMANTIC_WORKERS`, `URDIRA_SEMANTIC_EMBED_BATCH`, `URDIRA_LOCAL_EMBEDDINGS_MODEL`, `URDIRA_LOCAL_EMBEDDINGS_DTYPE` |
 | Optional HTTP embedding provider | `URDIRA_EMBEDDINGS_PROVIDER`, `URDIRA_EMBEDDINGS_ENDPOINT`, `URDIRA_EMBEDDINGS_API_KEY`, `URDIRA_EMBEDDINGS_MODEL`, `URDIRA_EMBEDDINGS_DIMENSIONS`, `URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS`, `URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS` |
@@ -525,6 +536,9 @@ are not part of the public contract and may change without notice.
 | Diagnostics | `URDIRA_DEBUG_TIMING` (also `urdira daemon start --debug-timing`), `URDIRA_STORAGE_DEBUG_TIMING` |
 
 ## Benchmark evidence
+
+The following August campaigns predate the v4 default and September query
+optimizations. They are historical comparisons, not measurements of current v4.
 
 Two frozen Vite campaigns compare ordinary repository tools,
 codebase-memory MCP, and Urdira MCP using the same model, commit, task protocol,
@@ -615,6 +629,8 @@ qualification additionally requires the correctness, crash, corruption,
 security, stress, deterministic replay, and three-run P95 gates in the
 [release policy](docs/decisions/08-performance-reliability-evaluation.md).
 
+## Retained v3 implementation
+
 Urdira v3's indexing hot path uses native `Uint8Array` streams, supervised Rust
 syntax workers, bounded Node-API logical-digest batches, and typed relational
 SQLite projections. The verified Rust worker exclusively owns JavaScript and
@@ -694,8 +710,15 @@ guide](docs/release.md#native-acceleration-campaign).
   is no remote MCP or hosted service.
 - Supported filesystems must provide reliable locking, atomic rename, durable
   sync, and SQLite WAL behavior.
-- Semantic search depends on the configured local model being present and
-  healthy. Structural and textual capabilities remain available if it is not.
+- Semantic search depends on the selected provider: cached model assets for
+  local inference, or an available explicitly configured HTTP endpoint.
+  Structural and textual capabilities remain available if it fails.
+- The residual checker is opt-in and does not establish full TypeScript
+  parity: the retained VS Code comparison still has 80 reference and 23 call
+  target differences. Pending sites and coverage gaps remain explicit.
+- Cold-index and memory targets remain unmet in the retained campaigns;
+  worker-only sub-second increments do not establish a daemon durability SLA.
+  See [current limitations and open work](docs/current-state.md#limitations-and-open-work).
 - The npm bootstrap requires Node.js to perform confirmed preparation. The
   prepared runtime supplies exact host-selected Rust and other native
   dependencies. Deterministic platform archives are a separate offline
@@ -731,42 +754,17 @@ prerequisites are documented in [docs/release.md](docs/release.md) and
 filenames, a real staged-file round trip, Windows path and IPC adapters,
 CRLF-sensitive Git fixtures, storage path decoding, and publication hygiene.
 
-The workspace-v3 and fixed publication SQL authorities live under
-`packages/storage/sql/`. After changing either authority, run
+The workspace-v3, workspace-v4, and fixed publication SQL authorities live under
+`packages/storage/sql/`. After changing an SQL authority, run
 `pnpm generate:workspace-sql`; the generated TypeScript wrappers and Rust
 constants are checked by the digest tests.
 
-The following native-cutover figures describe the v3 pipeline's own qualification
-history (the [current state](#current-state-v4-default-v3-legacy) section above
-has the current v4 reference measurements); they remain accurate for v3
-workspaces and the release gates in [docs/release.md](docs/release.md).
-The current bounded n8n qualification remains open. The post-cutover 8/32/128
-owner runs are exact and reconcile within five percent. Production structural
-indexing uses one Rust composition-worker generation for the syntax frontier
-and accumulated semantic stages: Rust owns grouping, validation,
-canonicalization, SQLite staging, receipts, publication, recovery, and
-post-publication lexical work. TypeScript no longer plans or accumulates
-structural rows and is never a production fallback; the private oracle switch
-is restricted to the differential baseline harness. Legacy donor bulk-copy
-paths (workspace fork and index-pack) are also bypassed, so they cannot open a
-second structural SQLite writer; the normal Rust generation is authoritative.
-The latest
-512-owner Rust run passed the 45-second admission gate
-at 30.707 seconds wall time (29.991 seconds observed readiness) and 1.80 GiB peak
-process-tree RSS with an exact visible-set digest (`retained benchmark`). This is a retained single preflight, not a P95 result; later rebuilt-runtime samples remain in the evidence log. Gate 5 remains intentionally
-gated while the <=30-second product target is validated across repeated runs. For this admission decision, the 2 GiB RSS figure is advisory: an exact run that exceeds it remains admissible when its agreed time gate passes, with the measured overage retained as optimization evidence. This is optimization evidence, not a 30-second
-SLA claim; see the [Rust cutover evidence](docs/evidence/2026-08-29-rust-core-indexing-handoff.md)
-and [indexing performance findings](docs/evidence/2026-08-29-indexing-performance-findings.md).
-The Rust sink keeps body payloads as a single typed staging BLOB; the direct
-production finalizer reads that relation in-place, so legacy candidate tables
-carry metadata/closures only and no duplicate structural body copy.
-The previous staged 512-owner measurements (104.990 and 90.817 seconds) are
-retained for comparison. An experimental single-generation variant is retained
-as rejected differential evidence because it changed the visible-set digest;
-it is not the production route. The checker and final Rust publication remain
-the dominant spans. The 20-cold/60-incremental campaign still requires explicit
-authorization. The set-based promotion evidence is retained in the [Rust
-cutover evidence](docs/evidence/2026-08-29-rust-core-indexing-handoff.md).
+The earlier Rust-cutover qualification and failed full-corpus runs are retained
+in the [August session report](docs/evidence/2026-08-31-rust-indexing-session-report.md).
+Those v3 and bounded-owner measurements are historical; current v4 measurements
+and their separate qualification limits are indexed in [current state](docs/current-state.md).
+A documentation refresh does not rerun expensive benchmark campaigns or turn
+an earlier preflight into a release qualification.
 
 The production package graph is the dependency-free `urdira` bootstrap,
 `@urdira/runtime`, and its public `@urdira/*` dependency closure.

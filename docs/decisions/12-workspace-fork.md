@@ -137,7 +137,7 @@ mints a new lock/configuration identity and forces complete reanalysis.
 - Disabling the optimization changes performance only; the progressive scan
   remains authoritative.
 
-## Historial de cambios
+## Change history
 
 - **2026-08-31** (Rust cutover): the donor-row bulk copier became
   compatibility/oracle-only once a persistent `urdira-indexing-worker` was

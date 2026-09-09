@@ -197,7 +197,7 @@ The indexing contract requires deterministic fixtures for duplicate and reordere
 
 The design defines consistent behavior for concurrent updates, missed watcher events, branch switches, non-Git directories, and paginated queries over retained snapshots. Implementation acceptance requires the conformance scenarios above on every supported platform watcher.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-07** (Frente S-E): the macOS `kqueue`-by-default watcher backend is now capped by `KQUEUE_FILE_WATCH_BUDGET` (2,000 eligible files); above the budget the daemon falls back to FSEvents to avoid the per-file file-descriptor cost of kqueue's `EVFILT_VNODE` registration, which was the confirmed root cause of `spawn EBADF` once a large corpus was watched (`docs/evidence/2026-09-08-v4-daemon-robustness.md` and `docs/evidence/2026-09-03-v4-p3-7-watcher-latency.md`).
 - **2026-09-09**: documented the `reconcile` scan scope (branch switch / `git pull` fast path) added for v4 workspaces, its `RECONCILE_DELTA_THRESHOLD = 0.01` cold/delta crossover (`crates/urdira-indexing-worker/src/v4/scan.rs:72`), and its measured noop/cold timings, verified against `docs/evidence/2026-09-06-v4-reconcile-threshold.md`.

@@ -15,9 +15,9 @@ contract changed (see "Authoritative roots history" below). The P2-2m
 `identity_key` corruption this decision's own verification could not
 detect is now **fixed** at the store-writer level (decision 26's changelog)
 — a Merkle leaf is still `(record_id, record_digest)`, never `identity_key`
-text, so this decision's own leaf-recompute verification still cannot see
-an `identity_key`-only corruption directly; it no longer needs to, since
-the corruption's root cause is closed.
+text, so leaf-recompute verification still cannot see an
+`identity_key`-only corruption directly. Closing that particular writer bug
+does not remove this verification limitation.
 
 ## Context
 
@@ -94,14 +94,11 @@ lexical/vector are absent"; `crates/urdira-worker-protocol`'s
 fields — `records`, `dependency`, `graph`, `metric` — with no vector field
 at all). Semantic vectors for v4 live entirely in the asynchronous
 `semantic.sqlite` sidecar (decision 26), maintained outside any scan
-transaction. **This drops `vector` from the family of digests a v4 snapshot
-transactionally commits to**, a real behavioral difference from decision 13
-that is not, in any evidence document read for this decision, explicitly
-framed as a considered supersession of decision 13's four-entry
-requirement — it falls out of the plan's own v4 §8.2 text simply never
-naming a `vector` set, and no design note explains why. Recorded here as a
-found discrepancy (see the parent task's report) rather than silently
-resolved.
+transaction. For v4, this explicitly supersedes Decision 13's v3
+four-entry requirement:
+the structural snapshot commits to `dependency`, `graph`, and `metric`, while
+semantic vectors use their own generation/provider-bound materialization and
+coverage state. A structural root does not certify semantic completeness.
 
 `canonical_record_set_digest`, every `projection_set_digest`, and
 `source_state_digest` also use entirely new byte formulas (the
@@ -311,10 +308,9 @@ byte-identical in both languages
 
 ## Open items (reported, not resolved)
 
-- **`vector` is silently absent from v4's transactional projection family**,
-  a real change from decision 13's four-entry v3 requirement with no
-  explicit design rationale found in the plan or its evidence — see "What
-  changed vs. decision 13" above.
+- **Semantic vectors are outside the structural snapshot digest.** Their
+  independent materialization and coverage must be checked separately, as
+  specified above and in Decision 16.
 - **`MANIFEST.roots` tracks only two of the four sets** (`records`,
   `dependency`); `graph`/`metric` roots exist only in their own `.tree`
   files and in the `merkle_roots` SQL table — an asymmetry inherited from
@@ -339,5 +335,7 @@ byte-identical in both languages
   print and pin them.
 - **`metric` is always empty**; no metric-projection generator exists, so
   the set is verified only by cross-checks, never by leaf recompute.
-- **`len()` bookkeeping after `read_from`** (per-bucket counts not
-  persisted) is unchanged; `root()` is unaffected.
+- **Disk-round-trip count repair is implemented.** Incremental bucket
+  updates carry the pre-update membership count; regression tests cover
+  count and root equality after reload. The earlier count-bookkeeping gap
+  is no longer open.

@@ -382,7 +382,7 @@ progress on the SAME connection) closes the P0 this task authorized fixing; a de
 export is a materially larger feature (a server-side operation registry with its own
 lifecycle/cleanup policy) that was out of this task's own time budget.
 
-## Historial de cambios
+## Change history
 
 - **2026-08-24** (feat: index pack + campaign-2 readiness levers): initial v3 pack decision (schema
   version 1, gzip/NDJSON carrier, `workspace-add --index-pack`).

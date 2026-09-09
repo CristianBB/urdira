@@ -85,8 +85,7 @@ infrastructure around it is rejected.
 
 - No engineering time is spent on a `PackStore`, pack registry, or network
   transport for index packs unless a future re-measurement shows the
-  inequality flip (e.g. a much slower network link where the transfer term
-  dominates differently, or a much larger corpus where cold-scan cost grows
+  inequality flip (e.g. a faster transfer path that reduces the transfer term, or a much larger corpus where cold-scan cost grows
   faster than pack-import overhead).
 - Distributing a v4 workspace between machines today means either a fresh
   cold scan on the destination machine, or a manual pack copy + import
@@ -103,8 +102,8 @@ infrastructure around it is rejected.
 ## Reopening this decision
 
 A future re-measurement could reopen R20 if either side of the inequality
-moves materially: a slower or metered network (raising the effective
-transfer rate below 50 MB/s in practice), a much larger corpus (where cold
+moves materially: a faster network (increasing effective transfer
+throughput above 50 MB/s), a much larger corpus (where cold
 scan cost grows faster than the fixed import/reconcile overhead), or a
 cheaper import path (e.g. an `import_wall` that skips the full-corpus
 reconcile walk for a freshly-imported, provably-untouched tree). Absent

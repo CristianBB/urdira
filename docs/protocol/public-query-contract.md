@@ -136,7 +136,7 @@ Outputs are `declarations` and `candidates`. Unique compiler-resolved declaratio
 
 Output `members` orders by source span, containment depth, and canonical subject key.
 
-Output `pending_sites` (additive, `unclassified`; 2026-09-04) lists every visible unresolved call/heritage site the v4 native structural store's `pending.sites` table still owns for `container`'s artifact -- the capability `core:find_records`' `possible` rows and `jsts:unresolved_call` diagnostics used to expose before both were folded into that table (see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md` §1-§2, §8). When `container` resolves to a module/artifact container entity, every visible pending site of that artifact is included; for any other entity, only sites whose resolved enclosing declaration (`source_id`) is `container` itself or one of the `members` this same call returns -- NOT a byte-span containment test against `container`'s own `primary_source_span`, which for a non-module entity is its name token only, never its full declaration body. Each item is `{path, start, end, site_kind, reason, source_id, stable_sort_key}`: `site_kind` is `"call" | "inherits" | "implements"`; `reason` is the `PendingReasonCode` name (source of truth: `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`); `source_id` is the enclosing entity's identity key, or `null` when it does not resolve (such a site is therefore only ever visible at the module level, never narrowed to a specific member). A workspace backed by the v3 (SQLite-only) store has no `pending.sites` table and always returns an empty `pending_sites` stream, never an error.
+Output `pending_sites` (additive, `unclassified`; 2026-09-04) lists every visible unresolved call/heritage site the v4 native structural store's `pending.sites` table still owns for `container`'s artifact -- the capability `core:find_records`' `possible` rows and `jsts:unresolved_call` diagnostics used to expose before both were folded into that table (see `docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md` §1-§2, §8). When `container` resolves to a module/artifact container entity, every visible pending site of that artifact is included; for any other entity, only sites whose resolved enclosing declaration (`source_id`) is `container` itself or one of the `members` this same call returns -- NOT a byte-span containment test against `container`'s own `primary_source_span`, which now covers its full declaration body. Membership still follows enclosing-declaration identity, not incidental span containment. Each item is `{path, start, end, site_kind, reason, source_id, stable_sort_key}`: `site_kind` is `"call" | "inherits" | "implements"`; `reason` is the `PendingReasonCode` name (source of truth: `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`); `source_id` is the enclosing entity's identity key, or `null` when it does not resolve (such a site is therefore only ever visible at the module level, never narrowed to a specific member). A workspace backed by the v3 (SQLite-only) store has no `pending.sites` table and always returns an empty `pending_sites` stream, never an error.
 
 ### `core:find_references`
 
@@ -430,3 +430,25 @@ The canonical data port receives the sealed handle for each binding and may
 consume it as a bounded iterator; adapters that only implement the legacy
 operation port are isolated behind an explicit compatibility materialisation
 boundary and cannot change the v3 wire semantics.
+
+
+## Current implementation notes: paging and status
+
+The query engine pages its immutable manifest by both item count and cumulative
+serialized item characters. A multi-stream first response shares the character
+allowance across streams. The daemon reduces effective query and continuation
+allowances to at most half its configured IPC frame size; callers continue the
+returned cursors for remaining items instead of requesting a larger transport
+frame.
+
+The manifest paginator admits the first item of each page to make progress,
+even if that item alone exceeds the character allowance. It measures item JSON,
+not the final transport envelope. The MCP projection may further reduce source
+content; an indivisible oversized item/envelope can still fail transport
+framing. This is an implementation limitation relative to the strict response
+budget requirement, not permission to silently omit structured results.
+
+`core:index_status` is served by the top-level status RPC / `urdira_index_status`
+MCP tool. The subject-producing query evaluator rejects it with
+`core:non_subject_operation`; advertising its status model does not make it a
+valid subject stage in a query pipeline or recipe.

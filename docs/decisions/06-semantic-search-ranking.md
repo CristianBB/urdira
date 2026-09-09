@@ -359,7 +359,7 @@ Evaluation datasets, metrics, acceptance thresholds, performance budgets, and pr
 
 This decision is architecturally complete. A concrete release is acceptable only when its resolved semantic profile and ranking-profile registry pass the semantic, deterministic, resource, and privacy gates defined by the dependent specifications.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-06** (`1abf127`, Frente S-A): implemented the affected-artifact pagination mechanism (`semantic_document_status` table, `affected_artifact_set_id`, stateless cursor, `core:semantic_affected_page`, `core:affected_set_stale`) folded into "Materialization and coverage" and "Error behavior" above.
 - **2026-09-08** (`5bfd3a4`, Frente S-H): `SqliteCanonicalQuerySnapshotPort.semantic_vectors` caches its fully-decoded result per `(workspace_id, profile_id, executable_binding_id, generation)`; a generation bump always invalidates it. Pure caching change, no effect on ranking semantics or exactness (mechanism owned by `docs/decisions/16-semantic-search-wiring.md`).

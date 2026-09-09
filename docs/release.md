@@ -4,6 +4,19 @@ This document is the operational checklist for Urdira 0.3.x. The normative
 distribution contract is [decision 10](decisions/10-daemon-mcp-packaging.md);
 the non-waivable qualification gates are [decision 08](decisions/08-performance-reliability-evaluation.md).
 
+## Checkout status and qualification scope
+
+The checkout still declares `0.3.3`, while the [Unreleased changelog](../CHANGELOG.md#unreleased)
+contains the later v4 and query/semantic changes. Before publication, apply
+[the versioning policy](versioning.md) to these breaking storage/behavior
+changes and align the bootstrap/runtime/package manifests. A documentation
+refresh is not a release or an implicit waiver of any qualification gate.
+
+The [current-state inventory](current-state.md) indexes retained September
+measurements. Cold worker timing, daemon readiness/durability, full embedding
+and warm query latency are separate fronts. v4 cold and memory targets remain
+unmet; historical v3/agent benchmarks do not certify the current v4 build.
+
 ## Release channels
 
 The primary public entry package is the dependency-free `urdira` bootstrap on

@@ -171,6 +171,6 @@ Acceptance requires crash injection before and after every publication step, byt
 
 The architecture satisfies incremental update, deterministic query, snapshot retention, pagination, and local deployment requirements with a defined migration and recovery strategy. Implementation acceptance requires the storage conformance suite above.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-09**: noted that v4 (decisions [26](26-v4-structural-store.md), [27](27-v4-merkle-bucket-digests.md), [29](29-v4-rust-owned-scan-pipeline.md)) is now the default storage format for newly added workspaces since 2026-09-04, verified against `isV4Enabled()`/`URDIRA_V4` in `packages/daemon/src/runtime.ts` and `docs/versioning.md`'s "v4 index-contract bump" section; this decision stays `Accepted` and authoritative because migrating already-registered v3 workspaces onto v4 remains unaddressed (`docs/versioning.md`), so the v3 stack this decision describes is still a live, supported path, not merely historical.

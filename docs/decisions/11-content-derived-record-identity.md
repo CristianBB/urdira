@@ -193,7 +193,7 @@ declaration.
 - Source observations, provider watermarks, snapshots, registries, candidates,
   and journals remain workspace-specific.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-09**: clarified that the E-P0j/0.5.0 entity span widening
   (`start`/`end` now the whole declaration) does not change identity, which

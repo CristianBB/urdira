@@ -6179,7 +6179,7 @@ Operation arguments use the approved `SubjectSelector` union, `StructuralFilter`
 
 `ResponseBudget.max_items` and `max_characters` are positive server-bounded limits. Both apply; the first limit reached ends hydration without altering total counts or result membership. `max_characters` uses the fixed compact-JSON counting convention defined by the API contract.
 
-Inline source snippets rendered alongside a discovery result (a trimmed, capped preview line under a match) are a presentational concern of the text-rendering adapter, not a canonical field of this model: they are computed at render time from `optional_source_snippets`/`primary_source_span` hydration, never stored, and controlled by a hidden, MCP-adapter-only option (`response_budget.snippet_lines`, default `0`, opt-in) that never reaches this canonical `QueryOptions`/`ResponseBudget` contract. See [Historial de cambios](#historial-de-cambios) for the mechanism and the acceptance evidence.
+Inline source snippets rendered alongside a discovery result (a trimmed, capped preview line under a match) are a presentational concern of the text-rendering adapter, not a canonical field of this model: they are computed at render time from `optional_source_snippets`/`primary_source_span` hydration, never stored, and controlled by a hidden, MCP-adapter-only option (`snippet_lines`, a top-level MCP argument, default `0`, opt-in) that never reaches this canonical `QueryOptions`/`ResponseBudget` contract. See [Change history](#change-history) for the mechanism and the acceptance evidence.
 
 `ContinuationRequest` never contains the original expression. Its opaque `cursor` selects an already materialized execution stream. `scope` must repeat the original ordered workspace IDs, comparison roles, and explicit snapshot selectors exactly; `response_budget` may be smaller than the original budget but cannot change result projection, snippet mode, evidence mode, or membership. A cursor cannot be used to recompute an expired execution.
 
@@ -6830,7 +6830,7 @@ replacement record is `digest({record, previous_record_id})` and receives a
 new identity salted by `owner_migration_barrier` derived from the old identity.
 Facts and evidence do not participate in this migration rule.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-06** (Frente N, plan `generic-waddling-hartmanis.md` §5): added a presentational, MCP-adapter-only inline snippet renderer (`packages/mcp/src/index.ts`'s engine-side `SNIPPET_POLICY` in `packages/engine/src/canonical-query-data-port.ts`) for `core:find_references`, `core:get_outline`, `core:search_hybrid`, and `core:search_semantic`, gated by a hidden `response_budget.snippet_lines` option that never enters this canonical `QueryOptions`/`ResponseBudget` contract. `snippet_lines: 0` is render-only (a `0` call still pays the hydration cost server-side; no engine-level no-hydration signal was added).
 - **2026-09-08** (R14, `docs/evidence/2026-09-08-agent-benchmark-inline-snippets.md`): an agent benchmark with snippets on-by-default lost a correctness check both new runs made (`restore.ts`'s `boxSelectionMode` allow-list) that a pre-snippet baseline run got right, so `DEFAULT_SNIPPET_LINES` (`packages/mcp/src/index.ts`) was changed from 1 to **0** — snippets are opt-in; a caller sets `snippet_lines: 1..3` explicitly to get them.

@@ -687,7 +687,7 @@ See the evidence doc for the full before/after latency table (both
 corpora), the `core:compare` diff design's worked example, and literal
 test/verification counts.
 
-## Historial de cambios
+## Change history
 
 - **2026-08-29** (Rust cutover): `urdira-indexing-core`/`urdira-indexing-worker`
   became the sole production structural/lexical writer and publication

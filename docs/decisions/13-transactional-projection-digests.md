@@ -6,7 +6,7 @@ Depends on: [Storage architecture](05-storage-projection-architecture.md) and [w
 
 ## Current contract
 
-`Snapshot.projection_set_digests` covers only projection families committed in
+For v3 workspaces, `Snapshot.projection_set_digests` covers only projection families committed in
 the snapshot publication transaction: `graph`, `dependency`, `metric`, and
 `vector`. All four entries are present even when their row count is zero.
 
@@ -44,8 +44,12 @@ structural corpus lives in the native segment store
 (`crates/urdira-structural-store`) instead of SQLite, so it cannot recompute
 this same field the SQL way; it populates the identically-shaped
 `projection_set_digests` field from its own native Merkle bucket digests
-instead (`packages/engine/src/v4-verify.ts`, `crates/urdira-structural-store/src/merkle.rs`
-via `iterVisibleDigests`/`iterVisibleGraphDigests`/`iterVisibleDependencyDigests`).
+instead. Its transactional entries are `dependency`, `graph`, and `metric`;
+`vector` is excluded because v4 semantic materialization is asynchronous and
+tracked separately. The four-entry requirement above applies only to v3.
+The v4 verifier (`packages/engine/src/v4-verify.ts`, `crates/urdira-structural-store/src/merkle.rs`
+via `iterVisibleDigests`/`iterVisibleGraphDigests`/`iterVisibleDependencyDigests`)
+checks the v4 set and recipes.
 See [v4 Merkle bucket digests](27-v4-merkle-bucket-digests.md) for that
 mechanism; this decision's SQL recipe still governs every SQL-backed
 (non-v4) workspace.

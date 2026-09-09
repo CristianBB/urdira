@@ -12,10 +12,11 @@ Implemented and the default for newly added workspaces since 2026-09-04
 partitioned (P2-2j), delta generations are single-file containers (P3-6),
 facet names and subject text live in the store's dictionaries (P2-2e),
 `entities.index` is a persisted, mandatory section since format 6 (F4 4.3).
-RSS gate (≤ 3 GiB) is **not met**: median 6.11 GiB at n8n, 14.18 GiB at VS
-Code (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §1.1 — RSS scales
+RSS gate (≤ 3 GiB) is **not met**: reported median 6.11 GiB at n8n; VS Code per-run peaks
+13.84–14.18 GiB (median 14.12 GiB) (`docs/evidence/2026-09-07-v4-vscode-campaign.md` §1.1 — RSS scales
 close to linearly with corpus size in this range). The writer's own ≤ 2.5 s
-target is also not met (final `write_ms` 5.83-8.41 s at n8n). The P2-2m
+target is also not met (September 7 F.3 median `write_ms` 5.972 s at n8n;
+the earlier final-measurement campaign reported 5.83–8.41 s). The P2-2m
 `identity_key`-zeroing corruption reported as an open critical bug through
 2026-09-05 is **fixed** — see "Open items" below.
 
@@ -82,6 +83,7 @@ not yet the plan's own `<data_root>/workspaces/<ws>/` subdirectory — see
                                candidate_issues, candidate_publication_journal,
                                generation_manifests, merkle_roots, plus the generic
                                lifecycle/GC/retention tables StorageMaintenance still reads
+<safeId>.sidecar/              scan working directory (WorkspaceScanRequest.sidecar_root)
 <safeId>.structural/           the segment store (this decision)
   MANIFEST                     published JSON manifest
   MANIFEST.next                same shape, written before the durable fsync pass
@@ -120,16 +122,16 @@ the partitioned write (`crates/urdira-structural-store/src/segment_io.rs`).
 | File | Content | Stride |
 |---|---|---:|
 | `records.keys` | `record_id` (32 B), sorted ascending | 32 |
-| `records.meta` | fixed row: `owner_artifact u32`, `owner_version u32`, `valid_from u32`, `valid_to u32` (0=open), `category u8`, `kind_id u16`, `universal_kind_id u16`, `facets u64` (bitmask), `span_artifact_version u32`, `span_start_byte u32`, `span_end_byte u32`, `span_start_line u32`, `span_end_line u32` (1-based, UTF-16 code units, since the 2026-09-05 line-numbers task — every producer now populates these via a shared per-file `LineIndex`; both fields stay OUT of the record digest, same treatment as every other derived-not-canonical field, so a line value can never change a record's digest), `identity_type u8`, `assignment_kind u8`, `name_id u32`, `source_subject u32`, `target_subject u32`, `relation_kind_id u16`, `body_off u64`, `body_len u32`, `ident_off u64`, `ident_len u32`, `identity_layout u8` (byte 89, since the 2026-09-05 campaign: `RAW=0`/`ENTITY=1`/`RELATION=2`/`RELATION_NO_SPAN=3` — see below), `entity_kind u8` (byte 90, ordinal into `dict.bin`'s `entity_kinds` list, `255`="not applicable") (91 B used, 96 B stride) | 96 |
+| `records.meta` | fixed row: `owner_artifact u32`, `owner_version u32`, `valid_from u32`, `valid_to u32` (0=open), `category u8`, `kind_id u16`, `universal_kind_id u16`, `facets u64` (bitmask), `span_artifact_version u32`, `span_start_byte u32`, `span_end_byte u32`, `span_start_line u32`, `span_end_line u32` (1-based line numbers; byte offsets remain UTF-8, since the 2026-09-05 line-numbers task — every producer now populates these via a shared per-file `LineIndex`; both fields stay OUT of the record digest, same treatment as every other derived-not-canonical field, so a line value can never change a record's digest), `identity_type u8`, `assignment_kind u8`, `name_id u32`, `source_subject u32`, `target_subject u32`, `relation_kind_id u16`, `body_off u64`, `body_len u32`, `ident_off u64`, `ident_len u32`, `identity_layout u8` (byte 89, since the 2026-09-05 campaign: `RAW=0`/`ENTITY=1`/`RELATION=2`/`RELATION_NO_SPAN=3` — see below), `entity_kind u8` (byte 90, ordinal into `dict.bin`'s `entity_kinds` list, `255`="not applicable") (91 B used, 96 B stride) | 96 |
 | `records.digests` | `record_digest`, `body_digest`, `identity_id`, `identity_key_digest`, `previous_record_id` (32 B each, zero when absent) | 160 |
 | `records.body` | heap: byte-identical UCE bodies | variable |
-| `records.ident` | heap: UTF-8 identity-key text — since the 2026-09-05 campaign, populated ONLY for rows whose `identity_layout` is `RAW` (byte 89 == 0, `ident_len` == 0 otherwise); at n8n scale this is 1.66% of all rows (36,113 of 2,174,446), 9 MB instead of the pre-campaign 611 MB, because an `ENTITY`/`RELATION`/`RELATION_NO_SPAN` row's identity key is reconstructed on read from its own typed fields instead (see below) | variable |
+| `records.ident` | heap: UTF-8 identity-key text — since the 2026-09-05 campaign, populated ONLY for rows whose `identity_layout` is `RAW` (byte 89 == 0, `ident_len` == 0 otherwise); in the September 5 n8n campaign this was 1.66% of all rows (36,113 of 2,174,446), 9 MB instead of the pre-campaign 611 MB, because an `ENTITY`/`RELATION`/`RELATION_NO_SPAN` row's identity key is reconstructed on read from its own typed fields instead (see below) | variable |
 | `records.by_owner` | `(owner_artifact u32, valid_from u32, valid_to u32, ordinal u32)`, sorted by `owner_artifact`, **inline validity** | 16 |
 | `records.by_name` | `(name_id u32, ordinal u32)`, sorted, no inline validity | 8 |
 | `records.by_kind` | `(universal_kind_id u16, category u8, kind_id u16, ordinal u32)`, sorted | 9 |
 | `records.by_identity` | `(identity_key_digest 32 B, ordinal u32)`, sorted; includes closed rows (identity chaining) | 36 |
 | `adj.out` / `adj.in` | `(subject_ordinal u32, valid_from u32, valid_to u32, ordinal u32)`, sorted, **inline validity** | 16 |
-| `entities.index` | `(owner_artifact u32, span_start u32, ordinal u32)`, sorted by `(owner_artifact, span_start)`, no inline validity — since the 2026-09-05 "frente 4" session (F4 4.3); mandatory in every base/delta this crate writes (format 6), unlike `pending.sites`/`dict.bin`/etc.'s "absent if empty" convention. Exactly the `CATEGORY_ENTITY` rows, excluding `jsts:entity_inferred_type` (an inferred-type row deliberately shares its declaration's own `(owner, start)` key — see `segment_io::is_entities_index_row`) | 12 |
+| `entities.index` | `(owner_artifact u32, name_start u32, ordinal u32)`, sorted by `(owner_artifact, name_start)`; `name_start` is recovered from identity text, not the full declaration span, no inline validity — since the 2026-09-05 "frente 4" session (F4 4.3); mandatory in every base/delta this crate writes (format 6), unlike `pending.sites`/`dict.bin`/etc.'s "absent if empty" convention. Exactly the `CATEGORY_ENTITY` rows, excluding `jsts:entity_inferred_type` (an inferred-type row deliberately shares its declaration's own `(owner, start)` key — see `segment_io::is_entities_index_row`) | 12 |
 | `deps.keys` | `dependency_id` (32 B), sorted — a deliberate addition beyond the plan's own sketch (a delta's `closures.deps` needs a standalone key to name which dependency edge closed) | 32 |
 | `deps.meta` | `record_ordinal u32` (`u32::MAX` = the bare `record:` sentinel v3-data quirk), `owner_artifact u32`, `owner_version u32`, `dep_artifact u32`, `dep_version u32`, `role u8`, `valid_from u32`, `valid_to u32` (29 B used, 32 B stride) | 32 |
 | `deps.reverse` | `(dep_artifact u32, ordinal u32)`, sorted | 8 |
@@ -153,13 +155,22 @@ losslessly from this row's own typed fields, with nothing stored in
 the two endpoints resolved one level deep via `dicts.subjects` -> `record_id`
 -> that record's own `identity_key()`), `RELATION_NO_SPAN`=3
 (`jsts:{rel}:{source_identity_key}:{target_identity_key}`, no
-`{path}:{start}:{end}` segment, e.g. `jsts:contains:...`). At n8n scale:
+`{path}:{start}:{end}` segment, e.g. `jsts:contains:...`). In the September 5 n8n campaign:
 98.34% of all rows classify as `ENTITY`/`RELATION`/`RELATION_NO_SPAN`
 (370,285 / 1,768,048 / 0 of 2,174,446), only 1.66% (36,113 — external/type-of/
 diagnostic/v3-converted identities, or a relation whose endpoint is not
 resolvable) still need `RAW`. See `docs/evidence/
 2026-09-05-v4-group-a-cold-lines-references.md` §4 for the measured
 byte-size effect (`records.ident` 611 MB → 9 MB).
+
+**Current span rule:** entity records carry full declaration spans. Their
+identity and checker lookup retain the identifier start recovered from
+`identity_key`; the final span-fidelity section below explains this distinction.
+The codec chooses a compact layout only when reconstruction from typed fields
+exactly matches the original identity; otherwise it writes `RAW`. A declaration
+span whose start differs from the identifier can therefore require `RAW`. The
+September 5 compression proportions above predate the full-span change and
+are not a measurement of the current layout distribution.
 
 **`entities.index` as a persisted section (F4 4.3, format bump 5→6, no
 migration).** Before this, mapping a residual pass's resolved call/heritage
@@ -171,14 +182,14 @@ inferred_type` (an inferred-type row deliberately carries the SAME `path`/
 `start` as the declaration it types, so it must never win that key's slot —
 see the exclusion's own rationale, unchanged by this section). This section
 makes that lookup O(sites) instead of O(corpus): a sorted array of
-`(owner_artifact u32, span_start u32, ordinal u32)` triples, written
+`(owner_artifact u32, name_start u32, ordinal u32)` triples, written
 alongside `by_name` in both the base writers
 (`segment_io::write_hot_and_secondary_files[_partitioned]`) and the delta
 writer (`writer::build_delta_sections`), filtered by the same rule
 (`segment_io::is_entities_index_row`/`inferred_type_kind_id`) so all three
 writers apply the exclusion identically. Read side: `StoreReader::entity_
 by_owner_and_start(owner, start, generation)` binary-searches each
-segment's own array for the key — `(owner_artifact, span_start)` is
+segment's own array for the key — `(owner_artifact, name_start)` is
 expected unique among LIVE rows (enforced at write time by the inferred-
 type exclusion, not by any uniqueness check across every historical row a
 segment's array may still list), so a genuine collision among several
@@ -458,18 +469,21 @@ and `NativeStoreBuilder` (write side, cold-only, used only by the v3→v4
 test/oracle converter — see "Open items").
 `packages/engine/src/native-query-snapshot-port.ts`'s
 `NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotPort`
-maps each of the 18 operations' underlying port methods onto this handle
+maps the structural query port methods onto this handle
 (`records_by_ids`/`records_by_name`/`records_by_selector` → bsearch/range
 scans on the ordinal indexes; `graph_edges_by_subject_ids`/
 `relation_pairs_by_subject_ids` → `adjacency`; `records_for_query[_batches]`
 → `iterVisibleBatch`; everything catalog/FTS/vector-shaped — `artifacts_by_filter`,
 `artifact_text`, `capability_states`, `search_literal`, `semantic_*` —
 delegated to a wrapped `SqliteCanonicalQuerySnapshotPort`).
-`records_by_ids` for the `identity_id`/`identity_key` forms, and
-`records_by_selector` above a 512-combo cap, fall back to a full
-visible-corpus scan (`O(corpus)`, correct but not indexed) —
-documented gaps, not silent approximations
-(`docs/evidence/2026-09-02-v4-p2-5-native-port.md` §3.2).
+`records_by_ids` now resolves `record_id`, `identity_id`, and `identity_key`
+through native indexes. Identity batches retain a 1,000-selector cap and
+fail with `core:selector_unresolvable` above it. Kind/category listing uses
+`by_kind_universal` when no concrete kind is supplied; complex selector
+combinations retain an exact visible-batch fallback rather than a claim that
+every query shape has a dedicated index. See the
+[identity/compare evidence](../evidence/2026-09-08-v4-identity-lookup-and-compare.md)
+and [pushdown catalog](../evidence/2026-09-08-v4-full-pushdown-catalog.md).
 Port selection is per-workspace: the daemon reads `workspace_meta.structural_store`
 (`"native"` vs. `"sqlite"`) AND checks that the sibling `.structural/`
 directory actually exists on disk before routing to the native port,
@@ -489,12 +503,14 @@ connection `SqliteCanonicalQuerySnapshotPort` uses for its fallback methods
 (`core:search_text` otherwise fails outright with "no such table" on a v4
 catalog, since those tables never existed there — fixed in
 `docs/evidence/2026-09-02-v4-p2-7-daemon-wiring.md` §3). Lexical maintenance
-runs in-process against the `ATTACH`ed sidecar (not through the threaded
-worker — that is a documented follow-up); semantic maintenance is
-deliberately **not wired for v4 at all**, because decision 17's entity-grain
-lane reads `record_occurrences`/`record_value_nodes` directly, and those
-tables do not exist in the v4 schema — `submitSemanticMaintenance` no-ops
-for any v4 workspace rather than failing repeatedly.
+runs against the attached sidecar; the v4 daemon also wires semantic
+maintenance through `semantic-v4-wiring.ts` and
+`createNativeSemanticEntityRecordSource`. Native entity enumeration replaces
+the missing v3 structural SQL tables. Sharded child processes reconcile
+vectors, document status, coverage summaries and the segment cache. The
+semantic completion marker advances only for the generation/provider actually
+processed; `semantic.current` can become true. Decisions 16/17 govern this
+asynchronous materialization independently of structural readiness.
 
 ### Catalog schema v4
 
@@ -552,12 +568,13 @@ gzip/NDJSON row carrier, because v4 has no per-row representation of its
 structural corpus at all — it is a binary mmap segment store. Both
 additions are self-contained, tested end to end against real
 Rust-produced v4 workspaces (their v4 sections reached 100% line coverage
-in P4-b-1, `docs/evidence/2026-09-04-v4-p4-b-prep-health.md`), and **not yet
-wired into any daemon RPC or into the v3 fork/pack orchestration** — that
-integration (fork-eligibility policy, workspace registration, path
-selection) is left for whoever wires v4 daemon routing further
-(`docs/evidence/2026-09-03-v4-p2-4-digest-contract.md` §3.1). Verify, fork,
-and pack were not exercised in the final measurement session (final §6).
+in P4-b-1, `docs/evidence/2026-09-04-v4-p4-b-prep-health.md`), and explicit v4 pack export/import are now wired through the daemon's
+`core:index_pack_export` and `workspace-add --index-pack` paths. Import always
+reconciles against the destination tree, with normal scan fallback on a failed
+attempt. `forkV4Workspace` remains a separate copy helper; the retained
+v3 donor-selection path must not be described as automatic v4 donor reuse.
+See Decision 23 and the September VS Code pack/daemon evidence.
+
 A `merkle/<set>.tree` file is a fixed ~35.8 MB regardless of corpus size,
 so even the smallest fixture's pack is ~140 MB before compression.
 
@@ -579,9 +596,9 @@ so even the smallest fixture's pack is ~140 MB before compression.
 - A workspace's structural corpus is portable and fork/pack-friendly by
   construction, without any record remap — a stronger property than v3's
   content-derived-identity-plus-remap model (decision 11, decision 12).
-- v3 and v4 never share a writable data root or a reader; the boundary is
-  the same destructive, non-migrated one decision 22 already establishes for
-  v3, extended by `index_contract 0x34` (see `docs/versioning.md`).
+- One installation/data root can contain separate v3 and v4 workspace
+  stores. A workspace never mixes their structural readers or digest recipes;
+  converting its format requires a fresh index (see `docs/versioning.md`).
 
 ## Open items (reported, not resolved)
 
@@ -610,22 +627,17 @@ so even the smallest fixture's pack is ~140 MB before compression.
   relation records (`docs/evidence/2026-09-02-v4-p2-3-structural-store.md`
   §1.4). The mutation harness's oracle compares only those two sets for
   the same reason (P3-4).
-- **Record volume (owner decision).** Possible relation rows and their
-  paired `jsts:unresolved_call` diagnostics are 1,276,972 of the 2,831,264
-  records (45%); the store scales sub-linearly with them (+1.7-2.4 s
-  materialize, +1.1-1.8 s write, §16.3) but they are the largest single
-  lever left on every cold gate (decision 29, open item 4).
-- **3 undecodable record bodies** (zero-filled payloads, 2 `core:call` +
-  1 `jsts:diagnostic`) on n8n, pre-existing, record ids in P2-2i.
-- **Semantic maintenance is not wired for v4** (`semantic.current` is
-  reported `false` for every v4 workspace, P4-d); lexical maintenance runs
-  in-process, not on the threaded worker.
-- **Fork/pack daemon wiring** and the fork envelope-digest gap (decision 27)
-  are unchanged.
-- **The `dependency` incremental-diff gap is CLOSED** (P3-2 §3 — a
-  `dependency_id` recipe leak, not a store defect; decision 29).
+- **Record volume remains a cost driver.** The old 2,831,264-row census
+  included diagnostics subsequently folded into `pending.sites`; it is not
+  the current record population. Keep candidate visibility and explicit
+  uncertainty when evaluating further reductions.
+- **Historical integrity findings need a dated scope.** The zero-filled-body
+  census predates the writer repair and is not a current reproduced defect.
+  Merkle checks alone still cannot certify unchanged identity text.
+- **Fork envelope verification** remains limited as recorded by Decision 27;
+  this is distinct from the now-wired explicit pack path and semantic lane.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-05** (P2-2m, `docs/evidence/2026-09-05-v4-p2-2m-identity-key-corruption.md`): root-caused and fixed the `identity_key`-zeroing corruption reported as an open critical bug above. Two real bugs in `crates/urdira-structural-store/src/segment_io.rs`'s hot-file writer: (1) every `records.*` write used a single-shot `write_at`, which POSIX permits to short-write silently — replaced with `write_all_at` (12 call sites, both the flat and partitioned writer); (2) fixing (1) alone did not close the corruption — a concurrent sparse-file allocation race on macOS/APFS could still silently revert one writer's already-`write_all_at`-confirmed bytes to the pre-allocation zero value when up to 16 partition writers extended the SAME sparse file's allocated-extent metadata concurrently. Fixed by `create_sized_hot_files`, which forces real block allocation across a hot file's entire length (`materialize_real`, single-threaded per file, in parallel across the five files) strictly before any concurrent writer touches it, so every later write only overwrites already-allocated blocks. Verified clean across 5 production-path cold runs + 2 in-process diagnostic runs + 1 incremental-oracle run, plus a new `#[ignore]`d stress test (`materialize_write_read_roundtrip_never_loses_an_identity_key`, 200k synthetic records × 200 iterations). This corruption was invisible to the header `xxh3` and to the Merkle roots (both computed from in-memory data before the writer ran) — only the classification invariant (decision 28) and a full-store diagnostic scan could detect it; that gap in the store's own integrity story is unchanged by this fix (a future verify extension would need to re-read persisted bytes, not trust in-memory roots).
 - **2026-09-07** (Frente E-P0j, `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md` §1.3): entity span fidelity fix — see below (folded from the former standalone amendment).
@@ -675,7 +687,8 @@ itself is unchanged — every caller already passed it a tsgo-reported
 `name_start_utf16`, never a declaration span. **No `records.meta`/segment
 byte layout changed; `entities.index`'s own on-disk shape (three `u32`s,
 sorted by the first two) is byte-identical** — only WHICH value gets fed into
-column 2 at write time changed, so this table's own row above is unaffected.
+column 2 at write time changed, so the physical stride is unchanged; the table above names the current
+identifier-position key explicitly.
 
 Records changed digest for every real v4 entity (a one-time fleet republish;
 `JAVASCRIPT_TYPESCRIPT_VERSION` bumped 0.4.0 -> 0.5.0, `docs/versioning.md`).

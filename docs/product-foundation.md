@@ -51,13 +51,14 @@ current architecture.
 | 29 | v4 Rust-owned worker scan pipeline (cold and incremental) | Approved and implemented; default for new workspaces since 2026-09-04 | [v4 Rust-owned scan pipeline](decisions/29-v4-rust-owned-scan-pipeline.md) |
 | 30 | Index pack distribution (rule R20) | Closed 2026-09-07: no distributed pack-transport layer built | [Index pack distribution](decisions/30-index-pack-distribution.md) |
 
-The 2026-08-29 Rust indexing-core cutover is governed by the amendments in
+The 2026-08-29 Rust indexing-core cutover is governed by the current contracts in
 Decisions 21, 22 and 25 and the [structural indexing fast path](protocol/structural-indexing-fast-path.md).
 The 2026-09 v4 cutover (Decisions 26-29) replaces the v3 native pipeline's
 scan orchestration, structural storage, and digesting with a Rust-owned
 worker and its own mmap-served structural store for newly added workspaces,
-while leaving public query semantics, the MCP surface, and the decisions
-below unchanged; an already-registered v3 workspace keeps working as v3
+while retaining the public query API and five-tool MCP surface; the linked
+contracts describe the additive operations and format-specific behavior. An
+already-registered v3 workspace keeps working as v3
 (`URDIRA_V4=0` opts a new workspace out). The accompanying handoff and
 evidence documents are evidence only and cannot override these current
 specifications.
@@ -74,6 +75,10 @@ the production composition roots, and [versioning](versioning.md) records the
 v4 index-contract bump and default-format flip.
 
 `decisions/01-universal-data-model.md` is the complete inventory and source of truth for shared logical model names and shapes. Operation-specific public argument schemas are linked from that inventory to the single authoritative [Public query contract](protocol/public-query-contract.md); no document may define a parallel or legacy variant.
+
+Implementation, defaults, retained performance evidence, and unresolved limits
+are summarized separately in [current state](current-state.md). That inventory
+is evidence, not an additional source of normative behavior.
 
 ## Supporting registry index
 
@@ -257,7 +262,7 @@ Registry definitions referenced by a result page are included once by default, d
 
 ### Deterministic, agent-oriented operations
 
-Urdira is not primarily a chat interface and is not merely a vector search engine. Its main interface will be a stable set of typed operations designed around tasks coding agents perform.
+Urdira is not primarily a chat interface and is not merely a vector search engine. Its main interface is a stable set of typed operations designed around tasks coding agents perform.
 
 The same query against the same indexed revision and configuration should produce the same result. Results must expose evidence, provenance, completeness, and uncertainty instead of presenting heuristic conclusions as proven facts.
 
@@ -287,9 +292,9 @@ Urdira should optimize for agent turns, not merely for the number of internal en
 
 An agent must not need to perform semantic discovery in one call and then issue separate calls for callers, entry points, tests, or source context. Urdira must be able to execute dependent stages internally and return one bounded, evidence-backed result.
 
-This requires more than batching independent requests. Urdira will support composed queries in which later stages consume entities produced by earlier stages. The composition model will be declarative and typed; it will not allow arbitrary code or command execution.
+This requires more than batching independent requests. Urdira supports composed queries in which later stages consume entities produced by earlier stages. The composition model is declarative and typed; it does not allow arbitrary code or command execution.
 
-The agent-facing API will provide three complementary levels:
+The agent-facing API provides three complementary levels:
 
 1. **Individual operations** for precise questions about already known entities.
 2. **Declarative pipelines** for dependent discovery, traversal, filtering, ranking, and projection in one request.
@@ -313,7 +318,7 @@ The active extension registry is itself a composable query source. An agent may 
 
 Every operation that can return an unbounded result set must support pagination. This is especially critical for composed queries because MCP clients and coding agents impose response-size and context-window limits.
 
-A composed query will produce a persistent, revision-pinned result stream that can be traversed forward and backward within explicit response-size budgets. An agent must be able to continue an existing investigation without resubmitting or recomputing its earlier stages.
+A composed query produces a persistent, revision-pinned result stream that can be traversed forward and backward within explicit response-size budgets. An agent must be able to continue an existing investigation without resubmitting or recomputing its earlier stages.
 
 Pagination is part of the core query contract rather than an MCP-specific workaround. Transport adapters may expose it differently, but they must preserve the same execution identity, ordering, snapshot, and continuation semantics.
 
@@ -405,7 +410,10 @@ execute models or receive query text.
 The default local provider uses `Xenova/all-MiniLM-L6-v2`. Its assets are not
 part of Urdira release archives and are acquired only through an explicit
 configuration operation with a visible provisioning result. Startup,
-indexing, querying, pagination, replay, and maintenance remain offline. The
+indexing, querying, pagination, replay, and maintenance use cached assets
+without model downloads. The default local provider operates offline; an
+explicit HTTP provider sends embedding inputs to its configured endpoint
+(see [semantic runtime](decisions/16-semantic-search-wiring.md)). The
 complete rule is [semantic model provisioning](decisions/18-semantic-model-provisioning.md).
 
 Provider identity pins every output-affecting model/runtime/configuration
@@ -612,7 +620,9 @@ Change impact should normally be computed from primitive facts and relationship 
 
 Language-specific extensions use registered namespaced kinds, facets, relations, diagnostics, and capabilities without changing the language-neutral engine or public query algebra.
 
-Relational persistence, native worker transfer, and incremental logical digest computation are governed by Decision 21. Public MCP requests and responses remain concise JSON projections and are never hashed directly. Every digest field has one explicit computed or referenced contract pinned by the registry snapshot.
+Relational v3 persistence and its native indexing boundary are governed by
+Decision 21; Decisions 26–29 govern v4 structural persistence, bucketed Merkle
+digests and scan/semantic execution. Public MCP requests and responses remain concise JSON projections and are never hashed directly. Every digest field has one explicit computed or referenced contract pinned by the registry snapshot.
 
 ## Contract maintenance
 

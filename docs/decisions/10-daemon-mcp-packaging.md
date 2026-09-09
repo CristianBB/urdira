@@ -17,7 +17,7 @@ Define the local process architecture, MCP adapter, workspace registry access, i
 - Urdira does not modify source files or expose arbitrary commands.
 - MCP exposes active plugin, resolution-lock, capability, and activation-attempt status but cannot mutate plugin state.
 - Runtime plugin contracts, registry contracts, package versions, capability contracts, stored-index decoders, and public query API versions negotiate independently under exact persisted locks.
-- Urdira ships one core-owned local code embedding provider, but no model weights or preinstalled model pack. The current flow downloads `Xenova/all-MiniLM-L6-v2` only during an explicitly confirmed configuration operation, reports the download to the user, and remains offline during startup, indexing, querying, pagination, and replay, as defined by [semantic model provisioning](18-semantic-model-provisioning.md). Language-plugin packages cannot contain embedding models, tokenizers, renderers, segmenters, generators, or inference runtimes.
+- Urdira ships one core-owned local code embedding provider, but no model weights or preinstalled model pack. The current flow downloads `Xenova/all-MiniLM-L6-v2` only during an explicitly confirmed configuration operation, reports the download to the user, and, when using the local provider, remains offline during startup, indexing, querying, pagination, and replay, as defined by [semantic model provisioning](18-semantic-model-provisioning.md). Language-plugin packages cannot contain embedding models, tokenizers, renderers, segmenters, generators, or inference runtimes.
 - One canonical deterministic model-pack manifest and its digest-addressed asset set define the logical installation independent of delivery. Every asset records its exact digest, decoded byte length, media type, and semantic role, and every declared asset is mandatory for that pack identity. The local content-addressed store deduplicates identical blobs across packs.
 - An offline distribution may bundle the manifest and all blobs. An explicit online administrative installation may retrieve the same blobs using delivery locators stored outside the canonical manifest. URLs, mirrors, credentials, transport headers, compression, and archive layout are non-authoritative and cannot change pack identity.
 - Pack publication is atomic after complete local verification. The daemon never downloads models during startup, indexing, query execution, pagination, or replay; missing local content produces explicit unavailable state until administrative repair.
@@ -240,6 +240,6 @@ per-owner callbacks never cross the application Node-API boundary. Archives
 must checksum these binaries alongside the existing addon, syntax worker and
 launcher, and startup fails closed on a missing or mismatched worker digest.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-09** (`7a29869`): documented the IPC frame's fixed size and the `response_budget.max_characters` clamp (half the frame) plus size-based page truncation in "Private daemon boundary" above -- a declared budget can no longer overflow the transport into `core:ipc_frame_too_large`.

@@ -34,8 +34,8 @@ sample is classified to an already-documented, out-of-scope root cause
 inference does not model, plus four small pre-existing unrelated
 residuals); accepted with this figure by the owner on 2026-09-09 rather
 than pursued further, since closing it needs real flow-sensitive type
-narrowing, out of this decision's scope. Open: `rpc_error` 13,737 raw
-sites; unions/overloads-as-per-candidate-possible-rows are built (2026-09-06
+narrowing, out of this decision's scope. The older residual census recorded `rpc_error` at 13,737 parity-scoped /
+105,635 raw sites; those counts have not been refreshed here; unions/overloads-as-per-candidate-possible-rows are built (2026-09-06
 amendment below, superseding the original "not built" status).
 
 ## Context
@@ -216,11 +216,23 @@ five amendments between 2026-09-06 and 2026-09-09 below:
   is a distinct, unmodeled gap — reported, not silently misclassified as an
   ambiguity.
 
-### The residual tsgo pass as built (P1-D-a…h)
+### Residual execution and historical measurements
 
 The owner's 2026-09-02 amendment authorized a checker pass outside the
 critical path, driven from Rust, publishing an improvement generation.
-As built:
+Current scheduling keeps the checker outside structural readiness. It is
+**off by default**; set `URDIRA_V4_RESIDUAL=1` before daemon startup to enable
+it. Default pass budgets are 120 seconds cold and 20 seconds incremental;
+`URDIRA_V4_RESIDUAL_BUDGET_MS` overrides both, and `0` disables that budget.
+A truncated pass publishes completed work with truncation/count metadata and
+reschedules remaining roots, subject to an epoch guard and a bounded number
+of continuations. Continuations keep the full file map visible for resolution
+while limiting the work roots. New source work invalidates stale attempts.
+The pass can emit inferred types and diagnostics even with zero pending sites.
+These are scheduling budgets, not a promise that an in-flight checker RPC or
+publication finishes at that exact millisecond.
+
+The implementation components and their earlier measurement history:
 
 - **Client** (`crates/urdira-tsgo-client`, P1-D-a): a from-scratch JSON-RPC
   client for TypeScript 7's `tsgo --api --async` (LSP-style framing, a
@@ -255,13 +267,13 @@ As built:
   a `semantic_upgrade` generation (`publish_delta_with_kind`), emitting
   `IndexingEvent::UpgradeCompleted` via a dedicated pump thread in `main.rs`
   (a first version delivered the event late — fixed there).
-- **Entity synthesis for members** (P1-D-d §3): v4's cold entity producer
-  materializes only module-level declarations, but the checker resolves
-  ordinary method-dispatch calls to class/interface members. The pass
-  therefore synthesizes the missing member entity (`try_synthesize_member_entity`)
+- **Entity synthesis for members**: the cold producer now materializes
+  class/interface members, parameters, namespace and external entities.
+  When the checker resolves a workspace declaration still missing from that
+  generation, the pass synthesizes the missing member entity (`try_synthesize_member_entity`)
   inside the same `semantic_upgrade` generation, using the identical
   `jsts:{kind}:{path}:{start}:{name}` identity recipe as every other entity
-  kind — so a future real member producer would continue the chain via
+  kind — so the cold producer and residual synthesis continue the chain via
   `by_identity_last`, not collide. Kind words match v3's vocabulary byte for
   byte (`method` including `MethodSignature`, `constructor`, `property`,
   `getter`/`setter`, `parameter`, `variable`; an arrow-function target
@@ -269,9 +281,11 @@ As built:
   wrong-target source before P1-D-f §5). The same member problem on the
   **source** side silently dropped 147,442 pending sites until `collect()`
   learned to parse `source_id` from the identity key (P1-D-f §6).
-- **Classification invariant**: for every relation row, the identity's
-  `:unresolved` suffix (or absence) must agree with `target_subject.is_some()`,
-  computed without decoding the body (`count_classification_mismatches`).
+- **Current classification invariant**: every emitted candidate or confirmed
+  relation has a real target; unresolved sites without a bounded target set
+  remain in `pending.sites`. The earlier pre-fold invariant equated the
+  `:unresolved` suffix with an absent target; the following counts describe
+  that historical repair, not the current candidate-row schema.
   The E1-E3/typeflow lane wrote `confirmed` + `target_id` for member targets
   the cold producer could never intern: 31,917 mismatched rows on n8n
   (~29K in P1-D-f's earlier build), which also explained the flat 15,590
@@ -289,14 +303,14 @@ As built:
   `rpc_error` 219,348 → 101,861 without changing `upgraded` (recovered sites
   went to `no_symbol`).
 
-**Residual pass result on n8n** (final §4.2, fresh cold + one pass;
+**Historical September 5 residual pass result on n8n** (final §4.2, fresh cold + one pass;
 identical across every clean run of the last three sessions):
 `upgraded = 83,707`, `external = 41,001`, `unresolved = 546,650`; after
 upgrade `core:call` confirmed 148,033 / possible 586,346, heritage
 confirmed 1,868 / possible 1,305. Pass wall 61.2 s (`total_ms` 53,526) on
 the in-process test path; tsgo child RSS was not collected.
 
-**Parity method and numbers** (`scripts/v4-call-parity-diff.mjs`, P1-D-f
+**Historical parity method and numbers** (`scripts/v4-call-parity-diff.mjs`, P1-D-f
 §2): every `core:call` v3 confirmed (retained v3 SQLite index of the same
 corpus, 205,468 sites, opened read-only) is joined by `(path, start, end)`
 to a v4 body dump carrying the store's own `target_subject` presence bit
@@ -343,56 +357,32 @@ from Rust via `crates/urdira-tsgo-client`. The owner's 2026-09-02
 authorization is the explicit GO E4 required, and the pass as built never
 gates readiness (it is opt-in and publishes after `ScanCompleted`).
 
-## Consequences
+## Consequences and remaining limits
 
-- A v4 workspace's structural generation never blocks on a compiler
-  process; the checker only improves precision after the fact.
-- Typeflow's zero measured wrong-target rate across ~9,500 census sites,
-  and the residual pass's 0 `different_target` across 205,468 v3-confirmed
-  sites, are the evidence that both mechanisms are sound; their coverage is
-  what falls short (77.8% recovery; 54.8% same-target parity, of which
-  19.9 points are the `external_lib` policy and 18.3 points a corpus
-  without `node_modules`).
-- Every unresolved site is now query-visible as a `possible` relation with
-  a reason, at the cost of +82% records (decision 29, open item 4).
-- Any consumer relying on inferred type text for an unannotated local, on
-  `jsts:compiler_diagnostic` rows, or on lib-target confirmed calls must
-  account for the smaller surface.
+- A v4 structural generation never waits for the residual compiler process.
+  Query-visible uncertainty is retained: possible candidate relations always
+  have targets; a site with no bounded candidate set remains pending.
+- Current target-agreement figures are the scoped September 9 n8n/VS Code
+  figures at the top of this document. The earlier 77.84% prototype recovery
+  and 54.8% residual parity tables are historical populations, not the current
+  coverage level or a general proof of soundness.
+- The reduced VS Code comparison still has 80 reference / 23 call target
+  differences. Full control-flow-sensitive type inference remains outside
+  the local typeflow model; supported narrowing rules do not imply complete
+  compiler equivalence.
+- External standard-library targets are not synthesized as confirmed
+  workspace declarations by the residual pass. Missing dependencies and
+  unresolved/checker-failed sites remain analysis limits.
+- The old `rpc_error` census, unmeasured tsgo child RSS and lane-count tuning
+  are retained follow-up evidence, not newly measured current counts.
+- Transitive alias resolution, pending-importer rediscovery, bounded
+  union/overload candidates, and JS-to-TS specifier mapping are implemented.
+  They must not remain on a generic “not implemented” list. The final
+  [VS Code campaign](../evidence/2026-09-07-v4-vscode-campaign.md) and
+  [reconcile evidence](../evidence/2026-09-06-v4-reconcile-threshold.md)
+  describe the remaining scoped cases and incremental regressions covered.
 
-## Open items (reported, not resolved)
-
-- **`rpc_error` 13,737 parity-scoped (105,635 raw sites, 4,513 `.ts`
-  owners).** The "`.js`/`.mjs`/`.cjs` excluded from roots" hypothesis is
-  refuted (only 9 of 105,635 sites are in a non-`.ts` file, all in the one
-  already-diagnosed `trim-fe-packageJson.js`; final §3). Most affected
-  owners fail on a partial fraction of their sites (e.g. 37/108), heavily
-  `__tests__`/`vi.mock` code — at least two mechanisms bundled, neither
-  explained; three synthetic reproductions failed (P1-D-e §3, P1-D-g §3).
-  The obvious fix (descending into a property-access callee's name) was
-  tried and reverted after a live wrong-target regression (P1-D-g §3.2).
-- **`external_lib` policy** awaits the owner's definition of "confirmed".
-- **VS Code `different` does not reach 0** (80 references / 23 calls at the
-  final 2026-09-09 measurement) — accepted with this figure by the owner;
-  closing it needs real flow-sensitive type narrowing (tracking the actual
-  initializer/assignment-site type through control flow), out of this
-  decision's scope. See "Current state" above.
-- **Lane-count tuning** has no empirical production-scale default (5 on the
-  measurement machine); tsgo child RSS during a pass was never measured.
-- **Overload-aware member resolution, transitive type aliases, a built-in
-  `lib.es5.d.ts` member table** remain unimplemented typeflow levers.
-- **`create` satisfying a previously-broken import** is not rediscovered by
-  the incremental `ProgramIndex`'s `add_file` alone (P3-8a §2.2).
-- **v4's alias fallback** confirms an alias's own import-specifier
-  declaration when the real target is unresolvable (`import {expect} from
-  'vitest'`), where v3 stays possible — a behavioral difference flagged for
-  the resolver owner, not normalized (P1-D-f §7).
-- **3 undecodable record bodies** (2 `core:call`, 1 `jsts:diagnostic`,
-  zero-filled payloads) out of 2,831,264, pre-existing (P2-2i).
-- Whether the hybrid lane's actual diagnostic emission call sites exclude
-  externally-resolved sites was verified only against the schema's stated
-  intent, not line by line (P1-D-g §4).
-
-## Historial de cambios
+## Change history
 
 - **2026-09-05** (`docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`): the cold producer began materializing class/interface members, referenced parameters, catch/rest bindings, ambient-namespace and external entities directly, and the classification invariant changed so every relation record carries a real `target_id` while an unresolved site lives in `pending.sites` instead of a bare `jsts:unresolved_call` diagnostic — see "The uncertainty contract, as it stands" above.
 - **2026-09-06** (Frente F, `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`): documented explicitly (no code change) that a union/overload receiver never promotes to `confirmed`, only to `possible` per candidate — see "The uncertainty contract" above; separately, `parameter_entity_rows` began materializing a `jsts:entity_parameter` entity for every declared parameter/catch-binding rather than only referenced ones (n8n count 74,769 → 79,764, floor re-pinned in `docs/evidence/2026-09-07-v4-f3-cold-incremental-floors-parity-threshold.md`), and `get_outline`'s child ordering was hardened to sort by span start rather than by `core:contains` relation-record order.

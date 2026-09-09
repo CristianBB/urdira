@@ -1,7 +1,7 @@
 # Versioning Policy
 
 Status: Approved (policy set by the project owner, 2026-08-13)
-Last updated: 2026-09-04
+Last updated: 2026-09-09
 
 This document defines when a version number in this repository takes a major,
 minor, or patch bump, and what a bump of the JS/TS analyzer plugin version
@@ -50,11 +50,11 @@ range. ANY change to it, patch or major alike, causes:
 2. **A one-time fleet republish** — each workspace's plugin resolution lock
    pins the version it was analyzed under; on the next daemon start the
    stale-lock re-resolution path (decision 14, `docs/decisions/14-plugin-upgrade-relock.md`)
-   re-locks and publishes an upgrade generation per workspace. At real
-   repository scale this is roughly one full analysis (~25s per 700-file
-   workspace) plus a publish, per workspace, sequentially — minutes for a
-   fleet. Queries stay available throughout (each workspace serves its prior
-   generation until its upgrade generation lands).
+   re-locks and publishes an upgrade generation per workspace. This can
+   require full analysis and publication; its cost depends on the workspace
+   format, corpus and enabled checker/provider configuration. The historical
+   v3 estimate is not a v4 upgrade benchmark. Each workspace retains its prior
+   generation until the upgrade generation lands, subject to query admission.
 
 Because the machinery reacts identically to every bump, the version number's
 ONLY job is communication — which is exactly why the table above must be
@@ -97,12 +97,13 @@ gated at runtime.
 
 The runtime consequence follows decision 22's own destructive, non-migrated
 boundary, extended unchanged: `index_contract` gains a new value (`0x34`)
-disjoint from v3's `0x33`; a v4 daemon has no reader for a v3 root and vice
-versa; there is no in-place migration, compatibility adapter, or dual-format
-reader. An operator moving a workspace onto v4 gets `recreateOutdatedWorkspaceDatabase`
-(old database and structural directory renamed aside, never deleted
-automatically) and a full reindex from scratch, exactly as decision 22
-already requires when the contract byte changes at all. CAS content may be
+disjoint from v3's `0x33`. The current daemon includes separate v3 and v4
+readers and selects one per workspace; neither reader interprets the other
+format. There is no in-place v3-to-v4 conversion. The
+`recreateOutdatedWorkspaceDatabase` recovery path applies to unsupported or
+outdated data, moving it aside and reindexing; it does not convert a healthy
+v3 workspace merely because v4 became the default. To select v4 for an
+existing source tree, register it into a fresh workspace store. CAS content may be
 reused across the boundary only when its scope, length, and digest all
 verify, per decision 22's existing policy.
 
@@ -116,7 +117,7 @@ flip only decides the format a workspace gets stamped with the first time
 its database file is created (`ensureV4Workspace`/`maybeBootstrapV4Workspace`
 no-op the instant that file already exists) -- it is not a migration:
 
-- An **existing v3 workspace keeps working as v3 forever**, with no
+- An **existing supported v3 workspace keeps working as v3 in this release**, with no
   automatic conversion. The P4-a/P4-b-prep "outdated workspace" recreation
   path (`recreateOutdatedWorkspaceDatabase`) only fires for a genuinely
   **outdated/unsupported** `index_contract` (a stale pre-v3 layout, or a v3
@@ -143,16 +144,30 @@ No default flip or existing-workspace migration path existed before this
 note (decision 29's own "Open items" listed the flip as outstanding for P4);
 migration of already-registered v3 workspaces onto v4 remains unaddressed.
 
+## Current checkout coordinates
+
+| Coordinate | Value | Meaning |
+|---|---|---|
+| Application/bootstrap package | `0.3.3` | Manifest version; later local changes remain Unreleased until versioning and release gates are completed. |
+| JS/TS plugin | `0.6.0` | Analyzer behavior/cache/lock identity, independent of the application version. |
+| Native binding API | `17` | Compiled addon handshake, including resident vector registration/top-K. |
+| v3 / v4 index contract | `0x33` / `0x34` | Per-workspace structural/digest format selection. |
+| v4 segment header | `6` | Native base/delta layout, including mandatory `entities.index`. |
+
+The v4 behavior/storage change still requires the version-policy treatment
+above before publication. This documentation update does not assign a new
+release number or claim that current local commits are published.
+
 ## Checklist for bumping `NATIVE_API_VERSION`
 
 `NATIVE_API_VERSION` (`packages/native/src/loader.ts`) identifies the native
 addon/worker handshake shape used by the Rust structural kernel
 (`crates/urdira-native-node/src/lib.rs`). Unlike the plugin version above, it
 has no single source of truth read across every boundary: the value is
-duplicated as a literal in five places, and a bump that updates only some of
+duplicated across six files, and a bump that updates only some of
 them fails closed with "Rust semantic bridge structural kernel binding is
 incompatible" (observed live during the S-I bump from 16 to 17, when the
-semantic-worker literal was left behind). Every bump must update all five in
+semantic-worker literal was left behind). Every bump must update all six files in
 the same change:
 
 1. `packages/native/src/loader.ts` — the canonical constant, checked against

@@ -4,6 +4,20 @@ Status: Accepted
 Last updated: 2026-08-21
 Depends on: Universal data model and plugin contract
 
+## Current implementation scope
+
+The sections below specify the language contract and required precision where
+an advertised capability is available; they are not a claim that every listed
+analysis is complete on every source tree. For the default v4 route,
+[Decision 28](28-v4-rust-semantics-and-residual-checker.md) governs the shipped
+Oxc/hybrid/typeflow resolver, bounded candidates, external-target policy and
+opt-in residual checker. It supersedes an interpretation that all v4 queries
+run a complete TypeScript compiler program or expose full flow-sensitive
+inference. The residual uses its documented virtual workspace and fixed
+compiler options, rather than promising every discovered project partition's
+compiler behavior. Read per-operation completeness and the
+[current-state limits](../current-state.md#limitations-and-open-work).
+
 ## Decision objective
 
 Define the exact first-language scope and the implementation strategy used to validate Urdira's generic architecture.

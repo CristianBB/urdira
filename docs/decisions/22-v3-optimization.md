@@ -259,7 +259,7 @@ metadata. The application passes those immutable values in the generation
 envelope; it does not insert candidate rows or receipts before the worker
 publishes.
 
-## Historial de cambios
+## Change history
 
 - **2026-08-29** (Rust cutover): the bounded pipeline, digest writers, and
   candidate publication moved from the TypeScript owner loop to the Rust

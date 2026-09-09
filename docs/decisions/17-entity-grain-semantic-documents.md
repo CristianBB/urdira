@@ -127,7 +127,7 @@ and self-heals any shard's failures.
 Cross-workspace vector sharing is unsupported. Content-identical documents
 under different workspace/provider bindings are reconciled independently.
 
-## Historial de cambios
+## Change history
 
 - **2026-09-06** (`8497e9c`, Frente S-A): added the `semantic_document_status` per-document ledger, folded into "Maintenance" above.
 - **2026-09-06** (`4404e6b`, Frente S-B): added the 256-token/32-token-overlap segmenter and per-segment entity vectors, folded into "Segmentation and per-segment entity vectors" above.

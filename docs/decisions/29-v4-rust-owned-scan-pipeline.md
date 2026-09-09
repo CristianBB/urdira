@@ -22,7 +22,7 @@ every mutation kind; the daemon-observed edit gate ("durable < 1 s") is
 corruption reported as an open critical bug through 2026-09-05 is **fixed**
 — see decision 26's changelog. `RECONCILE_DELTA_THRESHOLD` (below) is
 **0.01**, not the 0.25 default the scope first shipped with — measured and
-lowered the same week it landed (see "Historial de cambios").
+lowered the same week it landed (see "Change history").
 
 ## Decision
 
@@ -34,7 +34,7 @@ background residual-checker generation — driven by a single new protocol
 command, `IndexingCommand::WorkspaceScan`, replacing the
 TypeScript-orchestrated, multi-message v3 generation protocol for every
 workspace on v4. TypeScript's role is reduced to sending one command,
-applying readiness from the resulting events, and serving the 18 query
+applying readiness from the resulting events, and serving the registered query
 operations from the native structural store (decision 26) plus the
 unchanged SQLite catalog/lexical/semantic sidecars.
 
@@ -120,7 +120,7 @@ found and fixed in `docs/evidence/2026-09-03-v4-p3-5-daemon-latency.md` §4.1.
    cold-producer **classification repair** (P1-D-h) runs here: a
    `core:call`/`inherits`/`implements` row whose identity claims `confirmed`
    but whose target subject cannot be interned (a class/interface member —
-   the cold entity producer only materializes module-level declarations) is
+   the pre-fold cold producer only materialized module-level declarations) is
    downgraded to the canonical `possible` row (parallel read-only plan,
    sequential apply, then rebucket); 31,917 rows on n8n, 0.13-0.16 s
    (`docs/evidence/2026-09-05-v4-final-measurements.md` §2).
@@ -152,7 +152,9 @@ relation-subject key (the resolved entity's raw `record_id` bytes);
 artifact ids and could never match a from-scratch oracle, see "Central
 correctness finding"); `chained_record_id = sha256("urdira:v4-record-chain:v1\0" || record_digest || predecessor_record_id)`;
 `capability_state_digest`/`source_observation_watermarks` placeholders; and
-`span_start_line`/`span_end_line` always `0`.
+`span_start_line`/`span_end_line` populated by the source line index
+where a source span exists. Earlier zero-valued presentation spans were
+replaced by the line-number and declaration-span work.
 
 ### Measured cold performance (n8n corpus, 14,082 JS/TS owners)
 
@@ -234,8 +236,8 @@ of crashing the whole daemon (P4-b-prep §1); an outdated database is moved
 aside to `*.v3.stale-<timestamp>/` and re-bootstrapped (P4-a §2). Status
 surfaces (P4-d): `core:index_status` carries `storage_format`,
 `structural{queryable_generation,durable_generation,queryable}`,
-`lexical{completed_generation,current}`, `semantic{...,current}` (always
-`false` for v4 — semantic maintenance is not wired), `last_scan{kind,
+`lexical{completed_generation,current}`, `semantic{...,current}` (derived
+from the wired semantic materialization and its generation/provider marker), `last_scan{kind,
 changed_paths,timings,timeline}`, `search_text_ready`, `search_semantic_ready`;
 `core:status` exposes `daemon_epoch_ms_offset`; MCP/CLI/web render the lanes.
 
@@ -263,8 +265,9 @@ changed_paths,timings,timeline}`, `search_text_ready`, `search_semantic_ready`;
   exported surface is computed before/after; if the pre-edit surface is a
   subset of the post-edit surface (pure additions), the affected set narrows
   to the literal edited paths, otherwise the full reverse-import closure is
-  kept. Accepted residual: an importer with an already-unresolved import that
-  a new export now satisfies stays unresolved one generation longer.
+  kept. Later pending-importer, barrel, ambient-global and written-type
+  surface tracking closes the stale-importer gaps; the original one-generation
+  unresolved-import delay is not the current contract.
 - **`CandidateIndex`** (P3-6 §2): per-project reverse index `candidate path →
   importers whose specifier could resolve to it` (every extension/`index`
   variant of every relative/package/tsconfig strategy — deliberately an
@@ -306,7 +309,7 @@ changed_paths,timings,timeline}`, `search_text_ready`, `search_semantic_ready`;
 ### Reconcile: git-aware catch-up (`ScanScope::Reconcile`)
 
 A third `ScanScope`, alongside `Full` and `Changed` (added 2026-09-06,
-Frente E; full mechanism and bug history in "Historial de cambios" below).
+Frente E; full mechanism and bug history in "Change history" below).
 Where `Changed` trusts the caller's own path list, `Reconcile` carries no
 data at all: `scan.rs::run_reconcile` always performs a fresh authoritative
 walk (the same `catalog::enumerate`/`catalog::diff` primitives `Full`
@@ -336,7 +339,7 @@ instead of an unconditional `Full`.
   generation), re-walking rather than reusing a possibly-stale enumeration;
   `reconcile.fell_back_to_cold` distinguishes this from a size-driven `Cold`
   decision.
-- **Content-hash equivalence** (2026-09-06 fix, in "Historial de cambios"):
+- **Content-hash equivalence** (2026-09-06 fix, in "Change history"):
   a uri is `equivalent` (never `changed`) based on `content_hash` alone,
   not also a metadata digest (mtime/ctime/inode/...) — a `touch`, a `git
   stash` round trip, or an index-pack import that copies an already-indexed
@@ -442,69 +445,39 @@ be the corruption's cause (see "Open items").
 
 ### Consequences
 
-- Every one of the 18 public query operations that touches structural data
-  is served from the native store for a v4 workspace once `structural_ready`;
-  no v3 candidate-publication SQL path exists for v4 at all.
-- Cold indexing at n8n scale is ~20x faster than the v3 baseline (560 s →
-  27.7 s median) but 2.5-3.7x over the plan's own cold gates; this decision
-  claims the trajectory, not the gate.
-- Incremental compute is sub-second in the worker for every mutation kind;
-  what a user observes through the daemon is 1.3 s p50 to queryable, with a
-  long durable tail that is not yet explained.
-- Create/delete/rename are provably equivalent to a from-scratch scan;
-  edit is equivalent to a from-scratch rebuild over the store's visible
-  keys, by design.
-- v4 is the default for new workspaces; the v3 pipeline is still compiled,
-  shipped, and serving existing v3 workspaces.
+- Structural reads use the native store for a v4 workspace. Catalog, source,
+  lexical and vector methods use their own backing stores. Native pushdown
+  covers the indexed query shapes; exact fallback and resource errors remain
+  part of the query contract.
+- The retained n8n cold worker median is 23.369 seconds (wall 25.22 seconds),
+  and VS Code is 27.588 seconds (wall 29.96 seconds). These are not fresh
+  measurements of every subsequent resolver change. The cold and memory
+  gates remain unmet.
+- Worker-only increments have sub-second evidence for each mutation kind;
+  daemon-observed readiness and durable tails remain separate measurements.
+- Incremental/from-scratch comparison must distinguish logical record-set
+  equivalence from occurrence IDs chained through edit history (Decision 11).
+  The graph/dependency and logical-content oracles cover real checkout deltas,
+  barrels, ambient dependencies and written-type changes in the later campaign.
+- v4 is default for new workspaces. v3 remains compiled and serves existing
+  supported v3 workspaces; there is no automatic conversion.
 
-## Open items (reported, not resolved)
+## Open items and resolved historical findings
 
-1. ~~**CRITICAL — `identity_key` zeroing corruption (P2-2m).**~~ **FIXED**
-   2026-09-05 — see decision 26's changelog for the two root causes (a
-   short `write_at` and a concurrent sparse-file allocation race) and the
-   fix (`write_all_at` + up-front `materialize_real` allocation). Neither
-   the classification invariant nor Merkle verification are needed to
-   detect it any more, but neither would catch a future writer-level
-   corruption of the same shape (decision 27's own limitation is
-   unchanged).
-2. **Harness `spawn EBADF`.** `scripts/v4-mutation-harness.mjs`'s
-   `oracleVerify` crashed 2/2 at the final from-scratch oracle spawn, so
-   `roots_equal` was not verified through that harness in the final run
-   (root equality is covered by the pure-Rust n8n tests instead; final §4.4).
-3. **`pending.sites`/`entities.index` segment export not built** — superseded:
-   possible rows plus `jsts:unresolved_call` diagnostics deliver the same
-   visibility, and the residual pass derives its pending sites from the
-   possible rows themselves (P2-2i §10 records the remaining scope if the
-   literal export is still wanted).
-4. **Record volume — owner decision.** 637,530 possible `core:call` rows +
-   637,531 `jsts:unresolved_call` diagnostics are +1,276,972 records (+82%
-   over the 1,554,292 without them, 45% of the total). Removing them saves
-   +1.7-2.4 s materialize, +1.1-1.8 s write, and 0.2-1.7 GB RSS (§16.3), at
-   the cost of the query-visible "possible" relations and reason codes the
-   uncertainty contract (decision 28) now relies on. Not decided here.
-5. **`rpc_error` 13,737 parity-scoped (105,635 raw)** — decision 28.
-6. **Daemon durable tail**: the two 23-29 s `queryable_at`→`completed_at`
-   anomalies (final §4.4); and the 1.4-1.7 s daemon-observed vs 0.45-0.6 s
-   in-process worker gap (P3-5 §5.3).
-7. **Cold gates** (catalog, materialize, Queryable, ScanCompleted, RSS) — see
-   the gate table; remaining levers priced in §16.3/§17.5/§18.4/§18.6.
-8. **Existing-workspace migration** is unaddressed; **v3 deletion** (the v3
-   commands, candidate-publication SQL path, `MerkleRadixSet` writers,
-   `NativeStoreBuilder`, the Node semantic worker's checker lane) has not
-   happened — decision 22's cutover pattern.
-9. **Semantic maintenance is not wired for v4** (`semantic.current` is
-   always `false`; decision 26).
-10. Smaller: `parse_ms` ≤ 80 ms not met; `write_ms` > 60 ms on larger edits;
-    a `create` satisfying a broken import not rediscovered by the incremental
-    `ProgramIndex`; the first edit after cold pays 1.4-3.0 s; tsgo child RSS
-    during a residual pass never collected; `tests/v4-daemon-e2e.test.ts`
-    still uses `delete process.env.URDIRA_V4` to mean v3 (P4-b-2 §3);
-    `cargo fmt`/`clippy -D warnings` findings in `semantic_sites.rs`
-    (`PendingCallSite`/`PendingHeritageSite` unused fields, P4-b-2 §4) —
-    the final session's own workspace `clippy` run is reported clean (final
-    §5), so this may already be resolved.
+| Area | Status |
+|---|---|
+| Cold latency, materialization/write cost, memory | Measured targets remain unmet; see the gate table and [current evidence summary](../current-state.md). |
+| Daemon durable tail | Earlier end-to-end anomalies were not remeasured in this documentation refresh; worker-only gates do not close them. |
+| Residual checker | Opt-in, incomplete compiler parity; budgets and scoped unresolved cases are governed by Decision 28. |
+| Existing v3 workspaces | Supported by the retained route; automatic conversion and v3 removal are not implemented. |
+| Writer identity corruption | Fixed by complete writes and allocation before parallel writes; not an open current corruption claim. |
+| Mutation-harness `spawn EBADF` | Bounded retry implemented; the earlier failed harness run remains historical evidence. |
+| Pending sites and entity lookup sections | Persisted; included in the native store/pack path. |
+| Semantic maintenance | Wired end to end for v4, with native entity sourcing and generation/provider-bound completion. |
+| Pack daemon integration | Explicit export/import wired; destination reconcile is mandatory. Distribution infrastructure was closed by Decision 30. |
+| Pending imports / aliases / spans | Follow-up fixes implemented; the older missing-work claims are superseded by the September 6–9 evidence and regressions. |
 
-## Historial de cambios
+## Change history
 
 - **2026-09-05** (`docs/evidence/2026-09-04-v4-pending-sites-fold-and-member-entities.md`): the cold pipeline began materializing members, referenced parameters, catch/rest bindings, ambient-namespace and external entities directly, and unresolved call/heritage sites moved from a bare relation-plus-diagnostic pair into the `pending.sites` side table (decision 28 owns the semantics).
 - **2026-09-06** (Frente E, plan `generic-waddling-hartmanis.md` §2, `docs/evidence/2026-09-06-v4-reconcile-threshold.md`): added the third `ScanScope::Reconcile` mode — an always-authoritative walk that routes to the cheaper `Changed`-shaped path below a measured delta threshold (shipped at `RECONCILE_DELTA_THRESHOLD = 0.25`) or to `Full` at or above it, with an in-line `Cold` fallback on a failed `Delta` attempt; verified byte-identical roots to a from-scratch scan at every measured fraction. The threshold was re-measured and lowered to the current `0.01` the same week (§5 of the same evidence) — see "Reconcile" above for the current mechanism and value.
