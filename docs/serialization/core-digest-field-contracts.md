@@ -1,7 +1,7 @@
 # Core Digest Field Contracts
 
 Status: **Approved initial registry**  
-Last updated: 2026-08-08  
+Last updated: 2026-09-09  
 Depends on: [Universal data model](../decisions/01-universal-data-model.md) and [Urdira Canonical Encoding](urdira-canonical-encoding.md)
 
 ## Purpose and notation

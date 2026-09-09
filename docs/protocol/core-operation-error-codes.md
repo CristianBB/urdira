@@ -1,7 +1,7 @@
 # Core Operation Error Codes
 
 Status: **Approved initial registry**  
-Last updated: 2026-08-08  
+Last updated: 2026-09-09  
 Depends on: [Universal data model](../decisions/01-universal-data-model.md), [Query algebra and public API](../decisions/03-query-algebra-public-api.md), and [Semantic search and ranking](../decisions/06-semantic-search-ranking.md)
 
 ## Registry contract
@@ -222,3 +222,12 @@ for the full root-cause analysis and before/after measurements.
 | `core:non_subject_operation` | A status/administrative operation (`core:index_status`) was named as a `core:query` pipeline or recipe stage. It never emits `ResultSubject`-shaped stream items, so it cannot be bound like a subject-producing operation; call it as the top-level `core:index_status` RPC instead. | no | `correct_pipeline`, `inspect_index_status` | `operation_id`, `reason_code` |
 
 `core:non_subject_operation.reason_code` is exactly `not_subject_producing`.
+
+## Amendment 2026-09-06 (Frente S-A, semantic search wired end to end in v4)
+
+One code added for `core:semantic_affected_page` (see the [public query
+contract](public-query-contract.md#coresemantic_affected_page)).
+
+| Code | Description | Retryable | Recovery actions | Details fields |
+|---|---|---|---|---|
+| `core:affected_set_stale` | A `core:semantic_affected_page` cursor or `affected_artifact_set_id` names a set that no longer matches the workspace's current affected-document set (a scan or semantic materialization pass advanced underneath the caller). Never served as a mixed or partial page. | no | `reexecute_query`, `inspect_semantic_coverage` | `current_set_id` |

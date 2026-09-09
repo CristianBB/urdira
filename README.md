@@ -105,6 +105,56 @@ pipeline described below instead; this opt-out is intended for one release.
 Neither format is migrated into the other automatically -- a workspace keeps
 whichever format it was created with until it is removed and re-added.
 
+## Current state: v4 default, v3 legacy
+
+A newly registered workspace uses the v4 structural store described above by
+default. v4 adds, over the v3 pipeline documented later in this file:
+
+- **Reconcile scans.** A git checkout/pull/branch switch, or a watcher event
+  the daemon cannot safely interpret as an exact changed-file list, triggers
+  a `reconcile` scan instead of a guessed incremental one. Reconcile always
+  re-derives the true delta from one authoritative walk, treats a
+  content-identical file (same hash, stale mtime) as a no-op, and republishes
+  through the cheaper delta pipeline when the delta touches at most 1% of the
+  workspace (`RECONCILE_DELTA_THRESHOLD`, overridable with
+  `URDIRA_V4_RECONCILE_THRESHOLD`) or through a full rescan otherwise.
+  `core:index_status` reports the outcome in `last_scan.reconcile`;
+  `urdira reindex` always forces a full rescan.
+- **A background residual type-checker pass.** The bundled JavaScript/TypeScript
+  engine resolves most call, inheritance, and implements relationships locally
+  and unconditionally; what it cannot resolve without full type-flow analysis
+  is recorded as `possible` (with candidates) and later confirmed by a
+  background pass that runs the pinned TypeScript checker outside the
+  indexing critical path.
+- **Semantic search wired end to end.** Documents are split into token-bounded
+  segments and embedded per matched entity segment, with per-document status,
+  a coverage summary, and a segment cache exposed through `core:index_status`
+  and dedicated coverage/affected-page operations. `URDIRA_SEMANTIC_WORKERS`
+  bounds maintenance concurrency; an HTTP embedding provider is available
+  through `URDIRA_EMBEDDINGS_ENDPOINT`/`_MODEL`/`_DIMENSIONS`/`_API_KEY` (and
+  batching/limit knobs) as an alternative to the bundled local model.
+- **Orphaned workspace data detection.** `urdira workspace orphans` lists
+  structural or sidecar data left behind by an interrupted operation;
+  `urdira workspace orphans purge` (or `--all`) removes it. A sweep runs
+  automatically at daemon startup.
+- **Native query pushdown.** Query operations that reduce to an index lookup
+  over the structural store (identity lookups, kind-scoped listing, impact
+  analysis, related-test discovery, architecture inspection, and more) are
+  answered by the compiled Rust structural store directly instead of a
+  JavaScript scan; a record-scoped selector shape the store has no index for
+  is rejected explicitly (`core:selector_unresolvable`) rather than served by
+  an unbounded scan.
+- **A v4 index pack.** `core:index_pack_export`/`workspace-add --index-pack`
+  operate on the native structural store directly, re-keying `workspace_id`
+  on import and always running a `reconcile` scan afterward.
+
+Both formats share the same public MCP tools, CLI commands, and query
+contract. See [docs/architecture.md](docs/architecture.md) for the full v4
+pipeline (catalog, analyze, materialize, publish, reconcile, residual pass,
+lexical/semantic sidecars) and the retained v3 pipeline, and
+[docs/versioning.md](docs/versioning.md) for the v3/v4 compatibility and
+bump policy.
+
 ## Quick start
 
 Preview registration before changing local Urdira state:
@@ -381,6 +431,11 @@ construction, and frozen index status. See the
 [public query contract](docs/protocol/public-query-contract.md) and
 [MCP adapter contract](docs/protocol/mcp-adapter-contract.md).
 
+Text rendering is compact by default (no inline source snippet per match); an
+opt-in `snippet_lines` request field (0-3, default 0) adds a bounded literal
+excerpt per matched line for a client that wants it, at the cost of a larger
+response.
+
 Agents should first call `urdira_index_status` with the exact workspace root,
 then reuse its returned `query_scope` object byte-for-byte on every
 source-reading request. A returned cursor is opaque and must be continued with
@@ -404,6 +459,70 @@ arguments receive the complete upstream set, while scalar arguments require
 exactly one item. The same essential guidance is repeated in the
 `urdira_query` tool and pipeline schema descriptions for clients that do not
 surface server-level instructions.
+
+### The v4 pipeline, by crate
+
+The v4 scan described above runs cold and incremental generations inside one
+persistent per-workspace `urdira-indexing-worker` Rust process: catalog
+(parallel walk, hash, CAS put; `urdira-source-frontier`) -> parse
+(`urdira-jsts-syntax-worker`, an Oxc-based analyzer) -> facts and semantic
+resolution (the hybrid resolver plus the `urdira-jsts-typeflow` declared-types
+index) -> materialize -> immutable segment write (`urdira-structural-store`)
+-> SQLite catalog/snapshot publish, with the optional residual pass driven by
+`urdira-tsgo-client`. See [the current architecture map](docs/architecture.md)
+for the full flowchart and [v4 structural store](docs/decisions/26-v4-structural-store.md)
+through [v4 Rust-owned scan pipeline](docs/decisions/29-v4-rust-owned-scan-pipeline.md)
+for the normative decisions.
+
+Reference measurements from one Apple-silicon development host on 2026-09-09
+(engineering evidence, not a release P95 claim): a cold index of the n8n
+repository reaches queryable in 23.4 seconds; a no-op `git pull` reconcile
+completes in about 1.0 second; a cold index of the VS Code repository
+(4.48M records) reaches queryable in 30.0 seconds, with `find_references`
+answering in 0.4 seconds once warm; a complete semantic materialization of
+n8n takes 35-37 minutes end to end, dominated by ONNX embedding rather than
+indexing, after which `search_semantic` answers at a 135 ms p99 and
+`search_hybrid` at a 178 ms p99. See `docs/evidence/2026-09-0{6,7,8}-*.md` for
+the full campaign.
+
+## CLI command reference
+
+The closed CLI catalog (`packages/cli/src/index.ts`) accepts these commands,
+each requiring `--dry-run` or `--confirm` unless marked read-only or direct:
+
+| Category | Commands |
+|---|---|
+| Query (read-only) | `urdira status`, `urdira index`, `urdira query` |
+| Workspace | `urdira workspace list \| show <id> \| add <path> [--index-pack <file>] \| configure <id> \| remove <id> \| purge <id>`, `urdira workspace orphans` (read-only), `urdira workspace orphans purge [--all]` |
+| Codebase | `urdira codebase list \| create <name> \| rename <id> <name> \| assign <workspace> <codebase> \| unassign <workspace> \| remove <id>` |
+| Daemon (direct, no dry-run/confirm) | `urdira daemon start \| stop \| restart` |
+| Maintenance | `urdira config set [workspace] --value <json>`, `urdira repair [workspace]`, `urdira gc`, `urdira reindex [workspace]`, `urdira index-pack-export <workspace> [out] --out <file>` |
+| Agent integration | `urdira agent status \| install --client <name> \| uninstall --client <name> \| hook` |
+| Services (foreground) | `urdira mcp`, `urdira web` |
+
+`urdira workspace orphans` and `orphans purge` sweep the data root for
+structural/sidecar directories left behind by an interrupted operation; the
+daemon also runs the same sweep automatically at startup and reports a count
+and byte total in `urdira status`'s `orphaned_workspace_data`. Every
+destructive command supports `--json` and `--debug-timing`; see
+[the workspace administration contract](docs/protocol/workspace-administration-contract.md)
+for the full request/response shape of each RPC these commands call.
+
+## Environment variables
+
+Grouped by concern; unlisted internal tuning and differential-oracle switches
+are not part of the public contract and may change without notice.
+
+| Group | Variables |
+|---|---|
+| Data root and runtime | `URDIRA_DATA_ROOT`, `URDIRA_ENDPOINT`, `URDIRA_ENGINE_BUILD_ID`, `URDIRA_WATCHER_BACKEND` |
+| v4 indexing | `URDIRA_V4` (`0` opts a new workspace into v3), `URDIRA_V4_RECONCILE_THRESHOLD`, `URDIRA_V4_RESIDUAL`, `URDIRA_V4_RESIDUAL_BUDGET_MS`, `URDIRA_TSGO_BINARY`, `URDIRA_INDEXING_CORE_WORKER_PATH`, `URDIRA_INDEXING_CORE_TIMEOUT_MS` |
+| Scan and analysis performance | `URDIRA_CAS_PUT_CONCURRENCY`, `URDIRA_SCAN_BUDGET_MS`, `URDIRA_SCAN_IO_CONCURRENCY`, `URDIRA_CATALOG_HANDOFF_BYTES`, `URDIRA_ANALYSIS_WORKERS`, `URDIRA_STRUCTURAL_CONCURRENCY`, `URDIRA_SEAL_DIGEST_WORKERS` |
+| Lexical and semantic sidecars | `URDIRA_LEXICAL_INDEX`, `URDIRA_LEXICAL_OWNED_BY_RUST`, `URDIRA_SEMANTIC_INDEX`, `URDIRA_SEMANTIC_WORKERS`, `URDIRA_SEMANTIC_EMBED_BATCH`, `URDIRA_LOCAL_EMBEDDINGS_MODEL`, `URDIRA_LOCAL_EMBEDDINGS_DTYPE` |
+| Optional HTTP embedding provider | `URDIRA_EMBEDDINGS_PROVIDER`, `URDIRA_EMBEDDINGS_ENDPOINT`, `URDIRA_EMBEDDINGS_API_KEY`, `URDIRA_EMBEDDINGS_MODEL`, `URDIRA_EMBEDDINGS_DIMENSIONS`, `URDIRA_EMBEDDINGS_MAX_BATCH_INPUTS`, `URDIRA_EMBEDDINGS_MAX_INPUT_TOKENS` |
+| Native addon and workers | `URDIRA_NATIVE_REQUIRED`, `URDIRA_NATIVE_ROOT`, `URDIRA_NATIVE_ADDON_PATH`, `URDIRA_WORKER_PROTOCOL_VERSION` |
+| Index pack and fork | `URDIRA_INDEX_PACK`, `URDIRA_INDEX_PACK_VERIFY`, `URDIRA_INDEX_PACK_STREAM_VERIFY`, `URDIRA_WORKSPACE_FORK` |
+| Diagnostics | `URDIRA_DEBUG_TIMING` (also `urdira daemon start --debug-timing`), `URDIRA_STORAGE_DEBUG_TIMING` |
 
 ## Benchmark evidence
 
@@ -515,7 +634,7 @@ One bounded continuation drains several owner-delimited streams instead of
 performing one synchronous process round trip per owner. Those continuations
 carry Rust-sealed canonical record and dependency rows, not nested JavaScript
 object graphs or producer-owned staging columns. The host keeps those rows
-opaque: native API v16 reparses their exact canonical text, checks the target
+opaque: native API v17 reparses their exact canonical text, checks the target
 record definitions and emits compact accepted fields plus typed staging rows.
 Only the core-owned result can enter candidate staging; producer preseal is
 never acceptance authority.
@@ -523,7 +642,7 @@ The rule is shared by cold and incremental generations. Directory capture hashes
 source once, validates its filesystem boundary before and after the read, and
 hands a canonical prefix of up to 64 MiB of those exact bytes to CAS without
 reopening the source; remaining reads use eager registration and eight I/O
-lanes. For every Rust-owned structural generation, native API v16 also seals the exact
+lanes. For every Rust-owned structural generation, native API v17 also seals the exact
 typed record-publication scalars and UCE body bytes carried by those streams.
 SQLite promotes them into invisible candidate staging with fixed set-based SQL
 and publishes atomically. Progressive initial successors can use the same
@@ -557,7 +676,10 @@ and explicit portable import/export use bounded Protobuf-ES chunks; JSON is
 limited to configuration and MCP text/opaque references. Boundary telemetry
 records bytes read, transferred, copied, decoded, and retained.
 
-Mandatory native cutover requires the closed qualification campaign: exactly
+This qualification campaign gates the v3 Rust indexing-core cutover
+specifically; it does not gate the v4 structural store, which has its own
+[decisions](docs/decisions/26-v4-structural-store.md) and
+[evidence](docs/evidence/) trail. Mandatory native cutover requires the closed qualification campaign: exactly
 three counterbalanced runs on both `darwin-arm64` and `linux-x64-gnu`, with
 full/incremental digest equivalence, checksummed process-tree RSS evidence, all
 absolute tier-L limits, and the 25/40/25 improvement gates. The reproducible
@@ -595,11 +717,15 @@ URDIRA_RELEASE_TARGET=<host-target> pnpm package:release
 URDIRA_RELEASE_TARGET=<host-target> URDIRA_SKIP_INSTALL=1 pnpm release:acceptance
 ```
 
-`pnpm verify` checks architecture boundaries, lint, the complete test suite,
-coverage and critical branch thresholds, typechecking, generated-contract
-consistency, documentation links, local-path leaks, and public-repository
-hygiene. Release steps and external prerequisites are documented in
-[docs/release.md](docs/release.md).
+`pnpm verify` runs, in order, `check:architecture`, `build:native-artifacts`
+(the compiled addon plus the release `urdira-indexing-worker` build),
+`check:native` (`cargo fmt`/`clippy`), `test:native` (the Rust workspace test
+suite, including the `urdira-tsgo-client`/`urdira-indexing-worker` residual
+suites, which need `URDIRA_TSGO_BINARY`), `lint`, `test:coverage`, `typecheck`,
+`check:coverage-gate`, and `check:publication` (documentation links,
+local-path leaks, and public-repository hygiene). Release steps and external
+prerequisites are documented in [docs/release.md](docs/release.md) and
+[AGENTS.md](AGENTS.md#verification-commands).
 
 `pnpm preflight:windows` is the focused cross-platform gate for portable
 filenames, a real staged-file round trip, Windows path and IPC adapters,
@@ -610,6 +736,10 @@ The workspace-v3 and fixed publication SQL authorities live under
 `pnpm generate:workspace-sql`; the generated TypeScript wrappers and Rust
 constants are checked by the digest tests.
 
+The following native-cutover figures describe the v3 pipeline's own qualification
+history (the [current state](#current-state-v4-default-v3-legacy) section above
+has the current v4 reference measurements); they remain accurate for v3
+workspaces and the release gates in [docs/release.md](docs/release.md).
 The current bounded n8n qualification remains open. The post-cutover 8/32/128
 owner runs are exact and reconcile within five percent. Production structural
 indexing uses one Rust composition-worker generation for the syntax frontier
@@ -650,7 +780,7 @@ packages.
 flowchart TD
   Adapters["MCP and CLI"] --> Daemon["local daemon and IPC"]
   Daemon --> Engine["query, indexing, semantic, and workspace engine"]
-  Engine --> Infrastructure["SQLite, CAS, watchers, Git providers, model runtime"]
+  Engine --> Infrastructure["SQLite, native structural store, CAS,\nwatchers, Git providers, model runtime"]
   Infrastructure --> Foundation["contracts, Schema IR, logical digests, registries, plugin SDK"]
 ```
 

@@ -1,8 +1,17 @@
 # Final Architecture Consistency Audit
 
-Status: **Passed**  
+Status: **Passed** (dated snapshot; not re-run since)  
 Audited: 2026-08-08  
 Scope: every authoritative Urdira architecture, registry, protocol, taxonomy, and product-foundation document
+
+The counts and scope below are frozen to 2026-08-08 and predate the v4
+structural store, its decisions (26-30), and every registry addition made
+since (`core:semantic_affected_page`, `core:selector_unresolvable`,
+`core:non_subject_operation`, `core:affected_set_stale`, and others). This
+report is retained as evidence of that day's mechanical check, not as a
+current inventory; see [docs/architecture.md](../architecture.md) and
+[docs/product-foundation.md](../product-foundation.md) for the current
+specification index and counts.
 
 ## Authority
 

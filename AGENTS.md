@@ -134,6 +134,21 @@ Before handoff, run the complete gate:
 pnpm verify
 ```
 
+`pnpm verify` runs, in order: `check:architecture`, `build:native-artifacts`
+(`build:native` plus the release `urdira-indexing-worker` build), `check:native`
+(`cargo fmt --check` + `cargo clippy -D warnings`), `test:native` (`cargo test
+--workspace`, then the `urdira-tsgo-client`/`urdira-indexing-worker` `--ignored`
+suites, which require `URDIRA_TSGO_BINARY`, see below), `lint`, `test:coverage`
+(builds every package, then `vitest run --coverage`), `typecheck`,
+`check:coverage-gate`, and `check:publication`. On a memory-constrained machine
+run these stages one at a time instead of the combined `pnpm verify`, and set
+`CI=true` before any `vitest`-based stage (`test`, `test:coverage`): it caps
+`maxWorkers` at 2 and raises the test/hook timeouts, which is what keeps a
+loaded machine from producing spurious timeouts. Never poll for or wait on a
+background verify from another agent turn or subagent — a subagent cannot
+observe a job finishing after its own turn ends; resume it and check again
+instead.
+
 For release-facing changes, also run:
 
 ```bash
@@ -144,6 +159,42 @@ pnpm release:acceptance
 Coverage thresholds do not replace scenario tests. Critical canonical,
 publication, cursor, and security-policy behavior must retain the required
 branch coverage and adversarial cases.
+
+### Native builds and `NATIVE_API_VERSION`
+
+`cargo test -p urdira-tsgo-client`'s `--ignored` suites and
+`urdira-indexing-worker`'s residual tests need `URDIRA_TSGO_BINARY` pointing at
+the pinned `@typescript/typescript-<platform>` `tsc` binary inside
+`node_modules/.pnpm` (see `test:native` in `package.json` for the exact glob).
+After bumping `NATIVE_API_VERSION`, update all five literal sites listed in
+[docs/versioning.md](docs/versioning.md#checklist-for-bumping-native_api_version)
+and run `pnpm build:native` before `test:coverage` or `verify`; a stale
+prebuilt addon fails every native handshake closed instead of reporting a
+clear version mismatch.
+
+### Working in a git worktree
+
+Prefer a plain clone or `git worktree add` for isolated agent work. Two traps
+have caused repeated real breakage:
+
+- The worktree's root `node_modules` is a symlink into the main checkout's
+  pnpm store, not a real pnpm install. Per-package `node_modules/@urdira/*`
+  links must point INSIDE the worktree, not back at the main checkout's
+  packages — an agent that runs its own install from inside the worktree can
+  redirect those links onto the main checkout by mistake. If a link points at
+  the wrong tree, delete the broken link and reinstall with
+  `CI=true pnpm install --offline --frozen-lockfile` rather than a bare
+  `pnpm install`.
+- `CARGO_TARGET_DIR` should be shared across worktrees (point it at one
+  directory outside any worktree) so parallel agents do not each build a full
+  30-50 GB Rust target tree. After a `git reset` in a worktree, remove any
+  stale `dist/` output and `*.tsbuildinfo` files before rebuilding — leftover
+  build artifacts from before the reset can mask a real compile failure.
+
+Record what changed and what was measured for a performance- or
+integrity-sensitive front as a dated file under `docs/evidence/` (one file per
+front, named `YYYY-MM-DD-<front>.md`), even when the work does not land in the
+same commit as the evidence file.
 
 ## Handoff checklist
 

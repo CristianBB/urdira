@@ -1,7 +1,7 @@
 # Versioning Policy
 
 Status: Approved (policy set by the project owner, 2026-08-13)
-Last updated: 2026-08-19
+Last updated: 2026-09-04
 
 This document defines when a version number in this repository takes a major,
 minor, or patch bump, and what a bump of the JS/TS analyzer plugin version
@@ -142,3 +142,31 @@ no-op the instant that file already exists) -- it is not a migration:
 No default flip or existing-workspace migration path existed before this
 note (decision 29's own "Open items" listed the flip as outstanding for P4);
 migration of already-registered v3 workspaces onto v4 remains unaddressed.
+
+## Checklist for bumping `NATIVE_API_VERSION`
+
+`NATIVE_API_VERSION` (`packages/native/src/loader.ts`) identifies the native
+addon/worker handshake shape used by the Rust structural kernel
+(`crates/urdira-native-node/src/lib.rs`). Unlike the plugin version above, it
+has no single source of truth read across every boundary: the value is
+duplicated as a literal in five places, and a bump that updates only some of
+them fails closed with "Rust semantic bridge structural kernel binding is
+incompatible" (observed live during the S-I bump from 16 to 17, when the
+semantic-worker literal was left behind). Every bump must update all five in
+the same change:
+
+1. `packages/native/src/loader.ts` — the canonical constant, checked against
+   the addon binding, offline manifest, and build-id computation.
+2. `crates/urdira-native-node/src/lib.rs` — the Rust-side `NATIVE_API_VERSION`
+   constant returned by the addon's `nativeApiVersion()` export.
+3. `scripts/package-npm.mjs` — packaging-time manifest literal.
+4. `scripts/native-release.mjs` — release-artifact manifest literal.
+5. The semantic child-process handshakes in
+   `packages/plugin-javascript-typescript/src/rust-semantic-worker.ts` and
+   `packages/plugin-javascript-typescript/src/semantic-process-worker.ts`,
+   which cannot import the shared constant across the child-process boundary
+   and duplicate it as a literal instead.
+
+After bumping, `pnpm build:native` must rebuild the addon and worker before
+`pnpm verify`/`pnpm test:coverage` run, or the stale prebuilt binary will
+still advertise the old version and every handshake will fail closed.

@@ -1,7 +1,7 @@
 # Urdira Product Foundation
 
 Status: Current product contract
-Last updated: 2026-08-25
+Last updated: 2026-09-09
 
 ## Purpose of this document
 
@@ -45,18 +45,33 @@ current architecture.
 | 23 | Cross-machine index pack bootstrap | Approved and implemented | [Index pack](decisions/23-index-pack.md) |
 | 24 | Local web interface | Approved and implemented | [Local web interface](decisions/24-local-web-interface.md) |
 | 25 | Rust native acceleration | Approved | [Rust native acceleration](decisions/25-rust-native-acceleration.md) |
+| 26 | v4 immutable segment structural store | Approved and implemented; default for new workspaces since 2026-09-04 | [v4 structural store](decisions/26-v4-structural-store.md) |
+| 27 | v4 bucketed Merkle digest contract | Approved and implemented for v4 | [v4 Merkle bucket digests](decisions/27-v4-merkle-bucket-digests.md) |
+| 28 | v4 Rust semantic model: typeflow and the residual tsgo pass | Approved and implemented | [v4 Rust semantics and residual checker](decisions/28-v4-rust-semantics-and-residual-checker.md) |
+| 29 | v4 Rust-owned worker scan pipeline (cold and incremental) | Approved and implemented; default for new workspaces since 2026-09-04 | [v4 Rust-owned scan pipeline](decisions/29-v4-rust-owned-scan-pipeline.md) |
+| 30 | Index pack distribution (rule R20) | Closed 2026-09-07: no distributed pack-transport layer built | [Index pack distribution](decisions/30-index-pack-distribution.md) |
 
 The 2026-08-29 Rust indexing-core cutover is governed by the amendments in
 Decisions 21, 22 and 25 and the [structural indexing fast path](protocol/structural-indexing-fast-path.md).
-The accompanying handoff is evidence only and cannot override these current
+The 2026-09 v4 cutover (Decisions 26-29) replaces the v3 native pipeline's
+scan orchestration, structural storage, and digesting with a Rust-owned
+worker and its own mmap-served structural store for newly added workspaces,
+while leaving public query semantics, the MCP surface, and the decisions
+below unchanged; an already-registered v3 workspace keeps working as v3
+(`URDIRA_V4=0` opts a new workspace out). The accompanying handoff and
+evidence documents are evidence only and cannot override these current
 specifications.
 
 The order expresses dependency between current specifications. Decisions 21
 and 22 define the v3 native pipeline, relational authority, logical digests,
 and data-root boundary. Decision 23 defines optional verified index-pack
 bootstrap. Decision 25 defines mandatory bounded Rust library and worker
-boundaries without changing SQLite or public-query authority. The [current architecture](architecture.md) maps these contracts to
-the production composition roots.
+boundaries without changing SQLite or public-query authority. Decisions 26-29
+define the v4 structural store, its Merkle digest contract, its Rust-owned
+typeflow/residual semantic model, and its Rust-owned scan pipeline
+(cold, incremental, and git-reconcile scopes). The [current architecture](architecture.md) maps these contracts to
+the production composition roots, and [versioning](versioning.md) records the
+v4 index-contract bump and default-format flip.
 
 `decisions/01-universal-data-model.md` is the complete inventory and source of truth for shared logical model names and shapes. Operation-specific public argument schemas are linked from that inventory to the single authoritative [Public query contract](protocol/public-query-contract.md); no document may define a parallel or legacy variant.
 
@@ -72,6 +87,7 @@ Stable registries governed by the decision specifications are documented separat
 | Core candidate issue codes | Approved initial registry | Universal data model | [Core candidate issue codes](indexing/core-candidate-issue-codes.md) |
 | Core semantic registry | Approved initial registry | Semantic search and ranking | [Core semantic registry](semantic/core-semantic-reasons.md) |
 | Urdira v3 native pipeline and logical digests | Approved and implemented | Native pipeline and relational storage | [Native pipeline and relational storage](decisions/21-native-pipeline-relational-storage.md) |
+| Urdira v4 structural store, Merkle digests, and Rust-owned scan pipeline | Approved and implemented; default for new workspaces | v4 structural store; v4 Rust-owned scan pipeline | [v4 structural store](decisions/26-v4-structural-store.md), [v4 Merkle bucket digests](decisions/27-v4-merkle-bucket-digests.md), [v4 Rust-owned scan pipeline](decisions/29-v4-rust-owned-scan-pipeline.md) |
 | Logical digest field contracts | Current logical registry | Native pipeline and relational storage | [Core digest field contracts](serialization/core-digest-field-contracts.md) |
 | Logical schemas | Current logical registry | Native pipeline and relational storage | [Core canonical schemas](serialization/core-canonical-schemas.md) |
 | Logical comparators | Current logical registry | Native pipeline and relational storage | [Core canonical comparators](serialization/core-canonical-comparators.md) |
@@ -318,6 +334,7 @@ The agent launches only `urdira mcp`. This command directly serves the MCP inter
 The approved MCP surface is:
 
 - `urdira_query`: execute an individual operation, composed pipeline, or named investigation recipe.
+- `urdira_context`: convenience wrapper over `core:build_context` with a structural wait default.
 - `urdira_analyze_change`: analyze an existing or hypothetical change through a focused schema.
 - `urdira_build_context`: build a bounded context package for a coding task.
 - `urdira_index_status`: report repository, revision, capability, and freshness information.
@@ -599,7 +616,7 @@ Relational persistence, native worker transfer, and incremental logical digest c
 
 ## Contract maintenance
 
-The 25 linked specifications collectively define the current implemented and
+The 30 linked specifications collectively define the current implemented and
 approved architecture. Exact compiler/runtime versions, supported release targets, and
 benchmark corpus commits are recorded in release manifests and evidence.
 

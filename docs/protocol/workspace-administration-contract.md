@@ -33,11 +33,20 @@ snapshot untouched.
 The watcher is created only after both confirmation steps. One serialized
 watcher is retained per workspace and restored by the daemon. Git `HEAD` and
 worktree administration events preserve the workspace identity, stale the
-previous snapshot, and schedule one full reconciliation. Overflow, provider
-reset, or lost events widen to a full reconciliation before freshness is
-reported. On macOS the watcher uses the native `kqueue` backend rather than
-FSEvents, preventing client-queue drops during large indexing operations; the
-same inclusion exclusions apply to either native backend.
+previous snapshot, and schedule one reconciliation scan. Overflow, provider
+reset, or lost events widen to that same reconciliation before freshness is
+reported. For a v4 workspace, reconciliation is `ScanScope::Reconcile`: the
+worker measures the authoritative delta against the current frontier and
+republishes through the cheap incremental pipeline when it stays under
+`RECONCILE_DELTA_THRESHOLD` (`0.01` of the frontier), only falling back to a
+full rescan when the delta crosses that threshold or the incremental attempt
+itself fails (see [current architecture](../architecture.md)); a v3 workspace
+always widens to a full reconciliation. On macOS the watcher uses the native
+`kqueue` backend rather than FSEvents for a workspace under roughly 2,000
+files, preventing client-queue drops during large indexing operations; a
+larger workspace uses the `fs-events` backend instead so `kqueue`'s per-file
+descriptor budget cannot be exhausted. The same inclusion exclusions apply to
+every native backend.
 
 ## Administrative listing and Codebases
 
@@ -74,5 +83,18 @@ selects the most-specific containing Workspace; its returned query scope must
 be copied into each agent or web query rather than stored as global state.
 
 Workspace removal retains the existing recoverable tombstone. Physical purge
+of one named removed workspace (`workspace purge`, `core:workspace_purge`)
 remains a separate destructive operation and is never implied by removing a
 Workspace from the local UI.
+
+## Orphaned workspace data
+
+`workspace orphans` (`core:workspace_orphans_list`, read-only) reports
+on-disk workspace footprints -- the catalog database plus its v4
+`.structural`/`.sidecar` directories or v3 sibling files -- that have no
+active or tombstoned workspace registration pointing at them, typically left
+behind by a crash between deleting the registration and deleting its data. A
+periodic sweep runs the same detection at daemon startup. `workspace orphans
+purge` (`core:workspace_orphans_purge`, destructive) removes one or every
+listed orphan's complete on-disk footprint; it never touches a registered or
+tombstoned workspace's data.

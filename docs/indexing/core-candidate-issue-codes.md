@@ -8,6 +8,8 @@ Governing model: [Universal data model](../decisions/01-universal-data-model.md)
 
 This registry defines every initial `core:*` `CandidateIssueCodeDefinition` accepted by `CandidateIssue`. Candidate issues describe indexing control-plane attempts and never replace source-owned `DiagnosticRecord` knowledge. Payloads are closed: fields not listed for the selected code are rejected.
 
+This registry governs the v3 candidate lifecycle (`packages/engine/src/candidate-indexer.ts`, `fact-delta.ts`) only. A v4 workspace's Rust-owned scan pipeline (`crates/urdira-indexing-worker/src/v4/`) has no separate planning/analysis/validation candidate phases and never emits `CandidateIssue` records; a v4 scan failure is instead reported through `IndexingEvent::Error` and, for a first scan, the workspace's `degraded` status with `last_scan_error`/`last_scan_error_code` (see [current architecture](../architecture.md)).
+
 Every definition has `definition_revision: 1`, `schema_version: 1`, and `lifecycle_state: active`; `plugin_owner`, deprecation, retirement, and replacement fields are omitted. The exact trigger column is the normative `description`, including the condition under which the code may be emitted and the event it must not be generalized beyond.
 
 Common field types:

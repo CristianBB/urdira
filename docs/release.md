@@ -436,14 +436,25 @@ five-target matrix builds and executes the Rust closure on `darwin-arm64`,
 only that target's verified native files. Windows also runs the focused
 portability preflight.
 
-Native binding API v16 is the minimum compatible private handshake. It retains
-the Rust-sealed typed structural-publication projection and exact UCE body
-payload, adds independent receiving-core validation of opaque canonical
-FactDelta rows, and adds the closed native observation-profile dispatcher.
-Semantic process protocol 1.9 requires `structuralObservationBatch`; older
-addons are rejected before work. Release packaging and acceptance must reject a v15 binding
-rather than silently reconstructing nested rows in the host or selecting the
-typed publication lane with an incomplete native contract.
+Native binding API v17 is the required exact private handshake
+(`NATIVE_API_VERSION` in `packages/native/src/loader.ts` and
+`crates/urdira-native-node/src/lib.rs`; the loader rejects any other value,
+older or newer, before work). It retains the Rust-sealed typed
+structural-publication projection and exact UCE body payload, independent
+receiving-core validation of opaque canonical FactDelta rows, the closed
+native observation-profile dispatcher, and the resident vector top-K kernel
+used by the semantic query path. Semantic process protocol 1.9 requires
+`structuralObservationBatch`; older addons are rejected before work. Release
+packaging and acceptance must reject a mismatched binding version rather than
+silently reconstructing nested rows in the host or selecting the typed
+publication lane with an incomplete native contract.
+
+A v4-format workspace (the default for newly added workspaces since
+2026-09-04; see `versioning.md`) additionally requires the `urdira-indexing-worker`
+Rust binary to run its scan pipeline. `scripts/native-release.mjs` packages it
+under `indexing_core_worker` in the platform archive; the daemon discovers it
+as a sibling of the verified syntax worker or through
+`URDIRA_INDEXING_CORE_WORKER_PATH`.
 
 Required outcomes:
 
@@ -521,10 +532,12 @@ is an advisory budget for this admission decision: a sample that exceeds it is
 not rejected when its agreed time gate and exact-output checks pass, but the
 measured overage remains release evidence and an optimization item.
 
-The native staging helper copies `urdira-indexing-worker` when that optional
-composition binary is present. Existing platform manifests remain compatible;
-the daemon discovers the binary as a sibling of the verified syntax worker or
-through `URDIRA_INDEXING_CORE_WORKER_PATH`.
+The native staging helper copies `urdira-indexing-worker` into the platform
+archive when the build produced it (`indexing_core_worker` in
+`scripts/native-release.mjs`); see the v4 packaging note above for binary
+discovery. Since v4 is now the default format for new workspaces, a release
+build must run `pnpm build:native` with the `urdira-indexing-worker` crate
+included so the archive is not missing it.
 
 ## Rollback
 

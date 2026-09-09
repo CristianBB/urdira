@@ -10,7 +10,7 @@ This file is the authoritative initial registry for core semantic projection kin
 
 A semantic reason explains one artifact eligibility or coverage state. It does not replace a source diagnostic, private `CandidateIssue`, or operation error. A reason with `completeness_reason_code` degrades query completeness exactly through that paired definition. A reason without that mapping describes an intentional scope decision and cannot degrade completeness.
 
-No initial `EmbeddingProfile` is registered yet. The default local profile will be added only after model evaluation; the profile schema and activation rules are already approved.
+Embedding profile identity is derived, not hand-registered: `core:onnx-<model>-<dimensions>` for the default local ONNX provider (`packages/embedding-local/src/index.ts`, default model `Xenova/all-MiniLM-L6-v2`, e.g. `core:onnx-xenova-all-minilm-l6-v2-384`), `core:http-<model>-<dimensions>` for the HTTP-backed provider (`packages/engine/src/semantic-provider.ts`, configured through the `URDIRA_EMBEDDINGS_*` environment variables), and the fixed deterministic `core:local-hash-256-v1` fallback profile. Model assets are acquired only through an explicit administrative configuration operation and never at startup, index, query, or replay time ([decision 18](../decisions/18-semantic-model-provisioning.md)).
 
 ## Projection kind definitions
 

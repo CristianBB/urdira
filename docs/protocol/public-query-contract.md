@@ -2,7 +2,7 @@
 
 Status: **Approved and implemented v3 contract**
 
-Last updated: 2026-08-23
+Last updated: 2026-09-09
 
 Depends on: [Universal data model](../decisions/01-universal-data-model.md) and [Query algebra and public API](../decisions/03-query-algebra-public-api.md)
 
@@ -204,6 +204,16 @@ For literal searches, path constraints and the normalized `include_generated`/`i
 
 Output is `candidates` plus mandatory semantic coverage views. Hybrid additionally uses the exact lexical lanes defined by its ranking profile. Neither operation accepts profile IDs, scores, weights, top-k truncation, or approximate mode; all results are represented in persistent pageable order.
 
+### `core:semantic_affected_page`
+
+| Field | Presence | Exact meaning |
+|---|---|---|
+| `affected_artifact_set_id` | required identifier | The coverage view's `affected_artifact_set_id`, naming one fixed set of documents a semantic materialization pass has not yet covered. |
+| `cursor` | optional | Continuation token for an earlier page of the same set. |
+| `limit` | optional non-negative integer | Page size bound. |
+
+Output is a single `semantic_affected_artifacts` stream of `SemanticAffectedArtifactPage` items (result label `affected_page`, evidence class `unclassified`), required frontier `semantic`. When `affected_artifact_set_id` or its cursor no longer names the workspace's current affected-document set, the operation returns `core:affected_set_stale` (see [core operation error codes](core-operation-error-codes.md)) naming the `current_set_id` instead of serving a mixed or partial page.
+
 ### `core:get_source`
 
 | Field | Presence | Exact meaning |
@@ -309,7 +319,15 @@ code, retryability, and optional retry delay. Only API v3 is accepted on the
 public wire; older persisted snapshots are a storage concern and never change
 the request schema.
 
-Inside `QueryRequest`, this operation uses the mandatory explicit query scope. Global workspace discovery is available only through the dedicated `urdira_index_status` MCP/CLI wrapper below. Both return safe display roots, never private storage/package paths.
+For a v4 workspace, the response additionally includes `last_scan`: the
+most recent scan's `kind` (`full`, `changed`, or `reconcile`), its
+`changed_paths` when applicable, `timings`, and, only when `kind` is
+`reconcile`, a `reconcile` object (`mode`, `added`/`changed`/`deleted`,
+`frontier_size`, `threshold`, `fell_back_to_cold`) and, only when that
+reconcile followed a `core:index_pack_export` import, an `import` object. A
+v3 workspace never sets `last_scan`.
+
+Inside `QueryRequest`, this operation uses the mandatory explicit query scope. Global workspace discovery is available only through the dedicated `urdira_index_status` MCP/CLI wrapper below, whose unscoped response additionally reports `orphaned_workspace_data` (`count`, `bytes`) from the daemon's startup orphan sweep (see the [workspace administration contract](workspace-administration-contract.md)). Both return safe display roots, never private storage/package paths.
 
 ## Pipeline operator arguments
 

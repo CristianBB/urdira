@@ -2,15 +2,21 @@
 
 Status: **Internal approved protocol**  
 Version: **1.0.0**  
-Last updated: 2026-08-29
+Last updated: 2026-09-09
 
 ## Purpose
 
 This protocol defines the language-neutral high-throughput route from an
-immutable source snapshot to structural SQLite authority. JavaScript and
-TypeScript are the first production adapter, not part of the core contract.
-Adding another language must not add language identifiers, record kinds or
-semantic branches to the engine, native core or storage packages.
+immutable source snapshot to structural SQLite authority for a **v3**
+workspace ([decision 25](../decisions/25-rust-native-acceleration.md)).
+JavaScript and TypeScript are the first production adapter, not part of the
+core contract. Adding another language must not add language identifiers,
+record kinds or semantic branches to the engine, native core or storage
+packages. A v4 workspace (default for newly added workspaces since
+2026-09-04) does not use this route at all: `urdira-indexing-worker` owns the
+whole scan and writes to `urdira-structural-store` instead of SQLite; see
+[current architecture](../architecture.md) and
+[decisions 26](../decisions/26-v4-structural-store.md)-[29](../decisions/29-v4-rust-owned-scan-pipeline.md).
 
 ## Roles
 
@@ -146,6 +152,15 @@ digests and typed publication objects. Owner header and delta digests are
 streamed over the immutable canonical rows; the independent receiving core
 then reparses them and remains the only authority that may emit IDs, UCE
 payloads, registered digests and typed staging scalars.
+
+Native API v17 additionally moves the exact-vector top-K kernel to a resident
+contiguous vector buffer with a single native call per query, replacing v16's
+per-query buffer construction; this is a semantic query-path optimization and
+does not change the observation projection contract above. `NATIVE_API_VERSION`
+(`packages/native/src/loader.ts`) is the single exact handshake value; the
+loader rejects both an older and a newer addon rather than negotiating a
+range (see [versioning](../versioning.md#checklist-for-bumping-native_api_version)
+for the five literal sites a version bump must update together).
 
 Each future language engine owns its observation schema and native projector,
 but must return the same structural result and then use the same owner-scoped

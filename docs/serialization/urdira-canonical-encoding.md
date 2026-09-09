@@ -23,3 +23,11 @@ the v3 runtime. A pre-v3 or early-preview v3 data root is not decoded or
 migrated. Inventory and backup are external administrative actions; activation
 requires a fresh v3 root and source reindexing. CAS objects remain reusable only
 after complete digest, length, and workspace-scope verification.
+
+This page describes the v3 logical-digest recipe only. A v4 workspace does
+not use the logical digest writer or these registries at all: its record and
+dependency identities/digests are computed bytes-native inside
+`crates/urdira-native-core` (`structural_kernel_rows`), and its structural
+integrity is verified through the bucketed Merkle digest contract of
+[decision 27](../decisions/27-v4-merkle-bucket-digests.md) rather than a
+per-field logical digest.

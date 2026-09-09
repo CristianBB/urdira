@@ -2,7 +2,7 @@
 
 Status: Approved initial contract  
 Verified against MCP: 2026-07-28  
-Last verified: 2026-08-26
+Last verified: 2026-09-09
 
 ## Purpose
 
@@ -86,6 +86,7 @@ On a modern connection, `tools/call` follows the MCP `2026-07-28` result model:
 - A completed call returns `resultType: "complete"`.
 - In the agent profile no result carries `structuredContent`, so a client is guaranteed to find the full result in `content`. In the web profile the complete wrapper is also returned in `structuredContent`; `content` remains equivalent.
 - `content` contains exactly one text block. By default it is Urdira's compact, grep-like plain-text rendering of the public wrapper value; an undocumented `render: "json"` debug argument (accepted at runtime but never advertised in any schema, description, or the server instructions) instead puts the complete JSON-serialized wrapper in that same text block.
+- The compact text rendering can include a short inline source snippet for each result through an equally hidden `snippet_lines` argument (an integer `0`-`3`, accepted at runtime but never advertised in any schema, description, or the server instructions). It defaults to `0` (no inline snippet): a 2026-09-08 benchmark measured a cheaper but less reliable agent run with snippets enabled, so the default keeps them off. Setting `snippet_lines` only changes the rendered response size; it never changes which results are returned or their evidence, and it composes with `render: "json"`.
 - A successful Urdira operation sets `isError: false` or omits it when the SDK's exact type permits omission.
 - A recoverable Urdira `OperationError` returns the typed error wrapper as compact JSON in `content[0].text` and sets `isError: true`. The agent therefore receives the registered diagnostic code, retryability, recovery actions, and closed details needed to correct the call.
 
