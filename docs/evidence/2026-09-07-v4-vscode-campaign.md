@@ -2244,3 +2244,227 @@ UNDER-precision relative to v3's real answer, never a site where v3 itself is de
   local `node_modules` symlink, per-package `packages/{canonical,storage,contracts}/node_modules/
   @urdira/*` symlinks, and every `packages/*/dist`/`*.tsbuildinfo` this session produced (untracked,
   gitignored) removed at session close.
+
+## 18. E-P0r (2026-09-09): the DOMINANT pattern-1 residual — annotation-pinned receivers are no
+longer unconditionally reliable
+
+Base: `8f73515` (E-P0q merged). `ep0q-vscode-reduced` (the reduced VS Code checkout retained across
+E-P0m/E-P0o/E-P0p/E-P0q) had been deleted by session close/cleanup before this task started (shared
+`~/Proyectos/urdira-benchmark/v4-fold/` scratch area, multiple concurrent frente worktrees) — rebuilt
+fresh this session with the SAME documented recipe (`vscode-corpus-2026-09-06`, rsync
+`--exclude='**/fixtures/'` + `node_modules` excluded, `scripts/xterm-update.js` removed): 12,826
+TS/JS files (vs. E-P0q's own 12,841 — the SAME small rsync-pass file-count drift every session in
+this file already documents, not reconciled further). n8n corpus (`n8n-corpus-2026-09-02`,
+unreduced) unchanged. v3 oracles: `v3-vscode-2026-09-07`/`v3-n8n-2026-09-07-b`, both retained,
+read-only, unchanged.
+
+### 18.1 The rule
+
+`Self::rule_pins_receiver_uniquely` (`crates/urdira-jsts-syntax-worker/src/semantic_sites.rs:3628`)
+**removes `"member_declared_type"`** from its allow-list. This is the ONE rule string
+`record_local_type`'s explicit-annotation branch (`semantic_sites.rs:4225`) tags a same-file,
+directly-typed identifier receiver with — a parameter (`function use(x: I)`), a local variable
+(`let x: I` / `const x: I`), or a destructured binding, all reached through the SAME
+`local_types`-map lookup `type_of_expression`'s `Identifier` arm consults first
+(`semantic_sites.rs:3894`). E-P0o/E-P0p/E-P0q treated it as reliable on the theory that an explicit
+annotation pins the receiver "by literal syntax" the same way `this`/`super`/`new C()`/
+`ClassName.static` do; this session's own live VS Code sampling (§18.3 below, and the task's own
+enumeration of the E-P0q residual) shows that theory is wrong for THIS one rule specifically: unlike
+those four, an annotation names only the DECLARED type, and v3's real per-call-site answer is
+sometimes a narrower declaration reached by flow-sensitive analysis this crate's local, non-checker
+inference does not model. `"this"`/`"super"`/`"member_class_static"`/`"member_new_expression"` are
+UNCHANGED and stay reliable — none of them is ever subject to that "declared vs. actual" gap:
+`this`/`super` bind to the syntactically enclosing/parent class by JS's own runtime semantics,
+`ClassName.member`/`new ClassName()` name one concrete declaration directly, by literal construction
+syntax. `"instanceof_narrowed"`/`"type_predicate_narrowed"` also stay reliable, for decision 28's
+already-established reason (a PROVEN control-flow fact about THIS exact position, handled by their
+own dedicated narrowing branches which run BEFORE this allow-list is even consulted).
+
+Once `"member_declared_type"` drops off the allow-list, an annotation-pinned receiver falls through
+to the EXACT SAME `ProgramIndex::sibling_conformance_overrides` check (`urdira-jsts-typeflow`) every
+other unreliable-rule receiver already goes through (`resolve_static_member_reference`/
+`resolve_call_target_typeflow`, `semantic_sites.rs`) — no new mechanism, no new cost bound: the
+already-shipped `MAX_CANDIDATE_TARGETS = 8` cap (E-P0q) and `REASON_SIBLING_CONFORMANCE_UNBOUNDED`
+demotion apply unchanged. Concretely: `I`'s own declaration stays the resolved (`confirmed`) target
+when NO known `extends`/`implements` conformer of `I` redeclares the member (the common, zero-cost
+case — an annotated type with no further known subtype at all, or one that inherits the member
+without overriding it); a bounded (`<= 8`) redeclaring set demotes to `possible` with
+`{I.m} ∪ {S.m : S redeclares}`, never a guessed-down subset; an unbounded set stays `checker_pending`
+with NO candidate list at all. All three outcomes are `pending.sites`-visible so the residual (tsgo)
+can later confirm what cold cannot prove, exactly like every prior sibling-conformance case.
+
+This applies identically to references AND calls (`resolve_static_member_reference` and
+`resolve_call_target_typeflow` share the same `rule_pins_receiver_uniquely` gate at their own
+`MemberLookup::One` branch).
+
+### 18.2 Unit tests
+
+- `explicitly_annotated_parameter_of_the_narrower_sibling_interface_still_confirms` (unchanged
+  assertions, doc comment updated): annotation with NO further known redeclaring subtype (`IDerived`
+  is the leaf) → still `confirmed`, zero candidate rows — the "annotation with no known subtypes"
+  half of the rule.
+- `sibling_declaration_via_an_inherited_match_now_demotes_to_possible` (rewrite of
+  `..._still_confirms`, which asserted the OPPOSITE outcome pre-E-P0r): annotation (`mid: IMid`)
+  whose inherited match (`IBase.getModel`) is redeclared by a further descendant (`INarrow extends
+  IMid`) → demotes to `possible` with both declarations as candidates.
+- `implements_sibling_candidate_set_annotated_parameter_now_demotes_to_possible` (rewrite of
+  `..._still_confirms_to_the_interfaces_own_declaration`): `a: IAction` with `Action implements
+  IAction` redeclaring `run` → demotes to `possible` with both candidates — the exact `IAction`/
+  `Action` shape the live VS Code residual is dominated by.
+- `new_expression_receiver_stays_confirmed_even_when_a_known_subclass_overrides_the_member` (NEW):
+  `new Base().run()` stays `confirmed` to `Base.run` even though `Sub extends Base` redeclares —
+  `"member_new_expression"` is unaffected by this change, no "declared vs. actual" gap to narrow.
+- Four PRE-EXISTING "narrowing does not leak past its own guarded region" safety tests
+  (`type_predicate_narrowing_never_leaks_past_its_own_guarded_region`,
+  `negated_predicate_guard_without_a_definite_exit_never_narrows_what_follows`,
+  `negated_instanceof_guard_without_a_definite_exit_never_narrows_what_follows`,
+  `instanceof_narrowing_never_leaks_past_its_own_guarded_region`) all exercised the SAME shape
+  (annotated receiver, narrowing inactive at the read site, a redeclaring conformer exists) and
+  broke the moment this rule shipped — their own "unnarrowed resolution stays confirmed to the base
+  declaration" premise no longer holds. Rewritten to assert the new (and, per decision 28, more
+  correct) invariant: the unnarrowed resolution is now `possible` with BOTH declarations, and — the
+  actual safety property each test still protects — the narrowed-away declaration never appears
+  ALONE as a `confirmed` target outside its own guarded region. This IS "narrowing dentro del
+  bloque ⇒ confirmed al estrechado" (`type_predicate_narrowing_confirms_the_narrowed_descendants_
+  own_declaration_for_read_and_call`, unchanged, still passing) with its OWN safety companion
+  updated for the new outside-the-block baseline.
+
+`cargo fmt --all -- --check`: clean (a handful of PRE-EXISTING drift diffs in
+`crates/urdira-jsts-typeflow/src/lib.rs`/`semantic_sites.rs` unrelated to this session's own diff —
+present at base `8f73515` under this environment's pinned `rustfmt 1.9.0-stable` before any edit —
+normalized via `cargo fmt --all` alongside this session's own changes). `cargo clippy --workspace
+--all-targets --locked -- -D warnings`: clean. `cargo test -p urdira-jsts-syntax-worker -p
+urdira-indexing-worker -p urdira-jsts-typeflow --locked`: **`test result: ok. 337 passed; 0 failed;
+1 ignored`** (syntax-worker, +2 net over E-P0q's own 335: 1 new test, 2 renamed [no count change],
+4 rewritten in place), **`test result: ok. 155 passed; 0 failed; 19 ignored`** (indexing-worker,
+unchanged), **`test result: ok. 72 passed; 0 failed`** (typeflow, unchanged — this session's diff
+never touches this crate). `cargo build --release --locked -p urdira-indexing-worker`: clean.
+
+### 18.3 Cost in cold: demotions on both corpora
+
+Live cold-scan `pending.sites`/`IdentifierRef` reason counts, this session's own binary, BEFORE any
+residual pass:
+
+| | n8n `sibling_declaration_ambiguous` | n8n `sibling_conformance_unbounded` | VS Code `sibling_declaration_ambiguous` | VS Code `sibling_conformance_unbounded` |
+|---|---:|---:|---:|---:|
+| E-P0q (baseline) | 731 | 18 | 19,912 | 1,302 |
+| E-P0r (this session) | 2,369 | 37 | 47,226 | 2,215 |
+
+n8n: +1,638 references demoted from a confident (sometimes wrong) confirmation to `possible`/
+`checker_pending`. VS Code: +27,314 — the annotation case is far more common than the `extends`/
+`implements`-conformance-on-a-chain-receiver case E-P0q's own generalization already covered, as
+expected (a plain `x: I` parameter/local is the single most common receiver shape in both corpora).
+
+### 18.4 n8n gate: fully held, `confirmed_combined` refreshed
+
+References (`n8n_references_parity_debug_dump`, unreduced corpus, this session's own cold dump):
+`v3Total=1,340,591`, `v4_same_target=1,188,043` (**>= 1,187,000 floor OK**),
+**`v4_different_target=0`**, `v4_missing=152,548` (up 1,136 from E-P0q's own 151,412 — the new
+`sibling_declaration_ambiguous`/`sibling_conformance_unbounded` missing-reasons: 1,849 + 32 = 1,881
+of the increase, the rest ordinary corpus/reservoir noise). Calls (`dump_call_bodies_cold_only`,
+cold-only, no residual — sufficient for the ONE thing this gate checks per that function's own doc
+comment): `v3ConfirmedTotal=207,584`, `v4_confirmed_same_target=92,749`,
+**`v4_confirmed_different_target=0`**, `v4_possible=2,176`, `v4_missing_site=112,659`. **`different
+== 0` holds in BOTH populations**, unchanged from E-P0q.
+
+`n8n_residual_schedule_resumes_after_truncation` (`URDIRA_V4_RESIDUAL_BUDGET_MS=15000`, the
+dedicated `confirmed_combined` regression harness, `URDIRA_TSGO_BINARY` pointed at the pinned
+`@typescript/typescript-darwin-arm64@7.0.2` `tsc`): first run (against the UN-refreshed constant)
+measured **`confirmed_combined=161,802`** (core:call confirmed 159,934 + possible 669, heritage
+confirmed 1,868) — 41 below E-P0q's own 161,843, outside the ±4 tolerance, same "intended,
+safety-improving direction" every prior refresh in this file documents (fewer confirmed sites, never
+a wrong one). `REFERENCE_CONFIRMED_COMBINED` refreshed 161,843 → **161,802** in `residual.rs`
+(doc comment amended with this session's own attribution). Re-run after the refresh: exact match,
+**`test result: ok. 1 passed; 0 failed`**.
+
+### 18.5 VS Code gate: `different` cut sharply, still nonzero — classified, not guessed at
+
+References (reduced tree, `--v4-bodies` from this session's own single cold-scan run, `--classify-
+targets 1 --samples 200`): `v3 confirmed core:references sites=3,145,812`; `same=2,462,875` (78.3%,
+**>= 2,400,000 floor OK**), **`different=80`** (down from E-P0q's own 110, **-27%**),
+`missing=682,857`. Calls (`dump_call_bodies_cold_only` from the SAME cold-scan run, `--samples 200`):
+`v3 confirmed core:call sites=743,472`; `v4_confirmed_same_target=341,847`,
+**`v4_confirmed_different_target=23`** (down from E-P0q's own 61, **-62%**),
+`v4_possible=33,822` (up from E-P0q's own 25,817 — expected, this session's own new demotions),
+`v4_missing_site=367,780`. **`different == 0` still does NOT hold for VS Code.**
+
+Every one of the 80 reference / 23 call `different` samples (the parity scripts' own FULL
+`--samples 200` reservoir, which covers the entire `different` population at this scale — not a
+30-row subsample) classifies into one of the SAME patterns §17.4 already enumerated, none newly
+introduced by this session's own diff:
+
+| # | Pattern | Live samples this session | Disposition |
+|---|---|---:|---|
+| 1 | **Reliably-pinned receiver (by construction, or an annotation with no `sibling_conformance_overrides` hit), narrower real v3 answer** — decision 28's own receiver-typing-PRECISION gap (§17.4 pattern 1), UNCHANGED in kind: `getModel`/`getSelection`/`getTools`/`handle`/`uri`/`cellKind`/`internalMetadata`/`editStateSource`/`updateEditState`/`getEditState`/`model`/`id`/`language`/`referenceName`/`legacyFullNames`/`source`/`readFile` across `editorBrowser.ts`/`notebookBrowser.ts`/`baseCellViewModel.ts`/`languageModelToolsService.ts`/`chatViewModel.ts`/`files.ts`/`editor.ts`/`actions.ts` — every one of these EITHER has no known redeclaring conformer this crate's `sibling_conformance_overrides` can find (so the rule never even engages) OR the pinning rule is `"this"`/`"member_new_expression"`/a narrowing rule this session deliberately did NOT touch | 54 of 80 ref samples, 17 of 23 call samples (`getModel` x9, `updateEditState` x2, `getEditState` x3, `readFile` x1, `getSelection` x1, `getTools` x1) | **(b) not fixed, reported** — same disposition as §17.4: needs real flow-sensitive narrowing (tracking the actual initializer/assignment-site type), a materially different and larger feature than this session's own single rule change. Out of scope. |
+| 2 | `McpApps` namespace duplicate-declaration-merge bug (§16.4 pattern 5 / §17.4 pattern 2) | 26 of 80 ref samples | **(b) unchanged** — structurally unrelated to member/call resolution; re-investigated this session (grep for a second `namespace McpApps` block in `modelContextProtocolApps.ts` confirms the SAME duplicate-declaration-merge shape §16.4 already diagnosed) and confirmed still not a safe rule to add here: any fix would need namespace-merge-aware declaration identity, unrelated to `rule_pins_receiver_uniquely`/sibling-conformance. |
+| 3 | `createMarkupPreview` (§16.4 pattern 4 / §17.4 pattern 3) | 2 of 23 call samples | **(b) unchanged** — "own body wins over interface signature," the OPPOSITE preference from every mechanism in this file; re-confirmed not touched by this session's diff. |
+| 4 | `typeof`-value-copy (`getTargetOperatingSystem`/`getFloatingBarButtonStyles`, §16.4 pattern 6 / §17.4 pattern 4) | 3 of 23 call samples | **(b) unchanged** — `raw_type_ref_of_value_copy_expression`/`TypeQuery` branch, not touched. |
+| 5 | `marked` (`.d.ts` vs `.js` pair, §12.3 pattern H / §17.4 pattern 5) | 1 of 23 call samples | **(b) unchanged, previously investigated and explicitly reverted** (E-P0l): fixing it regressed elsewhere; not retried here. |
+
+Patterns 1-5 account for every one of the 80 ref / 23 call `different` sites this session's own full
+population inspection found; none is a regression this session's own diff introduced. Per this
+campaign's own consistent precedent (E-P0n §14.7, E-P0m §13.4, E-P0o §15.3, E-P0p §16.4, E-P0q §17.4
+all reported a nonzero, classified VS Code residual), this session closes at 110→80 references
+(-27%) and 61→23 calls (-62%), with `different == 0` continuing to hold for n8n in full. No
+`--known-v3-wrong` exceptions were needed or added.
+
+### 18.6 Residual (60s budget, VS Code) — `confirmed_combined` before/after
+
+`URDIRA_V4_RESIDUAL_BUDGET_MS=60000`, `n8n_residual_pass_debug_histogram` pointed at the reduced VS
+Code tree (same generic harness, historical `n8n_`-prefixed name), `URDIRA_TSGO_BINARY` set:
+
+| | `core:call` confirmed | `core:call` possible | heritage confirmed | `confirmed_combined` |
+|---|---:|---:|---:|---:|
+| COLD (generation 1) | 391,897 | 112,045 | 13,004 | **404,901** |
+| AFTER residual, 60s budget (generation 2) | 416,966 | 103,075 | 13,243 | **430,209** |
+
+The pass itself converged (`truncated=false`, `windows=26/26`) in 77.1s wall (36,184ms checker time,
+71,524ms total) — slightly over the 60s nominal budget (scheduling/window overhead, not the checker
+itself exceeding budget), upgrading **+25,308** sites (matching the pass's own reported
+`upgraded=25308`) out of VS Code's much larger pending population. In the SAME ballpark as E-P0p's
+own 60s-budget measurement (+23,583) — this session's own extra demotions (§18.3) do not
+meaningfully change how much the residual recovers per budget-second, consistent with "cost is
+proportional to corpus size, not to which rule produced the pending site."
+
+### 18.7 Files touched, verification, cleanup
+
+- `crates/urdira-jsts-syntax-worker/src/semantic_sites.rs`: `rule_pins_receiver_uniquely` —
+  `"member_declared_type"` removed from the allow-list, doc comment rewritten; 1 new unit test
+  (`new_expression_receiver_stays_confirmed_even_when_a_known_subclass_overrides_the_member`); 2
+  tests renamed + rewritten to assert the new `possible` outcome
+  (`sibling_declaration_via_an_inherited_match_now_demotes_to_possible`,
+  `implements_sibling_candidate_set_annotated_parameter_now_demotes_to_possible`); 1 doc-comment-only
+  update (`explicitly_annotated_parameter_of_the_narrower_sibling_interface_still_confirms`,
+  assertions unchanged); 4 pre-existing "narrowing does not leak" safety tests rewritten in place to
+  assert `possible`-with-both-candidates as the new unnarrowed baseline
+  (`type_predicate_narrowing_never_leaks_past_its_own_guarded_region`,
+  `negated_predicate_guard_without_a_definite_exit_never_narrows_what_follows`,
+  `negated_instanceof_guard_without_a_definite_exit_never_narrows_what_follows`,
+  `instanceof_narrowing_never_leaks_past_its_own_guarded_region`).
+- `crates/urdira-indexing-worker/src/v4/residual.rs`: `REFERENCE_CONFIRMED_COMBINED` refreshed
+  161,843 → 161,802 (own doc comment amended, this session's attribution).
+- `docs/decisions/28-v4-rust-semantics-and-residual-checker.md`: amendment recording the rule change
+  and the final classified residual (this section).
+- Verification (this session's own final state): `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` clean; `cargo test -p urdira-jsts-syntax-
+  worker -p urdira-indexing-worker -p urdira-jsts-typeflow --locked`: **`test result: ok. 337
+  passed; 0 failed; 1 ignored`** (syntax-worker), **`test result: ok. 155 passed; 0 failed; 19
+  ignored`** (indexing-worker), **`test result: ok. 72 passed; 0 failed`** (typeflow); `cargo test
+  --release --locked -p urdira-indexing-worker v4::residual::tests::n8n_residual_schedule_resumes_
+  after_truncation -- --ignored --test-threads=1`: **`test result: ok. 1 passed; 0 failed`** (after
+  the constant refresh); `cargo test --release --locked -p urdira-indexing-worker v4::residual::
+  tests::n8n_residual_pass_debug_histogram -- --ignored --test-threads=1` (pointed at the VS Code
+  reduced tree, §18.6): **`test result: ok. 1 passed; 0 failed`**; `cargo build --release --locked
+  -p urdira-indexing-worker`: clean; `CI=true ./node_modules/.bin/vitest run tests/phase-daemon-
+  v4-reconcile.test.ts tests/v4-scan.test.ts`: **3 passed | 4 skipped (7)**, 2 test files passed
+  (neither required the native addon/release worker binary, same as E-P0n's own smaller vitest run).
+- Worktree setup: base was `7d04d49` (unrelated, later commit, clean tree) — `git reset --hard
+  8f73515` + `git branch -m`, confirming `feedback_worktree_subagents_base_and_node_modules` yet
+  again. `packages/{canonical,storage,contracts}/dist` symlinked (not copied) straight to the main
+  checkout's own build output for the `.mjs` parity-diff scripts' `decodeCanonical`/schema imports —
+  safe because main was AT THE SAME `8f73515` base the whole session (read-only reuse, no write
+  under `/Users/Cristian/Proyectos/urdira`).
+- Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0r`) removed; scratch under
+  `~/Proyectos/urdira-benchmark/v4-fold/ep0r-{vscode-reduced,reports,scratch,n8n-residual-data,
+  n8n-residual-data2,vscode-residual-data}/` removed; this worktree's own local `node_modules`
+  symlink and `packages/{canonical,storage,contracts}/dist` symlinks removed at session close.

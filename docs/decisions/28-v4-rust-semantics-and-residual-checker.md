@@ -511,3 +511,51 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   `confirmed_combined` 161,903 → **161,843** (−60, the SAME "intended, safety-improving direction"
   every prior refresh documents — fewer confirmed sites, never a wrong one), `REFERENCE_CONFIRMED_
   COMBINED` refreshed accordingly.
+
+## Amendment 2026-09-09 (Frente E-P0r, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §18)
+
+- **An annotation alone no longer pins a receiver uniquely.** `rule_pins_receiver_uniquely`
+  (`semantic_sites.rs`) removes `"member_declared_type"` — the rule string tagging a same-file
+  parameter/local/destructured binding typed by an explicit annotation (`x: I`) — from its
+  reliable-rule allow-list. E-P0o/E-P0p/E-P0q's own text ("cuando el receptor SÍ está fijado ... el
+  destino es el miembro de ESE tipo") is amended: an annotation pins the receiver's DECLARED type,
+  but not necessarily its ACTUAL one at every read site — live VS Code sampling (the dominant
+  residual class every session from E-P0n through E-P0q reported and left unfixed) shows v3's real
+  per-call-site answer sometimes lands on a narrower declaration a known `extends`/`implements`
+  conformer redeclares, reached by flow-sensitive analysis (assignment tracking, generic
+  instantiation, ...) this crate's local, non-checker inference does not model. `"this"`/`"super"`/
+  `"member_class_static"`/`"member_new_expression"` are UNCHANGED and remain reliable: none of them
+  carries a "declared vs. actual" gap the way an annotation does — `this`/`super` bind to the
+  syntactically enclosing/parent class by JS's own runtime semantics, `ClassName.member`/
+  `new ClassName()` name one concrete declaration directly, by literal construction syntax.
+  `"instanceof_narrowed"`/`"type_predicate_narrowed"` also remain reliable (a PROVEN control-flow
+  fact about the exact read position, handled by their own dedicated narrowing branches that run
+  BEFORE this allow-list is even consulted).
+- **Mechanism reused, not duplicated.** Once `"member_declared_type"` drops off the allow-list, an
+  annotation-pinned receiver falls through to the SAME `ProgramIndex::sibling_conformance_overrides`
+  check (and the SAME `MAX_CANDIDATE_TARGETS = 8` cap / `REASON_SIBLING_CONFORMANCE_UNBOUNDED`
+  demotion) every other unreliable-rule receiver already uses — no new cost bound, no new
+  candidate-collection code. `I`'s own declaration stays `confirmed` when no known conformer
+  redeclares the member (the common, zero-cost case); a bounded redeclaring set demotes to
+  `possible` with `{I.m} ∪ {S.m : S redeclares}`; an unbounded set stays `checker_pending` with no
+  list. Applies identically to references and calls.
+- **Live measurement**: n8n (unreduced): `different == 0` holds in BOTH populations (unchanged);
+  `confirmed_combined` 161,843 → **161,802** (−41, the SAME safety-improving direction every prior
+  refresh documents), `REFERENCE_CONFIRMED_COMBINED` refreshed accordingly. VS Code (reduced tree,
+  rebuilt fresh this session, 12,826 files — the SAME documented rsync-pass file-count drift every
+  session in the evidence doc carries, not reconciled further): references `different` 110 → **80**
+  (-27%), calls `different` 61 → **23** (-62%) — the LARGEST single-session reduction in this whole
+  campaign's own residual, confirming the annotation case was the dominant remaining shape of the
+  receiver-typing-precision gap E-P0n's own pattern 1 first identified. `different == 0` STILL does
+  not hold for VS Code — the evidence doc's own §18.5 classifies every remaining sample: the large
+  majority (54/80 refs, 17/23 calls) is the SAME residual-precision gap, now narrower (a receiver
+  pinned by construction/`this`/a narrowing rule, or an annotation with no `sibling_conformance_
+  overrides` hit at all) — decision 28's own carve-out anticipated this: "cuando el receptor SÍ está
+  fijado [por construcción, no solo por anotación] ... el destino es el miembro de ESE tipo" remains
+  correct and is what v4 does; closing the remainder needs real flow-sensitive narrowing (tracking
+  the actual initializer/assignment-site type), a materially larger feature, still out of scope. The
+  rest (26/80 refs, 6/23 calls) is the four PRE-EXISTING, structurally unrelated residuals this
+  amendment does NOT touch (`McpApps` namespace-merge bug, `createMarkupPreview`'s own-body-wins
+  preference, `typeof`-value-copy, `marked`'s `.d.ts`/`.js` pair) — each re-examined this session and
+  confirmed to have no safe rule available (E-P0l's own `marked` fix was investigated and explicitly
+  reverted; the other three require mechanisms this session's single-rule change does not touch).
