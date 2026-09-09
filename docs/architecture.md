@@ -231,13 +231,39 @@ flowchart LR
   Publish --> Semantic["semantic reconciliation\nprofile-bound vectors"]
 ```
 
-First-generation acceleration (local fork of a compatible donor, or an
-explicit index pack) and the destructive, non-migrated `index_contract`
-cutover between formats are unchanged from decisions 22/23/26-29; see
+A v3 workspace keeps one correctness path even when reuse is available. A
+local fork reuses a verified donor inside the same installation. An
+explicitly supplied index pack crosses a trust boundary, so
+`attemptIndexPackImport` validates its manifest and local source multiset,
+verifies record bodies while streaming into an isolated scratch database,
+then reuses the fork copy and publication machinery. Any failure rolls back
+before the ordinary scan starts.
+
+```mermaid
+flowchart TD
+  Add["workspace-add with explicit root"] --> Fork{"compatible local donor?"}
+  Fork -->|yes| LocalVerify["local fork copy and verify"]
+  LocalVerify --> Ready["ready generation"]
+  Fork -->|no| Pack{"explicit index pack?"}
+  Pack -->|yes| Import["attemptIndexPackImport\nmanifest + local multiset"]
+  Import --> StreamVerify["stream scratch rows\nrecord verification workers"]
+  StreamVerify --> Copy["bounded bulk copy\npost-copy anchors and ownership"]
+  Copy -->|verified| Ready
+  Import -->|skip or failure| Rollback["rollback scratch/target attempt"]
+  StreamVerify -->|corrupt| Rollback
+  Copy -->|mismatch| Rollback
+  Pack -->|no| Scan["runProgressiveWorkspaceScan"]
+  Rollback --> Scan
+  Scan --> Ready
+```
+
+This diagram is the v3 route only. First-generation acceleration and the
+destructive, non-migrated `index_contract` cutover between formats are
+otherwise unchanged from decisions 22/23/26-29; see
 [docs/decisions/23-index-pack.md](decisions/23-index-pack.md) for the pack
-carrier (v4's own `core:index_pack_export`/`workspace-add --index-pack` route
-re-keys `workspace_id` and runs a `reconcile` scan after import rather than
-reusing the v3 fork/copy machinery directly).
+carrier (v4's own `core:index_pack_export`/`workspace-add --index-pack` route,
+described below, re-keys `workspace_id` and runs a `reconcile` scan after
+import rather than reusing this v3 fork/copy machinery).
 
 ## Readiness and operation availability
 
@@ -379,6 +405,7 @@ for measured export/import timings.
 | Semantic v4 wiring | `packages/daemon/src/semantic-v4-wiring.ts`, `packages/engine/src/semantic-entity-source-v4.ts`, `semantic-reconciler.ts` | Sidecar attachment, per-document status/coverage, segment cache, worker-thread maintenance. |
 | Workspace orphans | `packages/daemon/src/runtime.ts` (`core:workspace_orphans_list`/`_purge`), `packages/cli/src/index.ts` | Startup sweep and CLI subcommand for residual workspace data. |
 | v3 scan composition | `packages/engine/src/workspace-indexing-session.ts` | `runFullWorkspaceScan`/`runProgressiveWorkspaceScan`, retained for `URDIRA_V4=0` workspaces. |
+| v3 digest scheduling | `packages/engine/src/materialization-record-digest-pipeline.ts` and `materialization-digest-offload.ts` | Fail-safe record-digest overlap and `MaterializationDigestOffload`'s ordered-set worker offload, with a synchronous in-process fallback for any skipped or failed batch. |
 | Index pack bootstrap | `packages/engine/src/index-pack.ts`, `index-pack-verify-core.ts`, and `workspace-fork.ts` | Portable streaming carrier, untrusted verification, bounded copy, rollback, and scan fallback (v3 route; v4 uses its own native import path). |
 | Atomic storage publication | `packages/storage/src/publication-authority.ts` | Bounded command streams, phase checkpoints, immutable-row assertions, and current-pointer swap (v3). |
 | Query admission | `packages/engine/src/query-plan.ts` | API v3 normalization, stage dependency validation, operation versions, budgets, and plan digest. |
