@@ -65,6 +65,23 @@ export interface ReadPageRequest<T> {
   readonly expires_at?: string;
   readonly now?: string;
   readonly limit: number;
+  /**
+   * Hard ceiling, in JSON-serialized characters, on the items this page may
+   * carry -- independent of (and enforced IN ADDITION to) `limit`'s item
+   * count. Before this field existed, `readPage` only ever bounded a page by
+   * item count: `options.response_budget.max_characters` was validated at
+   * the request layer (`query-plan.ts`'s `validateBudget`) but never
+   * actually consulted while building a page, so a caller requesting a
+   * generous item count (or the engine's own generous
+   * `MAX_RESPONSE_CHARACTERS` ceiling) could produce a page whose serialized
+   * size vastly exceeded what any bounded transport (the daemon's fixed-size
+   * IPC frame, in particular) could carry -- surfacing as a hard transport
+   * failure instead of a clean, bounded page with a cursor for the rest.
+   * Truncation always keeps at least one item (see `readPage`'s loop) so a
+   * page never regresses to zero progress merely because a single item is
+   * itself larger than the remaining budget.
+   */
+  readonly max_characters: number;
   readonly reader: ManifestStreamReader<T>;
   readonly position_of?: (item: T) => string;
 }
@@ -134,6 +151,7 @@ export class CursorCache {
 
   async readPage<T>(request: ReadPageRequest<T>): Promise<ReadPageResult<T>> {
     if (!Number.isSafeInteger(request.limit) || request.limit < 1) throw new CursorCacheError("core:budget_invalid", "Cursor page limit must be a positive safe integer.");
+    if (!Number.isSafeInteger(request.max_characters) || request.max_characters < 1) throw new CursorCacheError("core:budget_invalid", "Cursor page character budget must be a positive safe integer.");
     const now = request.now ?? new Date().toISOString();
     let claims: QueryCursorClaims;
     if (request.cursor !== undefined) {
@@ -155,8 +173,23 @@ export class CursorCache {
     const readRequest: ManifestStreamReadRequest = { execution_id: claims.execution_id, result_stream: claims.result_stream, direction: claims.direction, limit: request.limit + 1 };
     if (claims.stable_position.length > 0) (readRequest as { position?: string }).position = claims.stable_position;
     const result = await request.reader.read(readRequest);
-    const items = result.items.slice(0, request.limit);
-    const hasMore = result.has_more || result.items.length > request.limit;
+    const itemLimited = result.items.slice(0, request.limit);
+    // Character-budget truncation on top of the item-count limit above --
+    // always keep at least the first item (a page that returns zero items
+    // and zero progress merely because one item is bigger than the whole
+    // budget would never terminate a naive continuation loop). Every item
+    // after the first stops as soon as adding it would exceed the budget,
+    // not after: the running total never includes a truncated item's size.
+    let consumedCharacters = 0;
+    let characterCutIndex = itemLimited.length;
+    for (let index = 0; index < itemLimited.length; index += 1) {
+      const itemCharacters = JSON.stringify(itemLimited[index]).length;
+      if (index > 0 && consumedCharacters + itemCharacters > request.max_characters) { characterCutIndex = index; break; }
+      consumedCharacters += itemCharacters;
+    }
+    const characterTruncated = characterCutIndex < itemLimited.length;
+    const items = characterTruncated ? itemLimited.slice(0, characterCutIndex) : itemLimited;
+    const hasMore = result.has_more || result.items.length > request.limit || characterTruncated;
     const firstPosition = items.length === 0 ? undefined : safePosition(items[0]!, 0, request.position_of);
     const lastPosition = items.length === 0 ? undefined : safePosition(items[items.length - 1]!, items.length - 1, request.position_of);
     const make = (direction: CursorDirection, position: string): string => this.encode({ ...claims, direction, stable_position: position });

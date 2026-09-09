@@ -2463,7 +2463,7 @@ proportional to corpus size, not to which rule produced the pending site."
   again. `packages/{canonical,storage,contracts}/dist` symlinked (not copied) straight to the main
   checkout's own build output for the `.mjs` parity-diff scripts' `decodeCanonical`/schema imports —
   safe because main was AT THE SAME `8f73515` base the whole session (read-only reuse, no write
-  under `/Users/Cristian/Proyectos/urdira`).
+  under `~/Proyectos/urdira`).
 - Cleanup: `CARGO_TARGET_DIR` (`.claude/worktrees/cargo-target-ep0r`) removed; scratch under
   `~/Proyectos/urdira-benchmark/v4-fold/ep0r-{vscode-reduced,reports,scratch,n8n-residual-data,
   n8n-residual-data2,vscode-residual-data}/` removed; this worktree's own local `node_modules`

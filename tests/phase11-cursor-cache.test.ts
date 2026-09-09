@@ -33,6 +33,7 @@ describe("Phase 11 cursor cache", () => {
       frozen_snapshot_digest: "snapshots-1",
       frozen_status_digest: "status-1",
       limit: 2,
+      max_characters: 1_000_000,
       reader: manifest,
     });
     expect(first.items.map((entry) => entry.id)).toEqual(["confirmed-a", "confirmed-b"]);
@@ -47,6 +48,7 @@ describe("Phase 11 cursor cache", () => {
       expected_frozen_snapshot_digest: "snapshots-1",
       expected_frozen_status_digest: "status-1",
       limit: 2,
+      max_characters: 1_000_000,
       reader: manifest,
     });
     expect(second.items.map((entry) => entry.id)).toEqual(["confirmed-c"]);
@@ -69,6 +71,7 @@ describe("Phase 11 cursor cache", () => {
       frozen_snapshot_digest: "snapshots-1",
       frozen_status_digest: "status-1",
       limit: 2,
+      max_characters: 1_000_000,
       reader: manifest,
     });
     expect(page.items.map((entry) => entry.id)).toEqual(["possible-c", "possible-b"]);
@@ -86,13 +89,14 @@ describe("Phase 11 cursor cache", () => {
       frozen_snapshot_digest: "snapshots-1",
       frozen_status_digest: "status-1",
       limit: 1,
+      max_characters: 1_000_000,
       reader: reader([{ id: "a", stable_sort_key: "a" }, { id: "b", stable_sort_key: "b" }]),
       expires_at: "2026-08-10T00:01:00.000Z",
       now: "2026-08-10T00:00:00.000Z",
     });
-    await expect(cache.readPage({ cursor: `${page.next_cursor}x`, limit: 1, reader: reader([]) })).rejects.toMatchObject({ code: "core:cursor_invalid" });
-    await expect(cache.readPage({ cursor: page.next_cursor!, expected_result_stream: "results/possible", limit: 1, reader: reader([]), now: "2026-08-10T00:00:00.000Z" })).rejects.toMatchObject({ code: "core:cursor_stream_mismatch" });
-    await expect(cache.readPage({ cursor: page.next_cursor!, limit: 1, reader: reader([]), now: "2026-08-10T00:02:00.000Z" })).rejects.toMatchObject({ code: "core:cursor_expired" });
+    await expect(cache.readPage({ cursor: `${page.next_cursor}x`, limit: 1, max_characters: 1_000_000, reader: reader([]) })).rejects.toMatchObject({ code: "core:cursor_invalid" });
+    await expect(cache.readPage({ cursor: page.next_cursor!, expected_result_stream: "results/possible", limit: 1, max_characters: 1_000_000, reader: reader([]), now: "2026-08-10T00:00:00.000Z" })).rejects.toMatchObject({ code: "core:cursor_stream_mismatch" });
+    await expect(cache.readPage({ cursor: page.next_cursor!, limit: 1, max_characters: 1_000_000, reader: reader([]), now: "2026-08-10T00:02:00.000Z" })).rejects.toMatchObject({ code: "core:cursor_expired" });
     expect(page.next_cursor).toBeTruthy();
   });
 });

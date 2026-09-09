@@ -590,11 +590,21 @@ export class QueryEngine {
       const streams = streamItems(evaluation);
       const pages: Record<string, QueryStreamPage> = {};
       const streamNames = new Set([...Object.keys(streams), ...Object.keys(evaluation.stream_sources ?? {})]);
+      // `max_characters` bounds the WHOLE response, not each stream in
+      // isolation -- an operation like `core:find_references` publishes two
+      // streams (`references`, `owners`) in one page, and handing each the
+      // full budget independently would let the combined page grow to
+      // (stream count * budget). Each stream instead spends down a shared
+      // remaining budget; `readPage` itself still guarantees at least one
+      // item per stream regardless of what is left, so a stream ordered
+      // after a large one is never silently starved to zero rows.
+      let remainingCharacters = request.options.response_budget.max_characters;
       for (const stream of streamNames) {
         const values = streams[stream] ?? [];
         await appendEvaluationStream(this.manifestStore, executionId, stream, "forward", evaluation.stream_sources?.[stream], values);
         await appendEvaluationStream(this.manifestStore, executionId, stream, "backward", evaluation.reverse_stream_sources?.[stream], [...values].reverse());
-        const page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, reader: this.manifestStore.reader });
+        const page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, max_characters: Math.max(1, remainingCharacters), reader: this.manifestStore.reader });
+        remainingCharacters = Math.max(0, remainingCharacters - page.items.reduce((sum, item) => sum + JSON.stringify(item).length, 0));
         pages[stream] = page;
       }
       return { query_execution_id: executionId, plan_digest: plan.plan_digest, streams: pages, completeness: (evaluation.completeness as QueryExecutionPage["completeness"]) ?? { overall_status: "unknown", dimensions: [] }, diagnostics: request.options.diagnostics.diagnostics === "none" ? [] : evaluation.diagnostics ?? [], registry: { mode: request.options.registry.registry, operation_ids: request.options.registry.registry === "none" ? [] : [...plan.operation_versions].map((binding) => binding.operation_id), recipe_ids: request.options.registry.registry === "none" ? [] : [...plan.recipe_versions].map((binding) => binding.recipe_id) }, ...(evaluation.semantic_state === undefined ? {} : { semantic_state: evaluation.semantic_state }), expires_at: expiresAt };
@@ -608,7 +618,7 @@ export class QueryEngine {
 
   async continue(request: QueryContinuationRequest): Promise<QueryExecutionPage> {
     const claims = this.cursorCache.decode(request.cursor);
-    const read = await this.cursorCache.readPage({ cursor: request.cursor, limit: request.response_budget.max_items, reader: this.manifestStore.reader, now: this.now() });
+    const read = await this.cursorCache.readPage({ cursor: request.cursor, limit: request.response_budget.max_items, max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, now: this.now() });
     // Backward storage is traversed in reverse, but every public page is
     // rendered in canonical forward order. CursorCache's traversal-relative
     // next/previous fields therefore swap when projected back to page order.

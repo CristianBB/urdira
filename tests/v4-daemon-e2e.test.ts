@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -761,7 +761,29 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
   it("the residual pass upgrades a possible `implements` heritage edge to confirmed, and find_references/completeness_report reflect it", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-residual-data-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-e2e-residual-workspace-"));
-    await cp(resolve(repoRoot, "tests/fixtures/codebases/typescript/task-planner/src"), workspaceRoot, { recursive: true });
+    // A purpose-built, self-contained fixture (same technique as the
+    // member/parameter-entity tests further below in this file) rather than
+    // the shared `task-planner` one this test used to `cp` wholesale: the
+    // shared fixture's own `InMemoryTaskRepository implements TaskRepository`
+    // is a PLAIN cross-file identifier, which cold scan now resolves
+    // directly (a real completeness improvement, not a bug -- confirmed live
+    // via this test's own query dump: a fully-formed, correctly-targeted
+    // `jsts:relation_implements` CONFIRMED row already exists right after
+    // `structural_ready`, before the residual pass ever runs). That upgrade
+    // leaves nothing left for the residual pass to promote for that
+    // relation, so this test needs a heritage clause cold scan still defers
+    // -- a QUALIFIED type reference (`Repo.TaskRepository`, syntactically a
+    // `ts.QualifiedName`/property-access in type position, exactly like
+    // `urdira-jsts-syntax-worker::semantic_sites`'s own
+    // `qualified_heritage_expression_stays_pending` unit test's `ns.Base`)
+    // stays pending -- `REASON_HERITAGE_DEFERRED`, `PendingSiteKind::
+    // Implements` -- until the residual pass's real type checker resolves
+    // it. `import * as Repo` produces the same qualified-name AST shape a
+    // local `namespace` would; `TaskRepository` itself stays a plain
+    // top-level export in its own file so `core:resolve_symbol`'s lookup
+    // below is unaffected.
+    await writeFile(join(workspaceRoot, "repository.ts"), "export interface TaskRepository {\n  save(id: string): void;\n}\n", "utf8");
+    await writeFile(join(workspaceRoot, "in-memory-repository.ts"), "import * as Repo from \"./repository.js\";\n\nexport class InMemoryTaskRepository implements Repo.TaskRepository {\n  save(id: string): void {\n    void id;\n  }\n}\n", "utf8");
     const originalV4Flag = process.env["URDIRA_V4"];
     const originalResidualFlag = process.env["URDIRA_V4_RESIDUAL"];
     let runtime: DaemonRuntime | undefined;
@@ -803,12 +825,12 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
       const repositoryInterfaceEntityId = repositoryInterfaceDecl[0]!["entity_id"];
       expect(typeof repositoryInterfaceEntityId).toBe("string");
 
-      // --- Before the upgrade: `implements TaskRepository` has no target
-      // yet -- since A2 (pending.sites migration) that means it is not a
-      // relation RECORD at all any more (it lives in the store's own
-      // `pending.sites` side table, invisible to `core:find_records`), so
-      // the precondition this test can still observe through the query
-      // engine is simply "no CONFIRMED `core:implements` row for
+      // --- Before the upgrade: `implements Repo.TaskRepository` has no
+      // target yet -- a qualified heritage reference stays pending (it
+      // lives in the store's own `pending.sites` side table, invisible to
+      // `core:find_records`) since A2 (pending.sites migration), so the
+      // precondition this test can still observe through the query engine
+      // is simply "no CONFIRMED `core:implements` row for
       // `InMemoryTaskRepository` exists yet". `find_references` on the
       // interface has no inbound heritage edge through it either (adjacency
       // only ever indexes a RESOLVED target -- residual.rs's own module

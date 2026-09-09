@@ -14,7 +14,7 @@ import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, 
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
 import { ensureSemanticAssetsInProcess, runSemanticReconcileSharded, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
 import { resolveV4SemanticEntitySource } from "./semantic-v4-wiring.js";
-import { LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
+import { IPC_DEFAULT_MAX_FRAME_BYTES, LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
 import { DAEMON_PRIVATE_INTERFACE_VERSION, daemonRpcCapabilities } from "./compatibility.js";
 
@@ -1460,6 +1460,30 @@ function attachIndexFreshness<T extends QueryExecutionPage>(page: T, workspace: 
 
 function requestRecord(payload: unknown): Record<string, unknown> {
   return payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
+}
+
+/**
+ * `core:query`/`core:query_continue`'s `response_budget.max_characters` is
+ * validated only against the engine's own generic ceiling
+ * (`query-plan.ts`'s `MAX_RESPONSE_CHARACTERS`, 10,000,000) -- nothing ties
+ * it to what THIS transport can actually carry. A caller can legally ask
+ * for a multi-megabyte budget while the local IPC frame is fixed-size
+ * (`LocalIpcServer`'s `max_frame_bytes`, default
+ * `IPC_DEFAULT_MAX_FRAME_BYTES`); `CursorCache.readPage` now bounds a page
+ * by that budget faithfully, so honoring an oversized budget verbatim just
+ * moves the same hard failure from "silently unenforced" to "correctly
+ * enforced but still too big for the wire" (`core:ipc_frame_too_large`).
+ * Clamp the EFFECTIVE budget passed to the engine down to a fraction of the
+ * frame instead, leaving headroom for the wire encoding's own overhead
+ * (protobuf framing, the envelope fields around `streams`, and any OTHER
+ * stream sharing the same frame) -- a caller's declared budget is still
+ * honored verbatim whenever it is already frame-safe, and the signed cursor
+ * this produces (`CursorCache`'s `next_cursor`) lets the caller page through
+ * the rest instead of the whole request failing.
+ */
+const IPC_RESPONSE_CHARACTER_SAFETY_FACTOR = 0.5;
+function frameSafeMaxCharacters(maxFrameBytes: number, requestedMaxCharacters: number): number {
+  return Math.max(1, Math.min(requestedMaxCharacters, Math.floor(maxFrameBytes * IPC_RESPONSE_CHARACTER_SAFETY_FACTOR)));
 }
 
 function parsedVcsState(serialized: string | undefined): Record<string, unknown> | undefined {
@@ -4582,7 +4606,11 @@ export class DaemonRuntime {
           // sites, per `DaemonRuntimeOptions.warm_records_budget_mb`'s "after
           // any load/warm completes" rule.
           if (request.call === "core:query") {
-            const queryRequest = request.payload as QueryRequest;
+            const rawQueryRequest = request.payload as QueryRequest;
+            const maxFrameBytes = options.max_frame_bytes ?? IPC_DEFAULT_MAX_FRAME_BYTES;
+            const requestedMaxCharacters = rawQueryRequest.options.response_budget.max_characters;
+            const clampedMaxCharacters = frameSafeMaxCharacters(maxFrameBytes, requestedMaxCharacters);
+            const queryRequest: QueryRequest = clampedMaxCharacters === requestedMaxCharacters ? rawQueryRequest : { ...rawQueryRequest, options: { ...rawQueryRequest.options, response_budget: { ...rawQueryRequest.options.response_budget, max_characters: clampedMaxCharacters } } };
             const hydrationStartedAt = Date.now();
             try {
               const page = attachIndexFreshness(await engine.execute(queryRequest, context.signal), registry.get(workspaceId));
@@ -4599,7 +4627,8 @@ export class DaemonRuntime {
             throw new DaemonError("core:ipc_request_invalid", "core:query_continue requires a cursor and a response budget.");
           }
           try {
-            return attachIndexFreshness(await engine.continue({ cursor, response_budget: { max_items: budget["max_items"] as number, max_characters: budget["max_characters"] as number } }), registry.get(workspaceId));
+            const maxFrameBytes = options.max_frame_bytes ?? IPC_DEFAULT_MAX_FRAME_BYTES;
+            return attachIndexFreshness(await engine.continue({ cursor, response_budget: { max_items: budget["max_items"] as number, max_characters: frameSafeMaxCharacters(maxFrameBytes, budget["max_characters"] as number) } }), registry.get(workspaceId));
           } finally {
             enforceWarmRecordsBudget(queryEngines, warmRecordsLru);
           }
