@@ -452,3 +452,62 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
   namespace bug — unchanged). n8n (unreduced): `different == 0` in BOTH populations (unchanged from
   2026-09-08); `confirmed_combined=161,903`, an EXACT match to `REFERENCE_CONFIRMED_COMBINED`
   (no refresh needed).
+
+## Amendment 2026-09-09 (Frente E-P0q, see `docs/evidence/2026-09-07-v4-vscode-campaign.md` §17)
+
+- **Sibling-candidate rule generalized to `implements` conformance too, with a NEW cost bound.**
+  `ProgramIndex::sibling_conformance_overrides` (a strict superset of `sibling_extends_overrides`,
+  which stays `extends`-only and untouched) walks a new `conformance_chain_reaches` (`extends` AND
+  `implements` edges together) — the 2026-09-08 amendment's own stated reason for NOT generalizing
+  to `implements` was an unbounded candidate set for a widely-implemented interface; this amendment
+  closes that by bounding COST instead of refusing the rule entirely: `MAX_CANDIDATE_TARGETS = 8`
+  (`semantic_sites.rs`) — a candidate set (including the originally-resolved target) larger than 8
+  demotes to `checker_pending` with NO candidate list at all (`sibling_conformance_unbounded`,
+  `PendingReasonCode` 11), never a guessed-down `possible` subset, never `confirmed`. A bounded set
+  demotes to `possible` exactly like the `extends` case. This is decision 28's own "el coste se
+  acota, la corrección no" principle applied literally: the earlier amendment treated an unbounded
+  candidate set as a reason to skip the rule; this one treats it as a reason to skip the LIST while
+  keeping the rule.
+- **Negated-`instanceof` early-return narrowing** (`extract_negated_instanceof_narrowings_from_
+  early_exit_test`) — the literal-`instanceof` sibling of the 2026-09-08 amendment's own negated
+  type-predicate idiom, reusing the identical `visit_statements`/`statement_definitely_exits`
+  infrastructure that amendment built, but pushing onto `instanceof_narrowings` (inheriting its own
+  call-target suppression, `suppress_instanceof_narrowing_for_calls`) rather than `type_predicate_
+  narrowings`.
+- **Standalone-function `param is T` type-predicate narrowing.** The 2026-09-08 amendment
+  represented `PredicateSubject::Parameter` but explicitly declined to consult it ("needs a
+  per-function parameter-name/position table this index does not otherwise keep"). This amendment
+  builds that table minimally: `summarize_function` (the one call site with the declaring
+  function's own parameter LIST in scope) patches a `position: Option<usize>` onto `Predicate
+  Subject::Parameter` at declaration time (`patch_predicate_parameter_position`, plain-identifier
+  parameters only). A bare-function call (`isFoo(x)`, as opposed to a member call `x.isFoo()`)
+  narrows the SAME-position argument, when that argument is itself a plain, unambiguous identifier
+  — reusing the EXISTING `type_predicate_narrowings` stack/bracketing (positive and negated-early-
+  return forms both), since the new logic is a callee-shape branch inside the existing extraction
+  function, not a new mechanism.
+- **Incremental-consistency gap found and fixed** (not itself a decision-28 semantics change, but
+  necessary for the sibling-conformance generalization to be SOUND under incremental reconcile): a
+  member read/call demoted to `possible` by the sibling-conformance check can depend on a
+  conformer's file the reading owner never `import`s at all (an interface-typed constructor
+  parameter property, reached through `this.<field>`, with zero import edge to the concrete
+  conformer). `OwnerSemantics::sibling_conformance_dependencies` records this cross-file dependency
+  explicitly (the SAME `DependencyRow` channel/mechanism Frente E-P0f's `ambient_global_
+  dependencies` already established for an analogous "real dependency, no backing import/export
+  relation" gap), so deleting/editing the ONLY conformer correctly reflows the dependent owner on
+  the next incremental reconcile. Found live via a REQUIRED e2e test regression, not a corpus
+  sample.
+- **Live measurement**: VS Code (reduced tree, 12,841 files — a different reduction pass than the
+  2026-09-08 amendment's own 10,044, not reconciled): references `different` 189 → 110 (-42%),
+  calls `different` 58 → 61 (a small, unreconciled increase attributed to the file-count/
+  composition drift between sessions, not a regression — every sampled `different` pair this
+  session inspected, across the FULL population rather than a 30-sample reservoir, matches an
+  ALREADY-DOCUMENTED pattern: the dominant remaining class is a receiver reliably pinned by one of
+  `rule_pins_receiver_uniquely`'s own reliable rules to a WIDER type, where v3's real per-call-site
+  answer is a narrower/different type this crate's non-flow-sensitive local inference cannot see —
+  the SAME general class the 2026-09-08 amendment's own pattern 1 already reported, now the large
+  majority of what remains since the `implements`-conformance-detection gap itself is closed).
+  `different == 0` STILL does not hold for VS Code — see the evidence doc's own §17.4 for the full
+  classification table. n8n (unreduced): `different == 0` holds in BOTH populations (unchanged);
+  `confirmed_combined` 161,903 → **161,843** (−60, the SAME "intended, safety-improving direction"
+  every prior refresh documents — fewer confirmed sites, never a wrong one), `REFERENCE_CONFIRMED_
+  COMBINED` refreshed accordingly.

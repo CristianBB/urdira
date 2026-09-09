@@ -107,6 +107,17 @@ const DEPENDENCY_ROLE_RESOLUTION_INPUT: u8 = 1;
 /// writeup and why this needs its own persisted `DependencyRow`, not just a
 /// same-call revisit.
 pub(super) const DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT: u8 = 2;
+/// E-P0q (2026-09-09, sibling-conformance-dependents integrity fix): a
+/// consumer -> conformer dependency for a member read/call this owner's
+/// typeflow-mediated resolution demoted (or capped, via `TooManyCandidates`)
+/// through `ProgramIndex::sibling_conformance_overrides` -- see
+/// `urdira_jsts_syntax_worker::OwnerSemantics::sibling_conformance_
+/// dependencies`'s own doc comment for the full root-cause writeup (the
+/// SAME shape `DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT` already closes for a
+/// different edge kind: a dependency that exists with NO backing `core:
+/// import`/`core:export` relation for the ordinary reverse-dependent
+/// closure to walk).
+pub(super) const DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT: u8 = 3;
 
 /// The `ProposedRecordDependency::dependency_role` text
 /// `urdira-indexing-worker::v4::analyze::run_scoped`/`run_cold` set on every
@@ -115,15 +126,21 @@ pub(super) const DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT: u8 = 2;
 /// the string `role_byte` matches below can never drift from what the
 /// producer actually writes.
 pub(super) const AMBIENT_GLOBAL_DEPENDENCY_ROLE: &str = "jsts:ambient_global_input";
+/// E-P0q: see `DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT`'s own doc comment
+/// -- the `ProposedRecordDependency::dependency_role` text `run_scoped` sets
+/// on every dependency built from `OwnerSemantics::sibling_conformance_
+/// dependencies`.
+pub(super) const SIBLING_CONFORMANCE_DEPENDENCY_ROLE: &str = "jsts:sibling_conformance_input";
 
 /// `dependency_role` is TEXT in v3 (`jsts:resolution_input`, per
 /// `urdira-jsts-native-projection`'s `project_owner`); `DependencyRow.role`
-/// is `u8`. Two roles exist in this pipeline's producers as of Frente
-/// E-P0f -- promote to a dictionary if a third is ever introduced.
+/// is `u8`. Three roles exist in this pipeline's producers as of Frente
+/// E-P0q -- promote to a dictionary if a fourth is ever introduced.
 fn role_byte(role: &str) -> u8 {
     match role {
         "jsts:resolution_input" => DEPENDENCY_ROLE_RESOLUTION_INPUT,
         AMBIENT_GLOBAL_DEPENDENCY_ROLE => DEPENDENCY_ROLE_AMBIENT_GLOBAL_INPUT,
+        SIBLING_CONFORMANCE_DEPENDENCY_ROLE => DEPENDENCY_ROLE_SIBLING_CONFORMANCE_INPUT,
         _ => DEPENDENCY_ROLE_UNKNOWN,
     }
 }

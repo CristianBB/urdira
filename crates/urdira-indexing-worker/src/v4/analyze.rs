@@ -20,7 +20,7 @@
 //! brief: v4 does not emit them).
 
 use super::ScanError;
-use super::deps::AMBIENT_GLOBAL_DEPENDENCY_ROLE;
+use super::deps::{AMBIENT_GLOBAL_DEPENDENCY_ROLE, SIBLING_CONFORMANCE_DEPENDENCY_ROLE};
 use super::timings::ScanClock;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1195,6 +1195,41 @@ pub fn run_scoped(
                 dependency_basis: "ambient_global_resolution",
                 source_reference: serde_json::json!({
                     "reference_type": "ambient_global",
+                    "declaring_path": declaring_path,
+                }),
+            });
+        }
+        // E-P0q (2026-09-09, sibling-conformance-dependents integrity fix):
+        // the SAME shape as the ambient-global loop right above, for a
+        // DIFFERENT edge kind -- `OwnerSemantics::sibling_conformance_
+        // dependencies`'s own doc comment has the full root-cause writeup
+        // (`TaskService` only ever imports the `TaskRepository` INTERFACE,
+        // never the concrete `InMemoryTaskRepository` conformer whose own
+        // redeclaration is what made `this.repository.create(...)`
+        // ambiguous in the first place -- deleting/editing that conformer
+        // needs an edge for the incremental pipeline's reverse-dependent
+        // closure to walk, since no ordinary import/export relation ever
+        // named it).
+        for declaring_path in &semantics.sibling_conformance_dependencies {
+            let Some(declaring_file) = files_by_path.get(declaring_path.as_str()) else {
+                continue;
+            };
+            owner.dependencies.push(ProposedRecordDependency {
+                proposed_dependency_id: format!(
+                    "jsts:sibling-conformance-dependency:{}->{declaring_path}",
+                    owner.owner_path,
+                ),
+                proposal_record_key: format!(
+                    "jsts:sibling-conformance-dependency-record:{}->{declaring_path}",
+                    owner.owner_path,
+                ),
+                dependency_artifact_id: declaring_file.artifact_id.clone(),
+                dependency_artifact_version_id: declaring_file.artifact_version_id.clone(),
+                dependency_target_path: declaring_path.clone(),
+                dependency_role: SIBLING_CONFORMANCE_DEPENDENCY_ROLE,
+                dependency_basis: "sibling_conformance_resolution",
+                source_reference: serde_json::json!({
+                    "reference_type": "sibling_conformance",
                     "declaring_path": declaring_path,
                 }),
             });

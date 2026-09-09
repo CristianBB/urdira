@@ -41,8 +41,8 @@ use oxc_allocator::{Allocator, ArenaVec};
 use oxc_ast::AstKind;
 use oxc_ast::Comment;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BinaryExpression, BinaryOperator, BindingPattern, CallExpression,
-    CatchParameter, ChainElement, Class, ClassType, ComputedMemberExpression,
+    Argument, ArrowFunctionExpression, BinaryExpression, BinaryOperator, BindingPattern,
+    CallExpression, CatchParameter, ChainElement, Class, ClassType, ComputedMemberExpression,
     ExportNamedDeclaration, ExportSpecifier, Expression, FormalParameter, FormalParameterRest,
     Function, FunctionType, IdentifierReference, IfStatement, ImportDeclaration,
     ImportDefaultSpecifier, ImportExpression, ImportNamespaceSpecifier, ImportOrExportKind,
@@ -309,6 +309,52 @@ pub struct OwnerSemantics {
     /// silently dropped -- flagged here rather than reproduced, matching
     /// this crate's own convention for such gaps elsewhere).
     pub ambient_global_dependencies: Vec<String>,
+    /// E-P0q (2026-09-09): every OTHER file's path this owner depends on
+    /// because a member read/call this owner's typeflow-mediated resolution
+    /// produced a `sibling_declaration_ambiguous`/`sibling_conformance_
+    /// unbounded` candidate through (`ProgramIndex::sibling_conformance_
+    /// overrides`, `resolve_static_member_reference`/`resolve_call_target_
+    /// typeflow`) -- deduped and sorted ascending (`SemanticWalker::
+    /// sibling_conformance_dependencies` is a `BTreeSet`). Root cause this
+    /// closes, the SAME SHAPE `ambient_global_dependencies` right above
+    /// already closes for a DIFFERENT edge kind: a sibling-conformance
+    /// candidate can live in a file this owner never `import`s at all --
+    /// `TaskService` (`src/services/task-service.ts`) only ever imports the
+    /// `TaskRepository` INTERFACE, never `InMemoryTaskRepository` (the
+    /// concrete `implements` conformer whose own redeclaration is what
+    /// makes `this.repository.create(...)` ambiguous in the first place) --
+    /// so the ordinary import/export-derived `DependencyRow`s `deps.rs`
+    /// already writes have NO edge for the incremental pipeline's reverse-
+    /// dependent closure to walk when that conformer is edited/deleted.
+    /// Found live via `reconcile_delete_roots_match_a_from_scratch_scan_
+    /// of_the_mutated_tree` (`urdira-indexing-worker::v4::tests_e2e`):
+    /// deleting `InMemoryTaskRepository` left `TaskService`'s own stale
+    /// `possible` candidate rows (targeting the now-deleted `InMemoryTask
+    /// Repository::create`/etc.) unresolved-but-present after an
+    /// incremental reconcile, diverging from a from-scratch scan of the
+    /// same final tree (which correctly re-confirms them once no
+    /// conformer remains). `urdira-indexing-worker::v4::analyze::run_
+    /// scoped` turns each entry here into a `ProposedRecordDependency` with
+    /// `dependency_role: "jsts:sibling_conformance_input"` (see `deps.rs`'s
+    /// own doc comment), the SAME `DependencyRow` channel `ambient_global_
+    /// dependencies` already uses -- `StoreReader::deps_reverse`/this
+    /// generation's own reverse-dependent scheduling see it for free.
+    /// Recorded ONLY when `sibling_conformance_overrides` returns a
+    /// NON-EMPTY set (whether the site ends up `possible`, still pending
+    /// under the `MAX_CANDIDATE_TARGETS` cap, or -- via `TooManyCandidates`
+    /// -- pending with no list at all: every one of those outcomes depends
+    /// on the SAME dynamic conformer set, so every one records the SAME
+    /// dependency) -- a reliably-typed receiver that never even reaches the
+    /// sibling check records nothing, matching `ambient_global_
+    /// dependencies`'s own "only a real cross-file fact" discipline.
+    /// Deliberately narrower than the general case, matching this task's
+    /// own precedent (`ambient_global_dependencies`'s doc comment, "A
+    /// CREATED path has no 'old' self to be a dependency target of"): a
+    /// BRAND NEW conformer added later that would newly ambiguate an
+    /// EXISTING confirmed site is not covered by this fix either (no prior
+    /// dependency edge exists for a file that did not exist when the
+    /// confirmation was made) -- out of scope here, the same accepted gap.
+    pub sibling_conformance_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -409,6 +455,7 @@ pub struct PendingSiteProposal {
 /// | 8 | `heritage_target_uncertain` | this crate, `PendingHeritageSite` |
 /// | 9 | `heritage_clause_partially_pending` | this crate, `PendingHeritageSite` |
 /// | 10 | `sibling_declaration_ambiguous` | this crate, `PendingCallSite`/`CandidateCallRow`/`CandidateReferenceRow` (E-P0o) |
+/// | 11 | `sibling_conformance_unbounded` | this crate, `PendingCallSite` (E-P0q) -- an `implements`-reached candidate set larger than `MAX_CANDIDATE_TARGETS`, pending with NO candidate rows (never `possible`, never `confirmed`) |
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingReasonCode {
@@ -423,6 +470,7 @@ pub enum PendingReasonCode {
     HeritageTargetUncertain = 8,
     HeritageClausePartiallyPending = 9,
     SiblingDeclarationAmbiguous = 10,
+    SiblingConformanceUnbounded = 11,
 }
 
 impl PendingReasonCode {
@@ -438,6 +486,7 @@ impl PendingReasonCode {
             REASON_HERITAGE_TARGET_UNCERTAIN => Self::HeritageTargetUncertain,
             REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING => Self::HeritageClausePartiallyPending,
             REASON_SIBLING_DECLARATION_AMBIGUOUS => Self::SiblingDeclarationAmbiguous,
+            REASON_SIBLING_CONFORMANCE_UNBOUNDED => Self::SiblingConformanceUnbounded,
             _ => Self::Unspecified,
         };
         code as u8
@@ -455,6 +504,7 @@ impl PendingReasonCode {
             8 => REASON_HERITAGE_TARGET_UNCERTAIN,
             9 => REASON_HERITAGE_CLAUSE_PARTIALLY_PENDING,
             10 => REASON_SIBLING_DECLARATION_AMBIGUOUS,
+            11 => REASON_SIBLING_CONFORMANCE_UNBOUNDED,
             _ => "unspecified",
         }
     }
@@ -745,6 +795,38 @@ const REASON_UNION_AMBIGUOUS: &str = "union_ambiguous";
 /// -- same reason string either way, decision 28's sibling-candidate rule
 /// is one mechanism regardless of site kind.
 const REASON_SIBLING_DECLARATION_AMBIGUOUS: &str = "sibling_declaration_ambiguous";
+/// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+/// §16.4 pattern 1): the SAME sibling-candidate ambiguity `REASON_SIBLING_
+/// DECLARATION_AMBIGUOUS` names, but reached through `implements`
+/// conformance (`ProgramIndex::sibling_conformance_overrides`) with MORE
+/// than `MAX_CANDIDATE_TARGETS` candidates -- an `implements`-reached
+/// candidate set (a widely-implemented interface like `IAction`) has no
+/// bound on how many implementers exist, unlike an `extends` subclass
+/// chain, so decision 28's "acotación de coste, no de corrección" carve-out
+/// applies: the site stays `checker_pending` with THIS reason and carries NO
+/// candidate rows at all (never a `possible` list, and never `confirmed`) --
+/// a later residual tsgo pass, not this list, is what may still resolve it.
+/// See `MAX_CANDIDATE_TARGETS`'s own doc comment for the exact cap and its
+/// rationale.
+const REASON_SIBLING_CONFORMANCE_UNBOUNDED: &str = "sibling_conformance_unbounded";
+/// E-P0q (2026-09-09): the maximum number of sibling-conformance candidates
+/// (`ProgramIndex::sibling_conformance_overrides`'s own result length,
+/// INCLUDING the originally-resolved `target` merged in -- the same set a
+/// `possible` row would need one entry per member of) this crate will ever
+/// publish as a list of `CandidateReferenceRow`/`CandidateCallRow` rows. This
+/// bounds COST (how large a candidate list a query engine and a human
+/// reviewing `possible` rows must wade through), never CORRECTNESS -- a site
+/// whose candidate count exceeds this cap is never guessed down to a
+/// (possibly wrong) subset; it demotes to `REASON_SIBLING_CONFORMANCE_
+/// UNBOUNDED` pending with NO list at all, per decision 28's own "el coste
+/// se acota, la corrección no" instruction. Fixed at 8: `sibling_extends_
+/// overrides`'s own `extends`-only candidate sets (E-P0o/E-P0p, still using
+/// this same cap for symmetry even though a subclass chain rarely gets this
+/// wide) and every live `implements` sample this session inspected
+/// (`IAction`/`ICellViewModel`/`IEditorPane`/...) both stay comfortably under
+/// this bound in practice -- chosen as a round number clearly above every
+/// observed real candidate count, not fit to a specific corpus statistic.
+const MAX_CANDIDATE_TARGETS: usize = 8;
 /// A2 (pending.sites migration): fallback reason for a `PendingSiteProposal`
 /// built from a [`PendingHeritageSite`] whose own `reason` field cannot be
 /// recovered for some future reason -- not reached by any code path today
@@ -917,6 +999,27 @@ impl DeclKind {
 
 fn declaration_id(kind: DeclKind, path: &str, start: u32, name: &str) -> String {
     format!("jsts:{}:{path}:{start}:{name}", kind.identity_name())
+}
+
+/// E-P0q (2026-09-09): the declaring PATH segment of a `jsts:{kind}:{path}:
+/// {start}:{name}` entity id -- the exact same format `declaration_id`
+/// above (and `urdira_jsts_typeflow::declaration_id`, byte-identical
+/// recipe) builds. Used ONLY to populate `sibling_conformance_
+/// dependencies` with the declaring file of a sibling-conformance
+/// candidate this crate never otherwise tracks a `path` for (`ProgramIndex`
+/// keeps no such field on a container/member -- see `sibling_conformance_
+/// overrides`'s own doc comment). Parsed from the END (`start`, `name`) so
+/// a `path` containing an internal `:` (never produced by this workspace's
+/// own relative POSIX paths, but not otherwise forbidden) would still be
+/// recovered whole. `None` for a malformed id (defensive only -- every
+/// candidate this function ever sees came from this crate's own
+/// `declaration_id`/`urdira_jsts_typeflow::declaration_id`).
+fn declaring_path_of_entity_id(entity_id: &str) -> Option<&str> {
+    let rest = entity_id.strip_prefix("jsts:")?;
+    let (_kind, rest) = rest.split_once(':')?;
+    let (path_and_start, _name) = rest.rsplit_once(':')?;
+    let (path, _start) = path_and_start.rsplit_once(':')?;
+    Some(path)
 }
 
 /// 2026-09-04 references-parity task, bucket 3: `parameters.items`'s own
@@ -1284,10 +1387,14 @@ struct CandidateReferenceRow {
 /// `TypeflowCallResolution` for a plain (non-call) member read -- `Candidates`
 /// is E-P0o's sibling-declaration ambiguity (see `CandidateReferenceRow`'s
 /// own doc comment); deliberately never a `Resolved` for that outcome, same
-/// zero-wrong-target discipline as the call case.
+/// zero-wrong-target discipline as the call case. `TooManyCandidates`
+/// (E-P0q) is the SAME ambiguity with a candidate set larger than
+/// `MAX_CANDIDATE_TARGETS` -- pending, but with NO candidate list at all,
+/// see `REASON_SIBLING_CONFORMANCE_UNBOUNDED`'s own doc comment.
 enum StaticMemberResolution {
     Resolved(String),
     Candidates(Vec<String>),
+    TooManyCandidates,
     Unresolved,
 }
 
@@ -1306,6 +1413,10 @@ enum TypeflowCallResolution {
         targets: Vec<String>,
         reason: &'static str,
     },
+    /// E-P0q: see `StaticMemberResolution::TooManyCandidates`'s own doc
+    /// comment -- the identical outcome for a CALL target instead of a plain
+    /// reference.
+    TooManyCandidates,
     Unresolved,
 }
 
@@ -1953,6 +2064,14 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// in several signatures across one file) collapse to one dependency
     /// edge, and `finish()`'s conversion needs no separate sort/dedup pass.
     ambient_global_dependencies: BTreeSet<String>,
+    /// E-P0q: accumulator for `OwnerSemantics::sibling_conformance_
+    /// dependencies` -- see that field's own doc comment. A `RefCell`
+    /// (unlike `ambient_global_dependencies` right above) because its two
+    /// writer call sites (`resolve_static_member_reference`/`resolve_call_
+    /// target_typeflow`) are both `&self` -- same interior-mutability need
+    /// `suppress_instanceof_narrowing_for_calls` already has, generalized
+    /// from a `Cell<bool>` flag to an accumulating set.
+    sibling_conformance_dependencies: std::cell::RefCell<BTreeSet<String>>,
 }
 
 impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
@@ -2025,6 +2144,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             is_test_source,
             line_index,
             ambient_global_dependencies: BTreeSet::new(),
+            sibling_conformance_dependencies: std::cell::RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -2823,6 +2943,19 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 .type_predicate_narrowing_of_call(call)
                 .into_iter()
                 .collect(),
+            // E-P0q (2026-09-09): `x?.hasModel()` -- an OPTIONAL-CHAIN
+            // predicate call (found live: `if (!editor?.hasModel()) return;`,
+            // `languageStatus.ts`). Truthy means BOTH `x` non-nullish AND the
+            // predicate true, so the narrowing is exactly the same proof;
+            // a falsy chain (negated early exit) likewise leaves only the
+            // "non-nullish and predicate true" case past the exit.
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::CallExpression(call) => self
+                    .type_predicate_narrowing_of_call(call)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -2835,21 +2968,79 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// SAME typeflow member lookup every other member call uses (`type_of_
     /// expression` + `Self::as_entity` + `ProgramIndex::member_predicate_
     /// receiver_narrowing`) to a member whose own declared return type is
-    /// `this is T`. `None` for anything else -- a non-member callee, a
-    /// computed/non-identifier receiver, a member that is not a proven
-    /// receiver-narrowing predicate -- never a guess.
+    /// `this is T`. E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-
+    /// campaign.md` §16.4 pattern 3): a bare-identifier callee (`isFoo(x)`,
+    /// never a member call) is delegated to `standalone_predicate_
+    /// narrowing_of_call` instead. `None` for anything else -- a computed/
+    /// non-identifier member receiver, a member that is not a proven
+    /// receiver-narrowing predicate, any OTHER callee shape (`new T()`,
+    /// `this.m()`'s own bare-`this` form already routed through the member
+    /// branch, a call expression callee, ...) -- never a guess.
     fn type_predicate_narrowing_of_call(
         &self,
         call: &CallExpression<'a>,
     ) -> Option<(SymbolId, String)> {
         let index = self.ctx.typeflow_index?;
-        let Expression::StaticMemberExpression(member) = &call.callee else {
+        match &call.callee {
+            Expression::StaticMemberExpression(member) => {
+                let Expression::Identifier(object) = &member.object else {
+                    return None;
+                };
+                let reference_id = object.reference_id.get()?;
+                let reference = self.scoping.get_reference(reference_id);
+                let symbol_id = reference.symbol_id()?;
+                if self.scoping.symbol_flags(symbol_id).is_import()
+                    || !self.scoping.symbol_redeclarations(symbol_id).is_empty()
+                {
+                    return None;
+                }
+                let (base_value, _rule) = self.type_of_expression(&member.object)?;
+                let (base_entity, is_static) = Self::as_entity(&base_value)?;
+                let narrowed_entity_id = index.member_predicate_receiver_narrowing(
+                    &base_entity,
+                    member.property.name.as_str(),
+                    is_static,
+                )?;
+                Some((symbol_id, narrowed_entity_id))
+            }
+            Expression::Identifier(callee) => {
+                self.standalone_predicate_narrowing_of_call(call, callee)
+            }
+            _ => None,
+        }
+    }
+
+    /// E-P0q (2026-09-09): the bare-function sibling of `type_predicate_
+    /// narrowing_of_call`'s member-call branch above -- `isFoo(x)` where
+    /// `isFoo` is a standalone top-level function declaration whose own
+    /// declared return type is `param is T`
+    /// (`ProgramIndex::function_predicate_parameter_narrowing`). `callee`
+    /// must resolve UNAMBIGUOUSLY to that single function declaration
+    /// (`resolve_identifier_to_kind`, the exact same certainty bar
+    /// `resolve_call_target` already applies to a plain-identifier callee);
+    /// `position` (the predicate's own parameter's zero-based index --
+    /// `PredicateSubject::Parameter`'s own doc comment) picks out the
+    /// matching CALL ARGUMENT -- narrowed only when that argument is itself
+    /// a plain, unambiguous local/parameter identifier (`Argument::
+    /// Identifier`, never a destructured binding, an import, or a
+    /// redeclared symbol -- same certainty bar every other narrowing rule
+    /// in this file enforces). `None` for anything else: too few arguments,
+    /// a spread/computed/non-identifier argument at that position, an
+    /// ambiguous callee, or a predicate this index never confidently
+    /// positioned -- never a guess at which argument the predicate's own
+    /// parameter corresponds to.
+    fn standalone_predicate_narrowing_of_call(
+        &self,
+        call: &CallExpression<'a>,
+        callee: &IdentifierReference<'a>,
+    ) -> Option<(SymbolId, String)> {
+        let index = self.ctx.typeflow_index?;
+        let function_id = self.resolve_identifier_to_kind(callee, &[DeclKind::Function])?;
+        let (position, target_id) = index.function_predicate_parameter_narrowing(&function_id)?;
+        let Argument::Identifier(argument) = call.arguments.get(position)? else {
             return None;
         };
-        let Expression::Identifier(object) = &member.object else {
-            return None;
-        };
-        let reference_id = object.reference_id.get()?;
+        let reference_id = argument.reference_id.get()?;
         let reference = self.scoping.get_reference(reference_id);
         let symbol_id = reference.symbol_id()?;
         if self.scoping.symbol_flags(symbol_id).is_import()
@@ -2857,14 +3048,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         {
             return None;
         }
-        let (base_value, _rule) = self.type_of_expression(&member.object)?;
-        let (base_entity, is_static) = Self::as_entity(&base_value)?;
-        let narrowed_entity_id = index.member_predicate_receiver_narrowing(
-            &base_entity,
-            member.property.name.as_str(),
-            is_static,
-        )?;
-        Some((symbol_id, narrowed_entity_id))
+        Some((symbol_id, target_id))
     }
 
     /// E-P0p (2026-09-09): the SAME proof `type_predicate_narrowing_of_
@@ -2927,6 +3111,83 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             }
             Expression::CallExpression(call) => self
                 .type_predicate_narrowing_of_call(call)
+                .into_iter()
+                .collect(),
+            // E-P0q (2026-09-09): `x?.hasModel()` -- an OPTIONAL-CHAIN
+            // predicate call (found live: `if (!editor?.hasModel()) return;`,
+            // `languageStatus.ts`). Truthy means BOTH `x` non-nullish AND the
+            // predicate true, so the narrowing is exactly the same proof;
+            // a falsy chain (negated early exit) likewise leaves only the
+            // "non-nullish and predicate true" case past the exit.
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::CallExpression(call) => self
+                    .type_predicate_narrowing_of_call(call)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §16.4 pattern 2): the SAME negated-early-return proof `extract_
+    /// negated_predicate_narrowings_from_early_exit_test` establishes for a
+    /// type-predicate CALL, generalized to a literal `instanceof` check
+    /// instead -- `if (!(x instanceof T)) return; ...x narrowed to T for
+    /// the rest of this block...`. Reaching any statement after such an
+    /// `if` proves the test was false; for a negated `instanceof` disjunct
+    /// (through any number of `||`-joined disjuncts, same reasoning as the
+    /// predicate case) that means the check itself was true. Pushed onto
+    /// `instanceof_narrowings` (never `type_predicate_narrowings`) by this
+    /// function's own caller (`visit_statements`) -- this is real subclass
+    /// narrowing, not interface-conformance narrowing, so it inherits the
+    /// EXACT SAME property-vs-callable suppression (`narrowed_target_is_a_
+    /// callable_kind`) and call-target suppression (`suppress_instanceof_
+    /// narrowing_for_calls`) every other `instanceof` narrowing already
+    /// carries -- the E-P0k regression this crate protects against
+    /// (`instanceof_narrowing_never_applies_to_a_calls_own_target_
+    /// resolution`) applies identically here.
+    fn extract_negated_instanceof_narrowings_from_early_exit_test(
+        &self,
+        expr: &Expression<'a>,
+    ) -> Vec<(SymbolId, String)> {
+        match expr {
+            Expression::ParenthesizedExpression(parenthesized) => self
+                .extract_negated_instanceof_narrowings_from_early_exit_test(
+                    &parenthesized.expression,
+                ),
+            Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+                let mut narrowings =
+                    self.extract_negated_instanceof_narrowings_from_early_exit_test(&logical.left);
+                narrowings.extend(
+                    self.extract_negated_instanceof_narrowings_from_early_exit_test(&logical.right),
+                );
+                narrowings
+            }
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                self.instanceof_narrowing_of_negated_operand(&unary.argument)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The single-negated-operand half of `extract_negated_instanceof_
+    /// narrowings_from_early_exit_test` -- `!(x instanceof T)`, `x
+    /// instanceof T` unwrapped through any number of parens, bottoming out
+    /// at the SAME `instanceof_narrowing_of_binary` the positive form
+    /// (`extract_instanceof_narrowings`) already uses -- never a guess for
+    /// anything else (`!a && !b`, a plain boolean, ...).
+    fn instanceof_narrowing_of_negated_operand(
+        &self,
+        operand: &Expression<'a>,
+    ) -> Vec<(SymbolId, String)> {
+        match operand {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.instanceof_narrowing_of_negated_operand(&parenthesized.expression)
+            }
+            Expression::BinaryExpression(binary) => self
+                .instanceof_narrowing_of_binary(binary)
                 .into_iter()
                 .collect(),
             _ => Vec::new(),
@@ -3375,6 +3636,47 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 | "member_class_static"
                 | "member_new_expression"
         )
+    }
+
+    /// E-P0q (2026-09-09): the class `expr` (a plain identifier receiver)
+    /// is currently `instanceof`-narrowed to, if any -- the innermost entry
+    /// of `instanceof_narrowings` for its symbol, read REGARDLESS of
+    /// `suppress_instanceof_narrowing_for_calls` (this is the call-target
+    /// resolver's own second opinion, see `resolve_call_target_typeflow`).
+    fn active_instanceof_narrowing_of(&self, expr: &Expression<'a>) -> Option<String> {
+        let Expression::Identifier(ident) = expr else {
+            return None;
+        };
+        let reference_id = ident.reference_id.get()?;
+        let symbol_id = self.scoping.get_reference(reference_id).symbol_id()?;
+        self.instanceof_narrowings
+            .iter()
+            .rev()
+            .find(|(narrowed_symbol, _)| *narrowed_symbol == symbol_id)
+            .map(|(_, class_id)| class_id.clone())
+    }
+
+    /// E-P0q (2026-09-09): records `OwnerSemantics::sibling_conformance_
+    /// dependencies` for every entry in `candidates` (a non-empty
+    /// `ProgramIndex::sibling_conformance_overrides` result -- called from
+    /// BOTH `resolve_static_member_reference`/`resolve_call_target_
+    /// typeflow`, and from EVERY one of the three outcomes a non-empty
+    /// result can lead to: `Candidates`, the `MAX_CANDIDATE_TARGETS`-capped
+    /// `TooManyCandidates`, all depend on the exact SAME dynamic conformer
+    /// set) whose OWN declaring path differs from this owner's -- see that
+    /// field's own doc comment for the root cause this closes. `&self`
+    /// (interior mutability via `RefCell`, matching `suppress_instanceof_
+    /// narrowing_for_calls`'s own precedent) since both call sites are
+    /// themselves `&self`.
+    fn record_sibling_conformance_dependencies(&self, candidates: &[String]) {
+        let mut dependencies = self.sibling_conformance_dependencies.borrow_mut();
+        for candidate in candidates {
+            if let Some(declaring_path) = declaring_path_of_entity_id(candidate)
+                && declaring_path != self.path
+            {
+                dependencies.insert(declaring_path.to_owned());
+            }
+        }
     }
 
     /// The `(entity_id, is_static)` pair a `TypeflowValue` carries, when it
@@ -4097,16 +4399,18 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             && !(rule == "instanceof_narrowed" && Self::narrowed_target_is_a_callable_kind(&target))
         {
             // E-P0o (2026-09-08, sibling-declaration ambiguity) / E-P0p
-            // (2026-09-09, generalized to an INHERITED match too): a known
-            // `extends`-descendant of `base_entity` might ALSO redeclare
-            // this exact member, regardless of whether `target` came from
-            // `base_entity`'s own direct declaration or one it inherits --
-            // `ProgramIndex::sibling_extends_overrides` already only ever
-            // returns DESCENDANTS of `base_entity`, so no separate "own vs
-            // inherited" gate is needed here at all, only `rule_pins_
-            // receiver_uniquely`'s own reliable-rule allow-list (see that
-            // function's own doc comment for why gating on `rule` alone,
-            // rather than on `ProgramIndex::own_member_ids`, keeps the
+            // (2026-09-09, generalized to an INHERITED match too) / E-P0q
+            // (2026-09-09, generalized to `implements` conformance too): a
+            // known `extends`/`implements`-conformance sibling of
+            // `base_entity` might ALSO redeclare this exact member,
+            // regardless of whether `target` came from `base_entity`'s own
+            // direct declaration or one it inherits --
+            // `ProgramIndex::sibling_conformance_overrides` already only
+            // ever returns DESCENDANTS/conformers of `base_entity`, so no
+            // separate "own vs inherited" gate is needed here at all, only
+            // `rule_pins_receiver_uniquely`'s own reliable-rule allow-list
+            // (see that function's own doc comment for why gating on `rule`
+            // alone, rather than on `ProgramIndex::own_member_ids`, keeps the
             // `EditorPane`/`MergeEditor` regression guard confirmed while
             // also correctly catching the live `ICodeEditor`/
             // `IActiveCodeEditor` counter-example). A reliably-typed
@@ -4114,17 +4418,27 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // "confirmation stays when the receptor is typed uniquely"
             // carve-out.
             if !Self::rule_pins_receiver_uniquely(rule) {
-                let mut candidates = index.sibling_extends_overrides(
+                let mut candidates = index.sibling_conformance_overrides(
                     &base_entity,
                     expr.property.name.as_str(),
                     is_static,
                 );
                 if !candidates.is_empty() {
-                    urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.record_sibling_conformance_dependencies(&candidates);
                     candidates.push(target);
                     candidates.sort();
                     candidates.dedup();
+                    // E-P0q: `MAX_CANDIDATE_TARGETS`'s own doc comment --
+                    // an `implements`-reached candidate set has no natural
+                    // bound the way an `extends` chain does; cost is
+                    // capped, correctness is not, so a set this large stays
+                    // pending with NO list rather than a guessed-down
+                    // `possible` subset.
+                    if candidates.len() > MAX_CANDIDATE_TARGETS {
+                        return StaticMemberResolution::TooManyCandidates;
+                    }
+                    urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return StaticMemberResolution::Candidates(candidates);
                 }
             }
@@ -4362,6 +4676,24 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         self.suppress_instanceof_narrowing_for_calls.set(true);
         let object_type = self.type_of_expression(&member.object);
         self.suppress_instanceof_narrowing_for_calls.set(false);
+        // E-P0q (2026-09-09): the narrowing E-P0k suppressed above is NOT
+        // discarded -- it is consulted as a SECOND, competing resolution.
+        // Found live on VS Code, two opposite v3 answers for the SAME shape:
+        // `activePane instanceof MergeEditor && activePane.getControl()`
+        // (E-P0k) resolves to the UNNARROWED declaration, while `if
+        // (breakpoint instanceof Breakpoint) { breakpoint.getId() }`
+        // (`breakpointsView.ts`) and `if (!(action instanceof
+        // MenuItemAction)) return; action.run(...)` (`scmViewPane.ts`)
+        // resolve to the NARROWED class's own redeclaration. No rule this
+        // crate can state picks one without guessing, so when the narrowed
+        // class's own lookup disagrees with the unnarrowed one the call is
+        // published as `possible` with BOTH candidates (decision 28: never
+        // `confirmed` on a coin flip); when both agree (an inherited, never
+        // redeclared member) it stays confirmed as before. See
+        // `instanceof_narrowed_call_with_a_redeclaring_class_is_possible_
+        // with_both_candidates_never_confirmed` and `docs/evidence/2026-09-
+        // 07-v4-vscode-campaign.md` §17.
+        let instanceof_narrowed_class = self.active_instanceof_narrowing_of(&member.object);
         if let Some((base_value, rule)) = object_type {
             match &base_value {
                 // P2-2j: a union receiver routes to `members_of_union` --
@@ -4470,26 +4802,59 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                                 }
                                 // E-P0o (2026-09-08, sibling-declaration
                                 // ambiguity) / E-P0p (2026-09-09,
-                                // generalized to an INHERITED match too):
-                                // same check, same rationale, as `resolve_
-                                // static_member_reference`'s own -- see
-                                // that function's own doc comment and
-                                // `rule_pins_receiver_uniquely`'s doc
-                                // comment for the exact "reliable rule"
-                                // allow-list (no separate own-vs-inherited
-                                // gate needed here either).
-                                if !Self::rule_pins_receiver_uniquely(rule) {
-                                    let mut candidates = index.sibling_extends_overrides(
+                                // generalized to an INHERITED match too) /
+                                // E-P0q (2026-09-09, generalized to
+                                // `implements` conformance too): same check,
+                                // same rationale, as `resolve_static_member_
+                                // reference`'s own -- see that function's own
+                                // doc comment and `rule_pins_receiver_
+                                // uniquely`'s doc comment for the exact
+                                // "reliable rule" allow-list (no separate
+                                // own-vs-inherited gate needed here either).
+                                // E-P0q: see `instanceof_narrowed_class`'s
+                                // own comment above.
+                                let mut narrowing_unresolved = false;
+                                if let Some(narrowed_class) = &instanceof_narrowed_class {
+                                    match index.members(
+                                        narrowed_class,
+                                        member.property.name.as_str(),
+                                        false,
+                                    ) {
+                                        urdira_jsts_typeflow::MemberLookup::One(narrowed_target)
+                                            if narrowed_target == target => {}
+                                        urdira_jsts_typeflow::MemberLookup::One(narrowed_target) => {
+                                            urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            let mut targets = vec![target, narrowed_target];
+                                            targets.sort();
+                                            targets.dedup();
+                                            return TypeflowCallResolution::Candidates {
+                                                targets,
+                                                reason: REASON_SIBLING_DECLARATION_AMBIGUOUS,
+                                            };
+                                        }
+                                        _ => narrowing_unresolved = true,
+                                    }
+                                }
+                                if narrowing_unresolved || !Self::rule_pins_receiver_uniquely(rule)
+                                {
+                                    let mut candidates = index.sibling_conformance_overrides(
                                         &base_entity,
                                         member.property.name.as_str(),
                                         is_static,
                                     );
                                     if !candidates.is_empty() {
-                                        urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        self.record_sibling_conformance_dependencies(&candidates);
                                         candidates.push(target);
                                         candidates.sort();
                                         candidates.dedup();
+                                        // E-P0q: see `MAX_CANDIDATE_TARGETS`'s
+                                        // own doc comment.
+                                        if candidates.len() > MAX_CANDIDATE_TARGETS {
+                                            return TypeflowCallResolution::TooManyCandidates;
+                                        }
+                                        urdira_jsts_typeflow::DEMOTED_BY_SIBLING_DECLARATION
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         return TypeflowCallResolution::Candidates {
                                             targets: candidates,
                                             reason: REASON_SIBLING_DECLARATION_AMBIGUOUS,
@@ -5240,6 +5605,11 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             sites_digest,
             jsdoc_typed_file: self.jsdoc_typed_file,
             ambient_global_dependencies: self.ambient_global_dependencies.into_iter().collect(),
+            sibling_conformance_dependencies: self
+                .sibling_conformance_dependencies
+                .into_inner()
+                .into_iter()
+                .collect(),
         }
     }
     /// D.3: what `visit_ts_qualified_name` resolves `name.right` to, or the
@@ -6039,8 +6409,18 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// established here never leaks into an ENCLOSING list (matches
     /// `instanceof_narrowings`/`type_predicate_narrowings`'s own general
     /// "guarded region only" contract).
+    ///
+    /// E-P0q (2026-09-09) ALSO extends `instanceof_narrowings` the SAME way,
+    /// for the literal-`instanceof` sibling of this idiom (`if (!(editor
+    /// instanceof SimpleCommentEditor)) return; ...`, `docs/evidence/2026-
+    /// 09-07-v4-vscode-campaign.md` §16.4 pattern 2) -- a SEPARATE
+    /// `restore_len`/stack pair, since `instanceof_narrowings` carries its
+    /// own suppression rules (`suppress_instanceof_narrowing_for_calls`,
+    /// `narrowed_target_is_a_callable_kind`) that `type_predicate_
+    /// narrowings` does not.
     fn visit_statements(&mut self, stmts: &ArenaVec<'a, Statement<'a>>) {
         let restore_len = self.type_predicate_narrowings.len();
+        let instanceof_restore_len = self.instanceof_narrowings.len();
         for stmt in stmts {
             self.visit_statement(stmt);
             if let Statement::IfStatement(if_stmt) = stmt
@@ -6050,9 +6430,13 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                 let narrowings =
                     self.extract_negated_predicate_narrowings_from_early_exit_test(&if_stmt.test);
                 self.type_predicate_narrowings.extend(narrowings);
+                let instanceof_narrowings =
+                    self.extract_negated_instanceof_narrowings_from_early_exit_test(&if_stmt.test);
+                self.instanceof_narrowings.extend(instanceof_narrowings);
             }
         }
         self.type_predicate_narrowings.truncate(restore_len);
+        self.instanceof_narrowings.truncate(instanceof_restore_len);
     }
 
     /// E-P0k: `x instanceof C && ...right...` narrows `x` to `C` for the
@@ -6552,6 +6936,19 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                     }
                 }
             }
+            // E-P0q: the sibling-conformance candidate set exceeded
+            // `MAX_CANDIDATE_TARGETS` -- pending with NO candidate rows,
+            // never a guessed-down `possible` list. See `REASON_SIBLING_
+            // CONFORMANCE_UNBOUNDED`'s own doc comment.
+            StaticMemberResolution::TooManyCandidates => {
+                self.push_site(
+                    SiteKind::IdentifierRef,
+                    start,
+                    end,
+                    SiteDisposition::CheckerPending,
+                    Some(REASON_SIBLING_CONFORMANCE_UNBOUNDED),
+                );
+            }
             StaticMemberResolution::Unresolved => {
                 let reason = if self.jsdoc_typed_file {
                     REASON_JSDOC_TYPED_FILE
@@ -6799,6 +7196,25 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
                                     reason: candidate_reason,
                                 });
                             }
+                        }
+                        // E-P0q: see `StaticMemberResolution::
+                        // TooManyCandidates`'s own doc comment -- the
+                        // identical outcome for a CALL target: pending, with
+                        // NO candidate rows.
+                        TypeflowCallResolution::TooManyCandidates => {
+                            self.push_site(
+                                SiteKind::Call,
+                                start,
+                                end,
+                                SiteDisposition::CheckerPending,
+                                Some(REASON_SIBLING_CONFORMANCE_UNBOUNDED),
+                            );
+                            self.pending_call_sites.push(PendingCallSite {
+                                start,
+                                end,
+                                source_id: self.current_owner(),
+                                reason: REASON_SIBLING_CONFORMANCE_UNBOUNDED,
+                            });
                         }
                         TypeflowCallResolution::Unresolved => {
                             self.push_site(
@@ -12202,6 +12618,277 @@ function hitTest(): number {\n  let result: HitTestResult = new UnknownHitTestRe
         );
     }
 
+    /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §16.4 pattern 1, the DOMINANT VS Code residual): the sibling rule
+    /// generalized to `implements` conformance -- `Action implements
+    /// IAction` (never `extends`), receiver reached through `this.action`
+    /// (`"member_declared_type_chain"`, NOT a `rule_pins_receiver_uniquely`
+    /// reliable rule -- the same unreliable-rule shape every other sibling-
+    /// ambiguity test in this file uses). Must demote to `possible` with
+    /// BOTH candidates, never guess `IAction`'s own declaration merely
+    /// because `IAction` is what `type_of_expression` happened to resolve.
+    #[test]
+    fn implements_sibling_ambiguity_demotes_to_candidate_reference_rows_when_the_receiver_is_not_reliably_typed()
+     {
+        let source = "interface IAction {\n  run(): void;\n}\nclass Action implements IAction {\n  run(): void {}\n}\nclass Host {\n  action: IAction;\n  read() {\n    this.action.run;\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let iaction_run_id = "jsts:method:a.ts:22:run";
+        let action_run_id = "jsts:method:a.ts:73:run";
+        assert_eq!(source[22..].get(..3), Some("run"));
+        assert_eq!(source[73..].get(..3), Some("run"));
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != iaction_run_id && row.3 != action_run_id),
+            "this.action.run must NEVER confirm to either declaration once \
+             the receiver is not reliably typed -- an `implements` \
+             conformer is exactly as ambiguous as an `extends` descendant: \
+             rows={:?}",
+            resolved(&semantics)
+        );
+        let mut target_ids = BTreeSet::new();
+        for row in &semantics.candidate_reference_rows {
+            assert_eq!(
+                row.body.to_value()["reason"],
+                REASON_SIBLING_DECLARATION_AMBIGUOUS
+            );
+            target_ids.insert(
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .expect("target_id present")
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            target_ids,
+            BTreeSet::from([iaction_run_id.to_owned(), action_run_id.to_owned()]),
+            "both IAction's own declaration and Action's own implementing \
+             override must be present as candidates: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+    }
+
+    /// E-P0q: decision 28's own "confirmation stays when the receiver is
+    /// typed uniquely" carve-out, verified for the NEW `implements` shape
+    /// specifically -- `a: IAction` is an explicit, reliable annotation, so
+    /// `a.run` must confirm to `IAction`'s OWN declaration, never `Action`'s
+    /// implementing override (`resolve_static_member_reference`'s own `One`
+    /// match already only ever sees `IAction`'s own resolved member; the
+    /// task's own instruction -- "para un receptor `: I` el destino es
+    /// `I.m`, no la implementación" -- is exactly this).
+    #[test]
+    fn implements_sibling_candidate_set_reliably_typed_receiver_still_confirms_to_the_interfaces_own_declaration()
+     {
+        let source = "interface IAction {\n  run(): void;\n}\nclass Action implements IAction {\n  run(): void {}\n}\nfunction use(a: IAction) {\n  a.run;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let iaction_run_id = "jsts:method:a.ts:22:run";
+        let action_run_id = "jsts:method:a.ts:73:run";
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .any(|row| row.3 == iaction_run_id),
+            "a.run must confirm to IAction's own declaration: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| row.3 != action_run_id),
+            "a.run must NEVER confirm to Action's implementing override: \
+             rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics.candidate_reference_rows.is_empty(),
+            "a reliably-typed receiver must never produce a sibling \
+             candidate row: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+    }
+
+    /// E-P0q (`MAX_CANDIDATE_TARGETS`'s own doc comment, `docs/evidence/
+    /// 2026-09-07-v4-vscode-campaign.md` §16.4 pattern 1's own risk
+    /// analysis): a widely-implemented interface's own candidate set (9
+    /// implementers + `IAction`'s own declaration = 10, over the cap of 8)
+    /// must demote to pending with NO candidate list at all -- never a
+    /// guessed-down `possible` subset, never `confirmed`.
+    #[test]
+    fn implements_sibling_candidate_set_beyond_max_candidate_targets_stays_pending_with_no_candidate_list()
+     {
+        let mut source = String::from("interface IAction {\n  run(): void;\n}\n");
+        for i in 1..=9 {
+            source.push_str(&format!(
+                "class Impl{i} implements IAction {{\n  run(): void {{}}\n}}\n"
+            ));
+        }
+        source.push_str(
+            "class Host {\n  action: IAction;\n  read() {\n    this.action.run;\n  }\n}\n",
+        );
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", &source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", &source, &ctx).expect("analysis succeeds");
+        assert!(
+            semantics.candidate_reference_rows.is_empty(),
+            "a candidate set beyond MAX_CANDIDATE_TARGETS must publish NO \
+             candidate rows at all: rows={:?}",
+            semantics.candidate_reference_rows
+        );
+        assert!(
+            resolved(&semantics)
+                .iter()
+                .all(|row| !row.3.ends_with(":run")),
+            "this.action.run must never confirm to any of the 10 (9 \
+             implementers + IAction itself) candidate `run` declarations \
+             once the set is unbounded: rows={:?}",
+            resolved(&semantics)
+        );
+        assert!(
+            semantics
+                .pending_sites
+                .iter()
+                .any(|site| site.site_kind == SiteKind::IdentifierRef
+                    && site.reason.as_deref() == Some(REASON_SIBLING_CONFORMANCE_UNBOUNDED)),
+            "the site must stay pending with the unbounded-conformance \
+             reason: {:?}",
+            semantics.pending_sites
+        );
+    }
+
+    /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §16.4 pattern 2): the negated-early-return idiom, generalized to a
+    /// literal `instanceof` check (`instanceof_narrowings`, not `type_
+    /// predicate_narrowings`) -- `if (!(other instanceof GithubSlug))
+    /// return; ...other.value...` must narrow `other` to `GithubSlug` for
+    /// the rest of the block, exactly like the positive form (`if (other
+    /// instanceof GithubSlug) { ... }`) already does.
+    #[test]
+    fn negated_instanceof_early_return_narrows_the_rest_of_the_block() {
+        let source = "interface ISlug {\n  readonly value: string;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n}\nfunction use(other: ISlug): string {\n  if (!(other instanceof GithubSlug)) {\n    return \"\";\n  }\n  return other.value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let interface_value_id = "jsts:property:a.ts:29:value";
+        let github_slug_value_id = "jsts:parameter:a.ts:112:value";
+        assert_eq!(source[29..].get(..5), Some("value"));
+        assert_eq!(source[112..].get(..5), Some("value"));
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == github_slug_value_id),
+            "other.value, after the `if (!(other instanceof GithubSlug)) \
+             return;` guard, must resolve to GithubSlug's own parameter \
+             property: rows={rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.3 != interface_value_id),
+            "other.value, after the guard, must never resolve to ISlug's \
+             own (unnarrowed) interface property: rows={rows:?}"
+        );
+    }
+
+    /// E-P0q safety companion, mirroring `negated_predicate_guard_without_
+    /// a_definite_exit_never_narrows_what_follows`: the SAME negated-
+    /// `instanceof` guard, but the consequent does not definitely exit --
+    /// must narrow nothing.
+    #[test]
+    fn negated_instanceof_guard_without_a_definite_exit_never_narrows_what_follows() {
+        let source = "interface ISlug {\n  readonly value: string;\n}\nclass GithubSlug implements ISlug {\n  constructor(public readonly value: string) {}\n}\nfunction use(other: ISlug): string {\n  if (!(other instanceof GithubSlug)) {\n    console.log('not a github slug');\n  }\n  return other.value;\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let interface_value_id = "jsts:property:a.ts:29:value";
+        let github_slug_value_id = "jsts:parameter:a.ts:112:value";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == interface_value_id),
+            "other.value, after a guard that does not definitely exit, must \
+             still resolve normally to ISlug's own (unnarrowed) interface \
+             property: rows={rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.3 != github_slug_value_id),
+            "other.value must never be wrongly narrowed when the guard does \
+             not provably exit: rows={rows:?}"
+        );
+    }
+
+    /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §16.4 pattern 3): a STANDALONE function's own `param is T` predicate
+    /// (`isSub(x): x is Sub`), called as a bare function (`isSub(editor)`,
+    /// never a member call) -- inside the consequent, `editor` must narrow
+    /// to `Sub`'s own (real subclass) override.
+    #[test]
+    fn standalone_function_type_predicate_narrows_inside_the_consequent() {
+        let source = "class Base {\n  getModel(): unknown { return null; }\n}\nclass Sub extends Base {\n  getModel(): string { return \"\"; }\n}\nfunction isSub(x: Base): x is Sub {\n  return x instanceof Sub;\n}\nfunction use(editor: Base) {\n  if (isSub(editor)) {\n    editor.getModel;\n    editor.getModel();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:15:getModel";
+        let sub_get_model_id = "jsts:method:a.ts:81:getModel";
+        assert_eq!(source[15..].get(..8), Some("getModel"));
+        assert_eq!(source[81..].get(..8), Some("getModel"));
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == sub_get_model_id),
+            "editor.getModel, inside the isSub(editor) guard, must confirm \
+             to Sub's own override: rows={rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.3 != base_get_model_id),
+            "editor.getModel, inside the guard, must never confirm to \
+             Base's own (unnarrowed) declaration: rows={rows:?}"
+        );
+        let call_targets: Vec<String> = semantics
+            .typeflow_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            call_targets.iter().any(|target| target == sub_get_model_id),
+            "editor.getModel(), inside the guard, must confirm to Sub's own \
+             override: {call_targets:?}"
+        );
+        assert!(
+            call_targets
+                .iter()
+                .all(|target| target != base_get_model_id),
+            "editor.getModel(), inside the guard, must never confirm to \
+             Base's own (unnarrowed) declaration: {call_targets:?}"
+        );
+    }
+
+    /// E-P0q: the SAME standalone predicate, generalized to the negated-
+    /// early-return idiom -- `if (!isSub(editor)) return; ...` must narrow
+    /// `editor` to `Sub` for the rest of the block.
+    #[test]
+    fn negated_standalone_function_type_predicate_narrows_the_rest_of_the_block() {
+        let source = "class Base {\n  getModel(): unknown { return null; }\n}\nclass Sub extends Base {\n  getModel(): string { return \"\"; }\n}\nfunction isSub(x: Base): x is Sub {\n  return x instanceof Sub;\n}\nfunction use(editor: Base) {\n  if (!isSub(editor)) {\n    return;\n  }\n  editor.getModel;\n  editor.getModel();\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_model_id = "jsts:method:a.ts:15:getModel";
+        let sub_get_model_id = "jsts:method:a.ts:81:getModel";
+        let rows = resolved(&semantics);
+        assert!(
+            rows.iter().any(|row| row.3 == sub_get_model_id),
+            "editor.getModel, after the `if (!isSub(editor)) return;` \
+             guard, must confirm to Sub's own override: rows={rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.3 != base_get_model_id),
+            "editor.getModel, after the guard, must never confirm to \
+             Base's own (unnarrowed) declaration: rows={rows:?}"
+        );
+    }
+
     #[test]
     fn typeflow_union_of_the_same_entity_twice_behaves_as_a_non_union() {
         // `A | A` collapses to the single constituent `A` at the
@@ -14603,6 +15290,37 @@ declare module \"mymod\" {
         );
     }
 
+    /// E-P0q (2026-09-09) companion to the test right below: when the
+    /// `instanceof`-narrowed class does NOT redeclare the member, both the
+    /// unnarrowed and the narrowed lookup land on the SAME inherited
+    /// declaration -- no coin flip, the call stays CONFIRMED to it.
+    #[test]
+    fn instanceof_narrowed_call_stays_confirmed_when_the_narrowed_class_inherits_the_member() {
+        let source = "class EditorPane {\n  getControl(): unknown { return undefined; }\n}\nclass MergeEditor extends EditorPane {\n  other(): void {}\n}\nfunction use(activePane: EditorPane) {\n  if (activePane instanceof MergeEditor) {\n    activePane.getControl();\n  }\n}\n";
+        let (ctx, _index) = typeflow_ctx(&[("a.ts", source)], false);
+        let semantics =
+            analyze_owner_semantics_with_context("a.ts", source, &ctx).expect("analysis succeeds");
+        let base_get_control_id = "jsts:method:a.ts:21:getControl";
+        assert_eq!(source[21..].get(..11), Some("getControl("));
+        let call_targets: Vec<String> = semantics
+            .typeflow_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            call_targets,
+            vec![base_get_control_id.to_owned()],
+            "an inherited (never redeclared) member resolves identically \
+             narrowed or not -- confirmed, no candidates"
+        );
+        assert!(semantics.candidate_call_rows.is_empty());
+    }
+
     /// E-P0k adversarial-review fix: `instanceof_narrowings` is sound for a
     /// plain member READ but NOT for a CALL's own target resolution --
     /// found live against the VS Code corpus (`mergeEditor.ts`):
@@ -14612,6 +15330,16 @@ declare module \"mymod\" {
     /// stays the UNNARROWED declared type's own method (`EditorPane.
     /// getControl`), not `MergeEditor`'s own override. See
     /// `suppress_instanceof_narrowing_for_calls`'s own doc comment.
+    ///
+    /// E-P0q (2026-09-09) re-justified: the SAME live corpus also has the
+    /// OPPOSITE v3 answer for the same shape (`breakpointsView.ts`'s
+    /// `if (breakpoint instanceof Breakpoint) { breakpoint.getId() }` ->
+    /// `Breakpoint.getId`, the NARROWED class), so a call through an
+    /// `instanceof`-narrowed receiver whose narrowed class REDECLARES the
+    /// member is now published as `possible` with BOTH candidates -- the
+    /// invariant this test keeps is the one that matters under decision 28:
+    /// the subclass override is NEVER a CONFIRMED target here (and neither
+    /// is the base one any more -- a coin flip is not a confirmation).
     #[test]
     fn instanceof_narrowing_never_applies_to_a_calls_own_target_resolution() {
         let source = "class EditorPane {\n  getControl(): unknown { return undefined; }\n}\nclass MergeEditor extends EditorPane {\n  override getControl(): unknown { return 1; }\n}\nfunction use(activePane: EditorPane) {\n  if (activePane instanceof MergeEditor && activePane.getControl()) {\n    activePane.getControl();\n  }\n}\n";
@@ -14644,16 +15372,37 @@ declare module \"mymod\" {
             call_targets
                 .iter()
                 .all(|target| target != sub_get_control_id),
-            "activePane.getControl() must never resolve to MergeEditor's \
+            "activePane.getControl() must never CONFIRM to MergeEditor's \
              own override just because activePane was instanceof-narrowed \
              at the call site: {call_targets:?}"
         );
         assert!(
             call_targets
                 .iter()
-                .any(|target| target == base_get_control_id),
-            "activePane.getControl() must still resolve normally to \
-             EditorPane's own (unnarrowed) declaration: {call_targets:?}"
+                .all(|target| target != base_get_control_id),
+            "E-P0q: activePane.getControl() must not CONFIRM to EditorPane's \
+             own declaration either once the narrowed class redeclares it \
+             -- v3 answers both ways live, so this is `possible` with both: \
+             {call_targets:?}"
+        );
+        let mut candidate_targets: Vec<String> = semantics
+            .candidate_call_rows
+            .iter()
+            .map(|row| {
+                row.body.to_value()["target_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        candidate_targets.sort();
+        candidate_targets.dedup();
+        let mut expected = vec![base_get_control_id.to_owned(), sub_get_control_id.to_owned()];
+        expected.sort();
+        assert_eq!(
+            candidate_targets, expected,
+            "both the unnarrowed and the narrowed declaration must be \
+             published as `possible` candidates"
         );
         // The callee's own PROPERTY-position read (`core:references`, in
         // ADDITION to the separate `core:call` row above -- see `visit_

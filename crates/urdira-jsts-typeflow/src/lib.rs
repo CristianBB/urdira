@@ -222,10 +222,27 @@ pub enum PredicateSubject {
     /// `this is T` -- narrows the method's own RECEIVER (the object a
     /// member call/read reaches it through).
     Receiver,
-    /// `param is T` -- narrows a NAMED parameter of the declaring function/
-    /// method itself, by name (not yet consulted by any resolver in this
-    /// crate -- see `RawTypeRef::TypePredicate`'s doc comment).
-    Parameter(String),
+    /// `param is T` -- narrows a NAMED parameter of the declaring function
+    /// itself. `name` is the predicate's own text, captured the instant this
+    /// variant is built (`raw_type_ref_of_ts_type`'s `TSTypePredicate` arm,
+    /// which has no parameter-LIST context of its own -- it classifies one
+    /// `TSType` node in isolation). `position` is filled in ONLY by
+    /// `summarize_function` (E-P0q, 2026-09-09), the one call site that DOES
+    /// have the declaring function's own `FormalParameters` in scope at the
+    /// moment its return type is classified -- `parameter_position_by_name`
+    /// finds `name` among a PLAIN identifier parameter (never a
+    /// destructured/rest one -- same certainty bar every other resolver in
+    /// this crate applies) and records its zero-based index; `None`
+    /// otherwise (an arrow/method/callable-variable predicate this crate
+    /// does not thread position through for, or a name that does not match
+    /// any plain-identifier parameter). `ProgramIndex::function_predicate_
+    /// parameter_narrowing` refuses to narrow anything when `position` is
+    /// `None` -- never a guess at which call argument the predicate's own
+    /// parameter corresponds to.
+    Parameter {
+        name: String,
+        position: Option<usize>,
+    },
 }
 
 impl From<HeritageTarget> for RawTypeRef {
@@ -919,7 +936,15 @@ fn summarize_function(
         import_specifiers,
         synthetic_interfaces,
     );
-    let pending_return = matches!(return_type, RawTypeRef::Unknown)
+    // E-P0q (2026-09-09): this is the ONE call site with the declaring
+    // function's own `FormalParameters` in scope at the moment its return
+    // type is classified -- patch a `param is T` predicate's own `position`
+    // in now, never later (`PredicateSubject::Parameter`'s own doc comment
+    // explains why `raw_type_ref_of_ts_type` itself cannot do this).
+    let return_type = patch_predicate_parameter_position(return_type, &function.params);
+    // E-P0q: annotation-present-but-unclassified must never fall through to
+    // body inference -- see `member_entry_of_class_element`'s own comment.
+    let pending_return = function.return_type.is_none()
         .then(|| {
             collect_pending_return_shapes(
                 function.body.as_deref(),
@@ -936,6 +961,49 @@ fn summarize_function(
         return_type,
         pending_return,
         is_async: function.r#async,
+    })
+}
+
+/// E-P0q (2026-09-09): if `return_type` is `RawTypeRef::TypePredicate` whose
+/// own `subject` is `PredicateSubject::Parameter { position: None, .. }` (the
+/// state every predicate leaves `raw_type_ref_of_ts_type` in -- see that
+/// variant's own doc comment), look `name` up among `params`' own PLAIN
+/// identifier parameters (`parameter_position_by_name`) and fill `position`
+/// in; every other shape (a non-predicate return type, a `this is T`
+/// predicate, a predicate whose parameter name matches no plain-identifier
+/// parameter -- a destructured/rest one, or a typo`) passes through
+/// unchanged.
+fn patch_predicate_parameter_position(
+    return_type: RawTypeRef,
+    params: &oxc_ast::ast::FormalParameters,
+) -> RawTypeRef {
+    let RawTypeRef::TypePredicate { subject, target } = return_type else {
+        return return_type;
+    };
+    let subject = match subject {
+        PredicateSubject::Parameter { name, position: _ } => {
+            let position = parameter_position_by_name(params, &name);
+            PredicateSubject::Parameter { name, position }
+        }
+        PredicateSubject::Receiver => PredicateSubject::Receiver,
+    };
+    RawTypeRef::TypePredicate { subject, target }
+}
+
+/// E-P0q (2026-09-09): the zero-based index of `name` among `params`' own
+/// entries, considering ONLY a plain identifier binding (`BindingPattern::
+/// BindingIdentifier`) -- a destructured (`{ a, b }`/`[a, b]`) or rest
+/// parameter never qualifies (same certainty bar `push_constructor_
+/// parameter_property_declarations` already applies to a parameter
+/// property's own binding). `None` when no parameter matches -- never a
+/// guess.
+fn parameter_position_by_name(
+    params: &oxc_ast::ast::FormalParameters,
+    name: &str,
+) -> Option<usize> {
+    use oxc_ast::ast::BindingPattern;
+    params.items.iter().position(|param| {
+        matches!(&param.pattern, BindingPattern::BindingIdentifier(ident) if ident.name.as_str() == name)
     })
 }
 
@@ -1013,7 +1081,7 @@ fn object_shape_members_of(
                     import_specifiers,
                     synthetic_interfaces,
                 );
-                let pending_return = matches!(type_ref, RawTypeRef::Unknown)
+                let pending_return = function.return_type.is_none()
                     .then(|| {
                         if function.expression {
                             collect_pending_return_shapes_concise(
@@ -1044,7 +1112,7 @@ fn object_shape_members_of(
                     import_specifiers,
                     synthetic_interfaces,
                 );
-                let pending_return = matches!(type_ref, RawTypeRef::Unknown)
+                let pending_return = function.return_type.is_none()
                     .then(|| {
                         collect_pending_return_shapes(
                             function.body.as_deref(),
@@ -1117,7 +1185,9 @@ fn collect_callable_variable(
                 import_specifiers,
                 synthetic_interfaces,
             );
-            let return_type = if !matches!(annotated, RawTypeRef::Unknown) {
+            // E-P0q: an explicit annotation wins even when this crate cannot
+            // classify it (never a concise-body guess past a written type).
+            let return_type = if function.return_type.is_some() {
                 annotated
             } else if function.expression {
                 concise_arrow_object_literal_shape(
@@ -2095,9 +2165,13 @@ fn raw_type_ref_of_ts_type(
             };
             let subject = match &predicate.parameter_name {
                 TSTypePredicateName::This(_) => PredicateSubject::Receiver,
-                TSTypePredicateName::Identifier(ident) => {
-                    PredicateSubject::Parameter(ident.name.as_str().to_owned())
-                }
+                TSTypePredicateName::Identifier(ident) => PredicateSubject::Parameter {
+                    name: ident.name.as_str().to_owned(),
+                    // Patched in by `summarize_function` when it has the
+                    // declaring function's own parameter LIST in scope --
+                    // see `PredicateSubject::Parameter`'s own doc comment.
+                    position: None,
+                },
             };
             let target = raw_type_ref_of_ts_type(
                 &type_annotation.type_annotation,
@@ -2919,9 +2993,18 @@ fn member_entry_of_class_element(
             // P1-B: body inference only for a plain method or getter (a
             // setter always returns `void`; a constructor is never called
             // for its "return value") that has no return-type annotation
-            // of its own.
+            // of its own. E-P0q (2026-09-09): "no annotation" is checked
+            // SYNTACTICALLY (`return_type.is_none()`), never as `type_ref
+            // == Unknown` -- an annotation this crate cannot classify (a
+            // qualified `ns.IFace`, a generic, ...) still WINS over the
+            // body, exactly like TypeScript's own checker: found live,
+            // `TextModel.createSnapshot(): model.ITextSnapshot { return new
+            // TextModelSnapshot(...) }` was inferred to the concrete class
+            // (`snapshot.read()` -> `TextModelSnapshot.read`, v3 correctly
+            // says `ITextSnapshot.read`) -- `docs/evidence/2026-09-07-v4-
+            // vscode-campaign.md` §17.
             let pending_return = (return_type_eligible(method.kind)
-                && matches!(type_ref, RawTypeRef::Unknown))
+                && method.value.return_type.is_none())
             .then(|| {
                 collect_pending_return_shapes(
                     method.value.body.as_deref(),
@@ -4920,6 +5003,112 @@ impl ProgramIndex {
         ids
     }
 
+    /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §16.4 pattern 1, the DOMINANT VS Code residual E-P0o/E-P0p
+    /// deliberately left unfixed): the SAME sibling-declaration-ambiguity
+    /// relationship `sibling_extends_overrides` proves for real subclassing,
+    /// generalized to `implements` conformance too -- every OTHER known
+    /// container reachable from `entity_id` through ANY combination of
+    /// `extends`/`implements` edges (`conformance_chain_reaches`, never
+    /// `sibling_extends_overrides`'s own `extends`-only
+    /// `extends_chain_reaches`) that ALSO declares its OWN `name` member at
+    /// the given static/instance disposition. Live pattern this closes:
+    /// `IAction` (`src/vs/base/common/actions.ts`) declares `run`/`id`/...
+    /// itself; `Action` (`implements IAction`, never `extends` it) declares
+    /// its own overriding bodies for the same names -- a receiver typed
+    /// `IAction` with no reliable pinning rule cannot tell which of the two
+    /// v3's real per-call-site resolution would pick.
+    ///
+    /// **This is a STRICT SUPERSET of `sibling_extends_overrides`'s own
+    /// result** (`conformance_chain_reaches` walks every edge
+    /// `extends_chain_reaches` does, plus `implements` ones) -- callers use
+    /// THIS function instead of, never in addition to, the `extends`-only
+    /// one. `sibling_extends_overrides` itself stays UNCHANGED and is still
+    /// used by `has_known_subclass_override` (a DIFFERENT check, about
+    /// whether `collect_members`'s own `implements` FALLBACK is safe to use
+    /// at all -- deliberately `extends`-only, see that function's own doc
+    /// comment; broadening it here would be a scope change to a check this
+    /// task does not touch).
+    ///
+    /// **Decision 28's own cost-bounded, never-guess discipline applies
+    /// here differently than it does for `sibling_extends_overrides`**: an
+    /// `extends` sibling set is bounded by real subclass depth in practice,
+    /// but an `implements` conformance set is bounded only by how many
+    /// classes happen to implement a common, widely-used interface --
+    /// `IAction`-shaped interfaces in a codebase this size can have dozens
+    /// of implementers, an effectively unbounded candidate list with no way
+    /// to bound false ambiguity by enumerating all of them (`docs/
+    /// evidence/2026-09-07-v4-vscode-campaign.md` §16.4's own disposition
+    /// for pattern 1). This function itself does NOT cap its own result --
+    /// it always returns the FULL candidate set (correctness over hiding the
+    /// true count) -- callers (`resolve_static_member_reference`/`resolve_
+    /// call_target_typeflow`) are the ones that compare the result's length
+    /// against `MAX_CANDIDATE_TARGETS` and demote to a NO-LIST pending site
+    /// (`REASON_SIBLING_CONFORMANCE_UNBOUNDED`) instead of a `possible` row
+    /// per candidate whenever the set is too large to list -- see that
+    /// constant's own doc comment.
+    ///
+    /// Same linear-scan performance tradeoff as `sibling_extends_overrides`
+    /// (a genuinely rare fork in member resolution, not a hot path worth a
+    /// fifth incrementally-maintained index). `None` (an empty vec, never a
+    /// guess) when no such sibling exists.
+    pub fn sibling_conformance_overrides(
+        &self,
+        entity_id: &str,
+        name: &str,
+        is_static: bool,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for (other_id, other_container) in &self.containers {
+            if other_id == entity_id {
+                continue;
+            }
+            if !self.conformance_chain_reaches(other_id, entity_id) {
+                continue;
+            }
+            let effective_static = is_static && !other_container.is_interface;
+            for member in &other_container.members {
+                if member.name == name && member.is_static == effective_static {
+                    ids.push(member.entity_id.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// E-P0q (2026-09-09): `extends_chain_reaches`, generalized to ALSO walk
+    /// `implements` edges (class-implements-interface, and -- by the exact
+    /// same edge -- an interface's own `extends` of a base interface, since
+    /// `container.extends` already carries interface-extends-interface
+    /// heritage too, unchanged from `extends_chain_reaches`'s own walk).
+    /// Used ONLY by `sibling_conformance_overrides` -- `extends_chain_
+    /// reaches` itself stays untouched (still `extends`-only) since
+    /// `has_known_subclass_override`'s own "real subclassing, not interface
+    /// conformance" restriction must not change. Same depth cap and
+    /// cycle guard as `extends_chain_reaches`.
+    fn conformance_chain_reaches(&self, start_id: &str, target_id: &str) -> bool {
+        const MAX_DEPTH: usize = 32;
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![start_id.to_owned()];
+        while let Some(current) = stack.pop() {
+            if visited.len() >= MAX_DEPTH || !visited.insert(current.clone()) {
+                continue;
+            }
+            let Some(container) = self.containers.get(&current) else {
+                continue;
+            };
+            for base in container.extends.iter().chain(container.implements.iter()) {
+                if base == target_id {
+                    return true;
+                }
+                stack.push(base.clone());
+            }
+        }
+        false
+    }
+
     /// Whether walking `start_id`'s own `extends` chain (never `implements`
     /// -- this is specifically about CLASS subclassing, the relationship
     /// `super`/an overriding declaration follows, not interface
@@ -4994,6 +5183,44 @@ impl ProgramIndex {
         }
         match *target {
             ResolvedTypeRef::Entity(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// E-P0q (2026-09-09): the SAME narrowing `member_predicate_receiver_
+    /// narrowing` proves for a member's own `this is T`, for a STANDALONE
+    /// top-level function's own `param is T` predicate (`PredicateSubject::
+    /// Parameter`) -- closes decision 28's residual pattern 3 (`docs/
+    /// evidence/2026-09-07-v4-vscode-campaign.md` §16.4: a bare `isFoo(x)`
+    /// call, not a member call). `Some((position, entity_id_of_T))` only
+    /// when `entity_id` is a known top-level function whose own declared
+    /// return type is a `param is T` predicate AND `summarize_function`
+    /// confidently located the named parameter's own zero-based POSITION at
+    /// declaration time (`PredicateSubject::Parameter`'s own doc comment --
+    /// `None` there means a destructured/rest parameter, or a shape this
+    /// index does not thread position through for, and this function
+    /// refuses to narrow rather than guess). `position` lets the caller pick
+    /// out the matching ARGUMENT expression at a specific call site
+    /// (`call.arguments[position]`) -- this index itself has no notion of
+    /// call sites.
+    pub fn function_predicate_parameter_narrowing(
+        &self,
+        entity_id: &str,
+    ) -> Option<(usize, String)> {
+        let ResolvedTypeRef::TypePredicate { subject, target } =
+            self.function_return_type(entity_id)?
+        else {
+            return None;
+        };
+        let PredicateSubject::Parameter {
+            position: Some(position),
+            ..
+        } = subject
+        else {
+            return None;
+        };
+        match *target {
+            ResolvedTypeRef::Entity(id) => Some((position, id)),
             _ => None,
         }
     }
@@ -6997,6 +7224,153 @@ mod tests {
         );
     }
 
+    /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
+    /// §16.4 pattern 1): `sibling_conformance_overrides` finds an
+    /// `implements` conformer's own redeclaration -- `sibling_extends_
+    /// overrides` itself (`extends`-only) would find NOTHING here, since
+    /// `Action` reaches `IAction` through `implements`, never `extends`.
+    #[test]
+    fn sibling_conformance_overrides_finds_an_implements_conformer_that_redeclares_the_same_member()
+    {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface IAction {\n  run(): void;\n}\nclass Action implements IAction {\n  run(): void {}\n}\n",
+        );
+        assert_eq!(file_summary.interfaces.len(), 1, "{file_summary:?}");
+        assert_eq!(file_summary.classes.len(), 1, "{file_summary:?}");
+        let iaction_id = file_summary.interfaces[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        let candidates = index.sibling_conformance_overrides(&iaction_id, "run", false);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Action's own `run` override must be the sole candidate: {candidates:?}"
+        );
+        assert!(
+            index
+                .sibling_extends_overrides(&iaction_id, "run", false)
+                .is_empty(),
+            "the OLD extends-only function must stay untouched -- Action \
+             reaches IAction only through implements, never extends"
+        );
+    }
+
+    /// E-P0q: `sibling_extends_overrides` (still `extends`-only, used by
+    /// `has_known_subclass_override`'s own "real subclassing, not interface
+    /// conformance" restriction) must remain UNCHANGED by this task's own
+    /// `implements`-inclusive generalization -- a pure `implements` sibling
+    /// must never appear in its result.
+    #[test]
+    fn sibling_extends_overrides_stays_implements_blind_after_the_conformance_generalization() {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface IAction {\n  run(): void;\n}\nclass Action implements IAction {\n  run(): void {}\n}\nclass RealSub extends Action {\n  run(): void {}\n}\n",
+        );
+        let action_id = file_summary.classes[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        // `Action` has a REAL `extends` descendant (`RealSub`) -- must still
+        // be found by the old function.
+        assert_eq!(
+            index
+                .sibling_extends_overrides(&action_id, "run", false)
+                .len(),
+            1
+        );
+        let iaction_id = file_summary_interfaces_len_one_id(&index, "a.ts");
+        // `Action` itself is only reached from `IAction` through
+        // `implements` -- the OLD function must see nothing there.
+        assert!(
+            index
+                .sibling_extends_overrides(&iaction_id, "run", false)
+                .is_empty()
+        );
+    }
+
+    /// Test-only helper for `sibling_extends_overrides_stays_implements_
+    /// blind_after_the_conformance_generalization` -- `ProgramIndex` does
+    /// not expose its own interned interface ids by name, only by walking
+    /// `containers` directly (test-only; production code never needs this).
+    fn file_summary_interfaces_len_one_id(index: &ProgramIndex, path: &str) -> String {
+        index
+            .containers
+            .keys()
+            .find(|id| id.starts_with(&format!("jsts:interface:{path}:")))
+            .cloned()
+            .expect("exactly one interface container expected in this fixture")
+    }
+
+    /// E-P0q (2026-09-09): the position-patching half of decision 28's
+    /// pattern-3 closure -- `summarize_function`'s own `patch_predicate_
+    /// parameter_position` finds `x`'s zero-based index (0) and `Program
+    /// Index::function_predicate_parameter_narrowing` surfaces it alongside
+    /// the predicate's own resolved target.
+    #[test]
+    fn function_predicate_parameter_narrowing_resolves_a_standalone_functions_own_param_is_t_predicate()
+     {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Base {}\nclass Sub extends Base {}\nfunction isSub(x: Base): x is Sub {\n  return x instanceof Sub;\n}\n",
+        );
+        assert_eq!(file_summary.functions.len(), 1, "{file_summary:?}");
+        let is_sub_id = file_summary.functions[0].entity_id.clone();
+        let sub_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.function_predicate_parameter_narrowing(&is_sub_id),
+            Some((0, sub_id))
+        );
+    }
+
+    /// E-P0q: the predicate's own named parameter need not be the FIRST
+    /// one -- `patch_predicate_parameter_position` must find its REAL
+    /// position, never assume 0.
+    #[test]
+    fn function_predicate_parameter_narrowing_finds_the_non_first_parameters_own_position() {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Base {}\nclass Sub extends Base {}\nfunction isSub(label: string, x: Base): x is Sub {\n  return x instanceof Sub;\n}\n",
+        );
+        let is_sub_id = file_summary.functions[0].entity_id.clone();
+        let sub_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.function_predicate_parameter_narrowing(&is_sub_id),
+            Some((1, sub_id)),
+            "the predicate's own parameter is the SECOND one -- position \
+             must be 1, never guessed as 0"
+        );
+    }
+
+    /// E-P0q safety companion: a `this is T` predicate's own `subject` is
+    /// `PredicateSubject::Receiver`, never `Parameter` -- `function_
+    /// predicate_parameter_narrowing` must refuse it (that shape is
+    /// `member_predicate_receiver_narrowing`'s own job, and only for a
+    /// MEMBER, never a standalone function in the first place -- this
+    /// guards against a future refactor accidentally conflating the two).
+    #[test]
+    fn function_predicate_parameter_narrowing_is_none_for_a_this_is_t_shaped_return_type() {
+        let file_summary = summary_for(
+            "a.ts",
+            "class Base {}\nclass Sub extends Base {}\nfunction isSub(this: Base): this is Sub {\n  return this instanceof Sub;\n}\n",
+        );
+        let is_sub_id = file_summary.functions[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.function_predicate_parameter_narrowing(&is_sub_id),
+            None
+        );
+    }
+
     #[test]
     fn members_is_none_for_unknown_container() {
         let index = ProgramIndex::build(&BTreeMap::new(), &HashMap::new(), &HashMap::new());
@@ -7326,6 +7700,33 @@ mod tests {
     }
 
     // P1-B: shallow return-type inference fixed point.
+
+    /// E-P0q (2026-09-09): an EXPLICIT return annotation this crate cannot
+    /// classify (a qualified `ns.Type`) must still WIN over the body -- no
+    /// P1-B inference may run behind a written type. Found live:
+    /// `TextModel.createSnapshot(): model.ITextSnapshot { return new
+    /// TextModelSnapshot(...) }` was inferred to the concrete class, so
+    /// `snapshot.read()` confirmed `TextModelSnapshot.read` where v3 (and
+    /// TypeScript) say `ITextSnapshot.read`.
+    #[test]
+    fn annotated_but_unclassifiable_return_type_never_falls_back_to_body_inference() {
+        let file_summary = summary_for(
+            "a.ts",
+            "import * as model from './model';\nclass Foo {}\nexport function make(): model.IFoo {\n  return new Foo();\n}\nclass Host {\n  make(): model.IFoo {\n    return new Foo();\n  }\n}\n",
+        );
+        assert!(
+            file_summary.functions[0].pending_return.is_none(),
+            "a written (even unclassifiable) annotation disables body inference"
+        );
+        assert!(file_summary.classes[1].members[0].pending_return.is_none());
+        let make_id = file_summary.functions[0].entity_id.clone();
+        let host_id = file_summary.classes[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(index.function_return_type(&make_id), None);
+        assert_eq!(index.member_type_ref(&host_id, "make", false), None);
+    }
 
     #[test]
     fn infers_unannotated_function_return_from_new_expression() {
