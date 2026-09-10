@@ -77,6 +77,99 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::scope::ScopeFlags;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::Instant;
+
+/// One opt-in performance bucket. Durations are integer microseconds so the
+/// diagnostic stream is deterministic in shape and does not expose a float
+/// formatting policy.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct SemanticTelemetryBucket {
+    pub count: u64,
+    pub elapsed_us: u64,
+}
+
+impl SemanticTelemetryBucket {
+    fn record(&mut self, elapsed: std::time::Duration) {
+        self.count = self.count.saturating_add(1);
+        self.elapsed_us = self
+            .elapsed_us
+            .saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.elapsed_us = self.elapsed_us.saturating_add(other.elapsed_us);
+    }
+}
+
+/// Per-owner counters collected only when the caller explicitly enables
+/// `URDIRA_V4_DEBUG_SEMANTIC_PERF`. The normal semantic result remains
+/// byte-compatible because this is carried by the separate diagnostic result
+/// type below, never by `OwnerSemantics`.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct SemanticTelemetry {
+    pub site_count: u64,
+    pub import_resolution: SemanticTelemetryBucket,
+    pub reexport_resolution: SemanticTelemetryBucket,
+    pub heritage_resolution: SemanticTelemetryBucket,
+    pub call_resolution: SemanticTelemetryBucket,
+    pub reference_resolution: SemanticTelemetryBucket,
+    pub typeflow_lookup: SemanticTelemetryBucket,
+    pub union_walk: SemanticTelemetryBucket,
+    pub member_walk: SemanticTelemetryBucket,
+    pub sibling_conformance: SemanticTelemetryBucket,
+}
+
+impl SemanticTelemetry {
+    fn bucket_mut(&mut self, kind: TelemetryKind) -> &mut SemanticTelemetryBucket {
+        match kind {
+            TelemetryKind::Import => &mut self.import_resolution,
+            TelemetryKind::Reexport => &mut self.reexport_resolution,
+            TelemetryKind::Heritage => &mut self.heritage_resolution,
+            TelemetryKind::Call => &mut self.call_resolution,
+            TelemetryKind::Reference => &mut self.reference_resolution,
+            TelemetryKind::Typeflow => &mut self.typeflow_lookup,
+            TelemetryKind::Union => &mut self.union_walk,
+            TelemetryKind::Member => &mut self.member_walk,
+            TelemetryKind::Sibling => &mut self.sibling_conformance,
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.site_count = self.site_count.saturating_add(other.site_count);
+        self.import_resolution.merge(other.import_resolution);
+        self.reexport_resolution.merge(other.reexport_resolution);
+        self.heritage_resolution.merge(other.heritage_resolution);
+        self.call_resolution.merge(other.call_resolution);
+        self.reference_resolution.merge(other.reference_resolution);
+        self.typeflow_lookup.merge(other.typeflow_lookup);
+        self.union_walk.merge(other.union_walk);
+        self.member_walk.merge(other.member_walk);
+        self.sibling_conformance.merge(other.sibling_conformance);
+    }
+}
+
+/// Result wrapper used by the indexing worker's diagnostic path. Existing
+/// callers keep using `analyze_owner_semantics_with_context`, which returns
+/// only `OwnerSemantics`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SemanticAnalysisWithTelemetry {
+    pub semantics: OwnerSemantics,
+    pub telemetry: SemanticTelemetry,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TelemetryKind {
+    Import,
+    Reexport,
+    Heritage,
+    Call,
+    Reference,
+    Typeflow,
+    Union,
+    Member,
+    Sibling,
+}
 
 /// Output of [`analyze_owner_semantics`], handed off to the (future) E1b
 /// orchestrator in `urdira-indexing-worker`'s `process_owner`.
@@ -2072,9 +2165,14 @@ struct SemanticWalker<'a, 'ctx, 'r> {
     /// `suppress_instanceof_narrowing_for_calls` already has, generalized
     /// from a `Cell<bool>` flag to an accumulating set.
     sibling_conformance_dependencies: std::cell::RefCell<BTreeSet<String>>,
+    /// Diagnostic-only counters. The boolean keeps the disabled path to one
+    /// predictable branch and avoids constructing timers or atomics per site.
+    telemetry_enabled: bool,
+    telemetry: std::cell::RefCell<SemanticTelemetry>,
 }
 
 impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: &str,
         scoping: &'ctx Scoping,
@@ -2083,6 +2181,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         ctx: &'r HybridResolutionContext<'r>,
         member_qualified_names: BTreeMap<String, String>,
         line_index: LineIndex,
+        telemetry_enabled: bool,
     ) -> Self {
         let module_id = format!("jsts:module:{path}:0:{path}");
         let is_test_source = ctx
@@ -2145,7 +2244,48 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             line_index,
             ambient_global_dependencies: BTreeSet::new(),
             sibling_conformance_dependencies: std::cell::RefCell::new(BTreeSet::new()),
+            telemetry_enabled,
+            telemetry: std::cell::RefCell::new(SemanticTelemetry::default()),
         }
+    }
+
+    fn record_telemetry(&self, kind: TelemetryKind) {
+        if self.telemetry_enabled {
+            self.telemetry
+                .borrow_mut()
+                .bucket_mut(kind)
+                .record(std::time::Duration::ZERO);
+        }
+    }
+
+    fn measure_telemetry<T>(&self, kind: TelemetryKind, operation: impl FnOnce() -> T) -> T {
+        if !self.telemetry_enabled {
+            return operation();
+        }
+        let started = Instant::now();
+        let result = operation();
+        self.telemetry
+            .borrow_mut()
+            .bucket_mut(kind)
+            .record(started.elapsed());
+        result
+    }
+
+    fn measure_telemetry_mut<T>(
+        &mut self,
+        kind: TelemetryKind,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if !self.telemetry_enabled {
+            return operation(self);
+        }
+        let started = Instant::now();
+        let result = operation(self);
+        self.telemetry
+            .borrow_mut()
+            .bucket_mut(kind)
+            .record(started.elapsed());
+        result
     }
 
     /// Resolve `imported_name`, bound by the import declaration currently
@@ -2279,6 +2419,35 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     /// shared helper existed.
     #[allow(clippy::too_many_arguments)]
     fn resolve_named_binding_via_specifier(
+        &mut self,
+        source_specifier: Option<&str>,
+        name: &str,
+        pending_reason: &'static str,
+        is_type: bool,
+        start: u32,
+        end: u32,
+        policy: resolver::ExportPolicy,
+    ) -> ReferenceResolution {
+        let kind = if pending_reason == REASON_RE_EXPORT_BINDING {
+            TelemetryKind::Reexport
+        } else {
+            TelemetryKind::Import
+        };
+        self.measure_telemetry_mut(kind, |this| {
+            this.resolve_named_binding_via_specifier_inner(
+                source_specifier,
+                name,
+                pending_reason,
+                is_type,
+                start,
+                end,
+                policy,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_named_binding_via_specifier_inner(
         &mut self,
         source_specifier: Option<&str>,
         name: &str,
@@ -2653,6 +2822,10 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         disposition: SiteDisposition,
         reason: Option<&'static str>,
     ) {
+        if self.telemetry_enabled {
+            let mut telemetry = self.telemetry.borrow_mut();
+            telemetry.site_count = telemetry.site_count.saturating_add(1);
+        }
         self.sites.push(SemanticSite {
             start_utf16: start,
             end_utf16: end,
@@ -3257,12 +3430,14 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         self_id: Option<&str>,
         ident: Option<&IdentifierReference<'a>>,
     ) -> Result<(String, String), &'static str> {
-        let (Some(source_id), Some(ident)) = (self_id, ident) else {
-            return Err(REASON_HERITAGE_DEFERRED);
-        };
-        self.resolve_identifier_to_kind(ident, &[DeclKind::Class, DeclKind::Interface])
-            .map(|target_id| (source_id.to_owned(), target_id))
-            .ok_or(REASON_HERITAGE_TARGET_UNCERTAIN)
+        self.measure_telemetry(TelemetryKind::Heritage, || {
+            let (Some(source_id), Some(ident)) = (self_id, ident) else {
+                return Err(REASON_HERITAGE_DEFERRED);
+            };
+            self.resolve_identifier_to_kind(ident, &[DeclKind::Class, DeclKind::Interface])
+                .map(|target_id| (source_id.to_owned(), target_id))
+                .ok_or(REASON_HERITAGE_TARGET_UNCERTAIN)
+        })
     }
 
     fn current_is_static(&self) -> bool {
@@ -4406,6 +4581,17 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         &self,
         expr: &StaticMemberExpression<'a>,
     ) -> StaticMemberResolution {
+        self.measure_telemetry(TelemetryKind::Typeflow, || {
+            self.measure_telemetry(TelemetryKind::Member, || {
+                self.resolve_static_member_reference_inner(expr)
+            })
+        })
+    }
+
+    fn resolve_static_member_reference_inner(
+        &self,
+        expr: &StaticMemberExpression<'a>,
+    ) -> StaticMemberResolution {
         if let Some(index) = self.ctx.typeflow_index
             && let Some((base_value, rule)) = self.type_of_expression(&expr.object)
             && let Some((base_entity, is_static)) = Self::as_entity(&base_value)
@@ -4444,11 +4630,13 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
             // "confirmation stays when the receptor is typed uniquely"
             // carve-out.
             if !Self::rule_pins_receiver_uniquely(rule) {
-                let mut candidates = index.sibling_conformance_overrides(
-                    &base_entity,
-                    expr.property.name.as_str(),
-                    is_static,
-                );
+                let mut candidates = self.measure_telemetry(TelemetryKind::Sibling, || {
+                    index.sibling_conformance_overrides(
+                        &base_entity,
+                        expr.property.name.as_str(),
+                        is_static,
+                    )
+                });
                 if !candidates.is_empty() {
                     self.record_sibling_conformance_dependencies(&candidates);
                     candidates.push(target);
@@ -4664,6 +4852,15 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
     }
 
     fn resolve_call_target_typeflow(&self, expr: &CallExpression<'a>) -> TypeflowCallResolution {
+        self.measure_telemetry(TelemetryKind::Typeflow, || {
+            self.resolve_call_target_typeflow_inner(expr)
+        })
+    }
+
+    fn resolve_call_target_typeflow_inner(
+        &self,
+        expr: &CallExpression<'a>,
+    ) -> TypeflowCallResolution {
         let Some(index) = self.ctx.typeflow_index else {
             return TypeflowCallResolution::Unresolved;
         };
@@ -4729,8 +4926,14 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 // target, even when every constituent agrees).
                 TypeflowValue::Union(_) => {
                     if let Some((entity_ids, is_static)) = Self::as_entities(&base_value)
-                        && let urdira_jsts_typeflow::MemberLookup::UnionCandidates(targets) = index
-                            .members_of_union(&entity_ids, member.property.name.as_str(), is_static)
+                        && let urdira_jsts_typeflow::MemberLookup::UnionCandidates(targets) = self
+                            .measure_telemetry(TelemetryKind::Union, || {
+                                index.members_of_union(
+                                    &entity_ids,
+                                    member.property.name.as_str(),
+                                    is_static,
+                                )
+                            })
                     {
                         return TypeflowCallResolution::Candidates {
                             targets,
@@ -4867,11 +5070,14 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                                 }
                                 if narrowing_unresolved || !Self::rule_pins_receiver_uniquely(rule)
                                 {
-                                    let mut candidates = index.sibling_conformance_overrides(
-                                        &base_entity,
-                                        member.property.name.as_str(),
-                                        is_static,
-                                    );
+                                    let mut candidates =
+                                        self.measure_telemetry(TelemetryKind::Sibling, || {
+                                            index.sibling_conformance_overrides(
+                                                &base_entity,
+                                                member.property.name.as_str(),
+                                                is_static,
+                                            )
+                                        });
                                     if !candidates.is_empty() {
                                         self.record_sibling_conformance_dependencies(&candidates);
                                         candidates.push(target);
@@ -5301,7 +5507,7 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
         }
     }
 
-    fn finish(mut self) -> OwnerSemantics {
+    fn finish(mut self) -> (OwnerSemantics, SemanticTelemetry) {
         self.sites.sort_by(|left, right| {
             (
                 left.start_utf16,
@@ -5614,32 +5820,36 @@ impl<'a, 'ctx, 'r> SemanticWalker<'a, 'ctx, 'r> {
                 self.path
             );
         }
-        OwnerSemantics {
-            reference_rows,
-            covers_rows,
-            call_rows,
-            heritage_rows,
-            typeflow_call_rows,
-            typeflow_heritage_rows,
-            pending_site_rows,
-            candidate_call_rows,
-            candidate_reference_rows,
-            parameter_entity_rows,
-            parameter_contains_rows,
-            external_entity_rows,
-            external_contains_rows,
-            typeflow_oracle_hits: self.typeflow_oracle_hits,
-            typeflow_pending_call_shapes: self.typeflow_pending_call_shapes,
-            pending_sites,
-            sites_digest,
-            jsdoc_typed_file: self.jsdoc_typed_file,
-            ambient_global_dependencies: self.ambient_global_dependencies.into_iter().collect(),
-            sibling_conformance_dependencies: self
-                .sibling_conformance_dependencies
-                .into_inner()
-                .into_iter()
-                .collect(),
-        }
+        let telemetry = self.telemetry.into_inner();
+        (
+            OwnerSemantics {
+                reference_rows,
+                covers_rows,
+                call_rows,
+                heritage_rows,
+                typeflow_call_rows,
+                typeflow_heritage_rows,
+                pending_site_rows,
+                candidate_call_rows,
+                candidate_reference_rows,
+                parameter_entity_rows,
+                parameter_contains_rows,
+                external_entity_rows,
+                external_contains_rows,
+                typeflow_oracle_hits: self.typeflow_oracle_hits,
+                typeflow_pending_call_shapes: self.typeflow_pending_call_shapes,
+                pending_sites,
+                sites_digest,
+                jsdoc_typed_file: self.jsdoc_typed_file,
+                ambient_global_dependencies: self.ambient_global_dependencies.into_iter().collect(),
+                sibling_conformance_dependencies: self
+                    .sibling_conformance_dependencies
+                    .into_inner()
+                    .into_iter()
+                    .collect(),
+            },
+            telemetry,
+        )
     }
     /// D.3: what `visit_ts_qualified_name` resolves `name.right` to, or the
     /// specific pending reason to fall back to. `jsdoc_typed_file` is
@@ -6330,6 +6540,7 @@ fn catch_variable_contains_record(
 
 impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
+        self.record_telemetry(TelemetryKind::Reference);
         let start = ident.span.start;
         let end = ident.span.end;
         match self.resolve_identifier_reference(ident) {
@@ -7095,6 +7306,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// exactly as before E3. No self-reference guard: see `CallRow`'s doc
     /// comment for why a recursive call is still published.
     fn visit_call_expression(&mut self, expr: &CallExpression<'a>) {
+        self.record_telemetry(TelemetryKind::Call);
         let start = expr.span.start;
         let end = expr.span.end;
         let callee_is_identifier = matches!(&expr.callee, Expression::Identifier(_));
@@ -7279,6 +7491,7 @@ impl<'a, 'ctx, 'r> Visit<'a> for SemanticWalker<'a, 'ctx, 'r> {
     /// by `trace_behavior`/`analyze_impact`/`find_paths`) AND its paired
     /// `jsts:unresolved_call` diagnostic both silently vanished.
     fn visit_import_expression(&mut self, expr: &ImportExpression<'a>) {
+        self.record_telemetry(TelemetryKind::Call);
         self.push_site(
             SiteKind::Call,
             expr.span.start,
@@ -8207,6 +8420,18 @@ pub fn analyze_owner_semantics_with_context(
     source_text: &str,
     ctx: &HybridResolutionContext<'_>,
 ) -> Result<OwnerSemantics, AnalysisError> {
+    Ok(analyze_owner_semantics_with_context_telemetry(path, source_text, ctx, false)?.semantics)
+}
+
+/// Runs the semantic walk and returns opt-in per-owner counters. This is the
+/// only entry point used by the indexing worker's diagnostic path; callers
+/// pass `true` only when `URDIRA_V4_DEBUG_SEMANTIC_PERF` is set.
+pub fn analyze_owner_semantics_with_context_telemetry(
+    path: &str,
+    source_text: &str,
+    ctx: &HybridResolutionContext<'_>,
+    telemetry_enabled: bool,
+) -> Result<SemanticAnalysisWithTelemetry, AnalysisError> {
     let source_type =
         SourceType::from_path(std::path::Path::new(path)).map_err(|_| AnalysisError {
             code: ErrorCode::UnsupportedSource,
@@ -8262,9 +8487,14 @@ pub fn analyze_owner_semantics_with_context(
         ctx,
         member_qualified_names,
         line_index,
+        telemetry_enabled,
     );
     walker.visit_program(&parsed.program);
-    Ok(walker.finish())
+    let (semantics, telemetry) = walker.finish();
+    Ok(SemanticAnalysisWithTelemetry {
+        semantics,
+        telemetry,
+    })
 }
 
 #[cfg(test)]
@@ -9813,6 +10043,52 @@ mod tests {
             typeflow_oracle: false,
             ambient_index: Box::leak(Box::new(ambient_index)),
         }
+    }
+
+    #[test]
+    fn opt_in_telemetry_counts_resolution_families_without_changing_semantics() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "helper.ts".to_owned(),
+            target_file(
+                "helper.ts",
+                vec![target_entity(
+                    crate::EntityKind::Function,
+                    "helper.ts",
+                    16,
+                    "helper",
+                )],
+                vec![export_binding("helper", "helper")],
+            ),
+        );
+        files.insert(
+            "base.ts".to_owned(),
+            target_file(
+                "base.ts",
+                vec![target_entity(
+                    crate::EntityKind::Class,
+                    "base.ts",
+                    6,
+                    "Base",
+                )],
+                vec![export_binding("Base", "Base")],
+            ),
+        );
+        let ctx = helper_ctx(files);
+        let source = "import { helper } from \"./helper\";\nexport { helper } from \"./helper\";\nimport { Base } from \"./base\";\nclass Child extends Base {}\nfunction use() { return helper(); }\n";
+        let report = analyze_owner_semantics_with_context_telemetry("a.ts", source, &ctx, true)
+            .expect("analysis succeeds");
+        assert!(report.telemetry.import_resolution.count >= 1);
+        assert!(report.telemetry.reexport_resolution.count >= 1);
+        assert!(report.telemetry.heritage_resolution.count >= 1);
+        assert!(report.telemetry.call_resolution.count >= 1);
+        assert!(report.telemetry.reference_resolution.count >= 1);
+        assert!(report.telemetry.site_count >= report.telemetry.call_resolution.count);
+        assert_eq!(report.semantics.sites_digest, {
+            analyze_owner_semantics_with_context("a.ts", source, &ctx)
+                .expect("baseline analysis succeeds")
+                .sites_digest
+        });
     }
 
     #[test]

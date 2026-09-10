@@ -47,6 +47,31 @@ const RUST_SEMANTIC_PROTOCOL: &str = "urdira:jsts-rust-semantic.v1";
 // corpus-sized structural payload through the application process.
 const RUST_SEMANTIC_MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
 
+/// Emits a machine-readable identity line before any scan can start. It is
+/// deliberately silent in the normal worker path; debug timing or semantic
+/// performance profiling opts in to the line so a harness can prove that the
+/// diagnostic flag reached this process rather than merely its parent.
+fn emit_startup_attestation() {
+    let debug_timing_enabled = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
+    let semantic_perf_enabled = std::env::var_os("URDIRA_V4_DEBUG_SEMANTIC_PERF").is_some();
+    if !debug_timing_enabled && !semantic_perf_enabled {
+        return;
+    }
+    let current_exe = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    eprintln!(
+        "[urdira-indexing-worker] v4 startup_attestation {}",
+        serde_json::json!({
+            "schema_version": 1,
+            "pid": std::process::id(),
+            "current_exe": current_exe,
+            "debug_timing_enabled": debug_timing_enabled,
+            "semantic_perf_enabled": semantic_perf_enabled,
+        })
+    );
+}
+
 // Every structural generation invalidates queued lexical maintenance for an
 // older generation. `schedule_lexical_reconcile` snapshots this epoch when it
 // is scheduled and re-checks it both before taking the writer lease (quiet
@@ -2140,6 +2165,7 @@ impl Drop for SemanticChecker {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    emit_startup_attestation();
     let _publication_sql_digest = publication_v3_sql::PUBLICATION_V3_SQL_DIGEST;
     let mut decoder = FrameDecoder::default();
     struct ActiveOperation {

@@ -1,7 +1,7 @@
 # Performance, Reliability, and Evaluation
 
 Status: Accepted  
-Last updated: 2026-08-31
+Last updated: 2026-09-09
 Depends on: Query, indexing, storage, and JavaScript/TypeScript MVP specifications
 
 ## Decision objective
@@ -98,7 +98,7 @@ Once an execution is ready, P95 continuation hydration is 100 ms for a 50-item o
 
 On tier M, steady-state daemon resident memory is at most 4 GiB during indexing and 2 GiB while idle; tier L limits are 8 GiB and 3 GiB. A single ordinary query receives 1 GiB temporary memory and 30 seconds CPU by default; operation definitions may advertise a smaller class. Admission control prevents concurrent work from exceeding the installation memory ceiling.
 
-Structural analysis admission is explicit: owner work is deterministically sharded across a bounded number of independent workers, and a worker lease is never shared by concurrent scans. The pool rejects duplicate or over-capacity leases before starting analysis. Progressive structural publication retains only source metadata between stages; each later stage renews a captured-byte lease and verifies the referenced CAS bytes and digest before analysis. The expanded benchmark must first pass a sequential smoke covering all eight task cells; only then may a full rerun be admitted. P95 values are reportable only after at least three independent campaigns.
+Structural analysis admission is explicit: owner work is deterministically sharded across a bounded number of independent workers, and a worker lease is never shared by concurrent scans. The pool rejects duplicate or over-capacity leases before starting analysis. Progressive structural publication retains only source metadata between stages; each later stage renews a captured-byte lease and verifies the referenced CAS bytes and digest before analysis. The expanded benchmark must first pass a sequential Urdira smoke covering every task in the selected repositories; the full corpus requires all eight task cells. A broader smoke may supply the selected cells, but its audit must have zero failures and exactly one successful Urdira execution for each required task. Unselected tasks do not increase the required smoke count. Only then may a full rerun be admitted. P95 values are reportable only after at least three independent campaigns.
 
 Excluding explicitly installed model packs and retained historical snapshots, current structural database plus source CAS overhead must not exceed 2.5 times included source bytes. Generic semantic documents, segments, vectors, and indexes must not exceed another 3 times included source bytes. Reports separate logical live data, historical retention, shared CAS, model assets, temporary staging, and query cache so deduplication cannot conceal growth.
 
@@ -154,6 +154,25 @@ and a broad lifecycle-map task. They publish sample counts, failures, scope,
 cost assumptions, warnings, cleanup, and raw-audit digests. These comparisons
 are workload-specific supporting evidence; they do not replace the formal
 source-first, reliability, stress, or P95 release gates.
+
+For this external-tool comparison, Urdira readiness ends when the current
+complete structural snapshot is queryable. The campaign sets semantic indexing
+off, performs no semantic materialization, does not create a semantic sidecar,
+and rejects any Urdira cell in which one appears. Setup time therefore contains
+structural indexing only. The same cell-level process-tree scope measures peak
+RSS and mean CPU for every arm; Urdira host-only memory at readiness remains a
+separate diagnostic.
+
+The executable report records grader outcome and executed test outcome
+separately. Target coverage and unsafe omissions are evaluated against the
+corpus-declared changed paths, required patterns, and focused test. An
+evidence-grounded plan requires assigned discovery before the first edit and
+after every edit batch. Repository-read calls and returned context characters
+cover the discovery method assigned to the arm. Context without any declared
+task marker is reported as an unattributed-context proxy, not asserted to be
+semantically irrelevant. A test pass or failure requires a numeric exit code;
+otherwise the result remains unknown. Missing measurements remain unavailable
+and are never imputed as zero.
 
 Tasks are scored for correct target set, unsafe omissions, evidence-grounded plan, irrelevant context, repository-read tool calls, total agent turns, characters consumed, and wall time. Urdira release acceptance requires no reduction in task success, at least 35% fewer repository-intelligence calls, at least 25% fewer source characters returned, and at least 20% fewer turns on the median task versus the stronger baseline. Change-impact tasks must have zero missed gold `will_break` items in the release corpus when completeness is reported complete.
 

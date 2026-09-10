@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { decodeCanonical } from "../packages/canonical/src/index.js";
-import { WorkspaceRegistry, sidecarScanDirFor, structuralStoreDirFor, type RustWorkspaceScanTransport, type WorkspaceScanRequest } from "../packages/engine/src/index.js";
+import { WorkspaceRegistry, sidecarDatabasePathFor, sidecarScanDirFor, structuralStoreDirFor, type RustWorkspaceScanTransport, type WorkspaceScanRequest } from "../packages/engine/src/index.js";
 import { DaemonClient, DaemonRuntime, type DaemonRuntimeOptions } from "../packages/daemon/src/index.js";
 import { createDurableStorage, openSqliteDatabase, readStructuralStore } from "../packages/storage/src/index.js";
 
@@ -197,6 +197,8 @@ describe("Daemon v4 workspace-scan wiring (URDIRA_V4 default + explicit opt-out/
         const databasePath = registration.database_path;
         expect(existsSync(structuralStoreDirFor(databasePath))).toBe(true);
         expect(existsSync(sidecarScanDirFor(databasePath))).toBe(true);
+        expect(existsSync(sidecarDatabasePathFor(databasePath, "lexical"))).toBe(true);
+        expect(existsSync(sidecarDatabasePathFor(databasePath, "semantic"))).toBe(false);
 
         const raw = await openSqliteDatabase({ filename: databasePath, read_only: true });
         try {

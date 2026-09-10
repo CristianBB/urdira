@@ -38,6 +38,7 @@ implementation or release.
    Decisions 21/22/25 and the structural fast-path protocol retain that v3
    contract, while Decisions 26–29 govern v4.
 6. Use the [release process](release.md) for qualification and publication.
+   For comparative agent benchmarks, follow the [expanded campaign runbook](benchmarks/expanded-agent-campaign.md).
 
 Contributors and coding agents must also read [AGENTS.md](../AGENTS.md),
 [CONTRIBUTING.md](../CONTRIBUTING.md), and

@@ -259,6 +259,7 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
     env: {
       PATH: process.env["PATH"] ?? "",
       ...(process.env["URDIRA_DEBUG_TIMING"] === "1" ? { URDIRA_DEBUG_TIMING: "1" } : {}),
+      ...(process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"] === "1" ? { URDIRA_V4_DEBUG_SEMANTIC_PERF: "1" } : {}),
       // F5 hybrid lane (E1b, docs/evidence/2026-09-01-f5-hybrid-design.md):
       // the Rust composition worker gates every hybrid-lane behavior behind
       // these three variables. Forward them only when explicitly set, same
@@ -395,9 +396,10 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
       }
     } catch (error) { fail(error); }
   });
+  const exposeWorkerDiagnostics = process.env["URDIRA_DEBUG_TIMING"] === "1" || process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"] === "1";
   child.stderr.on("data", (chunk: Buffer) => {
     if (chunk.byteLength > 64 * 1024) fail(new Error("Indexing-core worker exceeded stderr allowance."));
-    if (process.env["URDIRA_DEBUG_TIMING"] === "1") process.stderr.write(chunk);
+    if (exposeWorkerDiagnostics) process.stderr.write(chunk);
   });
   child.on("error", fail);
   child.on("exit", (code, signal) => { if (healthy && !shutdownAcknowledged) fail(new Error(`Indexing-core worker exited (${code ?? signal ?? "unknown"}).`)); });

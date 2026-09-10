@@ -71,6 +71,19 @@ independent samples are launched. Benchmark invocations use the repository's
 built `apps/urdira/dist/index.js` and Node.js `>=24.18.1`; the globally
 installed `urdira` CLI is not part of the benchmark runtime.
 
+The next campaign's audit also captures host resources, start-time load and
+free capacity, source and executable hashes, effective indexing controls, a
+comparable runner-and-descendants process-tree sample for every arm, repository
+context volume, declared-target attribution, and real test-command exit codes.
+For Urdira, setup/readiness ends at complete current structural readiness.
+Semantic indexing and materialization are disabled, no semantic sidecar is
+created, and a cell is rejected if one appears.
+
+The [expanded campaign runbook](benchmarks/expanded-agent-campaign.md) records
+current runner flags, smoke semantics, audit limitations, and the unresolved
+provenance discrepancy between the historical narrative above and the August 27
+report. Do not reuse that narrative as verified input to a fresh campaign.
+
 ### Native acceleration campaign
 
 Decision 25 qualification uses the executable

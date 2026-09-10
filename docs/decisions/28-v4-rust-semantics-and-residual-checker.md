@@ -199,10 +199,29 @@ five amendments between 2026-09-06 and 2026-09-09 below:
   and that type declares the member directly, the site is `confirmed`
   outright — no candidate check needed. Otherwise (an unreliable rule, or a
   member reached only through inheritance/conformance),
-  `ProgramIndex::sibling_conformance_overrides` (the `extends`-only
-  `sibling_extends_overrides` widened to `extends` **and** `implements`
-  edges) finds every other known type that transitively conforms to the
-  resolved receiver type and redeclares the same member.
+  `ProgramIndex::sibling_conformance_overrides` finds every other known type
+  that transitively conforms to the resolved receiver type and redeclares the
+  same member. `ProgramIndex` maintains an incremental reverse index
+  containing only direct `extends` and `implements` edges. The lookup walks
+  descendants reachable from the resolved receiver with a cycle guard and a
+  32-edge path-depth bound; it does not scan every unrelated container,
+  materialize a transitive closure, or mutate shared state during the parallel
+  semantic walk. Cold construction is linear in the direct heritage edge
+  count, and an incremental reflow removes and recreates only the affected
+  containers' edges after pass 2 has finalized heritage.
+- **Extends-only subclass safety check**: `has_known_subclass_override` uses
+  the same `conformance_children` reverse index, filters each edge to the
+  candidate container's direct `extends` list, and returns immediately on the
+  first matching own member. This preserves the check's strict `extends`-only
+  meaning while avoiding a scan of every known container. It does not widen
+  the candidate-producing conformance operation, and it does not treat an
+  `implements` edge as subclassing.
+- **Member own fast path**: `members` first checks the receiver's own member
+  table without allocating traversal state. A unique own match returns
+  immediately; an own miss continues into the existing ordered `extends` and
+  `implements` walk without rescanning that receiver's own members. Ambiguous
+  own matches, unresolved heritage, depth limits, cycle guards, and final
+  ordering/deduplication retain their existing uncertainty contract.
 - **The bound**: `MAX_CANDIDATE_TARGETS = 8`. A candidate set (including the
   originally-resolved target) of 8 or fewer demotes the site to `possible`
   with one row per candidate (reason `sibling_declaration_ambiguous` for an
@@ -390,5 +409,3 @@ gates readiness (it is opt-in and publishes after `ScanCompleted`).
 - **2026-09-09, Frente E-P0p** (same evidence §16): generalized the sibling-candidate rule to inherited matches; added `this is T`/`param is T` type-predicate narrowing (both the positive and the negated-early-return idiom) as a new reliable rule; VS Code residual 281/153 → 189/58; n8n `confirmed_combined` 161,903, `different == 0` in both populations (unchanged).
 - **2026-09-09, Frente E-P0q** (§17): generalized the sibling-candidate rule to `implements` conformance, introducing the `MAX_CANDIDATE_TARGETS = 8` cost bound (a larger set demotes to `checker_pending`/`sibling_conformance_unbounded` with no candidate list); added negated-`instanceof` early-return narrowing and standalone-function `param is T` narrowing; recorded a new `sibling_conformance_dependencies` incremental-consistency edge for a conformer reached with no backing import statement; VS Code residual 189/58 → 110/61; n8n `confirmed_combined` 161,903 → 161,843.
 - **2026-09-09, Frente E-P0r** (§18, final refresh cited in "Current state" above): removed `member_declared_type` (an explicit type annotation) from the reliable-rule allow-list, so an annotated receiver now falls through to the same sibling-conformance candidate check as any other unreliable rule; VS Code residual 110/61 → 80/23, the largest single-session drop of the campaign; n8n `confirmed_combined` 161,843 → 161,802.
-
-

@@ -67,6 +67,8 @@ import {
 export interface EnsureV4WorkspaceInput {
   readonly storage: DurableStorage;
   readonly workspace_id: string;
+  /** Skip even the empty semantic sidecar schema when semantic indexing is disabled. */
+  readonly create_semantic_sidecar?: boolean;
 }
 
 export interface V4WorkspacePaths {
@@ -148,17 +150,19 @@ export async function ensureV4Workspace(input: EnsureV4WorkspaceInput): Promise<
       await database.close();
     }
   }
-  // Pre-create and schema BOTH sidecar files up front, at workspace creation
+  // Pre-create and schema enabled sidecar files up front, at workspace creation
   // time -- not lazily on the first lexical/semantic maintenance pass --
   // so the query-time ATTACH in `acquireWorkspaceQueryEngine` can rely on
-  // them always existing (with their schema already applied) from the
-  // workspace's very first query onward. A read-only query connection
+  // every enabled file existing (with its schema already applied) from the
+  // workspace's very first query onward. A disabled semantic sidecar remains
+  // absent until a later enabled bootstrap creates it. A read-only connection
   // cannot create a missing file when it ATTACHes one, and `core:search_text`
   // must not hard-fail with "no such table: lexical_index_state" just
   // because the first lexical pass has not completed yet -- it is meant to
   // serve partial (corpus-scan) results in that window instead
   // (`SqliteCanonicalQuerySnapshotPort.search_literal`'s own contract).
-  for (const kind of ["lexical", "semantic"] as const) {
+  const sidecarKinds = input.create_semantic_sidecar === false ? ["lexical"] as const : ["lexical", "semantic"] as const;
+  for (const kind of sidecarKinds) {
     const sidecarPath = sidecarDatabasePathFor(databasePath, kind);
     // Frente S-B (R22): the semantic sidecar's own additive column migration
     // (`ensureSemanticSidecarSchemaCompatibilityV4`) must run even when the

@@ -66,8 +66,8 @@ with an immutable, per-generation segment store: `crates/urdira-structural-store
 (design, evidence: `docs/evidence/2026-09-02-v4-p2-3-structural-store.md`),
 written and read exclusively from Rust, exposed to the daemon through a napi
 read path and a query port. SQLite remains the catalog, snapshot,
-control-plane, and lifecycle authority, plus two sidecar files for lexical
-FTS and semantic vectors.
+control-plane, and lifecycle authority, plus independently enabled sidecar
+files for lexical FTS and semantic vectors.
 
 ### Directory layout
 
@@ -498,13 +498,16 @@ semantic vectors (`vector_projection_rows`, `vector_shards`,
 (`<safeId>.lexical.sqlite`, `<safeId>.semantic.sqlite`), opened via
 `WorkspaceDatabase.openSidecar(kind)`, with the FK to `artifact_versions`
 necessarily dropped (cross-file FKs are not enforceable without `ATTACH`).
-The daemon's query path `ATTACH`es both sidecars onto the same read-only
+The daemon creates the lexical sidecar during workspace bootstrap. It creates
+the semantic sidecar only when semantic indexing is enabled; a later enabled
+registration or scan creates the missing file idempotently. The query path
+`ATTACH`es each sidecar that exists onto the same read-only
 connection `SqliteCanonicalQuerySnapshotPort` uses for its fallback methods
 (`core:search_text` otherwise fails outright with "no such table" on a v4
 catalog, since those tables never existed there — fixed in
 `docs/evidence/2026-09-02-v4-p2-7-daemon-wiring.md` §3). Lexical maintenance
-runs against the attached sidecar; the v4 daemon also wires semantic
-maintenance through `semantic-v4-wiring.ts` and
+runs against the attached lexical sidecar; when enabled, the v4 daemon also
+wires semantic maintenance through `semantic-v4-wiring.ts` and
 `createNativeSemanticEntityRecordSource`. Native entity enumeration replaces
 the missing v3 structural SQL tables. Sharded child processes reconcile
 vectors, document status, coverage summaries and the segment cache. The

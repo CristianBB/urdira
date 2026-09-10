@@ -1845,11 +1845,10 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   // `core:search_text` fails outright with "no such table:
   // lexical_index_state" for every v4 workspace, instead of the intended
   // "may be partial until lexical maintenance completes" contract.
-  // `ensureV4Workspace` pre-creates and schemas both sidecar files at
-  // workspace-creation time specifically so this ATTACH (on a READ-ONLY
-  // connection, which cannot create a missing file itself) always finds
-  // them already there -- `existsSync` here is a defensive check for a
-  // workspace that predates that pre-creation, not the expected path.
+  // `ensureV4Workspace` pre-creates each enabled sidecar before this
+  // READ-ONLY connection tries to ATTACH it. The semantic file is
+  // intentionally absent when semantic indexing is disabled, while the
+  // lexical file remains available for text search.
   // ATTACHed table names are disjoint from the main schema's by
   // construction (P2-1), so leaving the unqualified references in that
   // shared port completely unchanged still resolves correctly.
@@ -2073,9 +2072,9 @@ function pluginStatusForWorkspace(workspace: RegisteredWorkspace, catalog: reado
 function isV4Enabled(): boolean {
   return process.env["URDIRA_V4"] !== "0";
 }
-async function maybeBootstrapV4Workspace(workspaceId: string, storage: DurableStorage): Promise<void> {
+async function maybeBootstrapV4Workspace(workspaceId: string, storage: DurableStorage, createSemanticSidecar = true): Promise<void> {
   if (!isV4Enabled()) return;
-  await ensureV4Workspace({ storage, workspace_id: workspaceId });
+  await ensureV4Workspace({ storage, workspace_id: workspaceId, create_semantic_sidecar: createSemanticSidecar });
 }
 
 /**
@@ -2086,8 +2085,8 @@ async function maybeBootstrapV4Workspace(workspaceId: string, storage: DurableSt
  * background scan therefore creates a real `storage:workspace_not_found`
  * window between those two events.
  */
-async function ensureWorkspaceCatalogRegistration(workspace: RegisteredWorkspace, storage: DurableStorage): Promise<void> {
-  await maybeBootstrapV4Workspace(workspace.workspace_id, storage);
+async function ensureWorkspaceCatalogRegistration(workspace: RegisteredWorkspace, storage: DurableStorage, createSemanticSidecar = true): Promise<void> {
+  await maybeBootstrapV4Workspace(workspace.workspace_id, storage, createSemanticSidecar);
   await storage.catalog.registerWorkspace({
     workspace_id: workspace.workspace_id,
     canonical_root: workspace.canonical_root,
@@ -2370,6 +2369,7 @@ interface RunV4WorkspaceScanInput {
   readonly submitLexicalMaintenance: (workspaceId: string) => void;
   /** v4 storage wiring (2026-09-07): submitted right alongside `submitLexicalMaintenance` on every successful v4 scan -- see this function's own success-path comment for why semantic maintenance is no longer skipped for v4. */
   readonly submitSemanticMaintenance: (workspaceId: string) => void;
+  readonly semanticIndexEnabled: boolean;
   /** Frente P-1 (`generic-waddling-hartmanis.md` §7.1): the SAME
    * workspace_id -> pack path side channel `core:workspace_add`'s v3 branch
    * already consumes (`pendingIndexPackPaths`, `scheduleWorkspaceScan`'s
@@ -2563,7 +2563,7 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
       handleV4UpgradeCompleted(workspaceId, event);
     });
   }
-  const paths = await ensureV4Workspace({ storage: durableStorage, workspace_id: workspaceId });
+  const paths = await ensureV4Workspace({ storage: durableStorage, workspace_id: workspaceId, create_semantic_sidecar: input.semanticIndexEnabled });
   // Mirrors `attemptWorkspaceFork`'s own "genuine first-ever scan" predicate
   // (`priorSnapshotId === undefined`, i.e. `workspace.current_snapshot_id`):
   // no v4 snapshot has ever published for this workspace yet.
@@ -3538,7 +3538,7 @@ export class DaemonRuntime {
                 const priorSnapshotId = workspace.current_snapshot_id;
                 let database: WorkspaceDatabase | undefined;
                 try {
-                  await maybeBootstrapV4Workspace(workspace.workspace_id, durableStorage);
+                  await maybeBootstrapV4Workspace(workspace.workspace_id, durableStorage, options.semantic_index !== false);
                   await durableStorage.catalog.registerWorkspace({
                     workspace_id: workspace.workspace_id,
                     canonical_root: workspace.canonical_root,
@@ -3582,6 +3582,7 @@ export class DaemonRuntime {
                       resolveTransport: options.resolve_workspace_scan_transport,
                       submitLexicalMaintenance,
                       submitSemanticMaintenance,
+                      semanticIndexEnabled: options.semantic_index !== false,
                       pendingIndexPackPaths,
                       preemptMaintenanceForPublish,
                     });
@@ -3827,7 +3828,7 @@ export class DaemonRuntime {
                         reason: error instanceof Error ? error.message : String(error),
                         logger: (line) => console.error(line),
                       });
-                      await maybeBootstrapV4Workspace(workspaceId, durableStorage);
+                      await maybeBootstrapV4Workspace(workspaceId, durableStorage, options.semantic_index !== false);
                       console.error(`[urdira] workspace scan for ${workspaceId} recovered from an outdated-format database (moved ${recreated.movedPaths.length} file(s)/directory(ies) to ${recreated.staleDirectory}); scheduling a fresh Full scan`);
                       pendingScans.set(workspaceId, {
                         full: true,
@@ -4722,7 +4723,7 @@ export class DaemonRuntime {
             // operation; otherwise `workspaceReadiness` can legitimately see
             // `storage:workspace_not_found` while the background scan is still
             // performing this same registration.
-            if (confirmed && indexingStorage !== undefined) await ensureWorkspaceCatalogRegistration(existing, indexingStorage);
+            if (confirmed && indexingStorage !== undefined) await ensureWorkspaceCatalogRegistration(existing, indexingStorage, options.semantic_index !== false);
             if (confirmed && existing.status !== "indexing" && existing.status !== "ready" && existing.status !== "degraded") { options.workspace_registry.beginReconciliation(existing.workspace_id); scheduleWorkspaceScan(existing.workspace_id); }
             const current = options.workspace_registry.get(existing.workspace_id) ?? existing;
             if (watcherManager && confirmed) await startWorkspaceWatcher(watcherManager, current);
@@ -4781,7 +4782,7 @@ export class DaemonRuntime {
           // scan. The scan repeats this idempotently as a recovery guard, but
           // it must not be the first point at which the catalog becomes
           // visible.
-          if (confirmed && indexingStorage !== undefined) await ensureWorkspaceCatalogRegistration(workspace, indexingStorage);
+          if (confirmed && indexingStorage !== undefined) await ensureWorkspaceCatalogRegistration(workspace, indexingStorage, options.semantic_index !== false);
           const active = confirmed ? options.workspace_registry.beginReconciliation(workspace.workspace_id).workspace : workspace;
           if (confirmed) scheduleWorkspaceScan(active.workspace_id);
           if (watcherManager && confirmed) await startWorkspaceWatcher(watcherManager, active);
@@ -5053,6 +5054,10 @@ export class DaemonRuntime {
           const args = Array.isArray(payload["args"]) ? payload["args"] : [];
           const values = requestRecord(payload["values"]);
           const workspaceId = typeof args[0] === "string" ? args[0] : typeof values["workspace"] === "string" ? values["workspace"] : undefined;
+          const requestedScope = values["scope"];
+          if (requestedScope !== undefined && requestedScope !== "full" && requestedScope !== "reconcile") {
+            throw new DaemonError("core:ipc_request_invalid", "core:reindex scope must be full or reconcile.");
+          }
           const workspace = workspaceId === undefined ? undefined : options.workspace_registry.get(workspaceId);
           if (!workspace) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
           // Force a new candidate generation even for an already "ready" or
@@ -5073,17 +5078,17 @@ export class DaemonRuntime {
           // relaxing it (see final report).
           const alreadyIndexing = workspace.status === "indexing";
           const operation = options.workspace_registry.beginReconciliation(workspace.workspace_id);
-          // Frente E: `core:reindex` is an explicit, user-requested full
-          // republish -- never let the new `reconcile` default (small-delta
-          // scans go through the cheaper `changed`-shaped pipeline) narrow
-          // it. Added unconditionally (not just when `!alreadyIndexing`
-          // schedules a scan here): if a scan is already in flight, this
-          // still forces the NEXT one (whatever schedules it) full, which
-          // is the correct reading of "the user asked to reindex" either
-          // way.
-          forceFullScans.add(workspace.workspace_id);
+          // `core:reindex` remains a full republish by default. The explicit
+          // `scope: reconcile` form is the deterministic recovery trigger
+          // used by benchmark harnesses and other callers that need the
+          // authoritative changed frontier without forcing a full scan. Keep
+          // the force-full marker out of that form so v4's existing
+          // `requestedUris === undefined` -> `ScanScope::Reconcile` path can
+          // perform its bounded delta walk. If a scan is already in flight,
+          // the full form still forces the NEXT one full as before.
+          if (requestedScope !== "reconcile") forceFullScans.add(workspace.workspace_id);
           if (!alreadyIndexing) scheduleWorkspaceScan(workspace.workspace_id);
-          return { workspace_id: workspace.workspace_id, status: operation.workspace.status, reconciliation_operation_id: operation.operation_id, reindex_started: !alreadyIndexing };
+          return { workspace_id: workspace.workspace_id, status: operation.workspace.status, reconciliation_operation_id: operation.operation_id, reindex_started: !alreadyIndexing, scope: requestedScope === "reconcile" ? "reconcile" : "full" };
         }
         if (options.workspace_registry && indexingStorage && request.call === "core:repair") {
           const storage = indexingStorage;

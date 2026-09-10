@@ -91,6 +91,9 @@ pub struct TypeflowCache {
     /// Paths removed since `index` was last brought up to date -- drained
     /// by `build_index`, applied via `ProgramIndex::remove_file`.
     pending_removed: BTreeSet<String>,
+    /// Whether the current indexing pass requested opt-in typeflow timing.
+    /// Warm reflows inherit this setting from the most recent build call.
+    telemetry_enabled: bool,
     /// Frente E-P0g: the reverse half of `chain_watch_targets` (`resolve_
     /// import_targets_for`'s own doc comment) -- `target_path -> owning
     /// paths whose needed-import resolution used target_path as a
@@ -310,12 +313,36 @@ impl TypeflowCache {
     /// an exported entity's `start`-keyed id) and why omitting one is safe
     /// regardless (never produces a WRONG answer, only a possibly-stale-
     /// until-that-importer's-own-next-edit "unresolved").
+    #[allow(dead_code)]
     pub fn build_index(
         &mut self,
         resolver: &WorkspaceResolver,
         available: &BTreeSet<String>,
         files: &BTreeMap<String, SyntaxFileResult>,
     ) -> &ProgramIndex {
+        self.build_index_inner(resolver, available, files, false)
+    }
+
+    /// Builds the index with opt-in alias-phase telemetry for the indexing
+    /// worker's diagnostic stderr stream. The normal API remains timer-free.
+    pub fn build_index_with_telemetry(
+        &mut self,
+        resolver: &WorkspaceResolver,
+        available: &BTreeSet<String>,
+        files: &BTreeMap<String, SyntaxFileResult>,
+        telemetry_enabled: bool,
+    ) -> &ProgramIndex {
+        self.build_index_inner(resolver, available, files, telemetry_enabled)
+    }
+
+    fn build_index_inner(
+        &mut self,
+        resolver: &WorkspaceResolver,
+        available: &BTreeSet<String>,
+        files: &BTreeMap<String, SyntaxFileResult>,
+        telemetry_enabled: bool,
+    ) -> &ProgramIndex {
+        self.telemetry_enabled = telemetry_enabled;
         if self.index.is_none() {
             let all_paths: Vec<&str> = self.summaries.keys().map(String::as_str).collect();
             let (import_targets, pending_targets, chain_watch_targets) = resolve_import_targets_for(
@@ -325,10 +352,11 @@ impl TypeflowCache {
                 available,
                 files,
             );
-            self.index = Some(ProgramIndex::build(
+            self.index = Some(ProgramIndex::build_with_telemetry(
                 &self.summaries,
                 &import_targets,
                 &pending_targets,
+                self.telemetry_enabled,
             ));
             apply_chain_watch_updates(
                 &mut self.chain_watchers,

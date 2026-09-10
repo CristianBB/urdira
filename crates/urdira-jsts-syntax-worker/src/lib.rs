@@ -45,9 +45,11 @@ pub use resolver::{
 };
 pub use semantic_sites::{
     HybridResolutionContext, OwnerSemantics, PendingReasonCode, PendingSiteKind,
-    PendingSiteProposal, REASON_HERITAGE_UNRESOLVED, REASON_TARGET_NOT_INTERNED, SemanticSite,
+    PendingSiteProposal, REASON_HERITAGE_UNRESOLVED, REASON_TARGET_NOT_INTERNED,
+    SemanticAnalysisWithTelemetry, SemanticSite, SemanticTelemetry, SemanticTelemetryBucket,
     SiteDisposition, SiteKind, TypeflowOracleHit, ambiguous_ambient_would_be_external_count,
     analyze_owner_semantics, analyze_owner_semantics_with_context,
+    analyze_owner_semantics_with_context_telemetry,
     reset_ambiguous_ambient_would_be_external_count,
     reset_resolved_ambient_would_be_external_count, resolved_ambient_would_be_external_count,
 };

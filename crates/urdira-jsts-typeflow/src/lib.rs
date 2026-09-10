@@ -47,6 +47,7 @@ use oxc_syntax::symbol::SymbolId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// E-P0l (2026-09-08) coverage-recovery diagnostics: how many times
 /// `collect_members` gave up as "uncertain" specifically because of an
@@ -3349,6 +3350,14 @@ struct ResolvedContainer {
     has_unresolved_extends: bool,
 }
 
+/// Opt-in aggregate for the alias-chasing portion of `ProgramIndex` setup.
+/// The indexing worker exposes this only in its semantic performance stream.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct TypeflowTelemetry {
+    pub alias_chasing_count: u64,
+    pub alias_chasing_us: u64,
+}
+
 /// Cross-file class/interface member index (P0-S2/P1-A). Built once per
 /// generation from every file's `DeclSummary` plus the caller-resolved
 /// import table (see `HeritageTarget::Imported`'s doc comment) -- see the
@@ -3372,7 +3381,17 @@ struct ResolvedContainer {
 /// `incremental_matches_from_scratch_after_random_edits` test below
 /// verifies they agree.
 pub struct ProgramIndex {
+    telemetry: TypeflowTelemetry,
+    telemetry_enabled: bool,
     containers: HashMap<String, ResolvedContainer>,
+    /// Direct reverse heritage edges for `extends` and `implements`.
+    ///
+    /// `sibling_conformance_overrides` needs descendants of one known
+    /// container. Keeping only direct reverse edges avoids both the global
+    /// container scan and the O(C²) memory/update cost of a transitive
+    /// closure. The map is maintained together with `containers` by the
+    /// incremental file-contribution helpers below.
+    conformance_children: HashMap<String, HashSet<String>>,
     function_return_types: HashMap<String, ResolvedTypeRef>,
     /// P1-A: an explicitly-annotated top-level `const X: T = ...`'s own
     /// declared type -- see `VariableSummary`'s doc comment. Consulted
@@ -3969,6 +3988,10 @@ pub enum MemberLookup {
 }
 
 impl ProgramIndex {
+    pub fn telemetry(&self) -> TypeflowTelemetry {
+        self.telemetry
+    }
+
     /// `import_targets` maps `(owning_path, specifier, imported_name)` (a
     /// `HeritageTarget::Imported`'s three fields, `imported_name` `""` for a
     /// default/namespace import -- never resolved, see that variant's doc
@@ -3995,9 +4018,26 @@ impl ProgramIndex {
         import_targets: &HashMap<(String, String, String), String>,
         pending_targets: &HashMap<String, HashSet<String>>,
     ) -> Self {
-        let alias_targets = build_alias_targets(summaries, import_targets);
+        Self::build_with_telemetry(summaries, import_targets, pending_targets, false)
+    }
+
+    /// Same as [`Self::build`], with opt-in diagnostics for the alias-target
+    /// phase. The flag is threaded by the indexing worker only for its
+    /// stderr profiling pass, so ordinary callers retain the zero-overhead
+    /// path.
+    pub fn build_with_telemetry(
+        summaries: &BTreeMap<String, DeclSummary>,
+        import_targets: &HashMap<(String, String, String), String>,
+        pending_targets: &HashMap<String, HashSet<String>>,
+        telemetry_enabled: bool,
+    ) -> Self {
+        let (alias_targets, telemetry) =
+            build_alias_targets(summaries, import_targets, telemetry_enabled);
         let mut me = Self {
+            telemetry,
+            telemetry_enabled,
             containers: HashMap::new(),
+            conformance_children: HashMap::new(),
             function_return_types: HashMap::new(),
             variable_types: HashMap::new(),
             summaries: summaries.clone(),
@@ -4058,6 +4098,7 @@ impl ProgramIndex {
                 &me.alias_targets,
             );
         }
+        me.index_all_conformance_edges();
 
         let mut pending_functions = Vec::new();
         let mut pending_members = Vec::new();
@@ -4352,10 +4393,84 @@ impl ProgramIndex {
             return;
         };
         for entity_id in entities {
-            self.containers.remove(&entity_id);
+            if let Some(container) = self.containers.remove(&entity_id) {
+                self.remove_conformance_edges(&entity_id, &container);
+            }
             self.function_return_types.remove(&entity_id);
             self.variable_types.remove(&entity_id);
             self.entity_owner.remove(&entity_id);
+        }
+    }
+
+    /// Adds one direct reverse heritage edge. This is deliberately called
+    /// after pass 2: that pass may replace a `CallMember`'s provisional/
+    /// unresolved `extends` state.
+    fn add_conformance_edge(&mut self, base_id: &str, container_id: &str) {
+        self.conformance_children
+            .entry(base_id.to_owned())
+            .or_default()
+            .insert(container_id.to_owned());
+    }
+
+    /// Removes the direct reverse heritage edges owned by one container.
+    /// Empty buckets are dropped so repeated replace/remove operations do not
+    /// retain an unbounded trail of dead ids.
+    fn remove_conformance_edges(&mut self, container_id: &str, container: &ResolvedContainer) {
+        for base_id in container.extends.iter().chain(container.implements.iter()) {
+            let mut remove_bucket = false;
+            if let Some(children) = self.conformance_children.get_mut(base_id) {
+                children.remove(container_id);
+                remove_bucket = children.is_empty();
+            }
+            if remove_bucket {
+                self.conformance_children.remove(base_id);
+            }
+        }
+    }
+
+    /// Indexes every currently-live container. Used only by the cold build;
+    /// incremental reflows call `index_conformance_edges_for_files` below.
+    fn index_all_conformance_edges(&mut self) {
+        let edges: Vec<(String, String)> = self
+            .containers
+            .iter()
+            .flat_map(|(container_id, container)| {
+                container
+                    .extends
+                    .iter()
+                    .chain(container.implements.iter())
+                    .map(move |base_id| (base_id.clone(), container_id.clone()))
+            })
+            .collect();
+        for (base_id, container_id) in edges {
+            self.add_conformance_edge(&base_id, &container_id);
+        }
+    }
+
+    /// Indexes only the containers re-registered by one incremental reflow.
+    /// The old contributions were removed before pass 1, so this cannot leave
+    /// duplicate reverse edges in the direct index.
+    fn index_conformance_edges_for_files(&mut self, files: &[String]) {
+        let container_ids: Vec<String> = files
+            .iter()
+            .filter_map(|file| self.file_entities.get(file))
+            .flat_map(|entities| entities.iter())
+            .filter(|entity_id| self.containers.contains_key(*entity_id))
+            .cloned()
+            .collect();
+        let edges: Vec<(String, String)> = container_ids
+            .iter()
+            .filter_map(|container_id| self.containers.get(container_id).map(|c| (container_id, c)))
+            .flat_map(|(container_id, container)| {
+                container
+                    .extends
+                    .iter()
+                    .chain(container.implements.iter())
+                    .map(move |base_id| (base_id.clone(), container_id.clone()))
+            })
+            .collect();
+        for (base_id, container_id) in edges {
+            self.add_conformance_edge(&base_id, &container_id);
         }
     }
 
@@ -4376,7 +4491,13 @@ impl ProgramIndex {
         // before calling this) -- see `alias_targets`'s own doc comment
         // for why a full recompute, not an incremental patch, is correct
         // and cheap here.
-        self.alias_targets = build_alias_targets(&self.summaries, &self.import_targets);
+        let (alias_targets, telemetry) = build_alias_targets(
+            &self.summaries,
+            &self.import_targets,
+            self.telemetry_enabled,
+        );
+        self.alias_targets = alias_targets;
+        self.telemetry = telemetry;
         let mut deferred_functions = Vec::new();
         let mut deferred_variables = Vec::new();
         let mut deferred_members = Vec::new();
@@ -4415,6 +4536,7 @@ impl ProgramIndex {
                 );
             }
         }
+        self.index_conformance_edges_for_files(files);
         let mut pending_functions = Vec::new();
         let mut pending_members = Vec::new();
         for file in files {
@@ -4675,10 +4797,61 @@ impl ProgramIndex {
     /// EMPTY and uncertain, since "empty and uncertain" and "genuinely
     /// ambiguous" both mean the same thing here -- do not guess.
     pub fn members(&self, entity_id: &str, name: &str, is_static: bool) -> MemberLookup {
+        // The overwhelmingly common hit is a member declared directly on the
+        // receiver.  Resolve that case before allocating the walk's visited
+        // set/results vector.  `collect_members` already treats an own match
+        // as authoritative, so this is only a representation fast path.
+        if let Some(container) = self.containers.get(entity_id) {
+            let effective_static = is_static && !container.is_interface;
+            let mut own_matches = container
+                .members
+                .iter()
+                .filter(|member| member.name == name && member.is_static == effective_static);
+            let Some(first) = own_matches.next() else {
+                // The miss path below starts at the heritage edges and must
+                // not scan this container's own member table a second time.
+                let mut visited = std::collections::HashSet::new();
+                let mut found = Vec::new();
+                let uncertain = self.collect_members(
+                    entity_id,
+                    name,
+                    is_static,
+                    &mut visited,
+                    &mut found,
+                    true,
+                    false,
+                );
+                found.sort();
+                found.dedup();
+                return match (found.len(), uncertain) {
+                    (0, _) => MemberLookup::None,
+                    (1, false) => MemberLookup::One(found.pop().expect("checked len == 1")),
+                    _ => MemberLookup::Many(found),
+                };
+            };
+            let Some(second) = own_matches.next() else {
+                return MemberLookup::One(first.entity_id.clone());
+            };
+            let mut own = vec![first.entity_id.clone(), second.entity_id.clone()];
+            own.extend(own_matches.map(|member| member.entity_id.clone()));
+            own.sort();
+            own.dedup();
+            return match own.len() {
+                1 => MemberLookup::One(own.pop().expect("checked len == 1")),
+                _ => MemberLookup::Many(own),
+            };
+        }
         let mut visited = std::collections::HashSet::new();
         let mut found = Vec::new();
-        let uncertain =
-            self.collect_members(entity_id, name, is_static, &mut visited, &mut found, true);
+        let uncertain = self.collect_members(
+            entity_id,
+            name,
+            is_static,
+            &mut visited,
+            &mut found,
+            true,
+            true,
+        );
         found.sort();
         found.dedup();
         match (found.len(), uncertain) {
@@ -4773,6 +4946,7 @@ impl ProgramIndex {
     /// members always returns `false` immediately, regardless of any
     /// unresolved ancestor further up -- an own declaration always wins,
     /// with total certainty, over anything it might also inherit.
+    #[allow(clippy::too_many_arguments)]
     fn collect_members(
         &self,
         entity_id: &str,
@@ -4781,6 +4955,7 @@ impl ProgramIndex {
         visited: &mut std::collections::HashSet<String>,
         found: &mut Vec<String>,
         allow_implements_fallback: bool,
+        check_own_members: bool,
     ) -> bool {
         const MAX_DEPTH: usize = 32;
         if visited.len() >= MAX_DEPTH || !visited.insert(entity_id.to_owned()) {
@@ -4798,14 +4973,16 @@ impl ProgramIndex {
             // see. Uncertain, never "not found".
             return true;
         };
-        let effective_static = is_static && !container.is_interface;
-        for member in &container.members {
-            if member.name == name && member.is_static == effective_static {
-                found.push(member.entity_id.clone());
+        if check_own_members {
+            let effective_static = is_static && !container.is_interface;
+            for member in &container.members {
+                if member.name == name && member.is_static == effective_static {
+                    found.push(member.entity_id.clone());
+                }
             }
-        }
-        if !found.is_empty() {
-            return false;
+            if !found.is_empty() {
+                return false;
+            }
         }
         // Item A coverage fix (E-P0l, 2026-09-08): walk every RESOLVED
         // `extends` ancestor BEFORE giving up on an unresolved one --
@@ -4826,7 +5003,8 @@ impl ProgramIndex {
         // unresolved ancestor's mere existence).
         let mut uncertain = false;
         for base in &container.extends {
-            let base_uncertain = self.collect_members(base, name, is_static, visited, found, false);
+            let base_uncertain =
+                self.collect_members(base, name, is_static, visited, found, false, true);
             if !found.is_empty() {
                 return false;
             }
@@ -4880,7 +5058,7 @@ impl ProgramIndex {
         if allow_implements_fallback {
             for interface in &container.implements {
                 let iface_uncertain =
-                    self.collect_members(interface, name, false, visited, found, false);
+                    self.collect_members(interface, name, false, visited, found, false, true);
                 if !found.is_empty() {
                     return false;
                 }
@@ -4900,18 +5078,62 @@ impl ProgramIndex {
     /// `src/vs/workbench/browser/layout.ts`: the interface declares
     /// `zenModeIgnore`, the abstract base class does not declare its own,
     /// and ONLY the concrete subclass `RuntimeStateKey` does, via a
-    /// constructor parameter property). A linear scan over every container
-    /// this index knows about -- deliberately NOT a precomputed reverse
-    /// index (this crate's own incremental add/remove/replace machinery
-    /// would then need to keep a FOURTH index consistent, for a check this
-    /// rare: `collect_members` only ever reaches this point when a
-    /// container's own members AND its ENTIRE resolved `extends` chain both
-    /// came back confidently empty) -- correctness over the extra
-    /// bookkeeping a hot-path index would need.
+    /// constructor parameter property). The reverse conformance index is
+    /// filtered to `extends` edges here, preserving the strict subclassing
+    /// semantics without scanning every container or building a candidate
+    /// list that the caller only needs as a boolean.
     fn has_known_subclass_override(&self, ancestor_id: &str, name: &str, is_static: bool) -> bool {
-        !self
-            .sibling_extends_overrides(ancestor_id, name, is_static)
-            .is_empty()
+        const MAX_DEPTH: usize = 32;
+        let mut best_depth: HashMap<&str, usize> = HashMap::new();
+        let mut stack: Vec<(&str, usize)> = self
+            .conformance_children
+            .get(ancestor_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|child_id| {
+                let child = self.containers.get(child_id.as_str())?;
+                child
+                    .extends
+                    .iter()
+                    .any(|base_id| base_id == ancestor_id)
+                    .then_some((child_id.as_str(), 1))
+            })
+            .collect();
+        while let Some((current_id, depth)) = stack.pop() {
+            if depth > MAX_DEPTH
+                || best_depth
+                    .get(current_id)
+                    .is_some_and(|previous_depth| *previous_depth <= depth)
+            {
+                continue;
+            }
+            best_depth.insert(current_id, depth);
+            let Some(container) = self.containers.get(current_id) else {
+                continue;
+            };
+            let effective_static = is_static && !container.is_interface;
+            if container
+                .members
+                .iter()
+                .any(|member| member.name == name && member.is_static == effective_static)
+            {
+                return true;
+            }
+            if depth == MAX_DEPTH {
+                continue;
+            }
+            if let Some(children) = self.conformance_children.get(current_id) {
+                for child_id in children {
+                    let Some(child) = self.containers.get(child_id.as_str()) else {
+                        continue;
+                    };
+                    if child.extends.iter().any(|base_id| base_id == current_id) {
+                        stack.push((child_id.as_str(), depth + 1));
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// E-P0o (2026-09-08, sibling-declaration ambiguity -- 76% of VS Code's
@@ -4976,13 +5198,10 @@ impl ProgramIndex {
     /// `PredicateSubject`/`member_predicate_receiver_narrowing`'s own doc
     /// comments, `docs/evidence/2026-09-07-v4-vscode-campaign.md` §16.
     ///
-    /// A linear scan over every container this index knows about, same
-    /// performance tradeoff `has_known_subclass_override` already made for
-    /// the identical reason (this crate's own incremental add/remove/replace
-    /// machinery would otherwise need a FOURTH index kept consistent, for a
-    /// check only ever consulted at a genuinely rare fork in member
-    /// resolution). `None` (an empty vec, never a guess) when no such
-    /// sibling exists -- the ordinary, overwhelmingly common case.
+    /// This list-producing compatibility helper retains its complete result
+    /// contract; the hot boolean predicate above uses the reverse index and
+    /// does not call this global scan. `None` (an empty vec, never a guess)
+    /// when no such sibling exists is the ordinary case.
     pub fn sibling_extends_overrides(
         &self,
         entity_id: &str,
@@ -5015,7 +5234,7 @@ impl ProgramIndex {
     /// relationship `sibling_extends_overrides` proves for real subclassing,
     /// generalized to `implements` conformance too -- every OTHER known
     /// container reachable from `entity_id` through ANY combination of
-    /// `extends`/`implements` edges (`conformance_chain_reaches`, never
+    /// `extends`/`implements` edges (never
     /// `sibling_extends_overrides`'s own `extends`-only
     /// `extends_chain_reaches`) that ALSO declares its OWN `name` member at
     /// the given static/instance disposition. Live pattern this closes:
@@ -5026,11 +5245,12 @@ impl ProgramIndex {
     /// v3's real per-call-site resolution would pick.
     ///
     /// **This is a STRICT SUPERSET of `sibling_extends_overrides`'s own
-    /// result** (`conformance_chain_reaches` walks every edge
-    /// `extends_chain_reaches` does, plus `implements` ones) -- callers use
-    /// THIS function instead of, never in addition to, the `extends`-only
-    /// one. `sibling_extends_overrides` itself stays UNCHANGED and is still
-    /// used by `has_known_subclass_override` (a DIFFERENT check, about
+    /// result** (this traversal walks every edge
+    /// `sibling_extends_overrides` can reach, plus `implements` ones) --
+    /// callers use THIS function instead of, never in addition to, the
+    /// `extends`-only one. `sibling_extends_overrides` itself stays UNCHANGED
+    /// and is still used by `has_known_subclass_override` (a DIFFERENT check,
+    /// about
     /// whether `collect_members`'s own `implements` FALLBACK is safe to use
     /// at all -- deliberately `extends`-only, see that function's own doc
     /// comment; broadening it here would be a scope change to a check this
@@ -5054,10 +5274,14 @@ impl ProgramIndex {
     /// per candidate whenever the set is too large to list -- see that
     /// constant's own doc comment.
     ///
-    /// Same linear-scan performance tradeoff as `sibling_extends_overrides`
-    /// (a genuinely rare fork in member resolution, not a hot path worth a
-    /// fifth incrementally-maintained index). `None` (an empty vec, never a
-    /// guess) when no such sibling exists.
+    /// Walks the direct reverse conformance index from `entity_id` instead of
+    /// scanning every known container and checking each one's ancestry. The
+    /// traversal remains depth-capped and cycle-guarded. `MAX_DEPTH` is a
+    /// per-path heritage-edge depth from the queried entity (so depth 32 is
+    /// included, even when another path reached the same node more deeply),
+    /// rather than a global visited-node budget. The full result is still
+    /// sorted/deduplicated because callers use the complete set to preserve
+    /// the candidate/dependency contract.
     pub fn sibling_conformance_overrides(
         &self,
         entity_id: &str,
@@ -5065,54 +5289,54 @@ impl ProgramIndex {
         is_static: bool,
     ) -> Vec<String> {
         let mut ids = Vec::new();
-        for (other_id, other_container) in &self.containers {
+        const MAX_DEPTH: usize = 32;
+        // Retain the shallowest visit seen for each node. A plain visited
+        // set can miss valid descendants when a diamond reaches the same
+        // node through a depth-32 path before a shorter path is processed.
+        let mut best_depth: HashMap<&str, usize> = HashMap::new();
+        let mut stack: Vec<(&str, usize)> = self
+            .conformance_children
+            .get(entity_id)
+            .into_iter()
+            .flatten()
+            .map(|child_id| (child_id.as_str(), 1))
+            .collect();
+        while let Some((other_id, depth)) = stack.pop() {
+            // The root's direct child is depth 1, so a descendant at exactly
+            // `MAX_DEPTH` remains part of the bounded walk.
+            if depth > MAX_DEPTH
+                || best_depth
+                    .get(other_id)
+                    .is_some_and(|previous_depth| *previous_depth <= depth)
+            {
+                continue;
+            }
+            best_depth.insert(other_id, depth);
             if other_id == entity_id {
                 continue;
             }
-            if !self.conformance_chain_reaches(other_id, entity_id) {
+            let Some(other_container) = self.containers.get(other_id) else {
                 continue;
-            }
+            };
             let effective_static = is_static && !other_container.is_interface;
             for member in &other_container.members {
                 if member.name == name && member.is_static == effective_static {
                     ids.push(member.entity_id.clone());
                 }
             }
+            if depth < MAX_DEPTH
+                && let Some(children) = self.conformance_children.get(other_id)
+            {
+                stack.extend(
+                    children
+                        .iter()
+                        .map(|child_id| (child_id.as_str(), depth + 1)),
+                );
+            }
         }
         ids.sort();
         ids.dedup();
         ids
-    }
-
-    /// E-P0q (2026-09-09): `extends_chain_reaches`, generalized to ALSO walk
-    /// `implements` edges (class-implements-interface, and -- by the exact
-    /// same edge -- an interface's own `extends` of a base interface, since
-    /// `container.extends` already carries interface-extends-interface
-    /// heritage too, unchanged from `extends_chain_reaches`'s own walk).
-    /// Used ONLY by `sibling_conformance_overrides` -- `extends_chain_
-    /// reaches` itself stays untouched (still `extends`-only) since
-    /// `has_known_subclass_override`'s own "real subclassing, not interface
-    /// conformance" restriction must not change. Same depth cap and
-    /// cycle guard as `extends_chain_reaches`.
-    fn conformance_chain_reaches(&self, start_id: &str, target_id: &str) -> bool {
-        const MAX_DEPTH: usize = 32;
-        let mut visited = std::collections::HashSet::new();
-        let mut stack = vec![start_id.to_owned()];
-        while let Some(current) = stack.pop() {
-            if visited.len() >= MAX_DEPTH || !visited.insert(current.clone()) {
-                continue;
-            }
-            let Some(container) = self.containers.get(&current) else {
-                continue;
-            };
-            for base in container.extends.iter().chain(container.implements.iter()) {
-                if base == target_id {
-                    return true;
-                }
-                stack.push(base.clone());
-            }
-        }
-        false
     }
 
     /// Whether walking `start_id`'s own `extends` chain (never `implements`
@@ -5310,7 +5534,9 @@ const MAX_ALIAS_DEPTH: u8 = 8;
 fn build_alias_targets(
     summaries: &BTreeMap<String, DeclSummary>,
     import_targets: &HashMap<(String, String, String), String>,
-) -> HashMap<String, Option<ResolvedTypeRef>> {
+    telemetry_enabled: bool,
+) -> (HashMap<String, Option<ResolvedTypeRef>>, TypeflowTelemetry) {
+    let started = telemetry_enabled.then(Instant::now);
     let mut raw_by_id: HashMap<String, (String, RawTypeRef)> = HashMap::new();
     for summary in summaries.values() {
         for alias in &summary.type_aliases {
@@ -5343,7 +5569,13 @@ fn build_alias_targets(
         );
         resolved.insert(id.clone(), value);
     }
-    resolved
+    let telemetry = TypeflowTelemetry {
+        alias_chasing_count: u64::try_from(raw_by_id.len()).unwrap_or(u64::MAX),
+        alias_chasing_us: started
+            .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+            .unwrap_or_default(),
+    };
+    (resolved, telemetry)
 }
 
 /// D.2: structurally the SAME wrapper recursion `resolve_raw_type_ref`
@@ -7230,6 +7462,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subclass_override_walk_is_extends_only_and_depth_bounded() {
+        let mut source = String::from(
+            "interface Root {\n  marker(): void;\n}\nclass ImplementsOnly implements Root {\n  marker(): void {}\n}\n",
+        );
+        for i in 0..34 {
+            let base = if i == 0 {
+                "Root".to_owned()
+            } else {
+                format!("Chain{}", i - 1)
+            };
+            let member = if i == 32 { "  marker(): void;\n" } else { "" };
+            source.push_str(&format!(
+                "interface Chain{i} extends {base} {{\n{member}}}\n"
+            ));
+        }
+        let summary = summary_for("depth.ts", &source);
+        let root_id = summary.interfaces[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("depth.ts".to_owned(), summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+
+        assert!(!index.has_known_subclass_override(&root_id, "marker", false));
+
+        let mut shallow_source = String::from("interface Root {\n  marker(): void;\n}\n");
+        for i in 0..32 {
+            let base = if i == 0 {
+                "Root".to_owned()
+            } else {
+                format!("Chain{}", i - 1)
+            };
+            let member = if i == 31 { "  marker(): void;\n" } else { "" };
+            shallow_source.push_str(&format!(
+                "interface Chain{i} extends {base} {{\n{member}}}\n"
+            ));
+        }
+        let shallow_summary = summary_for("shallow.ts", &shallow_source);
+        let shallow_root = shallow_summary.interfaces[0].entity_id.clone();
+        let mut shallow_summaries = BTreeMap::new();
+        shallow_summaries.insert("shallow.ts".to_owned(), shallow_summary);
+        let shallow_index =
+            ProgramIndex::build(&shallow_summaries, &HashMap::new(), &HashMap::new());
+        assert!(shallow_index.has_known_subclass_override(&shallow_root, "marker", false));
+    }
+
+    #[test]
+    fn members_fast_path_preserves_own_ambiguity_and_inherited_misses() {
+        let summary = summary_for(
+            "members.ts",
+            "class Base { inherited(): void {} }\nclass Own { value(): void {} value(x: string): void {} }\nclass Derived extends Base {}\n",
+        );
+        let own_id = summary.classes[1].entity_id.clone();
+        let derived_id = summary.classes[2].entity_id.clone();
+        let own_members = summary.classes[1].members.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("members.ts".to_owned(), summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.members(&own_id, "value", false),
+            MemberLookup::Many(
+                own_members
+                    .iter()
+                    .map(|member| member.entity_id.clone())
+                    .collect(),
+            )
+        );
+        assert_eq!(
+            index.members(&derived_id, "missing", false),
+            MemberLookup::None
+        );
+        assert_eq!(
+            index.members(&derived_id, "inherited", false),
+            MemberLookup::One(
+                index
+                    .containers
+                    .values()
+                    .find_map(|container| container
+                        .members
+                        .iter()
+                        .find(|member| member.name == "inherited"))
+                    .expect("inherited member")
+                    .entity_id
+                    .clone(),
+            )
+        );
+    }
+
     /// E-P0q (2026-09-09, `docs/evidence/2026-09-07-v4-vscode-campaign.md`
     /// §16.4 pattern 1): `sibling_conformance_overrides` finds an
     /// `implements` conformer's own redeclaration -- `sibling_extends_
@@ -7293,6 +7612,287 @@ mod tests {
             index
                 .sibling_extends_overrides(&iaction_id, "run", false)
                 .is_empty()
+        );
+    }
+
+    /// Independent oracle for the pre-index implementation. Keeping this in
+    /// the test module makes the reverse-edge traversal testable without
+    /// simply asserting that the new implementation agrees with itself.
+    fn sibling_conformance_oracle(
+        index: &ProgramIndex,
+        entity_id: &str,
+        name: &str,
+        is_static: bool,
+    ) -> Vec<String> {
+        fn reaches(index: &ProgramIndex, start_id: &str, target_id: &str) -> bool {
+            const MAX_DEPTH: usize = 32;
+            let mut visited = HashSet::new();
+            let mut stack = vec![start_id.to_owned()];
+            while let Some(current) = stack.pop() {
+                if visited.len() >= MAX_DEPTH || !visited.insert(current.clone()) {
+                    continue;
+                }
+                let Some(container) = index.containers.get(&current) else {
+                    continue;
+                };
+                for base in container.extends.iter().chain(container.implements.iter()) {
+                    if base == target_id {
+                        return true;
+                    }
+                    stack.push(base.clone());
+                }
+            }
+            false
+        }
+
+        let mut ids = Vec::new();
+        for (other_id, other_container) in &index.containers {
+            if other_id == entity_id || !reaches(index, other_id, entity_id) {
+                continue;
+            }
+            let effective_static = is_static && !other_container.is_interface;
+            ids.extend(
+                other_container
+                    .members
+                    .iter()
+                    .filter(|member| member.name == name && member.is_static == effective_static)
+                    .map(|member| member.entity_id.clone()),
+            );
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_matches_the_old_oracle() {
+        let file_summary = summary_for(
+            "a.ts",
+            "interface Root {\n  run(): void;\n}\ninterface Mid extends Root {\n  run(): void;\n}\nclass Impl implements Root {\n  run(): void {}\n}\nclass Deep extends Mid {\n  run(): void {}\n}\nclass StaticBase {\n  static make(): void {}\n}\nclass StaticChild extends StaticBase {\n  static make(): void {}\n}\n",
+        );
+        let mut summaries = BTreeMap::new();
+        summaries.insert("a.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+
+        let container_ids: Vec<String> = index.containers.keys().cloned().collect();
+        for entity_id in container_ids {
+            for name in ["run", "make", "missing"] {
+                for is_static in [false, true] {
+                    assert_eq!(
+                        index.sibling_conformance_overrides(&entity_id, name, is_static),
+                        sibling_conformance_oracle(&index, &entity_id, name, is_static),
+                        "reverse index diverged for entity={entity_id}, name={name}, static={is_static}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_handles_cycles_and_wide_conformance() {
+        let mut source = String::from(
+            "interface Root {\n  run(): void;\n}\ninterface CycleA extends CycleB {\n  run(): void;\n}\ninterface CycleB extends CycleA {\n  run(): void;\n}\n",
+        );
+        for i in 0..40 {
+            source.push_str(&format!(
+                "class Impl{i} implements Root {{\n  run(): void {{}}\n}}\n"
+            ));
+        }
+        let file_summary = summary_for("wide.ts", &source);
+        let root_id = file_summary.interfaces[0].entity_id.clone();
+        let cycle_a_id = file_summary.interfaces[1].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("wide.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+
+        let wide = index.sibling_conformance_overrides(&root_id, "run", false);
+        assert_eq!(wide.len(), 40);
+        assert_eq!(
+            wide,
+            sibling_conformance_oracle(&index, &root_id, "run", false)
+        );
+        assert_eq!(
+            index.sibling_conformance_overrides(&cycle_a_id, "run", false),
+            sibling_conformance_oracle(&index, &cycle_a_id, "run", false)
+        );
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_preserves_depth_cutoff() {
+        let mut source = String::from("interface Root {\n  run(): void;\n}\n");
+        for i in 0..34 {
+            let base = if i == 0 {
+                "Root".to_owned()
+            } else {
+                format!("Chain{}", i - 1)
+            };
+            source.push_str(&format!(
+                "interface Chain{i} extends {base} {{\n  run(): void;\n}}\n"
+            ));
+        }
+        let file_summary = summary_for("depth.ts", &source);
+        let root_id = file_summary.interfaces[0].entity_id.clone();
+        let depth_32_member = file_summary.interfaces[32].members[0].entity_id.clone();
+        let depth_33_member = file_summary.interfaces[33].members[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("depth.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        let indexed = index.sibling_conformance_overrides(&root_id, "run", false);
+        assert_eq!(indexed.len(), 32);
+        assert!(indexed.contains(&depth_32_member));
+        assert!(!indexed.contains(&depth_33_member));
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_keeps_a_short_diamond_path() {
+        let mut source =
+            String::from("interface Root {\n  run(): void;\n}\ninterface Short extends Root {}\n");
+        for i in 0..31 {
+            let base = if i == 0 {
+                "Short".to_owned()
+            } else {
+                format!("Long{}", i - 1)
+            };
+            source.push_str(&format!("interface Long{i} extends {base} {{}}\n"));
+        }
+        source.push_str("interface Join extends Long30, Short {\n  run(): void;\n}\n");
+        let file_summary = summary_for("diamond.ts", &source);
+        let root_id = file_summary.interfaces[0].entity_id.clone();
+        let join_member = file_summary.interfaces.last().unwrap().members[0]
+            .entity_id
+            .clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("diamond.ts".to_owned(), file_summary);
+        let index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+
+        let indexed = index.sibling_conformance_overrides(&root_id, "run", false);
+        assert!(
+            indexed.contains(&join_member),
+            "the short depth-2 path must preserve Join even if the depth-33 path is visited first"
+        );
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_indexes_call_member_after_pass2_and_replace() {
+        let source_v1 = "class Base {\n  run(): void {}\n}\nclass Other {\n  run(): void {}\n}\nclass Z {\n  class(): Base { return new Base(); }\n}\nclass Derived extends Z.class({}) {\n  run(): void {}\n}\n";
+        let source_v2 = source_v1.replace("class(): Base", "class(): Other");
+        let summary_v1 = summary_for("mixin.ts", source_v1);
+        let summary_v2 = summary_for("mixin.ts", &source_v2);
+        let base_id = summary_v1.classes[0].entity_id.clone();
+        let other_id = summary_v2.classes[1].entity_id.clone();
+        let derived_id_v1 = summary_v1.classes[3].entity_id.clone();
+        let derived_id_v2 = summary_v2.classes[3].entity_id.clone();
+        let derived_member_v1 = summary_v1.classes[3].members[0].entity_id.clone();
+        let derived_member_v2 = summary_v2.classes[3].members[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("mixin.ts".to_owned(), summary_v1);
+        let mut index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            index.containers[&derived_id_v1].extends,
+            vec![base_id.clone()],
+            "cold pass 2 must resolve Z.class() to Base"
+        );
+        assert_eq!(
+            index.sibling_conformance_overrides(&base_id, "run", false),
+            vec![derived_member_v1]
+        );
+
+        let mut changed_summaries = BTreeMap::new();
+        changed_summaries.insert("mixin.ts".to_owned(), summary_v2.clone());
+        index.replace_file("mixin.ts", summary_v2, &HashMap::new(), &HashMap::new());
+        let fresh = ProgramIndex::build(&changed_summaries, &HashMap::new(), &HashMap::new());
+        assert_index_equal(&index, &fresh, "CallMember replace");
+        assert_eq!(
+            index.containers[&derived_id_v2].extends,
+            vec![other_id.clone()],
+            "incremental pass 2 must update the resolved CallMember target"
+        );
+        assert!(
+            index
+                .sibling_conformance_overrides(&other_id, "run", false)
+                .contains(&derived_member_v2)
+        );
+        assert!(
+            index
+                .sibling_conformance_overrides(&base_id, "run", false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_tracks_extends_to_implements_incrementally() {
+        let source_v1 = "interface Root {\n  run(): void;\n}\nclass Base {\n  run(): void {}\n}\nclass Child extends Base {\n  run(): void {}\n}\n";
+        let source_v2 = "interface Root {\n  run(): void;\n}\nclass Base {\n  run(): void {}\n}\nclass Child implements Root {\n  run(): void {}\n}\n";
+        let summary_v1 = summary_for("heritage.ts", source_v1);
+        let summary_v2 = summary_for("heritage.ts", source_v2);
+        let root_id = summary_v1.interfaces[0].entity_id.clone();
+        let base_id = summary_v1.classes[0].entity_id.clone();
+        let child_id = summary_v1.classes[1].entity_id.clone();
+        let child_member_v1 = summary_v1.classes[1].members[0].entity_id.clone();
+        let child_member_v2 = summary_v2.classes[1].members[0].entity_id.clone();
+        let mut summaries = BTreeMap::new();
+        summaries.insert("heritage.ts".to_owned(), summary_v1);
+        let mut index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.sibling_conformance_overrides(&base_id, "run", false),
+            vec![child_member_v1]
+        );
+
+        let mut changed_summaries = BTreeMap::new();
+        changed_summaries.insert("heritage.ts".to_owned(), summary_v2.clone());
+        index.replace_file("heritage.ts", summary_v2, &HashMap::new(), &HashMap::new());
+        let fresh = ProgramIndex::build(&changed_summaries, &HashMap::new(), &HashMap::new());
+        assert_index_equal(&index, &fresh, "extends-to-implements replace");
+        assert!(
+            index
+                .sibling_conformance_overrides(&base_id, "run", false)
+                .is_empty()
+        );
+        assert_eq!(
+            index.sibling_conformance_overrides(&root_id, "run", false),
+            vec![child_member_v2]
+        );
+        assert_eq!(index.containers[&child_id].extends, Vec::<String>::new());
+        assert_eq!(index.containers[&child_id].implements, vec![root_id]);
+    }
+
+    #[test]
+    fn sibling_conformance_reverse_index_stays_equal_after_incremental_replace_and_remove() {
+        let base_source = "interface Root {\n  run(): void;\n}\n";
+        let child_source = "class Child implements Root {\n  run(): void {}\n}\n";
+        let changed_child_source = "class Child {\n  run(): void {}\n}\n";
+        let mut summaries = BTreeMap::new();
+        summaries.insert("base.ts".to_owned(), summary_for("base.ts", base_source));
+        summaries.insert("child.ts".to_owned(), summary_for("child.ts", child_source));
+        let mut index = ProgramIndex::build(&summaries, &HashMap::new(), &HashMap::new());
+        let root_id = summaries["base.ts"].interfaces[0].entity_id.clone();
+
+        let mut changed_summaries = summaries.clone();
+        changed_summaries.insert(
+            "child.ts".to_owned(),
+            summary_for("child.ts", changed_child_source),
+        );
+        index.replace_file(
+            "child.ts",
+            changed_summaries["child.ts"].clone(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fresh_after_replace =
+            ProgramIndex::build(&changed_summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.sibling_conformance_overrides(&root_id, "run", false),
+            fresh_after_replace.sibling_conformance_overrides(&root_id, "run", false)
+        );
+
+        index.remove_file("child.ts");
+        changed_summaries.remove("child.ts");
+        let fresh_after_remove =
+            ProgramIndex::build(&changed_summaries, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            index.sibling_conformance_overrides(&root_id, "run", false),
+            fresh_after_remove.sibling_conformance_overrides(&root_id, "run", false)
         );
     }
 
@@ -8614,10 +9214,11 @@ mod tests {
     /// `containers`/`function_return_types`/`variable_types` together ARE
     /// the index's complete answer surface (`is_container`/`members`/
     /// `member_type_ref`/`function_return_type`/`variable_declared_type`
-    /// all read only these three maps) -- the remaining fields
-    /// (`summaries`, `import_targets`, `entity_owner`, `file_entities`,
-    /// `importers_of`) are this task's own INCREMENTAL bookkeeping, private
-    /// implementation detail with no query-visible effect of their own.
+    /// all read only these three maps). The direct reverse heritage index is
+    /// also compared because it is incremental bookkeeping whose divergence
+    /// would make the query-visible conformance result stale. The remaining
+    /// fields (`summaries`, `import_targets`, `entity_owner`, `file_entities`,
+    /// `importers_of`) have no query-visible effect of their own.
     fn assert_index_equal(incremental: &ProgramIndex, oracle: &ProgramIndex, context: &str) {
         diff_maps(
             &incremental.containers,
@@ -8636,6 +9237,12 @@ mod tests {
             &oracle.variable_types,
             context,
             "variable_types",
+        );
+        diff_maps(
+            &incremental.conformance_children,
+            &oracle.conformance_children,
+            context,
+            "conformance_children",
         );
     }
 

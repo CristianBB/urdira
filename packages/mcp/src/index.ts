@@ -1856,12 +1856,16 @@ export const MCP_SERVER_INSTRUCTIONS: string = buildInstructions();
  * a second hand-written protocol contract.
  */
 export function buildBenchmarkInstructions(discoveryPath?: string): string {
-  // The public MCP tool timeout is 300 seconds. Large frozen workspaces in
-  // the benchmark need more than 120 seconds to enumerate/catalog after an
-  // edit even when only one artifact is re-analyzed, so keep a 60-second IPC
-  // margin while giving the freshness gate enough time to observe the next
-  // current structural snapshot.
-  const benchmarkFreshnessTimeoutMs = 240_000;
+  // Keep the ordinary benchmark freshness wait below the public 300-second
+  // MCP tool timeout. Large repositories receive a size-tier timeout from
+  // the campaign driver; derive the freshness budget from that same finite
+  // cell deadline and leave a 60-second margin for MCP/IPC overhead. This
+  // lets post-edit structural readiness finish on L repositories without
+  // changing the semantic-index kill switch.
+  const configuredCellTimeoutMs = Number(process.env["URDIRA_BENCHMARK_FRESHNESS_TIMEOUT_MS"] ?? process.env["URDIRA_BENCHMARK_TIMEOUT_MS"] ?? "0");
+  const benchmarkFreshnessTimeoutMs = Number.isSafeInteger(configuredCellTimeoutMs) && configuredCellTimeoutMs > 900_000
+    ? Math.max(240_000, configuredCellTimeoutMs - 60_000)
+    : 240_000;
   const sourceOperations = operationRegistry
     .filter((operation) => ["core:find_artifacts", "core:search_text", "core:get_source", "core:build_context"].includes(operation.operation_id))
     .map((operation) => operation.operation_id);
@@ -1915,7 +1919,7 @@ export function buildBenchmarkInstructions(discoveryPath?: string): string {
     `Source-safe operations available at source_ready: ${sourceOperations.join(", ")}.`,
     "Use urdira_context for complete task context (it waits for the structural frontier by default), or one binding-oriented urdira_query pipeline with freshness.mode=wait.",
     "After editing, wait for the structural frontier before final symbol rediscovery: use freshness={mode:\"wait\",required_frontier:\"structural\",timeout_ms:N}. mode=current returns immediately and can explicitly report stale evidence while reindexing; its timeout does not make it wait.",
-    "On large workspaces, use timeout_ms:240000 for post-edit freshness waits; this stays below the MCP tool timeout and the wait remains part of the measured result.",
+    `On large workspaces, use timeout_ms:${benchmarkFreshnessTimeoutMs} for post-edit freshness waits; this stays below the configured finite MCP tool timeout and the wait remains part of the measured result.`,
     "urdira_query accepts exactly one top-level request_type plus query object. Inside query, freshness belongs only at options.freshness; do not add expression_type beside expression, and do not add operation_version to a direct operation expression. Every operation pipeline stage must use the exact field operation; never replace it with core, operator, or operation_id.",
     "For core:search_text, syntax is only literal or safe_regex; word_mode is only substring, identifier, or token; result_projection is only match, artifact, record, or entity. matches and subjects are output stream names for bindings, never result_projection values. Omit an optional field instead of inventing another enum value.",
     "For core:get_source, subjects must be closed selector objects, never bare path strings. A known path uses {subject_type:\"artifact\",path:\"src/example.ts\"}. For core:find_artifacts, paths belong at arguments.filter.paths (an array); there is no top-level arguments.path field. In a pipeline, core:find_artifacts exposes output artifacts (not subjects), so bind get_source.subjects from {stage_id:\"files\",output:\"artifacts\"}.",

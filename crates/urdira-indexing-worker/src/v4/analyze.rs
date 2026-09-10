@@ -30,7 +30,7 @@ use urdira_jsts_syntax_worker::{
     AmbientModuleIndex, AnalysisBudgets, ConfigAssetInput, HybridResolutionContext, ProposedRecord,
     ProposedRecordDependency, SourceInput, SyntaxFileResult, SyntaxWorkerState, WorkerMessage,
     WorkspaceResolver, ambiguous_ambient_would_be_external_count,
-    analyze_owner_semantics_with_context, decode_config_assets,
+    analyze_owner_semantics_with_context_telemetry, decode_config_assets,
     reset_ambiguous_ambient_would_be_external_count,
     reset_resolved_ambient_would_be_external_count, resolved_ambient_would_be_external_count,
 };
@@ -947,8 +947,15 @@ pub fn run_scoped(
     for path in &affected_paths {
         typeflow.mark_reflow(path);
     }
+    let semantic_perf_enabled = std::env::var_os("URDIRA_V4_DEBUG_SEMANTIC_PERF").is_some();
     let typeflow_index_started = std::time::Instant::now();
-    let typeflow_index = typeflow.build_index(&resolver, &available, project_files);
+    let typeflow_index = typeflow.build_index_with_telemetry(
+        &resolver,
+        &available,
+        project_files,
+        semantic_perf_enabled,
+    );
+    let typeflow_telemetry = typeflow_index.telemetry();
     let typeflow_index_elapsed = typeflow_index_started.elapsed();
     if debug_timing {
         eprintln!(
@@ -1018,7 +1025,8 @@ pub fn run_scoped(
         reset_resolved_ambient_would_be_external_count();
     }
     let hybrid_call_started = std::time::Instant::now();
-    let hybrid_results = run_hybrid_semantics(&hybrid_owners, &ctx, cas_signal)?;
+    let hybrid_results =
+        run_hybrid_semantics(&hybrid_owners, &ctx, cas_signal, semantic_perf_enabled)?;
     if debug_timing {
         eprintln!(
             "[urdira-indexing-worker] v4 resolve hybrid_semantics: {:.3}s affected_paths={} hybrid_owners={}",
@@ -1042,9 +1050,14 @@ pub fn run_scoped(
             resolved_ambient_would_be_external_count(),
         );
     }
+    if semantic_perf_enabled {
+        emit_semantic_perf(&hybrid_results, affected_path_count, typeflow_telemetry);
+    }
     clock.record_resolve(resolve_started.elapsed());
 
-    for (path, semantics) in hybrid_results {
+    for result in hybrid_results {
+        let path = result.path;
+        let semantics = result.semantics;
         let Some(owner) = owners.get_mut(&path) else {
             // Every affected path has a lane-1 facts entry (the loop above
             // inserts one for each `FactsResult` page, and `affected_paths`
@@ -1425,25 +1438,99 @@ fn run_hybrid_semantics(
     owners: &[&SourceInput],
     ctx: &HybridResolutionContext<'_>,
     cas_signal: Option<&CasWrittenSignal>,
-) -> Result<Vec<(String, urdira_jsts_syntax_worker::OwnerSemantics)>, ScanError> {
+    telemetry_enabled: bool,
+) -> Result<Vec<HybridOwnerResult>, ScanError> {
     owners
         .par_iter()
-        .map(|owner| analyze_one(owner, ctx, cas_signal))
+        .map(|owner| analyze_one(owner, ctx, cas_signal, telemetry_enabled))
         .collect()
+}
+
+struct HybridOwnerResult {
+    path: String,
+    semantics: urdira_jsts_syntax_worker::OwnerSemantics,
+    telemetry: urdira_jsts_syntax_worker::SemanticTelemetry,
+    wall_us: u64,
 }
 
 fn analyze_one(
     owner: &SourceInput,
     ctx: &HybridResolutionContext<'_>,
     cas_signal: Option<&CasWrittenSignal>,
-) -> Result<(String, urdira_jsts_syntax_worker::OwnerSemantics), ScanError> {
+    telemetry_enabled: bool,
+) -> Result<HybridOwnerResult, ScanError> {
+    let started = std::time::Instant::now();
     let text = read_owner_source_text(owner, cas_signal)?;
-    let semantics =
-        analyze_owner_semantics_with_context(&owner.path, &text, ctx).map_err(|error| {
-            ScanError(format!(
-                "v4 hybrid semantics failed for {}: {}",
-                owner.path, error.message
-            ))
-        })?;
-    Ok((owner.path.clone(), semantics))
+    let report =
+        analyze_owner_semantics_with_context_telemetry(&owner.path, &text, ctx, telemetry_enabled)
+            .map_err(|error| {
+                ScanError(format!(
+                    "v4 hybrid semantics failed for {}: {}",
+                    owner.path, error.message
+                ))
+            })?;
+    Ok(HybridOwnerResult {
+        path: owner.path.clone(),
+        semantics: report.semantics,
+        telemetry: report.telemetry,
+        wall_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    })
+}
+
+fn semantic_row_count(semantics: &urdira_jsts_syntax_worker::OwnerSemantics) -> usize {
+    semantics.reference_rows.len()
+        + semantics.covers_rows.len()
+        + semantics.call_rows.len()
+        + semantics.heritage_rows.len()
+        + semantics.typeflow_call_rows.len()
+        + semantics.typeflow_heritage_rows.len()
+        + semantics.candidate_call_rows.len()
+        + semantics.candidate_reference_rows.len()
+        + semantics.parameter_entity_rows.len()
+        + semantics.parameter_contains_rows.len()
+        + semantics.external_entity_rows.len()
+        + semantics.external_contains_rows.len()
+}
+
+fn emit_semantic_perf(
+    results: &[HybridOwnerResult],
+    affected_paths: usize,
+    typeflow_telemetry: urdira_jsts_typeflow::TypeflowTelemetry,
+) {
+    let mut aggregate = urdira_jsts_syntax_worker::SemanticTelemetry::default();
+    let mut owners: Vec<serde_json::Value> = results
+        .iter()
+        .map(|result| {
+            aggregate.merge(result.telemetry);
+            serde_json::json!({
+                "path": result.path,
+                "wall_us": result.wall_us,
+                "sites": result.telemetry.site_count,
+                "candidates": result.semantics.candidate_call_rows.len()
+                    + result.semantics.candidate_reference_rows.len(),
+                "pending": result.semantics.pending_sites.len(),
+                "rows": semantic_row_count(&result.semantics),
+            })
+        })
+        .collect();
+    owners.sort_by(|left, right| {
+        let left_wall = left["wall_us"].as_u64().unwrap_or_default();
+        let right_wall = right["wall_us"].as_u64().unwrap_or_default();
+        right_wall
+            .cmp(&left_wall)
+            .then_with(|| left["path"].as_str().cmp(&right["path"].as_str()))
+    });
+    owners.truncate(10);
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "affected_paths": affected_paths,
+        "hybrid_owners": results.len(),
+        "aggregate": aggregate,
+        "typeflow": typeflow_telemetry,
+        "top_owners": owners,
+    });
+    eprintln!(
+        "[urdira-indexing-worker] v4 semantic_perf {}",
+        serde_json::to_string(&payload).expect("semantic telemetry is serializable")
+    );
 }

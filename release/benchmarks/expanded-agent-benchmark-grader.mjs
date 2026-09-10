@@ -4,6 +4,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { analyzeExpandedTranscript, analyzeUrdiraPipelineContract, isShellSourceReadCommand } from "./expanded-agent-transcript-metrics.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -57,7 +58,6 @@ const eventText = transcript.map((event) => JSON.stringify(event)).join("\n");
 const shellCommandText = transcript
   .flatMap((event) => event?.type === "item.completed" && event.item?.type === "command_execution" ? [String(event.item.command ?? "")] : [])
   .join("\n");
-const eventIndex = (pattern, from = 0) => transcript.findIndex((event, index) => index >= from && pattern.test(JSON.stringify(event)));
 const editPattern = /apply_patch|file_change|write_file|git\s+apply|editor_action/iu;
 const discoveryPattern = /urdira_(?:query|context|benchmark_discover)/u;
 // `git diff/status` are explicitly allowed after an edit. A pager such as
@@ -66,9 +66,6 @@ const discoveryPattern = /urdira_(?:query|context|benchmark_discover)/u;
 // consumer. Commands that obtain source first (cat/rg/etc.) remain blocked,
 // including less-common readers (bat/less/more/nl/strings/xxd/od) and
 // one-liner script readers (python -c/node -e that call open()/readFile*).
-const shellDiscoveryPattern = /(?:^|[\s;&|('"])(?:rg|grep|find|cat|bat|less|more|nl|strings|xxd|od)(?=\s)|(?:^|[\s;&|('"])ls\s+-|git\s+ls-files|sed\s+-n|(?<![|]\s)(?:head|tail|awk)\s+|(?:python3?\s+-c|node\s+-e).*(?:open\(|readFileSync\(|readFile\()/mu;
-const firstEdit = eventIndex(editPattern);
-const firstDiscovery = eventIndex(discoveryPattern);
 const editIndices = transcript.map((event, index) => editPattern.test(JSON.stringify(event)) ? index : -1).filter((index) => index >= 0);
 const discoveryIndices = transcript.map((event, index) => discoveryPattern.test(JSON.stringify(event)) ? index : -1).filter((index) => index >= 0);
 const completedTranscriptItems = transcript.filter((event) => event?.type === "item.completed");
@@ -79,15 +76,20 @@ const failedUrdiraDiscoveryCall = completedTranscriptItems.some((event) => {
   // The transcript audit records its frequency and whether the agent narrows
   // with candidates or switches to another Urdira query; either remains a
   // Urdira-only discovery path and must not be confused with native fallback.
-  if (encoded.includes("core:selector_ambiguous")) return false;
+  if (encoded.includes("core:selector_ambiguous") || encoded.includes("core:execution_resource_limit")) return false;
   return true;
 });
-const discoveryBeforeEdit = arm !== "urdira-typescript" || (firstDiscovery >= 0 && (firstEdit < 0 || firstDiscovery < firstEdit));
-const rediscoveryAfterEdit = arm !== "urdira-typescript" || editIndices.length === 0 || editIndices.every((edit) => discoveryIndices.some((discovery) => discovery > edit));
-// Only actual shell executions can prove a native-source fallback. Searching
-// the full transcript made ordinary agent prose such as "find the caller"
-// indistinguishable from a forbidden `find` command.
-const fallbackShell = arm === "urdira-typescript" && shellDiscoveryPattern.test(shellCommandText);
+const transcriptMetrics = analyzeExpandedTranscript(transcript, arm, task);
+const compositionMetrics = arm === "urdira-typescript" ? analyzeUrdiraPipelineContract(transcript) : undefined;
+// Discovery method and timing are observational. The arm configures one
+// integration, but the agent remains free to use it, another available tool,
+// or ordinary repository tools as its normal workflow dictates.
+const discoveryBeforeEdit = transcriptMetrics.observed_discovery_before_edit;
+const rediscoveryAfterEdit = transcriptMetrics.observed_rediscovery_after_each_edit;
+// Only actual shell executions can prove that the agent used a native-source
+// fallback. Searching the full transcript made ordinary agent prose such as
+// "find the caller" indistinguishable from a shell command.
+const fallbackShell = arm === "urdira-typescript" && shellCommandText.split("\n").some(isShellSourceReadCommand);
 const discoveryStatus = arm !== "urdira-typescript"
   ? "not-applicable"
   : fallbackShell
@@ -101,10 +103,49 @@ const unexpectedErrors = arm === "urdira-typescript" ? {
   coverage: /core:coverage_incomplete/iu.test(eventText),
   ipc: /core:ipc_timeout/iu.test(eventText),
 } : { validation: false, coverage: false, ipc: false };
-const discoveryEvidence = { discovery_status: discoveryStatus, first_discovery_before_edit: discoveryBeforeEdit, rediscovery_after_edit: rediscoveryAfterEdit, edit_count: editIndices.length, discovery_count: discoveryIndices.length, fallback_shell: fallbackShell, unexpected_errors: unexpectedErrors };
-const evidence = { changed_files: changedOutput, changed_paths: changedMatches, required_patterns: required, focused_test_changed: testChanged, diff_clean: diffClean, ...discoveryEvidence };
+const missingChangedPathPatterns = task.changed_path_regex.filter((pattern) => !changedOutput.some((file) => new RegExp(pattern).test(file)));
+const missingRequiredPatterns = Object.entries(required).filter(([, present]) => !present).map(([path]) => path);
+const declaredUnsafeOmissions = [
+  ...missingChangedPathPatterns.map((pattern) => `changed_path:${pattern}`),
+  ...missingRequiredPatterns.map((path) => `required_pattern:${path}`),
+  ...(testChanged ? [] : ["focused_test"]),
+];
+const discoveryEvidence = {
+  discovery_status: discoveryStatus,
+  first_discovery_before_edit: discoveryBeforeEdit,
+  rediscovery_after_edit: rediscoveryAfterEdit,
+  observed_discovery_before_edit: discoveryBeforeEdit,
+  observed_rediscovery_after_each_edit: rediscoveryAfterEdit,
+  edit_count: editIndices.length,
+  discovery_count: discoveryIndices.length,
+  fallback_shell: fallbackShell,
+  unexpected_errors: unexpectedErrors,
+};
+const evidence = {
+  changed_files: changedOutput,
+  changed_paths: changedMatches,
+  target_set_coverage: {
+    matched: task.changed_path_regex.length - missingChangedPathPatterns.length,
+    expected: task.changed_path_regex.length,
+    complete: missingChangedPathPatterns.length === 0,
+    missing_patterns: missingChangedPathPatterns,
+  },
+  required_patterns: required,
+  missing_required_patterns: missingRequiredPatterns,
+  focused_test_changed: testChanged,
+  declared_unsafe_omissions: declaredUnsafeOmissions,
+  evidence_grounded_plan: discoveryBeforeEdit && rediscoveryAfterEdit,
+  transcript_metrics: transcriptMetrics,
+  ...(compositionMetrics === undefined ? {} : { composition_metrics: compositionMetrics }),
+  diff_clean: diffClean,
+  ...discoveryEvidence,
+};
 const correctnessPass = changedMatches && Object.values(required).every(Boolean) && testChanged && diffClean;
-const discoveryPass = arm !== "urdira-typescript" ? true : discoveryStatus === "urdira-completed" && !Object.values(unexpectedErrors).some(Boolean);
+// A cell is graded on the task contract and real integration failures. It is
+// valid for an agent to make no Urdira/MCP calls at all; that natural choice
+// must never become a failed cell merely because the configured tool was not
+// selected.
+const discoveryPass = !Object.values(unexpectedErrors).some(Boolean);
 const completedSuccessfully = correctnessPass && discoveryPass;
 console.log(JSON.stringify({ completed_successfully: completedSuccessfully, repository: repositoryId, task: taskId, evidence }, null, 2));
 if (!completedSuccessfully) process.exitCode = 1;

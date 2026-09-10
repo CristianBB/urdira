@@ -96,7 +96,7 @@ replay.
 
 A newly registered workspace is indexed with the v4 structural store by
 default: a native, immutable segment store plus a small SQLite catalog file,
-its lexical/semantic sidecar databases, and a `.structural/`/`.sidecar/`
+its enabled lexical and semantic sidecar databases, and a `.structural/`/`.sidecar/`
 directory pair, all siblings of the workspace's data file under the data
 root (see [`docs/README.md`](docs/README.md) and
 [v4 structural store](docs/decisions/26-v4-structural-store.md)). Set
@@ -536,6 +536,8 @@ are not part of the public contract and may change without notice.
 | Diagnostics | `URDIRA_DEBUG_TIMING` (also `urdira daemon start --debug-timing`), `URDIRA_STORAGE_DEBUG_TIMING` |
 
 ## Benchmark evidence
+
+For the next four-arm comparison, use the [expanded agent campaign runbook](docs/benchmarks/expanded-agent-campaign.md). It records the smoke scoped to selected repositories, small/medium/large examples, 32/96-run full-corpus matrix, executable commands, audit requirements, measured fields, and known historical provenance discrepancies. Urdira readiness is structural only; semantic indexing, materialization, and semantic-sidecar creation are excluded.
 
 The following August campaigns predate the v4 default and September query
 optimizations. They are historical comparisons, not measurements of current v4.

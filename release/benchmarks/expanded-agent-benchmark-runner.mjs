@@ -3,9 +3,10 @@
 /* One isolated repository/task/arm run for the expanded benchmark. */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { createTimingCapture, summarizeTimingCaptures } from "./expanded-agent-timing.mjs";
+import { findWorkerStartupAttestation } from "./urdira-worker-attestation.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -25,27 +26,21 @@ const codex = value("--codex", "/Applications/ChatGPT.app/Contents/Resources/cod
 const nodeBin = value("--node", process.execPath);
 const codegraphBin = value("--codegraph");
 const codebaseMemoryBin = value("--codebase-memory");
+const tgrepBin = value("--tgrep");
+const indexingWorkerBin = value("--indexing-worker", process.env.URDIRA_INDEXING_CORE_WORKER_PATH ?? join(root, "target", "release", process.platform === "win32" ? "urdira-indexing-worker.exe" : "urdira-indexing-worker"));
 const benchmarkTimeoutMs = Number(process.env.URDIRA_BENCHMARK_TIMEOUT_MS ?? "900000");
+// The benchmark disables the daemon's periodic sweep so it cannot add
+// background rescans to an otherwise idle incremental sample. After each
+// agent turn, waitForCurrentStructuralFrontier issues one explicit
+// `core:reindex` request with `scope: reconcile`; that deterministic frontier
+// trigger is timed and retained in the manifest/host log.
+const RECONCILIATION_SWEEP_INTERVAL_MS = 0;
 const repo = corpus.repositories.find((entry) => entry.id === repositoryId);
 const task = repo?.tasks.find((entry) => entry.id === taskId);
-if (!repo || !task || !["baseline", "urdira-typescript", "codebase-memory", "codegraph"].includes(arm)) throw new Error("Invalid repository, task, or arm");
+if (!repo || !task || !["baseline", "urdira-typescript", "codebase-memory", "codegraph", "tgrep"].includes(arm)) throw new Error("Invalid repository, task, or arm");
 const preflightOnly = argv.includes("--preflight-only");
 if ((!preflightOnly && (!worktree || !commit)) || !Number.isSafeInteger(sample) || sample < 1) throw new Error("--worktree, --commit, and a positive --sample are required");
 if (!Number.isSafeInteger(benchmarkTimeoutMs) || benchmarkTimeoutMs < 1_000) throw new Error("URDIRA_BENCHMARK_TIMEOUT_MS must be an integer of at least 1000ms");
-
-function validateAgentRoleConfig() {
-  const rolePath = join(homedir(), ".codex", "agents", "urdira_explorer.toml");
-  if (!existsSync(rolePath)) throw new Error(`Urdira benchmark preflight: agent role file is missing: ${rolePath}`);
-  const text = readFileSync(rolePath, "utf8");
-  const required = ["name", "description"];
-  for (const field of required) {
-    const assignment = new RegExp(`^\\s*${field}\\s*=\\s*`, "m");
-    if (!assignment.test(text)) throw new Error(`Urdira benchmark preflight: ${rolePath} is missing TOML field ${field}.`);
-  }
-  if (!/description\s*=\s*(['"]{3}[\s\S]+?['"]{3}|['"][^'"]+['"])/m.test(text)) throw new Error(`Urdira benchmark preflight: ${rolePath}.description is empty.`);
-  if (!/name\s*=\s*['"]urdira_explorer['"]/m.test(text)) throw new Error(`Urdira benchmark preflight: agent role name must be urdira_explorer.`);
-  return rolePath;
-}
 
 function validateRuntimePreflight() {
   const version = spawnSync(nodeBin, ["--version"], { encoding: "utf8" });
@@ -57,14 +52,11 @@ function validateRuntimePreflight() {
   for (const requiredPath of ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json", "packages/mcp/dist/index.js"]) {
     if (!existsSync(join(root, requiredPath))) throw new Error(`Urdira benchmark preflight: required project artifact is missing: ${requiredPath}`);
   }
-  const rolePath = arm === "urdira-typescript" ? validateAgentRoleConfig() : undefined;
-  return { node: (version.stdout ?? "").trim(), model, ...(rolePath === undefined ? {} : { agent_role: rolePath }), lockfile: join(root, "pnpm-lock.yaml"), plugin: "urdira:javascript_typescript", dist: join(root, "packages/mcp/dist/index.js") };
+  if (arm === "urdira-typescript" && !existsSync(indexingWorkerBin)) throw new Error(`Urdira benchmark preflight: indexing worker is missing: ${indexingWorkerBin}`);
+  return { node: (version.stdout ?? "").trim(), model, ...(arm === "urdira-typescript" ? { indexing_worker: indexingWorkerBin } : {}), lockfile: join(root, "pnpm-lock.yaml"), plugin: "urdira:javascript_typescript", dist: join(root, "packages/mcp/dist/index.js") };
 }
 
 const preflight = validateRuntimePreflight();
-const generatedUrdiraInstructions = arm === "urdira-typescript"
-  ? (await import(pathToFileURL(join(root, "apps/urdira/dist/index.js")).href)).MCP_BENCHMARK_INSTRUCTIONS
-  : undefined;
 if (preflightOnly) {
   process.stdout.write(`${JSON.stringify({ ok: true, repository_id: repositoryId, task_id: taskId, arm, ...preflight })}\n`);
   process.exit(0);
@@ -77,12 +69,19 @@ const runId = `${repositoryId}-${taskId}-${arm}-${sample}`;
 // worktree isolation are part of the benchmark contract.
 const effectiveDataRoot = arm === "urdira-typescript" ? (dataRoot ?? join("/tmp", "urdira-expanded-isolated", `${repositoryId}-${taskId}-${sample}`)) : dataRoot;
 const transcript = join(outputDir, `${runId}.jsonl`);
+const timingSidecar = join(outputDir, `${runId}.timing.json`);
 const manifestPath = join(outputDir, `${runId}.json`);
 const hostLog = join(outputDir, `${runId}.host.log`);
+const semanticPerfRequested = arm === "urdira-typescript" && process.env.URDIRA_V4_DEBUG_SEMANTIC_PERF === "1";
+let semanticPerfAttestation = null;
+const codexTimingCaptures = [];
+const timingSummary = () => summarizeTimingCaptures(codexTimingCaptures);
+const writeTimingSidecar = () => writeFileSync(timingSidecar, `${JSON.stringify(timingSummary(), null, 2)}\n`, "utf8");
+writeTimingSidecar();
 const recordFailure = (reason) => {
   const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
   try {
-    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
+    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
   } catch { /* retain the original failure when the output directory is unavailable */ }
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -90,22 +89,38 @@ const recordFailure = (reason) => {
 process.on("uncaughtException", recordFailure);
 process.on("unhandledRejection", recordFailure);
 const setupStartedAt = Date.now();
-const assignedPolicy = arm === "baseline"
-  ? "Use only ordinary shell/editor tools for discovery. Do not use any MCP, CodeGraph, codebase-memory, or symbol service."
-  : arm === "urdira-typescript"
-    ? generatedUrdiraInstructions
-    : arm === "codebase-memory"
-      ? "Use codebase-memory MCP for discovery: search_graph, trace_path, get_code_snippet, get_architecture, or search_code. Do not use grep, rg, find, or broad file listing to rediscover code."
-      : "Use CodeGraph MCP directly, especially codegraph_explore, codegraph_node, callers, callees, or impact. Treat returned source and call paths as discovery evidence; do not use grep, rg, find, or broad file listing to rediscover code.";
+
+async function waitForSemanticPerfAttestation() {
+  const deadline = Date.now() + benchmarkTimeoutMs;
+  let stderrTail = "";
+  while (Date.now() < deadline) {
+    try {
+      const stderr = readFileSync(hostLog, "utf8");
+      stderrTail = stderr.slice(-2000);
+      const attestation = findWorkerStartupAttestation(stderr);
+      if (attestation !== null) {
+        if (attestation.semantic_perf_enabled !== true) {
+          throw new Error(`Urdira worker semantic perf attestation disabled: ${JSON.stringify(attestation)}`);
+        }
+        return attestation;
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("attestation disabled")) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Urdira worker startup attestation missing before profiled metrics acceptance; semantic_perf_enabled=true was requested. stderr_tail=${stderrTail}`);
+}
 
 const run = (command, args, options = {}) => new Promise((resolve, reject) => {
   const child = spawn(command, args, { cwd: options.cwd, env: { ...process.env, ...(options.env ?? {}) }, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = ""; let stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+  const timingCapture = options.timing_label === undefined ? null : createTimingCapture({ label: options.timing_label });
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); timingCapture?.ingest(chunk); });
   child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
   if (options.input !== undefined) child.stdin.end(options.input); else child.stdin.end();
   child.on("error", reject);
-  child.on("close", (code, signal) => resolve({ code: code ?? 1, signal, stdout, stderr }));
+  child.on("close", (code, signal) => resolve({ code: code ?? 1, signal, stdout, stderr, timing: timingCapture?.finish() }));
 });
 const git = async (...args) => {
   const result = await run("git", args, { cwd: worktree });
@@ -118,20 +133,19 @@ if (argv.includes("--host")) await hostMain();
 await git("reset", "--hard", commit);
 await git("clean", "-fd");
 const setup = await prepareArm();
-const setupHint = setup.project === undefined ? "" : ` Use codebase-memory project ${setup.project} for graph calls.`;
 
 const initialInstruction = `You are working in the frozen ${repo.repository} checkout at commit ${commit}, in ${worktree}. This is an authorized internal benchmark change; treat it as an accepted maintenance/API task and do not pause to request repository-maintainer confirmation. Complete the first implementation phase of this coding task:
 
 ${task.prompt}
 
-Benchmark protocol: ${assignedPolicy}${setupHint} Work only in the checkout. Do not install dependencies. In this first instruction, inspect the relevant architecture, implement the core behavior and focused test scaffolding, but do not run the full repository suite. Do not commit. Summarize what remains for the follow-up.`;
-const followUpInstruction = `Continue the same ${repo.repository} task after your first edits. Re-discover the changed symbols using this arm's assigned method (${assignedPolicy})${setupHint} and verify that your discovery sees the modified files. Finish the implementation, public wiring, and focused tests required by this task. Do not install dependencies or commit. If dependencies are unavailable, record the exact deterministic blocker.`;
-const finalInstruction = `Perform the final handoff review for the same task. Check the diff for the requested behavior, cross-file callers, public types/exports, and focused tests. Run only a narrow relevant check if dependencies already exist; otherwise do not install them. After your LAST edit, you MUST re-discover every changed symbol using this arm's assigned method (${assignedPolicy}) and verify that the discovery sees the final modified files; do not edit again after that final re-discovery. Report every changed file, exact verification command/result, and any limitation. Do not commit.`;
+Benchmark protocol: work only in the checkout. Use the repository tools and any configured integrations that are available to you according to your normal coding workflow. Do not install dependencies. In this first instruction, inspect the relevant architecture, implement the core behavior and focused test scaffolding, but do not run the full repository suite. Do not commit. Summarize what remains for the follow-up.`;
+const followUpInstruction = `Continue the same ${repo.repository} task after your first edits. Inspect the current state and finish the implementation, public wiring, and focused tests required by this task. Use the configured integrations or ordinary repository tools as appropriate to your normal coding workflow. Do not install dependencies or commit. If dependencies are unavailable, record the exact deterministic blocker.`;
+const finalInstruction = `Perform the final handoff review for the same task. Check the diff for the requested behavior, cross-file callers, public types/exports, and focused tests. Run only a narrow relevant check if dependencies already exist; otherwise do not install them. Use any available repository tools according to your normal coding workflow and report what you actually used. Report every changed file, exact verification command/result, and any limitation. Do not commit.`;
 
 let host;
 let hostMetrics;
 if (arm === "urdira-typescript") {
-  host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot], { cwd: root, env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1", ...(arm === "urdira-typescript" ? { URDIRA_DEBUG_TIMING: "1", URDIRA_STORAGE_DEBUG_TIMING: "1" } : {}) }, stdio: ["ignore", "pipe", "pipe"] });
+  host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot, "--indexing-worker", indexingWorkerBin], { cwd: root, env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1", ...(arm === "urdira-typescript" ? { URDIRA_DEBUG_TIMING: "1", URDIRA_STORAGE_DEBUG_TIMING: "1" } : {}) }, stdio: ["ignore", "pipe", "pipe"] });
   hostMetrics = startHostMetrics(host, effectiveDataRoot);
   host.stdout.on("data", (chunk) => appendFileSync(hostLog, chunk));
   host.stderr.pipe((await import("node:fs")).createWriteStream(hostLog));
@@ -142,27 +156,33 @@ if (arm === "urdira-typescript") {
     host.on("error", reject);
     host.on("close", (code, signal) => { if (code !== 0 || signal !== null) { clearTimeout(timer); reject(new Error(`Urdira host exited before readiness (${code ?? "null"}/${signal ?? "none"})`)); } });
   });
+  if (semanticPerfRequested) semanticPerfAttestation = await waitForSemanticPerfAttestation();
 }
 const setupElapsedMs = Date.now() - setupStartedAt;
 
 const codexArgs = ["-m", model, "-s", "danger-full-access", "-a", "never", "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-C", worktree];
 const addMcp = (args) => {
   if (arm === "urdira-typescript") {
-    args.push("-c", `mcp_servers.urdira.command=${JSON.stringify(nodeBin)}`, "-c", `mcp_servers.urdira.args=[${JSON.stringify(join(root, "release/benchmarks/expanded-urdira-mcp-entry.mjs"))}]`, "-c", `mcp_servers.urdira.env.URDIRA_DATA_ROOT=${JSON.stringify(effectiveDataRoot)}`, "-c", "mcp_servers.urdira.startup_timeout_sec=120", "-c", "mcp_servers.urdira.tool_timeout_sec=300");
+    const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
+    args.push("-c", `mcp_servers.urdira.command=${JSON.stringify(nodeBin)}`, "-c", `mcp_servers.urdira.args=[${JSON.stringify(join(root, "release/benchmarks/expanded-urdira-mcp-entry.mjs"))}]`, "-c", `mcp_servers.urdira.env.URDIRA_DATA_ROOT=${JSON.stringify(effectiveDataRoot)}`, "-c", `mcp_servers.urdira.env.URDIRA_BENCHMARK_FRESHNESS_TIMEOUT_MS=${JSON.stringify(String(benchmarkTimeoutMs))}`, "-c", "mcp_servers.urdira.startup_timeout_sec=120", "-c", `mcp_servers.urdira.tool_timeout_sec=${mcpToolTimeoutSec}`);
   } else if (arm === "codebase-memory") {
-    args.push("-c", `mcp_servers.codebase-memory.command=${JSON.stringify(codebaseMemoryBin)}`, "-c", "mcp_servers.codebase-memory.startup_timeout_sec=120", "-c", "mcp_servers.codebase-memory.tool_timeout_sec=300");
+    const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
+    args.push("-c", `mcp_servers.codebase-memory.command=${JSON.stringify(codebaseMemoryBin)}`, "-c", "mcp_servers.codebase-memory.startup_timeout_sec=120", "-c", `mcp_servers.codebase-memory.tool_timeout_sec=${mcpToolTimeoutSec}`);
   } else if (arm === "codegraph") {
-    args.push("-c", `mcp_servers.codegraph.command=${JSON.stringify(codegraphBin)}`, "-c", `mcp_servers.codegraph.args=["serve","--mcp"]`, "-c", "mcp_servers.codegraph.startup_timeout_sec=120", "-c", "mcp_servers.codegraph.tool_timeout_sec=300");
+    const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
+    args.push("-c", `mcp_servers.codegraph.command=${JSON.stringify(codegraphBin)}`, "-c", `mcp_servers.codegraph.args=["serve","--mcp"]`, "-c", "mcp_servers.codegraph.startup_timeout_sec=120", "-c", `mcp_servers.codegraph.tool_timeout_sec=${mcpToolTimeoutSec}`);
   }
 };
 addMcp(codexArgs);
 const firstInstructionMs = Date.now();
-let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, input: initialInstruction });
+let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, input: initialInstruction, timing_label: "turn-1" });
+if (first.timing) { codexTimingCaptures.push(first.timing); writeTimingSidecar(); }
 writeFileSync(transcript, first.stdout, "utf8");
 let exitCode = first.code;
 let sessionId;
 let agentFinishedMs = Date.now();
 const interTurnFreshnessWaitsMs = [];
+const interTurnReconcileRequests = [];
 
 // Edits are watcher-indexed asynchronously. A warm benchmark must not send
 // the next instruction while Urdira is knowingly serving the previous
@@ -183,6 +203,24 @@ const waitForCurrentStructuralFrontier = async (afterTurn) => {
     const readyLine = readFileSync(hostLog, "utf8").split("\n").reverse().find((line) => line.startsWith("BENCH_HOST_READY "));
     if (readyLine !== undefined) gateWorkspaceId = JSON.parse(readyLine.slice("BENCH_HOST_READY ".length)).workspace_id;
   } catch { /* fall back to the legacy all-workspaces query below */ }
+  if (typeof gateWorkspaceId !== "string") {
+    // The host readiness marker is a diagnostic aid, not the source of
+    // workspace identity. Resolve the registered workspace from the daemon's
+    // explicit status scope when a pipe/log race leaves that marker absent.
+    // This read is outside repository context metrics and does not alter the
+    // structural frontier.
+    const status = await client.call("core:index_status", { api_version: 3 });
+    if (status.outcome === "success") {
+      gateWorkspaceId = status.payload?.workspaces?.find((candidate) => candidate.display_root === basename(worktree))?.workspace_id;
+    }
+  }
+  if (typeof gateWorkspaceId !== "string") throw new Error(`Urdira inter-turn freshness gate has no workspace id after turn ${afterTurn}`);
+  const reconcileStarted = Date.now();
+  const reconcile = await client.call("core:reindex", { args: [gateWorkspaceId], values: { scope: "reconcile" } });
+  const reconcileElapsed = Date.now() - reconcileStarted;
+  interTurnReconcileRequests.push({ after_turn: afterTurn, scope: "reconcile", request_elapsed_ms: reconcileElapsed, outcome: reconcile.outcome });
+  appendFileSync(hostLog, `BENCH_INTER_TURN_RECONCILE ${JSON.stringify({ after_turn: afterTurn, scope: "reconcile", request_elapsed_ms: reconcileElapsed, outcome: reconcile.outcome, workspace_id: gateWorkspaceId })}\n`);
+  if (reconcile.outcome !== "success") throw new Error(`Urdira inter-turn reconcile trigger failed after turn ${afterTurn}: ${JSON.stringify(reconcile)}`);
   let pollDelayMs = 500;
   let previousFrontier;
   while (Date.now() < deadline) {
@@ -212,23 +250,28 @@ if (first.code === 0) {
   const resume = ["-m", model, "-s", "danger-full-access", "-a", "never", "-C", worktree];
   addMcp(resume);
   resume.push("exec", "resume", sessionId, "--json", "--ignore-user-config", "--skip-git-repo-check");
-  const second = await run(codex, [...resume, "-"], { cwd: worktree, input: followUpInstruction });
+  const second = await run(codex, [...resume, "-"], { cwd: worktree, input: followUpInstruction, timing_label: "turn-2" });
+  if (second.timing) { codexTimingCaptures.push(second.timing); writeTimingSidecar(); }
   appendFileSync(transcript, second.stdout, "utf8");
   exitCode = second.code;
   if (second.code === 0) {
     interTurnFreshnessWaitsMs.push(await waitForCurrentStructuralFrontier(2));
-    const third = await run(codex, [...resume, "-"], { cwd: worktree, input: finalInstruction });
+    const third = await run(codex, [...resume, "-"], { cwd: worktree, input: finalInstruction, timing_label: "turn-3" });
+    if (third.timing) { codexTimingCaptures.push(third.timing); writeTimingSidecar(); }
     appendFileSync(transcript, third.stdout, "utf8");
     exitCode = third.code;
   }
   agentFinishedMs = Date.now();
 }
 if (host) await stopHost(host);
+if (hostMetrics?.semantic_sidecar_created === true) {
+  throw new Error("Semantic index exclusion failed: the Urdira benchmark created a semantic sidecar.");
+}
 
 const grade = await run(nodeBin, [join(root, "release/benchmarks/expanded-agent-benchmark-grader.mjs"), "--worktree", worktree, "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--transcript", transcript], { cwd: root });
 let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
-const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;
@@ -248,11 +291,18 @@ async function prepareArm() {
     if (result.code !== 0) throw new Error(`codebase-memory index failed: ${result.stderr}`);
     return { kind: "codebase-memory", project, indexed: true, elapsed_ms: Date.now() - started, output_tail: result.stdout.slice(-3000) };
   }
-  return { kind: "urdira-typescript", indexed: true, semantic_index: false, reconciliation_sweep_interval_ms: 0, readiness: phase };
+  if (arm === "tgrep") {
+    if (!tgrepBin || !existsSync(tgrepBin)) throw new Error(`tgrep executable not found: ${tgrepBin}`);
+    const started = Date.now();
+    const result = await run(tgrepBin, ["index", worktree], { cwd: root });
+    if (result.code !== 0) throw new Error(`tgrep index failed: ${result.stderr}`);
+    return { kind: "tgrep", indexed: true, index_path: join(worktree, ".tgrep"), elapsed_ms: Date.now() - started, output_tail: `${result.stdout.slice(-2000)}${result.stderr.slice(-2000)}` };
+  }
+  return { kind: "urdira-typescript", indexed: true, semantic_index: false, semantic_materialization: false, reconciliation_sweep_interval_ms: RECONCILIATION_SWEEP_INTERVAL_MS, readiness: "structural" };
 }
 
 function startHostMetrics(child, dataRoot) {
-  const state = { peak_rss_kib: 0, cpu_percent_samples: [], sample_count: 0, started_at: Date.now(), sqlite_bytes: 0, cas_bytes: 0, bytes_copied: null, bytes_transferred: null, bytes_decoded: null, readiness_events: [], ready_elapsed_ms: null, memory_budget_kib: null, memory_budget_exceeded: false, memory_budget_exceeded_at: null };
+  const state = { peak_rss_kib: 0, structural_readiness_peak_rss_kib: null, cpu_percent_samples: [], sample_count: 0, started_at: Date.now(), catalog_sqlite_bytes: 0, lexical_sqlite_bytes: 0, semantic_sqlite_bytes: 0, structural_store_bytes: 0, rust_sidecar_bytes: 0, cas_bytes: 0, bytes_copied: null, bytes_transferred: null, bytes_decoded: null, readiness_events: [], structural_readiness_ms: null, memory_budget_kib: null, memory_budget_exceeded: false, memory_budget_exceeded_at: null };
   let pending = "";
   child.stdout.on("data", (chunk) => {
     pending += chunk.toString();
@@ -263,7 +313,10 @@ function startHostMetrics(child, dataRoot) {
       if (!marker) continue;
       try {
         const payload = JSON.parse(marker[1]);
-        if (line.includes("BENCH_HOST_READY")) state.ready_elapsed_ms = Number(payload.elapsed_ms ?? (Date.now() - state.started_at));
+        if (line.includes("BENCH_HOST_READY")) {
+          state.structural_readiness_ms = Number(payload.elapsed_ms ?? (Date.now() - state.started_at));
+          state.structural_readiness_peak_rss_kib = state.peak_rss_kib;
+        }
         if (line.includes("BENCH_FRONTIER")) state.readiness_events.push(payload);
       } catch { /* retain process metrics even if a diagnostic line is malformed */ }
     }
@@ -288,7 +341,11 @@ function finalizeHostMetrics() {
   if (hostMetrics === undefined) return undefined;
   if (!hostMetrics.state) return hostMetrics;
   clearInterval(hostMetrics.timer);
-  hostMetrics.state.sqlite_bytes = directoryBytes(hostMetrics.dataRoot, (path) => /\.sqlite(?:-|$)/u.test(path));
+  hostMetrics.state.catalog_sqlite_bytes = directoryBytes(hostMetrics.dataRoot, (path) => /\.sqlite(?:-|$)/u.test(path) && !/\.(?:lexical|semantic)\.sqlite(?:-|$)/u.test(path));
+  hostMetrics.state.lexical_sqlite_bytes = directoryBytes(hostMetrics.dataRoot, (path) => /\.lexical\.sqlite(?:-|$)/u.test(path));
+  hostMetrics.state.semantic_sqlite_bytes = directoryBytes(hostMetrics.dataRoot, (path) => /\.semantic\.sqlite(?:-|$)/u.test(path));
+  hostMetrics.state.structural_store_bytes = directoryBytes(hostMetrics.dataRoot, (path) => path.includes(".structural/"));
+  hostMetrics.state.rust_sidecar_bytes = directoryBytes(hostMetrics.dataRoot, (path) => path.includes(".sidecar/"));
   hostMetrics.state.cas_bytes = directoryBytes(join(hostMetrics.dataRoot, "cas"));
   const cpu = hostMetrics.state.cpu_percent_samples;
   const result = {
@@ -299,12 +356,23 @@ function finalizeHostMetrics() {
     mean_cpu_percent: cpu.length === 0 ? null : cpu.reduce((sum, value) => sum + value, 0) / cpu.length,
     sample_count: hostMetrics.state.sample_count,
     duration_ms: Date.now() - hostMetrics.state.started_at,
-    sqlite_bytes: hostMetrics.state.sqlite_bytes,
+    readiness_boundary: "structural",
+    reconciliation_sweep_interval_ms: RECONCILIATION_SWEEP_INTERVAL_MS,
+    semantic_index: false,
+    semantic_materialization: false,
+    semantic_sidecar_created: hostMetrics.state.semantic_sqlite_bytes > 0,
+    catalog_sqlite_bytes: hostMetrics.state.catalog_sqlite_bytes,
+    lexical_sqlite_bytes: hostMetrics.state.lexical_sqlite_bytes,
+    semantic_sqlite_bytes: hostMetrics.state.semantic_sqlite_bytes,
+    structural_store_bytes: hostMetrics.state.structural_store_bytes,
+    rust_sidecar_bytes: hostMetrics.state.rust_sidecar_bytes,
     cas_bytes: hostMetrics.state.cas_bytes,
     bytes_copied: hostMetrics.state.bytes_copied,
     bytes_transferred: hostMetrics.state.bytes_transferred,
     bytes_decoded: hostMetrics.state.bytes_decoded,
-    ready_elapsed_ms: hostMetrics.state.ready_elapsed_ms,
+    structural_readiness_ms: hostMetrics.state.structural_readiness_ms,
+    structural_readiness_peak_rss_kib: hostMetrics.state.structural_readiness_peak_rss_kib,
+    ready_elapsed_ms: hostMetrics.state.structural_readiness_ms,
     readiness_events: hostMetrics.state.readiness_events,
   };
   hostMetrics = result;
@@ -337,13 +405,11 @@ async function hostMain() {
   const { defaultDaemonOptions } = await import("../../apps/urdira/dist/index.js");
   const { DaemonRuntime, DaemonClient } = await import("../../packages/daemon/dist/index.js");
   // A benchmark cell owns one frozen worktree and records every agent edit
-  // through the live watcher. The production five-minute reconciliation
-  // backstop is therefore redundant here, and on repositories whose initial
-  // structural publication itself takes >5 minutes its next tick can start a
-  // full no-change scan in the middle of the measured agent turn. Disable the
-  // sweep for this isolated host so only actual watcher events enter the
-  // sample; production defaults remain unchanged.
-  const runtime = await DaemonRuntime.start({ ...(await defaultDaemonOptions(dataRoot)), data_root: dataRoot, semantic_index: false, semantic_descriptor: undefined, reconciliation_sweep_interval_ms: 0 });
+  // through the live watcher. Keep the periodic sweep disabled so no
+  // background scan can contaminate the idle interval. The runner's explicit
+  // post-turn `scope: reconcile` request is the deterministic recovery path
+  // and its request plus frontier wait are measured in the manifest/host log.
+  const runtime = await DaemonRuntime.start({ ...(await defaultDaemonOptions(dataRoot)), data_root: dataRoot, semantic_index: false, semantic_descriptor: undefined, reconciliation_sweep_interval_ms: RECONCILIATION_SWEEP_INTERVAL_MS });
   const client = new DaemonClient(runtime.endpoint, { request_timeout_ms: benchmarkTimeoutMs });
   const registration = await client.call("core:workspace_add", { args: [worktree], confirmed: true, selected_technology_ids: ["javascript", "typescript"], selected_plugin_ids: ["urdira:javascript_typescript"] });
   if (registration.outcome !== "success") throw new Error(`workspace registration failed: ${JSON.stringify(registration)}`);
@@ -363,7 +429,6 @@ async function hostMain() {
       source_ready: entry?.source_ready === true,
       syntax_ready: entry?.syntax_ready === true,
       structural_ready: entry?.structural_ready === true,
-      semantic_ready: entry?.semantic_ready === true,
       structural_stage_ordinal: Number(entry?.structural_stage_ordinal ?? 0),
       structural_completeness: entry?.structural_completeness ?? null,
       structural_availability: entry?.structural_availability ?? null,
@@ -411,7 +476,7 @@ async function hostMain() {
     await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
   }
   if (!ready) throw new Error(`Timed out waiting for the Urdira ${phase === "warm" ? "current structural" : "source_ready"} frontier`);
-  process.stdout.write(`BENCH_HOST_READY ${JSON.stringify({ workspace: worktree, workspace_id: registeredWorkspaceId, repository: repositoryId, elapsed_ms: Date.now() - hostStartedAt })}\n`);
+  process.stdout.write(`BENCH_HOST_READY ${JSON.stringify({ workspace: worktree, workspace_id: registeredWorkspaceId, repository: repositoryId, readiness_boundary: "structural", semantic_index: false, semantic_materialization: false, reconciliation_sweep_interval_ms: RECONCILIATION_SWEEP_INTERVAL_MS, elapsed_ms: Date.now() - hostStartedAt })}\n`);
   const stop = async () => {
     process.stdout.write(`[urdira] byte telemetry ${JSON.stringify(runtime.byteTelemetrySnapshot())}\n`);
     await runtime.stop({ force: false });

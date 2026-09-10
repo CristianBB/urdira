@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +30,7 @@ import {
   createCanonicalPluginDigestAuthority,
   createLocalHashProvider,
   FactDeltaAcceptanceService,
+  sidecarDatabasePathFor,
   WorkspaceRegistry,
   type AcceptedFactDelta,
   type WorkspaceScanPluginProvider,
@@ -1450,6 +1452,8 @@ describe("Daemon post-ready semantic maintenance (D-slice) and core:search_seman
       // the race.
       const pollStorage = await createDurableStorage({ rootDir: dataRoot });
       try {
+        const databasePath = pollStorage.defaultWorkspaceDatabasePath(workspaceId);
+        expect(existsSync(sidecarDatabasePathFor(databasePath, "semantic"))).toBe(false);
         const database = await pollStorage.openWorkspace(workspaceId);
         try {
           const state = await database.projections.semanticIndexState();

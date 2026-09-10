@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,17 +10,21 @@ import {
   createIndexingCoreProcessTransport,
   createRustSyntaxAnalyzeRequest,
   type JavascriptTypescriptProcessTransport,
+  type IndexingCoreProcessTransport,
 } from "../packages/plugin-javascript-typescript/src/index.js";
 
 async function fakeIndexingCoreWorker(behavior: "normal" | "hang" | "bad_event" | "unknown_request" | "missing_request" | "error_event" | "handshake_mismatch" | "exit" | "stderr" = "normal"): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "urdira-indexing-core-transport-test-"));
   temporaryDirectories.push(directory);
   const path = join(directory, "worker.mjs");
+  const environmentPath = `${path}.env.json`;
   const protocolPath = join(process.cwd(), "packages/plugin-javascript-typescript/dist/rust-protocol.js");
   await writeFile(path, `
     import { encodeRustWorkerMessage } from ${JSON.stringify(protocolPath)};
     import { Buffer } from "node:buffer";
+    import { writeFileSync } from "node:fs";
     const behavior = ${JSON.stringify(behavior)};
+    writeFileSync(${JSON.stringify(environmentPath)}, JSON.stringify({ semanticPerf: process.env.URDIRA_V4_DEBUG_SEMANTIC_PERF }));
     let pending = Buffer.alloc(0);
     let sequence = 0;
     const readVarint = (body, state) => { let value = 0; let factor = 1; while (true) { const byte = body[state.offset++]; value += (byte & 127) * factor; if ((byte & 128) === 0) return value; factor *= 128; } };
@@ -36,7 +40,7 @@ async function fakeIndexingCoreWorker(behavior: "normal" | "hang" | "bad_event" 
 type FakeWorkerBehavior = "normal" | "hang_analyze" | "hang_read" | "stdout_eof" | "abort";
 
 const temporaryDirectories: string[] = [];
-const transports: JavascriptTypescriptProcessTransport[] = [];
+const transports: Array<Pick<JavascriptTypescriptProcessTransport, "terminate"> | Pick<IndexingCoreProcessTransport, "terminate">> = [];
 
 afterEach(async () => {
   await Promise.allSettled(transports.splice(0).map((transport) => transport.terminate()));
@@ -260,6 +264,30 @@ describe("JavaScript/TypeScript Rust process transport", () => {
     expect(() => createIndexingCoreProcessTransport({ command: "" })).toThrow(/command is required/iu);
     expect(() => createIndexingCoreProcessTransport({ command: process.execPath, max_message_bytes: 0 })).toThrow(/max_message_bytes is invalid/iu);
     expect(() => createIndexingCoreProcessTransport({ command: process.execPath, request_timeout_ms: 0 })).toThrow(/request_timeout_ms is invalid/iu);
+  });
+
+  it("forwards semantic perf opt-in to the worker and keeps it absent by default", async () => {
+    const previous = process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"];
+    try {
+      process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"] = "1";
+      const enabledScript = await fakeIndexingCoreWorker();
+      const enabledTransport = createIndexingCoreProcessTransport({ command: process.execPath, args: [enabledScript], request_timeout_ms: 1_000 });
+      transports.push(enabledTransport);
+      await enabledTransport.ready();
+      await enabledTransport.terminate();
+      expect(JSON.parse(await readFile(`${enabledScript}.env.json`, "utf8"))).toMatchObject({ semanticPerf: "1" });
+
+      delete process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"];
+      const defaultScript = await fakeIndexingCoreWorker();
+      const defaultTransport = createIndexingCoreProcessTransport({ command: process.execPath, args: [defaultScript], request_timeout_ms: 1_000 });
+      transports.push(defaultTransport);
+      await defaultTransport.ready();
+      await defaultTransport.terminate();
+      expect(JSON.parse(await readFile(`${defaultScript}.env.json`, "utf8"))).not.toHaveProperty("semanticPerf");
+    } finally {
+      if (previous === undefined) delete process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"];
+      else process.env["URDIRA_V4_DEBUG_SEMANTIC_PERF"] = previous;
+    }
   });
 
   it.each(["hang", "bad_event", "unknown_request", "missing_request", "error_event", "handshake_mismatch"] as const)("fails closed on composition-worker %s", async (behavior) => {

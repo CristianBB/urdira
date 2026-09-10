@@ -221,4 +221,22 @@ describe("Daemon v4 ScanScope::Reconcile wiring (Frente E)", () => {
       await stopV4Daemon(daemon);
     }
   }, 30_000);
+
+  it("core:reindex accepts an explicit reconcile scope without forcing a full scan", async () => {
+    process.env["URDIRA_V4"] = "1";
+    const daemon = await startV4Daemon();
+    try {
+      await pollUntilStructuralReady(daemon.client, daemon.workspaceId);
+      const reconciled = await daemon.client.call("core:reindex", { args: [daemon.workspaceId], values: { scope: "reconcile" } });
+      expect(reconciled.outcome).toBe("success");
+
+      await pollUntil(() => daemon.transportState.calls.length >= 2, 20_000);
+      expect(daemon.transportState.calls[1]?.scope).toEqual({ kind: "reconcile" });
+
+      const status = await pollUntilStructuralReady(daemon.client, daemon.workspaceId);
+      expect(status.last_scan?.kind).toBe("reconcile");
+    } finally {
+      await stopV4Daemon(daemon);
+    }
+  }, 30_000);
 });
