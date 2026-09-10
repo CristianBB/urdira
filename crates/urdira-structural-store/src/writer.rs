@@ -1111,7 +1111,7 @@ fn build_delta_sections(
     let batch_index = identity_codec::BatchIndex::from_rows(opened_rows);
     let resolve_identity = |id: &[u8; 32]| -> Option<Vec<u8>> {
         if let Some(key) = batch_index.get(id) {
-            return Some(key);
+            return Some(key.to_vec());
         }
         current_reader
             .get(id)

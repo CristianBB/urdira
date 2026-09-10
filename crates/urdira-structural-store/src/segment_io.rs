@@ -35,6 +35,7 @@ use crate::identity_codec::{self, BatchIndex, IDENTITY_LAYOUT_RAW};
 use crate::layout::*;
 use crate::row::{CATEGORY_ENTITY, Dictionaries, NONE_U32, PendingSiteKey, RecordRow};
 use crate::xxh;
+use fs2::FileExt as Fs2FileExt;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
@@ -363,6 +364,29 @@ fn materialize_real(file: &File, len: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Reserves physical blocks without writing a full zero image when the host
+/// exposes a real allocation primitive. The zero-write path remains the
+/// correctness fallback: callers never hand a sparse file to concurrent
+/// positional writers.
+fn physical_preallocate_or_materialize(file: &File, len: u64) -> std::io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "android"
+    ))]
+    {
+        if Fs2FileExt::allocate(file, len).is_ok() {
+            return Ok(());
+        }
+    }
+    materialize_real(file, len)
+}
+
 /// P2-2m: [`create_sized`] + [`materialize_real`] for exactly the five
 /// `records.*` hot files this module's two writers (`write_hot_and_
 /// secondary_files`/`_partitioned`) both build, with materialization done
@@ -375,11 +399,54 @@ fn create_sized_hot_files(specs: [(&Path, u64); 5]) -> Result<[Arc<File>; 5]> {
         .par_iter()
         .map(|(path, len)| -> Result<Arc<File>> {
             let file = create_sized(path, *len)?;
-            materialize_real(&file, *len)?;
+            physical_preallocate_or_materialize(&file, *len)?;
             Ok(Arc::new(file))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(files.try_into().unwrap_or_else(|_| unreachable!()))
+}
+
+#[cfg(test)]
+mod physical_preallocation_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn physical_preallocation_supports_parallel_disjoint_overwrites() {
+        let path = std::env::temp_dir().join(format!(
+            "urdira-physical-preallocation-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("create preallocation fixture");
+        physical_preallocate_or_materialize(&file, 16 * 1024 * 1024)
+            .expect("physical preallocation succeeds");
+        assert_eq!(file.metadata().unwrap().len(), 16 * 1024 * 1024);
+
+        std::thread::scope(|scope| {
+            for index in 0..16u64 {
+                let file = &file;
+                scope.spawn(move || {
+                    file.write_all_at(&[index as u8 + 1; 4096], index * 1024 * 1024)
+                        .expect("disjoint overwrite succeeds");
+                });
+            }
+        });
+
+        let mut reader = File::open(&path).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        for index in 0..16usize {
+            assert_eq!(bytes[index * 1024 * 1024], index as u8 + 1);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 /// Encodes a section's full byte blob (64-byte header + `body`) entirely
@@ -1149,12 +1216,16 @@ pub fn write_hot_and_secondary_files_partitioned(
         "write_hot_and_secondary_files_partitioned requires exactly N_NIBBLES partitions"
     );
 
+    let debug_timing = std::env::var_os("URDIRA_DEBUG_TIMING").is_some();
+
     // A3a: the batch index (`record_id -> identity_key bytes`, spanning
     // EVERY partition) must exist before any per-partition work starts --
     // a relation in partition N may point at an entity in partition M != N
     // -- so it's built here, once, and shared by reference into the
     // `par_iter` below (never rebuilt per partition).
+    let batch_index_started = std::time::Instant::now();
     let batch_index = BatchIndex::from_partitions(partitions);
+    let batch_index_elapsed = batch_index_started.elapsed();
     let resolve_identity = |id: &[u8; 32]| batch_index.get(id);
     // A3a-fix: `dicts.entity_kinds` is already complete (the caller
     // extended it with this batch's new words before calling this
@@ -1162,12 +1233,13 @@ pub fn write_hot_and_secondary_files_partitioned(
     // partitioned_with_pending`'s own doc comment).
     let entity_kinds = identity_codec::EntityKindIndex::from_dicts(dicts);
     // `layouts[nib][local]`/`entity_kind_bytes[nib][local]` mirror
-    // `partitions[nib][local]`, classified once here (single pass, still
-    // cheap relative to the I/O this function does) and reused by both
+    // `partitions[nib][local]`, classified once here across the independent
+    // partitions and reused by both
     // this prefix-sum loop and the per-partition write loop below -- never
     // re-classified per row.
+    let layouts_started = std::time::Instant::now();
     let (layouts, entity_kind_bytes): (Vec<Vec<u8>>, Vec<Vec<u8>>) = partitions
-        .iter()
+        .par_iter()
         .map(|part| {
             part.iter()
                 .map(|row| {
@@ -1181,7 +1253,9 @@ pub fn write_hot_and_secondary_files_partitioned(
                 .unzip()
         })
         .unzip();
+    let layouts_elapsed = layouts_started.elapsed();
 
+    let prefix_started = std::time::Instant::now();
     let mut row_base = [0usize; N_NIBBLES + 1];
     let mut body_base = [0u64; N_NIBBLES + 1];
     let mut ident_base = [0u64; N_NIBBLES + 1];
@@ -1204,6 +1278,7 @@ pub fn write_hot_and_secondary_files_partitioned(
     let n = row_base[N_NIBBLES];
     let total_body = body_base[N_NIBBLES];
     let total_ident = ident_base[N_NIBBLES];
+    let prefix_elapsed = prefix_started.elapsed();
 
     let keys_path = dir.join("records.keys");
     let meta_path = dir.join("records.meta");
@@ -1211,6 +1286,7 @@ pub fn write_hot_and_secondary_files_partitioned(
     let body_path = dir.join("records.body");
     let ident_path = dir.join("records.ident");
 
+    let preallocate_started = std::time::Instant::now();
     let [keys_file, meta_file, digests_file, body_file, ident_file] = create_sized_hot_files([
         (&keys_path, HEADER_LEN as u64 + (n * KEYS_STRIDE) as u64),
         (&meta_path, HEADER_LEN as u64 + (n * META_STRIDE) as u64),
@@ -1221,6 +1297,18 @@ pub fn write_hot_and_secondary_files_partitioned(
         (&body_path, HEADER_LEN as u64 + total_body),
         (&ident_path, HEADER_LEN as u64 + total_ident),
     ])?;
+    let preallocate_elapsed = preallocate_started.elapsed();
+    if debug_timing {
+        eprintln!(
+            "[urdira-structural-store] partitioned prepare: batch_index={:.3}s layouts={:.3}s prefix={:.3}s physical_preallocate={:.3}s total={:.3}s",
+            batch_index_elapsed.as_secs_f64(),
+            layouts_elapsed.as_secs_f64(),
+            prefix_elapsed.as_secs_f64(),
+            preallocate_elapsed.as_secs_f64(),
+            (batch_index_elapsed + layouts_elapsed + prefix_elapsed + preallocate_elapsed)
+                .as_secs_f64(),
+        );
+    }
 
     // P2-2j item 4 (RSS): unlike `write_hot_and_secondary_files`'s own
     // `nibble_buffers` (which keeps every nibble's FULL encoded buffers

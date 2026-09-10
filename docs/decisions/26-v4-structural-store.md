@@ -643,6 +643,20 @@ so even the smallest fixture's pack is ~140 MB before compression.
 ## Change history
 
 - **2026-09-05** (P2-2m, `docs/evidence/2026-09-05-v4-p2-2m-identity-key-corruption.md`): root-caused and fixed the `identity_key`-zeroing corruption reported as an open critical bug above. Two real bugs in `crates/urdira-structural-store/src/segment_io.rs`'s hot-file writer: (1) every `records.*` write used a single-shot `write_at`, which POSIX permits to short-write silently — replaced with `write_all_at` (12 call sites, both the flat and partitioned writer); (2) fixing (1) alone did not close the corruption — a concurrent sparse-file allocation race on macOS/APFS could still silently revert one writer's already-`write_all_at`-confirmed bytes to the pre-allocation zero value when up to 16 partition writers extended the SAME sparse file's allocated-extent metadata concurrently. Fixed by `create_sized_hot_files`, which forces real block allocation across a hot file's entire length (`materialize_real`, single-threaded per file, in parallel across the five files) strictly before any concurrent writer touches it, so every later write only overwrites already-allocated blocks. Verified clean across 5 production-path cold runs + 2 in-process diagnostic runs + 1 incremental-oracle run, plus a new `#[ignore]`d stress test (`materialize_write_read_roundtrip_never_loses_an_identity_key`, 200k synthetic records × 200 iterations). This corruption was invisible to the header `xxh3` and to the Merkle roots (both computed from in-memory data before the writer ran) — only the classification invariant (decision 28) and a full-store diagnostic scan could detect it; that gap in the store's own integrity story is unchanged by this fix (a future verify extension would need to re-read persisted bytes, not trust in-memory roots).
+- **2026-09-11** (physical preallocation): the five cold `records.*` files now
+  reserve real filesystem blocks through the platform allocation API before
+  concurrent disjoint overwrites begin. This replaces the successful path's
+  multi-gigabyte zero fill with `fs2::FileExt::allocate`; unsupported or failed
+  allocation falls back to the proven `materialize_real` zero-fill path. The
+  safety property from P2-2m is unchanged: no partition worker receives a
+  sparse file. File lengths, bytes, headers, hashes, manifest entries, Merkle
+  roots, and the delta/incremental path remain unchanged.
+- **2026-09-11** (partitioned identity classification): cold identity-layout
+  classification now runs independently across the 16 record-id partitions
+  and resolves same-batch relation endpoints through borrowed identity slices.
+  The delta writer keeps its batch-plus-store owned fallback because its
+  batches are small. Classification order within each partition, stored bytes,
+  hashes, roots, and incremental semantics remain unchanged.
 - **2026-09-07** (Frente E-P0j, `docs/evidence/2026-09-07-v4-semantic-wiring-and-embed-performance.md` §1.3): entity span fidelity fix — see below (folded from the former standalone amendment).
 
 ### Detail: entity span fidelity, `entities.index` re-keyed off identity text

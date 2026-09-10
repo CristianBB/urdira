@@ -330,10 +330,10 @@ fn try_entity(
 /// identity` (the caller's batch-plus-store lookup, `record_id ->
 /// identity_key bytes`) -- `None` otherwise, same never-guess discipline as
 /// [`try_entity`].
-fn try_relation(
+fn try_relation<R: AsRef<[u8]>>(
     row: &RecordRow,
     dicts: &Dictionaries,
-    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<R>,
 ) -> Option<Vec<u8>> {
     if row.category != CATEGORY_RELATION {
         return None;
@@ -352,8 +352,8 @@ fn try_relation(
         path,
         row.span_start_byte,
         row.span_end_byte,
-        &source_key,
-        &target_key,
+        source_key.as_ref(),
+        target_key.as_ref(),
     ))
 }
 
@@ -361,10 +361,10 @@ fn try_relation(
 /// endpoint-resolution discipline as [`try_relation`], but without a path
 /// or span at all (`jsts:contains:*` and any other relation kind whose
 /// identity never carried one).
-fn try_relation_no_span(
+fn try_relation_no_span<R: AsRef<[u8]>>(
     row: &RecordRow,
     dicts: &Dictionaries,
-    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<R>,
 ) -> Option<Vec<u8>> {
     if row.category != CATEGORY_RELATION {
         return None;
@@ -377,7 +377,11 @@ fn try_relation_no_span(
     let target_record_id = dicts.subjects.get(target_ord as usize)?;
     let source_key = resolve_identity(source_record_id)?;
     let target_key = resolve_identity(target_record_id)?;
-    Some(reconstruct_relation_no_span(rel, &source_key, &target_key))
+    Some(reconstruct_relation_no_span(
+        rel,
+        source_key.as_ref(),
+        target_key.as_ref(),
+    ))
 }
 
 /// Classifies one row's identity storage layout tag AND (for
@@ -388,10 +392,10 @@ fn try_relation_no_span(
 /// identity_key` directly at hand when they later decide whether to push
 /// its bytes. Returns `(layout, entity_kind_byte)`; `entity_kind_byte` is
 /// [`ENTITY_KIND_NONE`] unless `layout == IDENTITY_LAYOUT_ENTITY`.
-pub fn classify_identity_layout(
+pub fn classify_identity_layout<R: AsRef<[u8]>>(
     row: &RecordRow,
     dicts: &Dictionaries,
-    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<R>,
     entity_kinds: &EntityKindIndex,
 ) -> (u8, u8) {
     match row.category {
@@ -429,10 +433,10 @@ pub fn classify_identity_layout(
 /// only ever builds a candidate from `row`'s own typed fields and compares
 /// the two whole strings byte for byte. Prefer [`classify_identity_layout`]
 /// in a hot per-row loop that already has `row.identity_key` at hand.
-pub fn classify_identity(
+pub fn classify_identity<R: AsRef<[u8]>>(
     row: &RecordRow,
     dicts: &Dictionaries,
-    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    resolve_identity: &dyn Fn(&[u8; 32]) -> Option<R>,
     entity_kinds: &EntityKindIndex,
 ) -> (u8, u8, Vec<u8>) {
     let (layout, entity_kind_byte) =
@@ -477,8 +481,8 @@ impl<'a> BatchIndex<'a> {
         BatchIndex { by_record_id }
     }
 
-    pub fn get(&self, record_id: &[u8; 32]) -> Option<Vec<u8>> {
-        self.by_record_id.get(record_id).map(|s| s.to_vec())
+    pub fn get(&self, record_id: &[u8; 32]) -> Option<&'a [u8]> {
+        self.by_record_id.get(record_id).copied()
     }
 }
 
@@ -517,6 +521,18 @@ mod tests {
             relation_kind_id: NONE_U16,
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn batch_index_returns_the_original_identity_slice() {
+        let mut row = base_row();
+        row.identity_key = b"borrowed-identity".to_vec();
+        let expected = row.identity_key.as_ptr();
+        let rows = [row];
+        let index = BatchIndex::from_rows(&rows);
+
+        let actual = index.get(&rows[0].record_id).expect("indexed identity");
+        assert_eq!(actual.as_ptr(), expected);
     }
 
     fn dicts_with(kinds: &[&str], artifact_paths: &[&str], names: &[&str]) -> Dictionaries {
