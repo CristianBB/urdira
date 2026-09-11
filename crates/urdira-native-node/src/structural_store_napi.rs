@@ -403,6 +403,19 @@ pub struct NativeVisibleBatch {
     pub next_cursor: Option<String>,
 }
 
+#[napi(object)]
+pub struct NativeSelectorBatch {
+    pub rows: Vec<NativeOutputRecordRow>,
+    pub next_cursor: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeIdentityBatch {
+    pub rows: Vec<NativeOutputRecordRow>,
+    pub next_identity_key: Option<String>,
+    pub next_record_id: Option<String>,
+}
+
 /// Raw, from-scratch leaf export for `packages/engine/src/v4-verify.ts`
 /// (task: follow-up to P2-4). `keys`/`digests` are contiguous N*32-byte
 /// buffers (member key, logical/content digest), member `i`'s bytes at
@@ -1208,6 +1221,158 @@ impl NativeStructuralStoreHandle {
             limit as usize,
         );
         Ok(views.iter().map(|v| self.to_output(v, &dicts)).collect())
+    }
+
+    /// Exact paged union of the existing kind indexes. Empty selector
+    /// dimensions mean "any" and are expanded only over dictionary values;
+    /// no visible-record scan or truncation is used.
+    #[napi]
+    pub fn records_by_selector_page(
+        &self,
+        universal_kinds: Vec<String>,
+        categories: Vec<String>,
+        kinds: Vec<String>,
+        generation: u32,
+        limit: u32,
+        after_key_hex: Option<String>,
+    ) -> Result<NativeSelectorBatch> {
+        let dicts = self.reader.dictionaries();
+        let universal_kind_ids: Vec<u16> = if universal_kinds.is_empty() {
+            (0..dicts.universal_kinds.len())
+                .map(|value| value as u16)
+                .collect()
+        } else {
+            universal_kinds
+                .iter()
+                .filter_map(|value| {
+                    dicts
+                        .universal_kinds
+                        .iter()
+                        .position(|candidate| candidate == value)
+                        .map(|index| index as u16)
+                })
+                .collect()
+        };
+        let category_ids: Vec<u8> = if categories.is_empty() {
+            vec![0, 1, 2, 3, 4]
+        } else {
+            categories
+                .iter()
+                .map(|value| category_to_byte(value))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let kind_ids: Vec<u16> = if kinds.is_empty() {
+            Vec::new()
+        } else {
+            kinds
+                .iter()
+                .filter_map(|value| {
+                    dicts
+                        .kinds
+                        .iter()
+                        .position(|candidate| candidate == value)
+                        .map(|index| index as u16)
+                })
+                .collect()
+        };
+        let after_key = after_key_hex.as_deref().and_then(parse_hex32);
+        let (views, next_key) = self.reader.by_kind_selector(
+            &universal_kind_ids,
+            &category_ids,
+            &kind_ids,
+            generation as u64,
+            limit as usize,
+            after_key,
+        );
+        Ok(NativeSelectorBatch {
+            rows: views
+                .iter()
+                .map(|view| self.to_output(view, &dicts))
+                .collect(),
+            next_cursor: next_key.map(|key| hex_encode(&key)),
+        })
+    }
+
+    /// Counts a selector directly from the existing `by_kind` ranges. This
+    /// is intentionally a count-only operation: it does not call
+    /// `iterVisibleBatch`, decode records, or allocate a corpus-sized result.
+    #[napi]
+    pub fn count_visible_by_selector(
+        &self,
+        universal_kinds: Vec<String>,
+        categories: Vec<String>,
+        kinds: Vec<String>,
+        generation: u32,
+    ) -> Result<u32> {
+        let dicts = self.reader.dictionaries();
+        let universal_kind_ids: Vec<u16> = universal_kinds
+            .iter()
+            .filter_map(|value| {
+                dicts
+                    .universal_kinds
+                    .iter()
+                    .position(|candidate| candidate == value)
+                    .map(|index| index as u16)
+            })
+            .collect();
+        let category_ids: Vec<u8> = categories
+            .iter()
+            .map(|value| category_to_byte(value))
+            .collect::<Result<Vec<_>>>()?;
+        let kind_ids: Vec<u16> = kinds
+            .iter()
+            .filter_map(|value| {
+                dicts
+                    .kinds
+                    .iter()
+                    .position(|candidate| candidate == value)
+                    .map(|index| index as u16)
+            })
+            .collect();
+        let count = self.reader.count_by_kind_selector(
+            &universal_kind_ids,
+            &category_ids,
+            &kind_ids,
+            generation as u64,
+        );
+        u32::try_from(count)
+            .map_err(|_| napi_err("visible selector count exceeds the native numeric range"))
+    }
+
+    /// Keyset page over the existing structural identity index. The reader
+    /// compares reconstructed identity text and retains only one bounded
+    /// page; it never falls back to a visible-record scan or creates a new
+    /// index.
+    #[napi]
+    pub fn records_by_identity_key_page(
+        &self,
+        generation: u32,
+        limit: u32,
+        after_identity_key: Option<String>,
+        after_record_id_hex: Option<String>,
+    ) -> Result<NativeIdentityBatch> {
+        let after_id = after_record_id_hex.as_deref().and_then(parse_hex32);
+        if after_identity_key.is_some() != after_id.is_some() {
+            return Err(napi_err(
+                "identity keyset cursor requires identity_key and record_id together",
+            ));
+        }
+        let after_bytes = after_identity_key.as_deref().map(str::as_bytes);
+        let after = after_bytes.zip(after_id);
+        let dicts = self.reader.dictionaries();
+        let (views, next) =
+            self.reader
+                .by_identity_keyset(generation as u64, limit as usize, after);
+        Ok(NativeIdentityBatch {
+            rows: views
+                .iter()
+                .map(|view| self.to_output(view, &dicts))
+                .collect(),
+            next_identity_key: next
+                .as_ref()
+                .map(|entry| String::from_utf8_lossy(&entry.0).into_owned()),
+            next_record_id: next.map(|entry| hex_encode(&entry.1)),
+        })
     }
 
     /// Ordinal directly into the store's `artifacts` dictionary (see

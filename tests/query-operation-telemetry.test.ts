@@ -6,6 +6,7 @@ import {
   QueryOperationTelemetry,
   type QueryOperationMetric,
   type QueryOperationMetricProbe,
+  type QueryPageMetric,
 } from "../packages/engine/src/index.js";
 
 function metric(operationId: string, value: number, success = true): QueryOperationMetric {
@@ -66,6 +67,12 @@ describe("query operation telemetry", () => {
       event_loop_delay_ms: { total: 25_250, min: 5, max: 500, p50: 250, p95: 475, p99: 495 },
       copies: { total: 30_300, min: 6, max: 600, p50: 300, p95: 570, p99: 594 },
       rss_bytes: { total: 35_350, min: 7, max: 700, p50: 350, p95: 665, p99: 693 },
+      candidates: { total: 10_100, min: 2, max: 200, p50: 100, p95: 190, p99: 198 },
+      rows_hydrated: { total: 10_100, min: 2, max: 200, p50: 100, p95: 190, p99: 198 },
+      routes: {},
+      indexes: {},
+      decline_reasons: {},
+      fallback_reasons: {},
     });
   });
 
@@ -146,5 +153,62 @@ describe("query operation telemetry", () => {
       duration_ms: { p50: 2 },
       rows: { total: 0 },
     });
+  });
+
+  it("records bounded route metadata and initial page cost without exposing it in the page", async () => {
+    const operationMetrics: QueryOperationMetric[] = [];
+    const pageMetrics: QueryPageMetric[] = [];
+    const telemetry = new QueryOperationTelemetry();
+    let tick = 0;
+    const engine = new QueryEngine({
+      data_port: {
+        async execute() {
+          return {
+            streams: { records: [{ stable_sort_key: "record:1", value: { record_id: "record:1" } }] },
+            telemetry: {
+              route: "indexed_lookup",
+              index_used: "record_kind",
+              candidates: 3,
+              rows_hydrated: 1,
+            },
+          };
+        },
+      },
+      cursor_cache: new CursorCache({ signing_secret: "query-operation-telemetry-page" }),
+      now: () => "2026-08-28T00:00:00.000Z",
+      metric_clock: () => (tick += 5),
+      operation_metrics: (metric) => operationMetrics.push(metric),
+      page_metrics: (metric) => pageMetrics.push(metric),
+      operation_telemetry: telemetry,
+    });
+
+    const page = await engine.execute(request());
+    expect(page).not.toHaveProperty("telemetry");
+    expect(operationMetrics[0]).toMatchObject({
+      route: "indexed_lookup",
+      index_used: "record_kind",
+      candidates: 3,
+      rows_hydrated: 1,
+    });
+    expect(pageMetrics).toEqual([expect.objectContaining({
+      page_kind: "initial",
+      stream: "records",
+      candidates: 1,
+      rows_hydrated: 1,
+      success: true,
+    })]);
+    expect(pageMetrics[0]?.cost_ms).toBeGreaterThanOrEqual(0);
+    expect(telemetry.snapshot()[0]).toMatchObject({
+      routes: { indexed_lookup: 1 },
+      indexes: { record_kind: 1 },
+      candidates: { total: 3 },
+      rows_hydrated: { total: 1 },
+    });
+    expect(telemetry.pageSnapshot()).toEqual([expect.objectContaining({
+      stream: "records",
+      page_kind: "initial",
+      sample_count: 1,
+      rows_hydrated: expect.objectContaining({ total: 1 }),
+    })]);
   });
 });

@@ -1591,6 +1591,15 @@ pub struct StoreReader {
     prefault: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
+struct SelectorRange {
+    segment: Arc<Segment>,
+    lo: usize,
+    hi: usize,
+}
+
+type IdentityKeysetAfter<'a> = (&'a [u8], [u8; 32]);
+type IdentityKeysetNext = (Vec<u8>, [u8; 32]);
+
 impl StoreReader {
     pub fn open(dir: &Path) -> Result<Self> {
         let inner = StoreInner::load(dir)?;
@@ -1889,6 +1898,228 @@ impl StoreReader {
         }
         candidates.sort_by_key(|v| v.record_id());
         candidates.into_iter().take(limit).collect()
+    }
+
+    /// Exact paged union over the existing kind indexes. Empty `kinds` means
+    /// every producer kind under each `(universal_kind, category)` prefix;
+    /// empty `universal_kinds` or `categories` are expanded by the caller.
+    /// Results are merged by the canonical record id, so a cursor is stable
+    /// across segments and selector combinations without scanning records.
+    pub fn by_kind_selector(
+        &self,
+        universal_kind_ids: &[u16],
+        categories: &[u8],
+        kind_ids: &[u16],
+        generation: u64,
+        limit: usize,
+        after_key: Option<[u8; 32]>,
+    ) -> (Vec<RecordView>, Option<[u8; 32]>) {
+        if limit == 0 || universal_kind_ids.is_empty() || categories.is_empty() {
+            return (Vec::new(), None);
+        }
+        let inner = self.snapshot();
+        let mut ranges = Vec::new();
+        for &universal_kind_id in universal_kind_ids {
+            for &category in categories {
+                for &kind_id in if kind_ids.is_empty() {
+                    &[u16::MAX][..]
+                } else {
+                    kind_ids
+                } {
+                    for segment in &inner.segments {
+                        let data = &segment.by_kind[HEADER_LEN..];
+                        let (lo, hi) = if kind_id == u16::MAX {
+                            by_kind_universal_range(data, universal_kind_id, category)
+                        } else {
+                            by_kind_range(data, universal_kind_id, category, kind_id)
+                        };
+                        if lo < hi {
+                            ranges.push(SelectorRange {
+                                segment: Arc::clone(segment),
+                                lo,
+                                hi,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // `by_kind` is sorted by selector tuple, not by record id. Keep only
+        // the smallest `limit` visible keys in a bounded max-heap, then emit
+        // them in key order. This is incremental in memory and remains exact
+        // across segments and continuation cursors without collecting the
+        // result set globally.
+        let mut heap: std::collections::BinaryHeap<([u8; 32], usize, usize)> =
+            std::collections::BinaryHeap::new();
+        // Selector combinations can overlap (for example, duplicate values
+        // in a caller's selector). Keep only keys currently represented in
+        // the bounded page heap; this prevents duplicate rows without
+        // retaining a corpus-sized seen-set.
+        let mut heap_keys = std::collections::HashSet::<[u8; 32]>::with_capacity(limit);
+        for (index, range) in ranges.iter().enumerate() {
+            let data = &range.segment.by_kind[HEADER_LEN..];
+            for position in range.lo..range.hi {
+                let ordinal = by_kind_ordinal_at(data, position) as usize;
+                let view = RecordView {
+                    segment: Arc::clone(&range.segment),
+                    store: Arc::clone(&inner),
+                    ordinal,
+                };
+                if !view.is_visible(generation) {
+                    continue;
+                }
+                let key = view.record_id();
+                if after_key.is_some_and(|after| key <= after) {
+                    continue;
+                }
+                if heap_keys.contains(&key) {
+                    continue;
+                }
+                if heap.len() < limit {
+                    heap.push((key, index, ordinal));
+                    heap_keys.insert(key);
+                } else if let Some(max) = heap.peek()
+                    && key < max.0
+                {
+                    let removed = heap.pop().expect("heap is non-empty");
+                    heap_keys.remove(&removed.0);
+                    heap.push((key, index, ordinal));
+                    heap_keys.insert(key);
+                }
+            }
+        }
+        let mut selected: Vec<_> = heap.into_iter().collect();
+        selected.sort_by_key(|entry| entry.0);
+        let out = selected
+            .into_iter()
+            .map(|(_key, range_index, ordinal)| RecordView {
+                segment: Arc::clone(&ranges[range_index].segment),
+                store: Arc::clone(&inner),
+                ordinal,
+            })
+            .collect::<Vec<_>>();
+        let next_cursor = (out.len() == limit)
+            .then(|| out.last().map(|view| view.record_id()))
+            .flatten();
+        (out, next_cursor)
+    }
+
+    /// Counts visible rows in the existing `by_kind` selector ranges without
+    /// constructing `RecordView`s or transferring record bodies. Callers
+    /// must provide duplicate-free selector dimensions; the native binding
+    /// normalizes those dimensions before reaching this method.
+    pub fn count_by_kind_selector(
+        &self,
+        universal_kind_ids: &[u16],
+        categories: &[u8],
+        kind_ids: &[u16],
+        generation: u64,
+    ) -> u64 {
+        if universal_kind_ids.is_empty() || categories.is_empty() {
+            return 0;
+        }
+        let inner = self.snapshot();
+        let mut count = 0u64;
+        for &universal_kind_id in universal_kind_ids {
+            for &category in categories {
+                for &kind_id in if kind_ids.is_empty() {
+                    &[u16::MAX][..]
+                } else {
+                    kind_ids
+                } {
+                    for segment in &inner.segments {
+                        let data = &segment.by_kind[HEADER_LEN..];
+                        let (lo, hi) = if kind_id == u16::MAX {
+                            by_kind_universal_range(data, universal_kind_id, category)
+                        } else {
+                            by_kind_range(data, universal_kind_id, category, kind_id)
+                        };
+                        for position in lo..hi {
+                            let ordinal = by_kind_ordinal_at(data, position) as usize;
+                            let view = RecordView {
+                                segment: Arc::clone(segment),
+                                store: Arc::clone(&inner),
+                                ordinal,
+                            };
+                            if view.is_visible(generation) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Keyset page over the existing `records.by_identity` index. The index
+    /// is keyed by identity digest, so the indexed candidates are inspected
+    /// and compared by their reconstructed identity text; only the bounded
+    /// output heap is retained. No corpus/result materialization or new
+    /// index is performed.
+    pub fn by_identity_keyset(
+        &self,
+        generation: u64,
+        limit: usize,
+        after: Option<IdentityKeysetAfter<'_>>,
+    ) -> (Vec<RecordView>, Option<IdentityKeysetNext>) {
+        if limit == 0 {
+            return (Vec::new(), None);
+        }
+        let inner = self.snapshot();
+        let mut heap: std::collections::BinaryHeap<(Vec<u8>, [u8; 32], usize, usize)> =
+            std::collections::BinaryHeap::new();
+        let mut heap_ids = std::collections::HashSet::<[u8; 32]>::with_capacity(limit);
+        for (segment_index, segment) in inner.segments.iter().enumerate() {
+            let data = &segment.by_identity[HEADER_LEN..];
+            let entries = data.len() / BY_IDENTITY_STRIDE;
+            for position in 0..entries {
+                let ordinal = by_identity_ordinal_at(data, position) as usize;
+                let view = RecordView {
+                    segment: Arc::clone(segment),
+                    store: Arc::clone(&inner),
+                    ordinal,
+                };
+                if !view.is_visible(generation) {
+                    continue;
+                }
+                let record_id = view.record_id();
+                let identity_key = view.identity_key().into_owned();
+                if after.is_some_and(|(key, id)| {
+                    identity_key.as_slice() < key
+                        || (identity_key.as_slice() == key && record_id <= id)
+                }) {
+                    continue;
+                }
+                if heap_ids.contains(&record_id) {
+                    continue;
+                }
+                if heap.len() < limit {
+                    heap.push((identity_key, record_id, segment_index, ordinal));
+                    heap_ids.insert(record_id);
+                } else if let Some(max) = heap.peek()
+                    && (identity_key.as_slice(), record_id) < (max.0.as_slice(), max.1)
+                {
+                    let removed = heap.pop().expect("heap is non-empty");
+                    heap_ids.remove(&removed.1);
+                    heap.push((identity_key, record_id, segment_index, ordinal));
+                    heap_ids.insert(record_id);
+                }
+            }
+        }
+        let mut selected: Vec<_> = heap.into_iter().collect();
+        selected.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let next = selected.last().map(|entry| (entry.0.clone(), entry.1));
+        let full = selected.len() == limit;
+        let out = selected
+            .into_iter()
+            .map(|(_key, _id, segment_index, ordinal)| RecordView {
+                segment: Arc::clone(&inner.segments[segment_index]),
+                store: Arc::clone(&inner),
+                ordinal,
+            })
+            .collect();
+        (out, (next.is_some() && full).then_some(next).flatten())
     }
 
     pub fn by_identity_last(&self, identity_key_digest: &[u8; 32]) -> Option<RecordView> {

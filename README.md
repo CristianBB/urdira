@@ -447,6 +447,11 @@ opt-in `snippet_lines` request field (0-3, default 0) adds a bounded literal
 excerpt per matched line for a client that wants it, at the cost of a larger
 response.
 
+The web MCP profile returns the complete typed page in `structuredContent`.
+Its companion text block keeps labels, completeness, and opaque continuation
+cursors but omits repeated source snippets and hydration/evidence/registry
+payloads, so browser clients do not pay for the same response data twice.
+
 Agents should first call `urdira_index_status` with the exact workspace root,
 then reuse its returned `query_scope` object byte-for-byte on every
 source-reading request. A returned cursor is opaque and must be continued with
@@ -469,7 +474,13 @@ the argument it fills and points to an earlier `{stage_id, output}`; sequence
 arguments receive the complete upstream set, while scalar arguments require
 exactly one item. The same essential guidance is repeated in the
 `urdira_query` tool and pipeline schema descriptions for clients that do not
-surface server-level instructions.
+surface server-level instructions. Ordinary discovery uses `urdira_context`,
+while `urdira_query` is enough for one precise lookup; broad requests should be
+narrowed with paths, kinds, context artifacts, entity ids, filters, or response
+budgets. Continue paginated results with the exact cursor and original scope.
+Pipelines are optional and useful when they express data dependency or remove
+repeated calls; shell remains appropriate for edits, tests, builds, and git
+status/diff, while Urdira is preferred for scoped discovery and source reading.
 
 ### The v4 pipeline, by crate
 

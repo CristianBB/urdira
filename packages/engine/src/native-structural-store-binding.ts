@@ -140,6 +140,17 @@ export interface NativeVisibleBatch {
   readonly nextCursor?: string;
 }
 
+export interface NativeSelectorBatch {
+  readonly rows: readonly NativeOutputRecordRow[];
+  readonly nextCursor?: string;
+}
+
+export interface NativeIdentityBatch {
+  readonly rows: readonly NativeOutputRecordRow[];
+  readonly nextIdentityKey?: string;
+  readonly nextRecordId?: string;
+}
+
 /**
  * Raw `(key, logical_digest)` leaf batch -- `keys`/`digests` are
  * contiguous `N*32`-byte buffers, member `i`'s bytes at `[i*32, i*32+32)`
@@ -221,6 +232,14 @@ export declare class NativeStructuralStoreHandle {
    * `records_by_selector`'s own combo cap and fell back to a full-corpus
    * scan for `core:inspect_architecture`'s pushdown. */
   recordsByKindUniversal(universalKind: string, category: string, generation: number, limit: number): readonly NativeOutputRecordRow[];
+  /** Exact indexed selector page. Empty dimensions mean any value; the
+   * caller's opaque cursor is the last record id and is passed unchanged. */
+  recordsBySelectorPage(universalKinds: readonly string[], categories: readonly string[], kinds: readonly string[], generation: number, limit: number, afterKeyHex?: string): NativeSelectorBatch;
+  /** Count visible rows through existing `by_kind` ranges without decoding
+   * or transferring records. Selector dimensions are exact and bounded by
+   * the native range index; no visible-corpus batch scan is involved. */
+  countVisibleBySelector(universalKinds: readonly string[], categories: readonly string[], kinds: readonly string[], generation: number): number;
+  recordsByIdentityKeyPage(generation: number, limit: number, afterIdentityKey?: string, afterRecordIdHex?: string): NativeIdentityBatch;
   recordsByOwnerOrdinal(ownerArtifactOrdinal: number, generation: number): readonly NativeOutputRecordRow[];
   adjacency(subjectIds: readonly string[], direction: "outbound" | "inbound", generation: number): readonly NativeOutputEdgeRow[];
   changedBetween(g1: number, g2: number): readonly NativeChangedEntry[];

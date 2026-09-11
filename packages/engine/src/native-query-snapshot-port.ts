@@ -51,6 +51,24 @@ import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
 import { INELIGIBLE_ENTITY_RECORD_KIND } from "./semantic-reconciler.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 
+export interface NativeLexicalSearchFilters {
+  readonly path_patterns?: readonly string[];
+  readonly language?: readonly string[];
+  readonly namespace?: readonly string[];
+  readonly kind?: readonly string[];
+  readonly subject_type?: readonly string[];
+}
+
+export interface NativeLexicalSearchPage {
+  readonly capability: "indexed" | "unsupported";
+  /** `safe_regex` is an exact paged artifact/CAS source scan, not FTS. */
+  readonly route: "fts" | "artifact_cas_paged";
+  readonly index_used: "lexical_fts" | "artifact_versions_keyset";
+  readonly matches: readonly LexicalSearchMatch[];
+  readonly next_cursor?: string;
+  readonly unsupported_reason?: "safe_regex" | "structural_filter";
+}
+
 const VISIBLE_BATCH_SIZE = 4_096;
 // Bounds `records_by_selector`'s (universal_kind x category x kind) combo
 // expansion when one or more selector dimensions is omitted (meaning "any
@@ -65,8 +83,63 @@ const SELECTOR_COMBO_CAP = 512;
 // small-N graph-pushdown/selector-list callers that rely on this path.
 const OTHER_IDS_COUNT_CAP = 1_000;
 
+export interface NativeIndexedRecordPage {
+  readonly records: readonly CanonicalQueryRecord[];
+  readonly next_cursor?: string;
+}
+
 function strings(value: unknown): readonly string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function lexicalCursor(value: string | undefined): { readonly artifact_id: string; readonly artifact_version_id: string } | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const decoded: unknown = JSON.parse(value);
+    if (Array.isArray(decoded) && decoded.length === 2 && typeof decoded[0] === "string" && typeof decoded[1] === "string") return { artifact_id: decoded[0], artifact_version_id: decoded[1] };
+  } catch { /* Older callers may pass a bare version id; retain that cursor shape. */ }
+  return { artifact_id: "", artifact_version_id: value };
+}
+
+function encodeLexicalCursor(artifactId: string, versionId: string): string {
+  return JSON.stringify([artifactId, versionId]);
+}
+
+function lexicalPathMatches(path: string | null, patterns: readonly string[] | undefined): boolean {
+  if (patterns === undefined || patterns.length === 0) return true;
+  if (path === null) return false;
+  return patterns.some((pattern) => {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/gu, "\\$&").replaceAll("**", ".*").replaceAll("*", "[^/]*").replaceAll("?", "[^/]");
+    return new RegExp(`^${escaped}$`, "u").test(path);
+  });
+}
+
+function lexicalMatches(text: string, pattern: string, mode: "literal" | "safe_regex", caseSensitive: boolean): readonly number[] {
+  if (mode === "safe_regex") {
+    let expression: RegExp;
+    try { expression = new RegExp(pattern, caseSensitive ? "gu" : "giu"); }
+    catch { throw new QueryPlanError("core:selector_invalid", "The safe_regex lexical pattern is invalid."); }
+    const offsets: number[] = [];
+    for (const match of text.matchAll(expression)) if (match.index !== undefined) offsets.push(match.index);
+    return offsets;
+  }
+  const haystack = caseSensitive ? text : text.toLocaleLowerCase();
+  const needle = caseSensitive ? pattern : pattern.toLocaleLowerCase();
+  if (needle.length === 0) return [];
+  const offsets: number[] = [];
+  let offset = 0;
+  while (offset < haystack.length) {
+    const found = haystack.indexOf(needle, offset);
+    if (found < 0) break;
+    offsets.push(found);
+    offset = found + Math.max(1, needle.length);
+  }
+  return offsets;
+}
+
+function lexicalLineSpans(text: string, offsets: readonly number[], patternLength: number): readonly { readonly start_line: string; readonly end_line: string }[] {
+  const lineAt = (offset: number): string => String(text.slice(0, Math.max(0, offset)).split("\n").length);
+  return offsets.map((offset) => ({ start_line: lineAt(offset), end_line: lineAt(offset + Math.max(0, patternLength - 1)) }));
 }
 
 function recordIdHexOf(id: string): string | undefined {
@@ -91,6 +164,16 @@ function findArtifactOrdinal(dicts: NativeDictionaries, artifactId: string | und
 /** Served from `crates/urdira-native-node`'s `NativeStructuralStoreHandle`
  * (see module doc). Construct via `NativeCanonicalQuerySnapshotPort.open`. */
 export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotPort {
+  /**
+   * Identity-ordered comparison batches intentionally retain the canonical
+   * SQLite lane.  `identity_assignments_owner_key_idx` is the authoritative
+   * existing ordering index for this projection; the native structural
+   * segment has no raw identity-key ordering column.  The delegated port
+   * supplies a keyset cursor `(identity_key, record_id)`, so repeated keys
+   * remain adjacent and are never skipped or duplicated across pages.
+   */
+  readonly records_for_query_batches_order = "identity_key" as const;
+
   private constructor(
     private readonly database: SqliteDatabase,
     private readonly handle: NativeStructuralStoreHandle,
@@ -99,27 +182,14 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
   ) {}
 
   /**
-   * Frente S-F (2026-09-08): `semantic_entity_scope_counts`'s own full
-   * corpus walk (`scanAll`, an FFI batch call PER `VISIBLE_BATCH_SIZE` rows
-   * plus a JS-side filter over every row) is O(corpus), not O(1) -- unlike
-   * every other `semantic_*` method here, it cannot simply delegate to the
-   * SQLite port, because `record_occurrences` (the table that method's
-   * SQLite counterpart counts) is never populated when the structural
-   * corpus lives in the native store (this class's own doc comment). Called
-   * on EVERY `core:search_semantic`/`core:search_hybrid` -- measured live
-   * at 5.0-5.4s on a 2,490-file/~40k-record real corpus (queueing every
-   * OTHER concurrently-fired `semantic_*` call behind it on the same
-   * connection, reproducing the exact multi-second symptom this frente's
-   * own materialized-summary fix was built to eliminate for a DIFFERENT
-   * cost center -- see `docs/evidence/2026-09-08-v4-semantic-latency-and-n8n-embed.md`).
-   * The corpus this counts is immutable for a fixed `generation` (only a
-   * NEW generation can change which entities are visible), so caching the
-   * result by generation makes every call after the first, for the SAME
-   * generation, an O(1) map lookup -- exactly the "warm/hot" scenario this
-   * frente's own p99 target (`docs/evidence`'s "n8n completo caliente") is
-   * about. Unbounded by design (one small integer per generation this port
-   * instance has ever seen; a workspace's generation count over a daemon's
-   * lifetime is not adversarial-sized).
+   * Frente S-F (2026-09-08): `semantic_entity_scope_counts` uses the native
+   * by-kind range count because `record_occurrences` (the table that the
+   * SQLite counterpart counts) is not populated when the structural corpus
+   * lives in the native store. The count is body-free and remains bounded by
+   * the existing selector ranges, so it cannot queue other semantic calls
+   * behind a full record decode.
+   * The result is cached by immutable generation, making repeat calls O(1)
+   * without retaining record bodies.
    */
   private readonly entityScopeCountCache = new Map<number, number>();
 
@@ -194,16 +264,6 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return decodeRow(input, this.interner);
   }
 
-  private *scanAll(generation: number): Generator<NativeOutputRecordRow> {
-    let cursor: string | undefined;
-    for (;;) {
-      const batch = this.handle.iterVisibleBatch(generation, VISIBLE_BATCH_SIZE, cursor);
-      yield* batch.rows;
-      if (batch.nextCursor === undefined) return;
-      cursor = batch.nextCursor;
-    }
-  }
-
   // --- structural methods, served from the native store -------------------
 
   readonly has_warm_records = async (): Promise<boolean> => false;
@@ -252,6 +312,7 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
 
   async *records_for_query_batches(scope: QueryScope, batchSize = VISIBLE_BATCH_SIZE): AsyncIterable<readonly CanonicalQueryRecord[]> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > VISIBLE_BATCH_SIZE) throw new RangeError("Native query batch size is outside the bounded range.");
     const generation = await this.ensureGeneration(scope);
     if (generation === undefined) return;
     let cursor: string | undefined;
@@ -261,6 +322,29 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       yield batch.rows.map((row) => this.decode(row, scope.workspace_id));
       if (batch.nextCursor === undefined) return;
       cursor = batch.nextCursor;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Stable identity-key batches for comparison merge consumers.  Structural
+   * records are served by the native store, but identity assignment ordering
+   * is still owned by SQLite's existing `identity_assignments_owner_key_idx`;
+   * delegating preserves that index-backed keyset contract without building a
+   * second native index or materializing the record corpus.
+   */
+  async *records_for_query_batches_by_identity(scope: QueryScope, batchSize = VISIBLE_BATCH_SIZE): AsyncIterable<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > VISIBLE_BATCH_SIZE) throw new RangeError("Native identity batch size is outside the bounded range.");
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return;
+    let cursor: { readonly identity_key: string; readonly record_id: string } | undefined;
+    for (;;) {
+      const page = this.handle.recordsByIdentityKeyPage(generation, batchSize, cursor?.identity_key, cursor === undefined ? undefined : recordIdHexOf(cursor.record_id));
+      if (page.rows.length === 0) return;
+      yield page.rows.map((row) => this.decode(row, scope.workspace_id));
+      if (page.nextIdentityKey === undefined || page.nextRecordId === undefined) return;
+      cursor = { identity_key: page.nextIdentityKey, record_id: `record:${page.nextRecordId}` };
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
@@ -291,8 +375,8 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     // the same `identity_key` text) and `recordsByIdentityKeys` (that
     // on-disk `by_identity` range, digested with the exact hash used at
     // ingestion). Before this frente, BOTH forms fell into
-    // `scanAll(generation)` -- a full linear decode of the entire visible
-    // generation, the diagnosed root cause of `core:analyze_impact`/`core:
+    // the old full linear decode of the entire visible generation, the
+    // diagnosed root cause of `core:analyze_impact`/`core:
     // find_related_tests`'s multi-second per-call cost at n8n/VS Code scale
     // (`docs/evidence/2026-09-08-v4-full-pushdown-catalog.md` §5.3,
     // decision 25's Q1/Q-3 amendments).
@@ -367,7 +451,7 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * (the engine layer has no registry mapping a universal_kind to its own
    * kind strings; that mapping is plugin-local). That inflated `comboCount`
    * past `SELECTOR_COMBO_CAP` for realistic selectors and silently fell
-   * back to the full-corpus `scanAll` branch below -- measured live on n8n
+   * back to a full-corpus branch below -- measured live on n8n
    * (2,198,601 records): 26.4-30.1s for two `inspect_architecture` calls,
    * exactly the "full scan disguised as a bounded call" this cap exists to
    * make rare. Now answered via `recordsByKindUniversal` (the native
@@ -378,10 +462,11 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
    * dimension in the combo count at all.
    *
    * This method's return type has no `undefined`/"decline" signal (unlike
-   * e.g. `graph_edges_by_subject_ids`), so when the expansion would still be
-   * unbounded (`SELECTOR_COMBO_CAP`) this falls back to one full
-   * visible-corpus scan filtered in JS rather than ever answering
-   * incorrectly -- slower, never wrong.
+   * e.g. `graph_edges_by_subject_ids`). An expansion outside
+   * `SELECTOR_COMBO_CAP`, including an omitted selector that would mean
+   * "every visible record", fails explicitly with a resource-limit error.
+   * The native production path never turns an optional pushdown miss into a
+   * hidden full-corpus decode.
    */
   async records_by_selector(scope: QueryScope, selector: RecordColumnSelector, limit: number): Promise<readonly CanonicalQueryRecord[]> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
@@ -392,39 +477,116 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     const universalKinds = selector.universal_kinds !== undefined && selector.universal_kinds.length > 0 ? selector.universal_kinds : dicts.universalKinds;
     const explicitKinds = selector.kinds !== undefined && selector.kinds.length > 0 ? selector.kinds : undefined;
     const found = new Map<string, CanonicalQueryRecord>();
-    if (explicitKinds === undefined) {
-      const comboCount = categories.length * universalKinds.length;
-      if (comboCount > 0 && comboCount <= SELECTOR_COMBO_CAP) {
-        for (const category of categories) {
-          for (const universalKind of universalKinds) {
-            for (const row of this.handle.recordsByKindUniversal(universalKind, category, generation, limit)) found.set(row.recordId, this.decode(row, scope.workspace_id));
-          }
-        }
-        return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id)).slice(0, limit);
-      }
-    } else {
-      const comboCount = categories.length * universalKinds.length * explicitKinds.length;
-      if (comboCount > 0 && comboCount <= SELECTOR_COMBO_CAP) {
-        for (const category of categories) {
-          for (const universalKind of universalKinds) {
-            for (const kind of explicitKinds) {
-              for (const row of this.handle.recordsByKindExact(universalKind, category, kind, generation, limit)) found.set(row.recordId, this.decode(row, scope.workspace_id));
-            }
-          }
-        }
-        return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id)).slice(0, limit);
-      }
+    const comboCount = explicitKinds === undefined
+      ? categories.length * universalKinds.length
+      : categories.length * universalKinds.length * explicitKinds.length;
+    if (comboCount === 0 || comboCount > SELECTOR_COMBO_CAP) {
+      throw new QueryPlanError(
+        "core:execution_resource_limit",
+        `Native structural selector requires ${comboCount} indexed combinations, outside the bounded pushdown limit of ${SELECTOR_COMBO_CAP}; refusing a full visible-corpus scan. Narrow the selector or split the request into smaller indexed selectors.`,
+        { limit_kind: "native_selector_combinations", configured_limit: SELECTOR_COMBO_CAP, observed_or_required: comboCount },
+      );
     }
-    const categorySet = selector.categories !== undefined && selector.categories.length > 0 ? new Set(selector.categories) : undefined;
-    const universalKindSet = selector.universal_kinds !== undefined && selector.universal_kinds.length > 0 ? new Set(selector.universal_kinds) : undefined;
-    const kindSet = explicitKinds !== undefined ? new Set(explicitKinds) : undefined;
-    for (const row of this.scanAll(generation)) {
-      if (categorySet !== undefined && !categorySet.has(row.category)) continue;
-      if (universalKindSet !== undefined && !universalKindSet.has(row.universalKind)) continue;
-      if (kindSet !== undefined && !kindSet.has(row.kind)) continue;
-      found.set(row.recordId, this.decode(row, scope.workspace_id));
+    const page = this.handle.recordsBySelectorPage([...universalKinds], [...categories], explicitKinds === undefined ? [] : [...explicitKinds], generation, limit);
+    for (const row of page.rows) found.set(row.recordId, this.decode(row, scope.workspace_id));
+    return [...found.values()];
+  }
+
+  /** Exact indexed selector page for the canonical owner to connect to
+   * `stream_sources`. The cursor is the last returned record id and is
+   * stable across immutable native generations. */
+  async records_by_selector_page(scope: QueryScope, selector: RecordColumnSelector, limit: number, after_record_id?: string): Promise<NativeIndexedRecordPage> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new RangeError("limit must be a positive safe integer");
+    const afterKeyHex = after_record_id === undefined ? undefined : recordIdHexOf(after_record_id);
+    if (after_record_id !== undefined && afterKeyHex === undefined) throw new QueryPlanError("core:cursor_invalid", "The native selector cursor must contain a record:<64-hex> identity.");
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return { records: [] };
+    const batch = this.handle.recordsBySelectorPage(
+      selector.universal_kinds ?? [],
+      selector.categories ?? [],
+      selector.kinds ?? [],
+      generation,
+      limit,
+      afterKeyHex,
+    );
+    const records = batch.rows.map((row) => this.decode(row, scope.workspace_id));
+    const nextCursor = batch.nextCursor === undefined ? records.at(-1)?.record_id : `record:${batch.nextCursor}`;
+    return nextCursor === undefined ? { records } : { records, next_cursor: nextCursor };
+  }
+
+  /** Exact, bounded lexical page over the existing lexical candidates. The
+   * method advances through ordered candidate pages and never materializes the
+   * corpus; the returned cursor resumes after the last candidate inspected. */
+  async search_lexical_page(
+    scope: QueryScope,
+    pattern: string,
+    mode: "literal" | "safe_regex",
+    options: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly filters?: NativeLexicalSearchFilters } = {},
+    limit = 100,
+    after_cursor?: string,
+  ): Promise<NativeLexicalSearchPage> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new RangeError("limit must be a positive safe integer");
+    const filters = options.filters;
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Native lexical queries require one explicit workspace.");
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return { capability: "indexed", route: "artifact_cas_paged", index_used: "artifact_versions_keyset", matches: [] };
+    const cursor = lexicalCursor(after_cursor);
+    const language = filters?.language?.filter((value) => value.length > 0) ?? [];
+    const namespace = filters?.namespace?.filter((value) => value.length > 0) ?? [];
+    const kinds = filters?.kind?.filter((value) => value.length > 0) ?? [];
+    const subjectTypes = filters?.subject_type?.filter((value) => value.length > 0) ?? [];
+    // Namespace is represented by the source path in the native snapshot;
+    // fold it into the same exact glob predicate instead of inventing a new
+    // index. Kind and subject_type are resolved through native kind/category
+    // ranges, then applied by owner artifact version below.
+    const pathPatterns = [...(filters?.path_patterns ?? []), ...namespace];
+    const knownCategories = ["entity", "relation", "fact", "evidence", "diagnostic"] as const;
+    const structuralCategories = subjectTypes.length > 0 ? subjectTypes.filter((value): value is typeof knownCategories[number] => knownCategories.includes(value as typeof knownCategories[number])) : [];
+    if (subjectTypes.some((value) => value !== "artifact" && !knownCategories.includes(value as typeof knownCategories[number]))) return { capability: "indexed", route: "artifact_cas_paged", index_used: "artifact_versions_keyset", matches: [] };
+    const dictionaries = kinds.length > 0 || structuralCategories.length > 0 ? this.handle.dictionaries() : undefined;
+    const sourceOnly = scope.snapshot_id?.startsWith("source-snapshot:") === true;
+    const completion = sourceOnly ? undefined : await this.database.get<{ completed_generation: number }>("SELECT completed_generation FROM lexical_index_state WHERE workspace_id = ?", [scope.workspace_id]);
+    const lexicalCurrent = !sourceOnly && completion?.completed_generation === generation;
+    const useFts = mode === "literal" && lexicalCurrent && pattern.length >= 3;
+    const candidatePageSize = 256;
+    let candidateCursor = cursor;
+    const matches: LexicalSearchMatch[] = [];
+    let moreCandidates = false;
+    for (;;) {
+      const cursorSql = candidateCursor === undefined ? "" : " AND (candidate.artifact_id > ? OR (candidate.artifact_id = ? AND candidate.artifact_version_id > ?))";
+      const cursorParams = candidateCursor === undefined ? [] : [candidateCursor.artifact_id, candidateCursor.artifact_id, candidateCursor.artifact_version_id];
+      const sourceTable = useFts ? `lexical_fts AS candidate JOIN lexical_documents AS document ON document.workspace_id = candidate.workspace_id AND document.artifact_id = candidate.artifact_id AND document.artifact_version_id = candidate.artifact_version_id JOIN artifact_versions AS version ON version.workspace_id = document.workspace_id AND version.artifact_version_id = document.artifact_version_id JOIN source_artifacts AS artifact ON artifact.workspace_id = document.workspace_id AND artifact.artifact_id = document.artifact_id` : `artifact_versions AS candidate JOIN source_artifacts AS artifact ON artifact.workspace_id = candidate.workspace_id AND artifact.artifact_id = candidate.artifact_id`;
+      // SQLite FTS5's MATCH operand must name the virtual table itself;
+      // using the `candidate` alias here is parsed as a missing column.
+      const candidateWhere = useFts ? "candidate.workspace_id = ? AND lexical_fts MATCH ? AND document.valid_from_generation <= ? AND (document.valid_to_generation IS NULL OR document.valid_to_generation > ?)" : "candidate.workspace_id = ? AND candidate.valid_from_generation <= ? AND (candidate.valid_to_generation IS NULL OR candidate.valid_to_generation > ?)";
+      const candidateParams = useFts ? [scope.workspace_id, `\"${pattern.replaceAll('"', '""')}\"`, generation, generation, ...cursorParams] : [scope.workspace_id, generation, generation, ...cursorParams];
+      const candidates = await this.database.all<{ artifact_id: string; artifact_version_id: string; normalized_path: string | null; language_hint: string | null }>(`SELECT candidate.artifact_id, candidate.artifact_version_id, artifact.normalized_path, ${useFts ? "version.language_hint" : "candidate.language_hint"} AS language_hint FROM ${sourceTable} WHERE ${candidateWhere}${cursorSql} ORDER BY candidate.artifact_id, candidate.artifact_version_id LIMIT ${candidatePageSize}`, candidateParams);
+      if (candidates.length === 0) break;
+      moreCandidates = candidates.length === candidatePageSize;
+      let stoppedForLimit = false;
+      for (const candidate of candidates) {
+        candidateCursor = { artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id };
+        if (!lexicalPathMatches(candidate.normalized_path, pathPatterns) || (language.length > 0 && (candidate.language_hint === null || !language.includes(candidate.language_hint)))) continue;
+        if (dictionaries !== undefined) {
+          const ownerOrdinal = findArtifactOrdinal(dictionaries, candidate.artifact_id, candidate.artifact_version_id);
+          const ownerRows = ownerOrdinal === undefined ? [] : this.handle.recordsByOwnerOrdinal(ownerOrdinal, generation);
+          if (!ownerRows.some((row) => (kinds.length === 0 || kinds.includes(row.kind)) && (structuralCategories.length === 0 || structuralCategories.includes(row.category as typeof knownCategories[number])))) continue;
+        }
+        const file = await this.sqlite.artifact_text(scope, candidate.artifact_version_id);
+        if (file === undefined) continue;
+        const offsets = lexicalMatches(file.text, pattern, mode, options.case_sensitive === true);
+        if (offsets.length === 0) continue;
+        matches.push({ artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id, offsets, line_spans: lexicalLineSpans(file.text, offsets, pattern.length) });
+        if (matches.length >= limit) { stoppedForLimit = true; break; }
+      }
+      if (stoppedForLimit || !moreCandidates) break;
     }
-    return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id)).slice(0, limit);
+    const route = useFts ? "fts" : "artifact_cas_paged";
+    const index_used = useFts ? "lexical_fts" : "artifact_versions_keyset";
+    if (matches.length < limit && !moreCandidates) return { capability: "indexed", route, index_used, matches };
+    const nextCursor = candidateCursor === undefined ? undefined : encodeLexicalCursor(candidateCursor.artifact_id, candidateCursor.artifact_version_id);
+    return nextCursor === undefined ? { capability: "indexed", route, index_used, matches } : { capability: "indexed", route, index_used, matches, next_cursor: nextCursor };
   }
 
   async container_records_by_artifact_references(scope: QueryScope, references: readonly string[]): Promise<readonly CanonicalQueryRecord[]> {
@@ -590,10 +752,10 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (generation === undefined) return { entity_count: 0 };
     const cached = this.entityScopeCountCache.get(generation);
     if (cached !== undefined) return { entity_count: cached };
-    let entityCount = 0;
-    for (const row of this.scanAll(generation)) {
-      if (row.category === "entity" && row.kind !== INELIGIBLE_ENTITY_RECORD_KIND) entityCount += 1;
-    }
+    const dictionaries = this.handle.dictionaries();
+    const universalKinds = [...dictionaries.universalKinds];
+    const kinds = dictionaries.kinds.filter((kind) => kind !== INELIGIBLE_ENTITY_RECORD_KIND);
+    const entityCount = this.handle.countVisibleBySelector(universalKinds, ["entity"], kinds, generation);
     this.entityScopeCountCache.set(generation, entityCount);
     return { entity_count: entityCount };
   }

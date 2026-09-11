@@ -291,7 +291,8 @@ async function publishAndQuery(language: "javascript" | "typescript"): Promise<v
       await expect(opened.publishCandidate(publication)).resolves.toMatchObject({ status: "published", generation: 1 });
       expect(await opened.database.all("SELECT dependency_role FROM artifact_dependencies WHERE workspace_id = ?", [workspaceId])).toEqual(expect.arrayContaining([expect.objectContaining({ dependency_role: "jsts:resolution_input" })]));
 
-      const engine = new QueryEngine({ data_port: new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database)), cursor_cache: new CursorCache({ signing_secret: `secret:${language}` }), now: () => now });
+      const snapshot = Object.assign(new SqliteCanonicalQuerySnapshotPort(opened.database), { test_only_allow_legacy_full_corpus_fallback: true as const });
+      const engine = new QueryEngine({ data_port: new CanonicalRecordQueryDataPort(snapshot), cursor_cache: new CursorCache({ signing_secret: `secret:${language}` }), now: () => now });
       const records = await engine.execute(query(workspaceId, "core:find_records", { selector: { record_categories: ["entity"], kind_selector: { universal_kinds: ["core:type"] }, filter: { languages: [language] } } }));
       expect(records.completeness).toMatchObject({ overall_status: capabilityStates[0]!.status });
       expect(bodies(records, "records").map((body) => body["name"])).toEqual(expect.arrayContaining(["TaskService", "TaskRepository", "InMemoryTaskRepository"]));

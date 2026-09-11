@@ -1544,6 +1544,32 @@ export interface FormatUrdiraResultOptions {
   readonly snippet_lines?: number;
 }
 
+// The web profile has a typed `structuredContent` channel for the complete
+// page.  Keep the human-readable content channel useful for discovery and
+// pagination without serializing the same source payload twice.  These keys
+// are presentation payloads, not identifiers or cursor state; the complete
+// values remain available in `structuredContent` and are therefore still
+// accessible to typed clients and continuations.
+const WEB_DETAIL_KEYS = new Set(["optional_source_snippets", "source_text", "source", "snippet", "snippets", "hydration", "evidence", "registry"]);
+
+function webContentSummary(value: unknown, key?: string): unknown {
+  if (key !== undefined && WEB_DETAIL_KEYS.has(key)) return undefined;
+  if (Array.isArray(value)) return value.map((entry) => webContentSummary(entry));
+  if (!isRecord(value)) return value;
+  const result: JsonRecord = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    const summarized = webContentSummary(childValue, childKey);
+    if (summarized !== undefined) result[childKey] = summarized;
+  }
+  return result;
+}
+
+function renderWebContent(page: JsonRecord, pageKind: "query" | "index_status", render: "text" | "json"): string {
+  const summary = webContentSummary(page) as JsonRecord;
+  if (render === "json") return stableJson({ page: summary });
+  return pageKind === "index_status" ? renderIndexStatusText(summary) : renderQueryPageText(summary, 0);
+}
+
 // A live benchmark (2026-08-14) found that Claude Code's MCP client reads
 // ONLY `structuredContent` -- never `content[0].text` -- whenever a tool
 // declares an `outputSchema` at all, because the SDK requires
@@ -1577,13 +1603,15 @@ export function formatUrdiraResult(value: unknown, options: FormatUrdiraResultOp
   }
   if (options.render === "json") {
     const result: CallToolResult = {
-      content: [{ type: "text", text: stableJson({ page: stable }) }],
+      content: [{ type: "text", text: options.presentation_profile === "web" ? renderWebContent(isRecord(stable) ? stable : {}, options.page_kind ?? "query", "json") : stableJson({ page: stable }) }],
     };
     return options.presentation_profile === "web" ? { ...result, structuredContent: { page: stable } } : result;
   }
   const page = isRecord(stable) ? stable : {};
   const pageKind = options.page_kind ?? "query";
-  const text = pageKind === "index_status" ? renderIndexStatusText(page) : renderQueryPageText(page, options.snippet_lines ?? DEFAULT_SNIPPET_LINES);
+  const text = options.presentation_profile === "web"
+    ? renderWebContent(page, pageKind, "text")
+    : pageKind === "index_status" ? renderIndexStatusText(page) : renderQueryPageText(page, options.snippet_lines ?? DEFAULT_SNIPPET_LINES);
   const result: CallToolResult = {
     content: [{ type: "text", text }],
   };
@@ -1793,6 +1821,13 @@ function buildInstructions(): string {
     "- urdira_query — custom direct operation, registered recipe, dependent pipeline, or signed-cursor continuation.",
     "- urdira_analyze_change — one read-only hypothetical change-impact question with an exact target.",
     "- urdira_build_context — explicit core:build_context wrapper when task, facets, and seeds are already known; otherwise prefer urdira_context.",
+    "USING URDIRA WITHOUT OVERREACHING",
+    "Use urdira_context for ordinary task discovery: it is the default when you need a bounded set of definitions, callers, dependencies, tests, contracts, or extension points.",
+    "Use urdira_query for one precise lookup, a registered recipe, or a dependent query; a direct operation is enough for a single lookup.",
+    "Narrow broad queries with an exact path, kind, context artifact, or returned entity id; use filters and response budgets instead of requesting a whole workspace.",
+    "Continue with the exact cursor and the original scope when a result has more pages; do not rerun the query or edit the cursor.",
+    "Use shell for edits, tests, builds, and git status or diff. Prefer Urdira for scoped repository discovery and source reading; use shell to inspect source only when Urdira cannot provide the needed file or operation.",
+    "Pipelines are optional: prefer them when they remove repeated calls or express data dependency; use direct operations or parallel independent queries otherwise.",
     "",
     "CHOOSING AN urdira_query EXPRESSION",
     "- operation: exactly one lookup. Put operation-specific fields in expression.arguments. Do not add operation_version to a direct operation expression.",

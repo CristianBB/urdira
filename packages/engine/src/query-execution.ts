@@ -27,6 +27,8 @@ export interface QueryExecutionOptions {
   readonly metric_clock?: () => number;
   /** Operation-local resource probe. Storage adapters may inject exact counters. */
   readonly operation_metric_probe?: QueryOperationMetricProbe;
+  /** Internal page-cost hook. Metrics never enter query/MCP response models. */
+  readonly page_metrics?: (metric: QueryPageMetric) => void;
 }
 
 export interface QueryOperationMetric {
@@ -40,6 +42,22 @@ export interface QueryOperationMetric {
   readonly rss_bytes: number;
   /** Compatibility alias for the original serialized-byte metric. */
   readonly bytes: number;
+  readonly success: boolean;
+  readonly route?: string;
+  readonly index_used?: string;
+  readonly candidates?: number;
+  readonly rows_hydrated?: number;
+  readonly decline_reason?: string;
+  readonly fallback_reason?: string;
+}
+
+export interface QueryPageMetric {
+  readonly page_kind: "initial" | "continuation";
+  readonly stream: string;
+  readonly cost_ms: number;
+  readonly candidates: number;
+  readonly rows_hydrated: number;
+  readonly serialized_bytes: number;
   readonly success: boolean;
 }
 
@@ -81,11 +99,29 @@ export interface QueryOperationTelemetrySummary {
   readonly event_loop_delay_ms: QueryMetricDistribution;
   readonly copies: QueryMetricDistribution;
   readonly rss_bytes: QueryMetricDistribution;
+  readonly candidates: QueryMetricDistribution;
+  readonly rows_hydrated: QueryMetricDistribution;
+  readonly routes: Readonly<Record<string, number>>;
+  readonly indexes: Readonly<Record<string, number>>;
+  readonly decline_reasons: Readonly<Record<string, number>>;
+  readonly fallback_reasons: Readonly<Record<string, number>>;
 }
 
-type QueryMetricField = "duration_ms" | "rows" | "decoded_bytes" | "serialized_bytes" | "event_loop_delay_ms" | "copies" | "rss_bytes";
+export interface QueryPageTelemetrySummary {
+  readonly page_kind: "initial" | "continuation";
+  readonly stream: string;
+  readonly sample_count: number;
+  readonly success_count: number;
+  readonly failure_count: number;
+  readonly cost_ms: QueryMetricDistribution;
+  readonly candidates: QueryMetricDistribution;
+  readonly rows_hydrated: QueryMetricDistribution;
+  readonly serialized_bytes: QueryMetricDistribution;
+}
 
-const QUERY_METRIC_FIELDS: readonly QueryMetricField[] = ["duration_ms", "rows", "decoded_bytes", "serialized_bytes", "event_loop_delay_ms", "copies", "rss_bytes"];
+type QueryMetricField = "duration_ms" | "rows" | "decoded_bytes" | "serialized_bytes" | "event_loop_delay_ms" | "copies" | "rss_bytes" | "candidates" | "rows_hydrated";
+
+const QUERY_METRIC_FIELDS: readonly QueryMetricField[] = ["duration_ms", "rows", "decoded_bytes", "serialized_bytes", "event_loop_delay_ms", "copies", "rss_bytes", "candidates", "rows_hydrated"];
 
 interface QueryOperationTelemetryAccumulator {
   sample_count: number;
@@ -94,10 +130,22 @@ interface QueryOperationTelemetryAccumulator {
   next_sample_index: number;
   readonly totals: Record<QueryMetricField, number>;
   readonly samples: QueryOperationMetric[];
+  readonly routes: Map<string, number>;
+  readonly indexes: Map<string, number>;
+  readonly decline_reasons: Map<string, number>;
+  readonly fallback_reasons: Map<string, number>;
+}
+
+interface QueryPageTelemetryAccumulator {
+  sample_count: number;
+  success_count: number;
+  failure_count: number;
+  next_sample_index: number;
+  readonly samples: QueryPageMetric[];
 }
 
 function emptyMetricTotals(): Record<QueryMetricField, number> {
-  return { duration_ms: 0, rows: 0, decoded_bytes: 0, serialized_bytes: 0, event_loop_delay_ms: 0, copies: 0, rss_bytes: 0 };
+  return { duration_ms: 0, rows: 0, decoded_bytes: 0, serialized_bytes: 0, event_loop_delay_ms: 0, copies: 0, rss_bytes: 0, candidates: 0, rows_hydrated: 0 };
 }
 
 function nearestRank(sorted: readonly number[], percentile: number): number {
@@ -105,7 +153,11 @@ function nearestRank(sorted: readonly number[], percentile: number): number {
 }
 
 function distribution(samples: readonly QueryOperationMetric[], field: QueryMetricField, total: number): QueryMetricDistribution {
-  const sorted = samples.map((sample) => sample[field]).sort((left, right) => left - right);
+  return distributionValues(samples.map((sample) => sample[field] ?? 0), total);
+}
+
+function distributionValues(values: readonly number[], total: number): QueryMetricDistribution {
+  const sorted = [...values].sort((left, right) => left - right);
   return {
     total,
     min: sorted[0] ?? 0,
@@ -116,10 +168,20 @@ function distribution(samples: readonly QueryOperationMetric[], field: QueryMetr
   };
 }
 
+const MAX_TELEMETRY_CATEGORIES = 64;
+function recordCategory(map: Map<string, number>, value: string | undefined): void {
+  if (value === undefined || value.length === 0) return;
+  const bounded = value.slice(0, 128);
+  const existing = map.get(bounded);
+  if (existing !== undefined) { map.set(bounded, existing + 1); return; }
+  if (map.size < MAX_TELEMETRY_CATEGORIES) map.set(bounded, 1);
+}
+
 /** Internal, bounded and deterministic per-operation telemetry aggregation. */
 export class QueryOperationTelemetry {
   private readonly maxSamplesPerOperation: number;
   private readonly operations = new Map<string, QueryOperationTelemetryAccumulator>();
+  private readonly pages = new Map<string, QueryPageTelemetryAccumulator>();
 
   constructor(options: { readonly max_samples_per_operation?: number } = {}) {
     const limit = options.max_samples_per_operation ?? 1_024;
@@ -130,13 +192,38 @@ export class QueryOperationTelemetry {
   record(metric: QueryOperationMetric): void {
     let accumulator = this.operations.get(metric.operation_id);
     if (accumulator === undefined) {
-      accumulator = { sample_count: 0, success_count: 0, failure_count: 0, next_sample_index: 0, totals: emptyMetricTotals(), samples: [] };
+      accumulator = { sample_count: 0, success_count: 0, failure_count: 0, next_sample_index: 0, totals: emptyMetricTotals(), samples: [], routes: new Map(), indexes: new Map(), decline_reasons: new Map(), fallback_reasons: new Map() };
       this.operations.set(metric.operation_id, accumulator);
     }
     accumulator.sample_count += 1;
     if (metric.success) accumulator.success_count += 1;
     else accumulator.failure_count += 1;
-    for (const field of QUERY_METRIC_FIELDS) accumulator.totals[field] += metric[field];
+    const normalized: QueryOperationMetric = {
+      ...metric,
+      candidates: metric.candidates ?? metric.rows,
+      rows_hydrated: metric.rows_hydrated ?? metric.rows,
+    };
+    for (const field of QUERY_METRIC_FIELDS) accumulator.totals[field] += normalized[field] ?? 0;
+    for (const [map, value] of [[accumulator.routes, normalized.route], [accumulator.indexes, normalized.index_used], [accumulator.decline_reasons, normalized.decline_reason], [accumulator.fallback_reasons, normalized.fallback_reason]] as const) {
+      recordCategory(map, value);
+    }
+    if (accumulator.samples.length < this.maxSamplesPerOperation) accumulator.samples.push(normalized);
+    else {
+      accumulator.samples[accumulator.next_sample_index] = normalized;
+      accumulator.next_sample_index = (accumulator.next_sample_index + 1) % this.maxSamplesPerOperation;
+    }
+  }
+
+  recordPage(metric: QueryPageMetric): void {
+    const key = `${metric.page_kind}\u0000${metric.stream}`;
+    let accumulator = this.pages.get(key);
+    if (accumulator === undefined) {
+      accumulator = { sample_count: 0, success_count: 0, failure_count: 0, next_sample_index: 0, samples: [] };
+      this.pages.set(key, accumulator);
+    }
+    accumulator.sample_count += 1;
+    if (metric.success) accumulator.success_count += 1;
+    else accumulator.failure_count += 1;
     if (accumulator.samples.length < this.maxSamplesPerOperation) accumulator.samples.push(metric);
     else {
       accumulator.samples[accumulator.next_sample_index] = metric;
@@ -160,7 +247,30 @@ export class QueryOperationTelemetry {
         event_loop_delay_ms: distribution(accumulator.samples, "event_loop_delay_ms", accumulator.totals.event_loop_delay_ms),
         copies: distribution(accumulator.samples, "copies", accumulator.totals.copies),
         rss_bytes: distribution(accumulator.samples, "rss_bytes", accumulator.totals.rss_bytes),
+        candidates: distribution(accumulator.samples, "candidates", accumulator.totals.candidates),
+        rows_hydrated: distribution(accumulator.samples, "rows_hydrated", accumulator.totals.rows_hydrated),
+        routes: Object.fromEntries([...accumulator.routes].sort(([left], [right]) => left.localeCompare(right))),
+        indexes: Object.fromEntries([...accumulator.indexes].sort(([left], [right]) => left.localeCompare(right))),
+        decline_reasons: Object.fromEntries([...accumulator.decline_reasons].sort(([left], [right]) => left.localeCompare(right))),
+        fallback_reasons: Object.fromEntries([...accumulator.fallback_reasons].sort(([left], [right]) => left.localeCompare(right))),
       }));
+  }
+
+  pageSnapshot(): readonly QueryPageTelemetrySummary[] {
+    return [...this.pages.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([key, accumulator]) => {
+      const [pageKind, stream] = key.split("\u0000");
+      return {
+        page_kind: pageKind as QueryPageMetric["page_kind"],
+        stream: stream ?? "",
+        sample_count: accumulator.sample_count,
+        success_count: accumulator.success_count,
+        failure_count: accumulator.failure_count,
+        cost_ms: distributionValues(accumulator.samples.map((sample) => sample.cost_ms), accumulator.samples.reduce((sum, sample) => sum + sample.cost_ms, 0)),
+        candidates: distributionValues(accumulator.samples.map((sample) => sample.candidates), accumulator.samples.reduce((sum, sample) => sum + sample.candidates, 0)),
+        rows_hydrated: distributionValues(accumulator.samples.map((sample) => sample.rows_hydrated), accumulator.samples.reduce((sum, sample) => sum + sample.rows_hydrated, 0)),
+        serialized_bytes: distributionValues(accumulator.samples.map((sample) => sample.serialized_bytes), accumulator.samples.reduce((sum, sample) => sum + sample.serialized_bytes, 0)),
+      };
+    });
   }
 }
 
@@ -416,6 +526,26 @@ function finiteNonNegative(value: number | undefined, fallback = 0): number {
   return value !== undefined && Number.isFinite(value) ? Math.max(0, value) : fallback;
 }
 
+function boundedTelemetryLabel(value: string | undefined): string | undefined {
+  return value === undefined || value.length === 0 ? undefined : value.slice(0, 128);
+}
+
+function operationTelemetryFields(telemetry: OperationEvaluation["telemetry"], rows: number): Pick<QueryOperationMetric, "route" | "index_used" | "candidates" | "rows_hydrated" | "decline_reason" | "fallback_reason"> {
+  if (telemetry === undefined) return {};
+  const route = boundedTelemetryLabel(telemetry.route);
+  const indexUsed = boundedTelemetryLabel(telemetry.index_used);
+  const declineReason = boundedTelemetryLabel(telemetry.decline_reason);
+  const fallbackReason = boundedTelemetryLabel(telemetry.fallback_reason);
+  return {
+    ...(route === undefined ? {} : { route }),
+    ...(indexUsed === undefined ? {} : { index_used: indexUsed }),
+    candidates: finiteNonNegative(telemetry.candidates, rows),
+    rows_hydrated: finiteNonNegative(telemetry.rows_hydrated, rows),
+    ...(declineReason === undefined ? {} : { decline_reason: declineReason }),
+    ...(fallbackReason === undefined ? {} : { fallback_reason: fallbackReason }),
+  };
+}
+
 function defaultMetricProbe(): QueryOperationMetricProbe {
   return {
     begin: () => {
@@ -474,6 +604,7 @@ function measuredPort(port: QueryDataPort, sink: (metric: QueryOperationMetric) 
           rss_bytes: finiteNonNegative(resources.rss_bytes),
           bytes: serializedBytes,
           success: true,
+          ...operationTelemetryFields(evaluation.telemetry, rows),
         });
         return evaluation;
       } catch (error) {
@@ -535,6 +666,8 @@ export class QueryEngine {
   private readonly idFactory: (plan: NormalizedQueryPlan) => string;
   private readonly stageSpoolFactory: () => Promise<StageSpool>;
   private readonly abortSignal: AbortSignal | undefined;
+  private readonly pageMetricSinks: readonly ((metric: QueryPageMetric) => void)[];
+  private readonly metricClock: () => number;
   private sequence = 0;
 
   constructor(options: QueryExecutionOptions) {
@@ -548,6 +681,11 @@ export class QueryEngine {
       options.metric_clock ?? (() => performance.now()),
       options.operation_metric_probe ?? defaultMetricProbe(),
     );
+    this.pageMetricSinks = [
+      ...(options.page_metrics === undefined ? [] : [options.page_metrics]),
+      ...(options.operation_telemetry === undefined ? [] : [(metric: QueryPageMetric) => options.operation_telemetry!.recordPage(metric)]),
+    ];
+    this.metricClock = options.metric_clock ?? (() => performance.now());
     this.cursorCache = options.cursor_cache;
     this.manifestStore = options.manifest_store ?? new MemoryManifestStore();
     this.now = options.now ?? (() => new Date().toISOString());
@@ -603,7 +741,17 @@ export class QueryEngine {
         const values = streams[stream] ?? [];
         await appendEvaluationStream(this.manifestStore, executionId, stream, "forward", evaluation.stream_sources?.[stream], values);
         await appendEvaluationStream(this.manifestStore, executionId, stream, "backward", evaluation.reverse_stream_sources?.[stream], [...values].reverse());
-        const page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, max_characters: Math.max(1, remainingCharacters), reader: this.manifestStore.reader });
+        const pageStarted = this.metricClock();
+        let page: ReadPageResult<QueryStreamItem>;
+        try {
+          page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, max_characters: Math.max(1, remainingCharacters), reader: this.manifestStore.reader });
+          let serializedBytes = 0;
+          try { serializedBytes = canonicalBytes(page.items).byteLength; } catch { /* Internal telemetry remains best-effort. */ }
+          this.reportPage({ page_kind: "initial", stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: page.items.length, rows_hydrated: page.items.length, serialized_bytes: serializedBytes, success: true });
+        } catch (error) {
+          this.reportPage({ page_kind: "initial", stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: 0, rows_hydrated: 0, serialized_bytes: 0, success: false });
+          throw error;
+        }
         remainingCharacters = Math.max(0, remainingCharacters - page.items.reduce((sum, item) => sum + JSON.stringify(item).length, 0));
         pages[stream] = page;
       }
@@ -618,7 +766,17 @@ export class QueryEngine {
 
   async continue(request: QueryContinuationRequest): Promise<QueryExecutionPage> {
     const claims = this.cursorCache.decode(request.cursor);
-    const read = await this.cursorCache.readPage({ cursor: request.cursor, limit: request.response_budget.max_items, max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, now: this.now() });
+    const pageStarted = this.metricClock();
+    let read: ReadPageResult<QueryStreamItem>;
+    try {
+      read = await this.cursorCache.readPage({ cursor: request.cursor, limit: request.response_budget.max_items, max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, now: this.now() });
+      let serializedBytes = 0;
+      try { serializedBytes = canonicalBytes(read.items).byteLength; } catch { /* Internal telemetry remains best-effort. */ }
+      this.reportPage({ page_kind: "continuation", stream: claims.result_stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: read.items.length, rows_hydrated: read.items.length, serialized_bytes: serializedBytes, success: true });
+    } catch (error) {
+      this.reportPage({ page_kind: "continuation", stream: claims.result_stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: 0, rows_hydrated: 0, serialized_bytes: 0, success: false });
+      throw error;
+    }
     // Backward storage is traversed in reverse, but every public page is
     // rendered in canonical forward order. CursorCache's traversal-relative
     // next/previous fields therefore swap when projected back to page order.
@@ -630,6 +788,12 @@ export class QueryEngine {
       ...(read.next_cursor === undefined ? {} : { previous_cursor: read.next_cursor }),
     };
     return { query_execution_id: claims.execution_id, plan_digest: claims.projection_digest, streams: { [claims.result_stream]: page }, completeness: claims.completeness ?? { overall_status: "unknown", dimensions: [] }, diagnostics: [], registry: { mode: "none", operation_ids: [], recipe_ids: [] }, expires_at: claims.expires_at };
+  }
+
+  private reportPage(metric: QueryPageMetric): void {
+    for (const sink of this.pageMetricSinks) {
+      try { sink(metric); } catch { /* Telemetry cannot affect query correctness. */ }
+    }
   }
 
   private async evaluate(plan: NormalizedQueryPlan, scope: QueryScope, executionId: string, spool?: StageSpool, abortSignal?: AbortSignal): Promise<OperationEvaluation> {

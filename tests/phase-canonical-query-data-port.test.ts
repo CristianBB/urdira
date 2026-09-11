@@ -7,6 +7,9 @@ import type { QueryParticipant, QueryScope } from "@urdira/contracts";
 import { createDurableStorage, flattenRelationalValue, relationalValueCommands, type SqliteCommand, type SqliteDatabase, type SqliteRunResult, type SqliteValue } from "../packages/storage/src/index.js";
 import {
   CanonicalRecordQueryDataPort,
+  CursorCache,
+  DurableManifestStore,
+  QueryEngine,
   QueryPlanError,
   RecordBodyInterner,
   SqliteCanonicalQuerySnapshotPort,
@@ -644,6 +647,7 @@ describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-s
   it("refuses the generic full-corpus fallback with a typed error once visible_record_count exceeds the safety cap", async () => {
     let recordsForQueryCalled = false;
     const oversized: CanonicalQuerySnapshotPort = {
+      test_only_allow_legacy_full_corpus_fallback: true,
       records: () => { throw new Error("must not reach records() once visible_record_count exceeds the cap"); },
       records_for_query: async () => { recordsForQueryCalled = true; return []; },
       visible_record_count: async () => 200_001,
@@ -657,14 +661,33 @@ describe("SqliteCanonicalQuerySnapshotPort/CanonicalRecordQueryDataPort corpus-s
     // fallback still runs (an empty corpus here, so every downstream
     // operation branch trivially returns empty streams rather than
     // asserting real content, which is not this test's point).
-    const withinCap: CanonicalQuerySnapshotPort = { records: async () => [], records_for_query: async () => [], visible_record_count: async () => 200_000 };
+    const withinCap: CanonicalQuerySnapshotPort = { test_only_allow_legacy_full_corpus_fallback: true, records: async () => [], records_for_query: async () => [], visible_record_count: async () => 200_000 };
     await expect(new CanonicalRecordQueryDataPort(withinCap).execute({ operation_id: "core:analyze_impact", result_streams: ["will_break", "must_update", "may_be_affected"], arguments: { target: { subject_type: "record", record_id: "record:" + "a".repeat(64) }, change: { change_type: "delete" } }, scope })).resolves.toBeDefined();
 
     // A port that never implements `visible_record_count` (e.g. most
     // `SqliteCanonicalQuerySnapshotPort` deployments today) is never newly
     // restricted -- omitting the capability is treated as "no guard".
-    const noGuard: CanonicalQuerySnapshotPort = { records: async () => [], records_for_query: async () => [] };
+    const noGuard: CanonicalQuerySnapshotPort = { test_only_allow_legacy_full_corpus_fallback: true, records: async () => [], records_for_query: async () => [] };
     await expect(new CanonicalRecordQueryDataPort(noGuard).execute({ operation_id: "core:analyze_impact", result_streams: ["will_break", "must_update", "may_be_affected"], arguments: { target: { subject_type: "record", record_id: "record:" + "a".repeat(64) }, change: { change_type: "delete" } }, scope })).resolves.toBeDefined();
+  });
+
+  it("rejects production-like adapters without a dedicated route before records or records_for_query are called", async () => {
+    const calls: string[] = [];
+    const productionLike: CanonicalQuerySnapshotPort = {
+      records: async () => { calls.push("records"); throw new Error("production route must not scan the corpus"); },
+      records_for_query: async () => { calls.push("records_for_query"); throw new Error("production route must not scan the corpus"); },
+    };
+    const dataPort = new CanonicalRecordQueryDataPort(productionLike);
+    const matrix = [
+      ["core:resolve_symbol", ["declarations", "candidates"], { reference: "missing" }],
+      ["core:find_records", ["records"], { selector: { record_categories: ["entity"] } }],
+      ["core:analyze_impact", ["will_break", "must_update", "may_be_affected"], { target: { subject_type: "record", record_id: "record:" + "a".repeat(64) }, change: { change_type: "delete" } }],
+      ["core:inspect_architecture", ["entry_points", "public_surfaces", "layers"], {}],
+    ] as const;
+    for (const [operation_id, result_streams, argumentsValue] of matrix) {
+      await expect(dataPort.execute({ operation_id, result_streams, arguments: argumentsValue, scope })).rejects.toMatchObject({ code: "core:required_capability_unsupported" });
+    }
+    expect(calls).toEqual([]);
   });
 });
 
@@ -723,6 +746,7 @@ const FAREWELL_END = FILE_TEXT.length - 1;
 
 function stubPort(overrides: Partial<CanonicalQuerySnapshotPort> = {}): CanonicalQuerySnapshotPort {
   return {
+    test_only_allow_legacy_full_corpus_fallback: true,
     async records() {
       return [
         stubRecord("rec-greet", "artv-1", { path: "src/a.ts", start: GREET_START, end: GREET_END, name: "greet" }),
@@ -736,6 +760,21 @@ function stubPort(overrides: Partial<CanonicalQuerySnapshotPort> = {}): Canonica
     },
     ...overrides,
   };
+}
+
+class TestManifestLifecycle {
+  private readonly segments = new Map<string, readonly unknown[]>();
+
+  async appendManifestSegment(_executionId: string, segmentId: string, entries: readonly unknown[]): Promise<void> {
+    this.segments.set(segmentId, entries);
+  }
+
+  async hydrateManifestSegment<T>(_executionId: string, segmentId: string, start: number, limit: number): Promise<readonly T[]> {
+    return (this.segments.get(segmentId) ?? []).filter((entry) => {
+      const ordinal = typeof entry === "object" && entry !== null && "ordinal" in entry ? Number(entry.ordinal) : 0;
+      return ordinal >= start && ordinal < start + limit;
+    }) as readonly T[];
+  }
 }
 
 function getSourceOperation(entityIds: readonly string[], source: Readonly<Record<string, unknown>>) {
@@ -1475,7 +1514,7 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const coldResult = await cold.data.execute(operation);
       expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
       const warmResult = await warm.data.execute(operation);
-      expect(coldResult).toEqual(warmResult);
+      expect(coldResult.streams).toEqual(warmResult.streams);
       expect((coldResult.streams["declarations"] as readonly unknown[]).length).toBe(1);
     });
   });
@@ -1490,12 +1529,12 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const coldResult = await cold.data.execute(operation);
       expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
       const warmResult = await warm.data.execute(operation);
-      expect(coldResult).toEqual(warmResult);
+      expect(coldResult.streams).toEqual(warmResult.streams);
       expect(coldResult.streams["declarations"]).toEqual([]);
     });
   });
 
-  it("core:resolve_symbol: a dotted (qualified-name-shaped) reference falls back to the full path on the cold port, and still matches the warmed path", async () => {
+  it("core:resolve_symbol: a dotted qualified-name reference stays on the indexed cold path", async () => {
     await withWorkspace(async (opened) => {
       await seedPushdownWorkspace(opened);
       await opened.database.run("DELETE FROM record_value_nodes WHERE record_id = ?", ["rec-export-canvas"]);
@@ -1506,12 +1545,71 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const operation = { operation_id: "core:resolve_symbol", result_streams: ["declarations", "candidates"], arguments: { reference: "export.ts.exportToCanvas" }, scope };
       const coldResult = await cold.data.execute(operation);
       const warmResult = await warm.data.execute(operation);
-      expect(coldResult).toEqual(warmResult);
+      expect(coldResult.streams).toEqual(warmResult.streams);
       expect((coldResult.streams["declarations"] as readonly unknown[]).length).toBe(1);
-      // Complex fallback queries use the uncached v2 SQL path; they do not
-      // turn a one-off graph/name lookup into a retained corpus.
+      // Qualified lookup uses the final name segment index and an exact
+      // qualified_name recheck; it does not turn a one-off lookup into a
+      // retained corpus.
       expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
     });
+  });
+
+  it("core:resolve_symbol: context_artifact and kind_selector use indexed candidates without the corpus fallback", async () => {
+    await withWorkspace(async (opened) => {
+      await seedPushdownWorkspace(opened);
+      const { cold, warm } = pushdownPorts(opened.database);
+      await warm.data.warm(scope);
+
+      const operation = {
+        operation_id: "core:resolve_symbol", result_streams: ["declarations", "candidates"],
+        arguments: { reference: "exportToCanvas", context_artifact: "artv-1", context_byte_offset: 1, kind_selector: { universal_kinds: ["core:callable"] }, resolution_scope: "visible" },
+        scope,
+      } as const;
+      const coldResult = await cold.data.execute(operation);
+      const warmResult = await warm.data.execute(operation);
+      expect(coldResult.streams).toEqual(warmResult.streams);
+      // The fixture does not publish a primary source span, so the explicit
+      // byte-offset constraint is an exact miss on both cold and warm paths.
+      expect((coldResult.streams["declarations"] as readonly unknown[]).length).toBe(0);
+      expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
+    });
+  });
+
+  it("core:resolve_symbol: cold/warm parity covers context offset, scopes, qualified names, kind selectors, and unresolved contexts", async () => {
+    const declarations: readonly CanonicalQueryRecord[] = [
+      { ...stubRecord("rec-a", "artv-a", { name: "Thing", qualified_name: "mod.Thing", path: "src/a.ts", language: "typescript" }), owner_artifact_id: "art-a", kind: "function", universal_kind: "core:callable", primary_source_span: { artifact_version_id: "artv-a", start_byte: "0", end_byte: "20" } },
+      { ...stubRecord("rec-b", "artv-b", { name: "Thing", qualified_name: "mod.Thing", path: "src/b.ts", language: "typescript" }), owner_artifact_id: "art-b", kind: "interface", universal_kind: "core:type", primary_source_span: { artifact_version_id: "artv-b", start_byte: "0", end_byte: "20" } },
+    ];
+    const containers: readonly CanonicalQueryRecord[] = [{ ...stubRecord("container-a", "artv-a", { path: "src/a.ts", name: "src/a.ts" }), owner_artifact_id: "art-a", universal_kind: "core:container", kind: "module" }];
+    const makePort = (warm: boolean, withContainer = true): CanonicalQuerySnapshotPort => ({
+      test_only_allow_legacy_full_corpus_fallback: true,
+      records: async () => warm ? declarations : [],
+      records_by_name: async () => declarations,
+      container_records_by_artifact_references: async () => withContainer ? containers : [],
+      has_warm_records: async () => warm,
+    });
+    const cold = new CanonicalRecordQueryDataPort(makePort(false));
+    const warm = new CanonicalRecordQueryDataPort(makePort(true));
+    const values = (evaluation: Awaited<ReturnType<CanonicalRecordQueryDataPort["execute"]>>): readonly string[] => (evaluation.streams["declarations"] ?? []).map((entry) => String((entry as { readonly value: { readonly record_id: string } }).value.record_id));
+    for (const [label, args, expected] of [
+      ["visible", { reference: "Thing", context_artifact: "src/a.ts", resolution_scope: "visible" }, ["rec-a"]],
+      ["workspace", { reference: "Thing", context_artifact: "src/a.ts", resolution_scope: "workspace" }, ["rec-a", "rec-b"]],
+      ["exports", { reference: "Thing", context_artifact: "src/a.ts", resolution_scope: "exports" }, ["rec-a", "rec-b"]],
+      ["qualified", { reference: "mod.Thing", resolution_scope: "workspace" }, ["rec-a", "rec-b"]],
+      ["kind", { reference: "Thing", kind_selector: { kinds: ["interface"] }, resolution_scope: "workspace" }, ["rec-b"]],
+      ["offset", { reference: "Thing", context_artifact: "src/a.ts", context_byte_offset: 10, resolution_scope: "visible" }, ["rec-a"]],
+      ["offset miss", { reference: "Thing", context_artifact: "src/a.ts", context_byte_offset: 30, resolution_scope: "visible" }, []],
+    ] as const) {
+      const operation = { operation_id: "core:resolve_symbol", result_streams: ["declarations", "candidates"], arguments: args, scope };
+      const coldResult = await cold.execute(operation);
+      const warmResult = await warm.execute(operation);
+      expect(values(coldResult), label).toEqual(expected);
+      expect(coldResult.streams).toEqual(warmResult.streams);
+    }
+    const missingContext = new CanonicalRecordQueryDataPort(makePort(false, false));
+    const missingResult = await missingContext.execute({ operation_id: "core:resolve_symbol", result_streams: ["declarations", "candidates"], arguments: { reference: "Thing", context_artifact: "missing.ts", resolution_scope: "visible" }, scope });
+    expect(values(missingResult)).toEqual([]);
+    expect((missingResult.telemetry?.route)).toBe("indexed_pushdown");
   });
 
   it("core:get_source: cold pushdown resolves subjects by entity_id and by record_id and matches the warmed path, without touching the full-corpus cache", async () => {
@@ -1535,7 +1633,7 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const coldResult = await cold.data.execute(operation);
       expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
       const warmResult = await warm.data.execute(operation);
-      expect(coldResult).toEqual(warmResult);
+      expect(coldResult.streams).toEqual(warmResult.streams);
       expect((coldResult.streams["sources"] as readonly unknown[]).length).toBe(2);
     });
   });
@@ -1555,9 +1653,10 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const coldResult = await cold.data.execute(operation);
       expect(await cold.snapshot.has_warm_records(scope)).toBe(false);
       const warmResult = await warm.data.execute(operation);
-      expect(coldResult).toEqual(warmResult);
+      expect(coldResult.streams).toEqual(warmResult.streams);
       const records = coldResult.streams["records"] as ReadonlyArray<{ readonly value: { readonly body: { readonly name: string } } }>;
       expect(records.map((entry) => entry.value.body.name).sort()).toEqual(["exportToCanvas", "exportToSvg"]);
+      expect(coldResult.telemetry).toMatchObject({ route: "indexed_pushdown", index_used: "records_by_selector", candidates: 2, rows_hydrated: 2 });
     });
   });
 
@@ -1570,8 +1669,29 @@ describe("CanonicalRecordQueryDataPort cold-path pushdown equivalence", () => {
       const operation = { operation_id: "core:find_records", result_streams: ["records"], arguments: { selector: { record_categories: ["relation"] } }, scope };
       const coldResult = await cold.data.execute(operation);
       const warmResult = await warm.data.execute(operation);
-      expect(coldResult).toEqual(warmResult);
+      expect(coldResult.streams).toEqual(warmResult.streams);
       expect(coldResult.streams["records"]).toEqual([]);
+    });
+  });
+});
+
+describe("SqliteCanonicalQuerySnapshotPort identity-ordered comparison batches", () => {
+  it("uses keyset pages ordered by identity_key with deterministic record-id ties", async () => {
+    await withWorkspace(async (opened) => {
+      await seedPushdownWorkspace(opened);
+      await opened.database.transaction(recordOccurrenceCommands("rec-duplicate", "artv-1", 1, { name: "exportToSvg", language: "typescript" }));
+      await insertIdentityAssignment(opened, { assignmentId: "assign-duplicate", identityId: "id-duplicate", identityKey: "jsts:function:packages/excalidraw/scene/export.ts:500:exportToSvg", recordId: "rec-duplicate", ownerArtifactVersionId: "artv-1", validFromGeneration: 1 });
+      const port = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      expect(port.records_for_query_batches_order).toBe("identity_key");
+      const records: CanonicalQueryRecord[] = [];
+      for await (const batch of port.records_for_query_batches_by_identity!(scope, 1)) {
+        expect(batch.length).toBeLessThanOrEqual(1);
+        records.push(...batch);
+      }
+      const keys = records.map((record) => record.identity_key!);
+      expect(keys.length).toBeGreaterThan(4);
+      expect(keys).toEqual([...keys].sort((left, right) => left < right ? -1 : left > right ? 1 : 0));
+      expect(keys.filter((key) => key === "jsts:function:packages/excalidraw/scene/export.ts:500:exportToSvg")).toHaveLength(2);
     });
   });
 });
@@ -1867,6 +1987,27 @@ describe("SqliteCanonicalQuerySnapshotPort D6 pushdown methods", () => {
 });
 
 describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () => {
+  it("reports an exact typed error instead of truncating lexical candidates above the cap", async () => {
+    const matches = Array.from({ length: 201 }, (_, index) => ({ artifact_id: `art-${index}`, artifact_version_id: `artv-${index}`, offsets: [index] }));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      search_literal: async () => matches,
+      records_by_artifact_versions: async (_scope, ids) => ids.map((id) => stubRecord(`record-${id}`, id, { path: `${id}.ts` })),
+    }));
+    await expect(port.execute(searchTextOperation({ syntax: "literal" }))).rejects.toMatchObject({ code: "core:execution_resource_limit", details: { limit_kind: "lexical_pushdown_candidate_cap" } });
+  });
+
+  it("reports an exact typed error instead of truncating lexical offsets above the cap", async () => {
+    const matches = [{ artifact_id: "art-1", artifact_version_id: "artv-1", offsets: Array.from({ length: 2_001 }, (_unused, index) => index) }];
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      search_literal: async () => matches,
+      records_by_artifact_versions: async (_scope, ids) => ids.map((id) => stubRecord(`record-${id}`, id, { path: `${id}.ts` })),
+    }));
+    await expect(port.execute(searchTextOperation({ syntax: "literal" }))).rejects.toMatchObject({
+      code: "core:execution_resource_limit",
+      details: { limit_kind: "lexical_pushdown_candidate_cap", observed_or_required: { offsets: 2_001 } },
+    });
+  });
+
   it("prefers real file-text matches over the corpus scan once lexical maintenance has completed, carrying source_span and match_count", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
@@ -2014,7 +2155,7 @@ describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () =>
     });
   });
 
-  it("falls back to the corpus scan for syntax: safe_regex or a non-path filter, even once lexical maintenance is complete", async () => {
+  it("rejects syntax: safe_regex or non-pushdown filters instead of hiding a corpus scan", async () => {
     await withWorkspace(async (opened) => {
       await seedSearchTextWorkspace(opened);
       await insertLexicalDocument(opened, "art-1", "artv-search", NEEDLE_FILE_TEXT, 1);
@@ -2022,9 +2163,7 @@ describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () =>
       const dataPort = new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database, needleContent()));
 
       for (const args of [{ syntax: "safe_regex" }, { filter: { languages: ["typescript"] } }]) {
-        const evaluation = await dataPort.execute(searchTextOperation(args));
-        expect(evaluation.streams["matches"]).toEqual([]);
-        expect(evaluation.streams["subjects"]).toEqual([]);
+        await expect(dataPort.execute(searchTextOperation(args))).rejects.toMatchObject({ code: "core:required_capability_unsupported", details: { capability: "core:operation_pushdown" } });
       }
 
       // An explicitly empty filter object is still eligible.
@@ -2043,6 +2182,129 @@ describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () =>
       const evaluation = await dataPort.execute(searchTextOperation({ syntax: "literal" }));
       expect((evaluation.streams["matches"] as readonly unknown[]).length).toBe(2);
     });
+  });
+});
+
+describe("CanonicalRecordQueryDataPort bounded indexed overviews", () => {
+  it("rejects an architecture inventory above its legacy cap instead of returning a truncated overview", async () => {
+    const containers = Array.from({ length: 501 }, (_unused, index) => stubRecord(`container-${index}`, "artv-1", { name: `container-${index}` }));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("architecture cap must not fall back to a full corpus read"); },
+      records_by_selector: async (_scope, selector) => selector.universal_kinds?.[0] === "core:container" ? containers : [],
+    }));
+    await expect(port.execute({
+      operation_id: "core:inspect_architecture",
+      result_streams: ["entry_points", "public_surfaces", "layers"],
+      arguments: {},
+      scope,
+    })).rejects.toMatchObject({
+      code: "core:execution_resource_limit",
+      details: { limit_kind: "inspect_architecture_pushdown_cap", configured_limit: 500, observed_or_required: { containers: 501, types: 0 } },
+    });
+  });
+
+  it("reports the configured and observed selector cap when the legacy find_records capability overflows", async () => {
+    const rows = Array.from({ length: 5_001 }, (_unused, index) => stubRecord(`record-${index}`, "artv-1", { name: `record-${index}` }));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("find_records cap must not fall back to a full corpus read"); },
+      records_by_selector: async () => rows,
+    }));
+    await expect(port.execute({
+      operation_id: "core:find_records",
+      result_streams: ["records"],
+      arguments: { selector: { record_categories: ["entity"] } },
+      scope,
+    })).rejects.toMatchObject({
+      code: "core:execution_resource_limit",
+      details: { limit_kind: "find_records_pushdown_cap", configured_limit: 5_000, observed_or_required: 5_001 },
+    });
+  });
+
+  it("streams an architecture inventory through paginated selectors without applying the legacy 500-row cap", async () => {
+    const containers = Array.from({ length: 501 }, (_unused, index) => stubRecord(`container-${index}`, "artv-1", { name: `container-${index}` }));
+    const snapshot = stubPort({
+      records: async () => { throw new Error("paginated architecture must not fall back to a full corpus read"); },
+      records_by_selector_page: async (_scope, selector, limit, afterRecordId) => {
+        const source = selector.universal_kinds?.[0] === "core:container" ? containers : [];
+        const start = afterRecordId === undefined ? 0 : source.findIndex((record) => record.record_id === afterRecordId) + 1;
+        const records = source.slice(start, start + Math.min(limit, 128));
+        return { records, ...(records.length > 0 && start + records.length < source.length ? { next_cursor: records.at(-1)!.record_id } : {}) };
+      },
+    });
+    const evaluation = await new CanonicalRecordQueryDataPort(snapshot).execute({
+      operation_id: "core:inspect_architecture",
+      result_streams: ["entry_points", "public_surfaces", "layers"],
+      arguments: {},
+      scope,
+    });
+    const streamed = [] as unknown[];
+    for await (const entry of evaluation.stream_sources?.["entry_points"] ?? []) streamed.push(entry);
+    expect(streamed).toHaveLength(501);
+    expect(evaluation.streams["entry_points"]).toEqual([]);
+  });
+
+  it("rejects an impact closure above its node cap instead of returning a partial caller set", async () => {
+    const callers = Array.from({ length: 20_001 }, (_unused, index) => stubRecord(`caller-${index}`, "artv-1", { name: `caller-${index}` }));
+    const edges = callers.map((record) => ({
+      edge_id: `edge-${record.record_id}`,
+      source_subject_id: record.record_id,
+      target_subject_id: "target",
+      relation_record_id: `relation-${record.record_id}`,
+      relation_kind: "core:call",
+      role: "source",
+      evidence_class: "confirmed",
+    }));
+    const target = stubRecord("target", "artv-1", { name: "target" });
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("impact cap must not fall back to a full corpus read"); },
+      records_by_ids: async (_scope, ids) => ids.includes("target") ? [target] : callers.filter((record) => ids.includes(record.record_id)),
+      graph_edges_by_subject_ids: async () => edges,
+    }));
+    await expect(port.execute({
+      operation_id: "core:analyze_impact",
+      result_streams: ["will_break", "must_update", "may_be_affected", "tests_to_run", "uncertain_dynamic_usage"],
+      arguments: { target: { subject_type: "record", record_id: "target" }, change: { change_type: "delete" } },
+      scope,
+    })).rejects.toMatchObject({
+      code: "core:execution_resource_limit",
+      details: { limit_kind: "relation_closure_node_cap", configured_limit: 20_000, relation_kind: "core:call" },
+    });
+  }, 60_000);
+
+  it("lets QueryEngine seal and page a selector stream source instead of observing the compatibility empty array", async () => {
+    const allRecords = Array.from({ length: 5 }, (_unused, index) => stubRecord(`record-${index}`, "artv-1", { name: `record-${index}` }));
+    const snapshot = stubPort({
+      records: async () => { throw new Error("streaming selector must not fall back to a full corpus read"); },
+      records_by_selector_page: async (_scope, _selector, limit, afterRecordId) => {
+        const start = afterRecordId === undefined ? 0 : allRecords.findIndex((record) => record.record_id === afterRecordId) + 1;
+        const records = allRecords.slice(start, start + Math.min(limit, 2));
+        return { records, ...(records.length > 0 && start + records.length < allRecords.length ? { next_cursor: records.at(-1)!.record_id } : {}) };
+      },
+    });
+    const lifecycle = new TestManifestLifecycle();
+    const engine = new QueryEngine({
+      data_port: new CanonicalRecordQueryDataPort(snapshot),
+      cursor_cache: new CursorCache({ signing_secret: "canonical-selector-stream" }),
+      manifest_store: new DurableManifestStore(lifecycle as never),
+      now: () => now,
+    });
+    const request = {
+      api_version: 3,
+      scope,
+      expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
+      options: {
+        freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported",
+        evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "none", diagnostic_detail: false },
+        snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 },
+        registry: { registry: "none", include_payload_schemas: false }, response_budget: { max_items: 2, max_characters: 100_000 },
+      },
+    } as const;
+    const first = await engine.execute(request);
+    expect(first.streams["records"]?.items.map((entry) => (entry.value as { readonly record_id: string }).record_id)).toEqual(["record-0", "record-1"]);
+    const second = await engine.continue({ cursor: first.streams["records"]!.next_cursor!, response_budget: { max_items: 2, max_characters: 100_000 } });
+    expect(second.streams["records"]?.items.map((entry) => (entry.value as { readonly record_id: string }).record_id)).toEqual(["record-2", "record-3"]);
+    const third = await engine.continue({ cursor: second.streams["records"]!.next_cursor!, response_budget: { max_items: 2, max_characters: 100_000 } });
+    expect(third.streams["records"]?.items.map((entry) => (entry.value as { readonly record_id: string }).record_id)).toEqual(["record-4"]);
   });
 });
 
@@ -3666,6 +3928,40 @@ describe("RecordBodyInterner cross-workspace body sharing", () => {
  * `diffComparisonRecordSets` doc comments and `docs/evidence/2026-09-08-v4-
  * identity-lookup-and-compare.md` for the design writeup this exercises.
  */
+describe("CanonicalRecordQueryDataPort indexed relation capability", () => {
+  const relationItem = (recordId: string, stableSortKey: string) => ({ value: { record_id: recordId }, stable_sort_key: stableSortKey, result_classification: "unclassified" as const });
+
+  it("uses relation_pairs_by_subject_ids without reading the record corpus", async () => {
+    let indexedCalls = 0;
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("relation query must not materialize records"); },
+      records_for_query: async () => { throw new Error("relation query must not scan records"); },
+      records_for_query_batches: async function* () { throw new Error("relation query must not scan record batches"); },
+      relation_pairs_by_subject_ids: async (_scope, leftIds, rightIds) => {
+        indexedCalls += 1;
+        return leftIds.includes("left") && rightIds.includes("right") ? new Set(["left\u0000right"]) : new Set();
+      },
+    }));
+    const left = relationItem("left", "left-key");
+    const right = relationItem("right", "right-key");
+    await expect(port.relation_exists!(scope, left, right, {}, "outbound")).resolves.toBe(true);
+    await expect(port.relation_pairs!(scope, [left], [right], {}, "outbound")).resolves.toEqual(new Set(["left-key\u0000right-key"]));
+    expect(indexedCalls).toBe(2);
+  });
+
+  it("returns a typed capability error instead of falling back to a full relation scan", async () => {
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("relation query must not materialize records"); },
+      records_for_query: async () => { throw new Error("relation query must not scan records"); },
+      records_for_query_batches: async function* () { throw new Error("relation query must not scan record batches"); },
+    }));
+    const left = relationItem("left", "left-key");
+    const right = relationItem("right", "right-key");
+    await expect(port.relation_exists!(scope, left, right, {}, "outbound")).rejects.toMatchObject({ code: "core:required_capability_unsupported" });
+    await expect(port.relation_pairs!(scope, [left], [right], {}, "outbound")).rejects.toMatchObject({ code: "core:required_capability_unsupported" });
+  });
+});
+
 describe("CanonicalRecordQueryDataPort core:compare (Frente Q-4)", () => {
   function compareRecord(recordId: string, identityKey: string, ownerArtifactVersionId: string, body: Readonly<Record<string, unknown>>, overrides: Partial<CanonicalQueryRecord> = {}): CanonicalQueryRecord {
     return {
@@ -3693,6 +3989,20 @@ describe("CanonicalRecordQueryDataPort core:compare (Frente Q-4)", () => {
   }
 
   function comparePort(basePort: CanonicalQuerySnapshotPort, targetPort: CanonicalQuerySnapshotPort, baseId = "ws-compare-base", targetId = "ws-compare-target", homePort: CanonicalQuerySnapshotPort = targetPort): CanonicalRecordQueryDataPort {
+    // Keep small fixtures explicit about the bounded capability while the
+    // production adapter rejects the removed legacy full-corpus compare path.
+    const bounded = (port: CanonicalQuerySnapshotPort): CanonicalQuerySnapshotPort => ({
+      ...port,
+      records_for_query_batches_order: "identity_key",
+      records_for_query_batches: async function* (queryScope: QueryScope): AsyncIterable<readonly CanonicalQueryRecord[]> {
+        const source = port.records_for_query_batches === undefined
+          ? (async function* (): AsyncIterable<readonly CanonicalQueryRecord[]> { yield port.records_for_query !== undefined ? await port.records_for_query(queryScope) : await port.records(queryScope); })()
+          : port.records_for_query_batches(queryScope);
+        for await (const batch of source) yield [...batch].sort((left, right) => (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id));
+      },
+    });
+    basePort = bounded(basePort);
+    targetPort = bounded(targetPort);
     const resolver: ComparisonParticipantResolver = async (workspaceId) => {
       if (workspaceId === baseId) return basePort;
       if (workspaceId === targetId) return targetPort;
@@ -3786,6 +4096,64 @@ describe("CanonicalRecordQueryDataPort core:compare (Frente Q-4)", () => {
     const evaluation = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["correlated"], { selection: [{ subject_type: "entity", entity_id: "rec-base-alpha" }, { subject_type: "entity", entity_id: "rec-target-alpha" }] }));
     const values = (evaluation.streams["correlated"] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
     expect(values.map((value) => value["identity_key"])).toEqual(["sym:alpha"]);
+  });
+
+  it("compares an over-cap corpus through bounded range batches with exact parity", async () => {
+    async function* oversizedBatches(identity: string, body: Readonly<Record<string, unknown>>): AsyncIterable<readonly CanonicalQueryRecord[]> {
+      let diagnosticIndex = 0;
+      let first = true;
+      while (first || diagnosticIndex < 200_001) {
+        const batch: CanonicalQueryRecord[] = [];
+        if (first) {
+          batch.push(compareRecord(`rec-${identity}`, identity, `artv-${identity}`, body));
+          first = false;
+        }
+        while (batch.length < 512 && diagnosticIndex < 200_001) {
+          batch.push(compareRecord(`diagnostic-${identity}-${diagnosticIndex}`, `diagnostic:${identity}:${diagnosticIndex}`, `artv-${identity}`, { diagnosticIndex }, { category: "diagnostic" }));
+          diagnosticIndex += 1;
+        }
+        yield batch;
+      }
+    }
+    const batchPort = (identity: string, body: Readonly<Record<string, unknown>>): CanonicalQuerySnapshotPort => ({
+      records: async () => { throw new Error("compare must use bounded range batches"); },
+      records_for_query: async () => { throw new Error("compare must not use the full-corpus fallback"); },
+      records_for_query_batches_order: "identity_key",
+      records_for_query_batches: () => oversizedBatches(identity, body),
+      visible_record_count: async () => 200_002,
+    });
+    const port = comparePort(batchPort("sym:alpha", { name: "alpha", value: 1 }), batchPort("sym:alpha", { name: "alpha", value: 2 }));
+    const evaluation = await port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["added", "removed", "changed", "moved", "correlated"]));
+    const values = (streamName: string): readonly Record<string, unknown>[] => (evaluation.streams[streamName] ?? []).map((entry) => (entry as { readonly value: Record<string, unknown> }).value);
+    expect(values("added")).toHaveLength(0);
+    expect(values("removed")).toHaveLength(0);
+    expect(values("changed").map((value) => value["identity_key"])).toEqual(["sym:alpha"]);
+    expect(values("moved")).toHaveLength(0);
+    expect(values("correlated").map((value) => value["identity_key"])).toEqual(["sym:alpha"]);
+  });
+
+  it("rejects a legacy comparison adapter without bounded range capability", async () => {
+    const legacy = (workspaceId: string): CanonicalQuerySnapshotPort => ({
+      records: async () => { throw new Error(`legacy full scan must not run for ${workspaceId}`); },
+      records_for_query: async () => { throw new Error(`legacy full scan must not run for ${workspaceId}`); },
+    });
+    const port = new CanonicalRecordQueryDataPort(legacy("ws-compare-target"), {
+      comparison_participants: async (workspaceId) => legacy(workspaceId),
+    });
+    await expect(port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["correlated"]))).rejects.toMatchObject({ code: "core:required_capability_unsupported", details: { capability: "core:records_for_query_batches" } });
+  });
+
+  it("fails before consuming an adapter whose batches do not declare identity order", async () => {
+    const unordered = (records: readonly CanonicalQueryRecord[]): CanonicalQuerySnapshotPort => ({
+      records_for_query_batches: async function* () { yield records; },
+      records: async () => { throw new Error("unordered compare must fail before a full read"); },
+    });
+    const port = comparePort(unordered([compareRecord("base", "sym:z", "artv-1", { name: "z" })]), unordered([compareRecord("target", "sym:z", "artv-1", { name: "z" })]));
+    // comparePort supplies the explicit fixture capability; this direct
+    // adapter path proves the production contract independently.
+    const direct = new CanonicalRecordQueryDataPort(unordered([compareRecord("target", "sym:z", "artv-1", { name: "z" })]), { comparison_participants: async () => unordered([compareRecord("base", "sym:z", "artv-1", { name: "z" })]) });
+    await expect(direct.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["correlated"]))).rejects.toMatchObject({ code: "core:required_capability_unsupported", details: { capability: "core:records_for_query_batches_order" } });
+    await expect(port.execute(compareOperation(compareScope("ws-compare-base", "ws-compare-target"), ["correlated"]))).resolves.toBeDefined();
   });
 
   it("with no explicit base/target roles, falls back to participant order (decision 03)", async () => {

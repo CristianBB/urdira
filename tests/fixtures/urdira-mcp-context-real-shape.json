@@ -1,0 +1,24 @@
+{
+  "type": "item.completed",
+  "item": {
+    "id": "item_fixture",
+    "type": "mcp_tool_call",
+    "server": "urdira",
+    "tool": "urdira_context",
+    "arguments": {
+      "api_version": 3,
+      "scope": { "scope_type": "single_workspace", "workspace_id": "workspace:fixture-anonymized" },
+      "task": "Trace the target implementation and focused tests",
+      "facets": ["definitions", "tests"],
+      "options": { "snippets": { "mode": "relevant", "max_total_characters": 20000 }, "response_budget": { "max_characters": 30000 } }
+    },
+    "result": {
+      "content": [{
+        "type": "text",
+        "text": "# 1 result\n\n== src/example.ts ==\n:10 (jsts:relation_contains)\n    export function target(): void {\n        return;\n    }\n"
+      }],
+      "structured_content": null
+    },
+    "status": "completed"
+  }
+}

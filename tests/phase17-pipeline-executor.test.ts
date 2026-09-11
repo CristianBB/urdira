@@ -324,7 +324,7 @@ describe("canonical handle binding boundary", () => {
       owner_artifact_version_id: "artifact-version-1",
       body: { name: "bound" },
     };
-    const snapshot = { records: async () => [record] } as never;
+    const snapshot = { records: async () => [record], test_only_allow_legacy_full_corpus_fallback: true } as never;
     const port = new CanonicalRecordQueryDataPort(snapshot);
     const handle = stageSetHandle("execution-boundary", "find", "subjects", [subj({ subject_type: "record", record_id: "bound-record" }, "bound")]);
     const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: { subject_type: "stage_output", stage_id: "find", output: "subjects" } }, scope: scope("workspace:handle-boundary"), input_handles: new Map([["find.subjects", handle]]) });

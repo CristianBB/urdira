@@ -113,7 +113,12 @@ describe("expanded agent report", () => {
       api_v3_discovery_calls: 5,
       explicit_workspace_discovery_calls: 5,
       composition_metrics: { composition_shape_valid: null, pipeline_calls: 0, recipe_calls: 0, direct_operation_calls: 5 },
+      shell_output_characters: null,
+      tgrep_output_characters: null,
+      target_attributed_characters: null,
+      discovery_adoption: { zero_mcp: false },
     });
+    expect(report.runs[0].metrics.tool_output_characters).toBeGreaterThan(0);
     expect(report).toMatchObject({
       report_version: 2,
       task_comparisons: [{

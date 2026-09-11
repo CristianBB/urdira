@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { resolveNativeTarget, type NativeLibc, type NativeTarget } from "./targets.js";
 import type { NativeBinding } from "./types.js";
 
-export const NATIVE_API_VERSION = 17;
+export const NATIVE_API_VERSION = 18;
 export const NODE_API_VERSION = 10;
 export const NATIVE_PACKAGE_MANIFEST_VERSION = 1;
 export const NATIVE_WORKER_PROTOCOL = "urdira.ipc.v2";

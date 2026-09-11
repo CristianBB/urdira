@@ -61,7 +61,7 @@ describe("@urdira/native target loader", () => {
 
   it("rejects wrong API versions, targets, and incomplete exports", () => {
     const base = { platform: "darwin", arch: "arm64", artifact_path: "/fixture/urdira-native.node", exists: () => true } as const;
-    expect(() => loadNativeBinding({ ...base, load: () => binding("aarch64-apple-darwin", 9) })).toThrow(/API mismatch/iu);
+    expect(() => loadNativeBinding({ ...base, load: () => binding("aarch64-apple-darwin", 17) })).toThrow(/API mismatch/iu);
     expect(() => loadNativeBinding({ ...base, load: () => binding("x86_64-apple-darwin") })).toThrow(/target mismatch/iu);
     expect(() => loadNativeBinding({ ...base, load: () => ({ nativeApiVersion() { return 10; } }) })).toThrow(/does not export/iu);
     expect(() => loadNativeBinding({ ...base, exists: () => false, load: () => binding("aarch64-apple-darwin") })).toThrow(/artifact is missing/iu);

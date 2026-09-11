@@ -72,7 +72,7 @@ export {
   type WorkspaceConfigurationProposal,
 } from "./workspace-configuration.js";
 export { CursorCache, CursorCacheError, type CursorCacheOptions, type CursorDirection, type ManifestStreamReader, type ManifestStreamReadRequest, type ManifestStreamReadResult, type QueryCursorClaims, type ReadPageRequest, type ReadPageResult } from "./cursor-cache.js";
-export { evaluateOperation, expandRelations, findShortestPaths, type EvaluateOperationInput, type ExpandedRelation, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem, type RelationEdge, type RelationExpansionOptions, type ShortestPath, type ShortestPathOptions } from "./query-operators.js";
+export { evaluateOperation, expandRelations, findShortestPaths, type EvaluateOperationInput, type ExpandedRelation, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryOperationEvaluationTelemetry, type QueryStreamItem, type RelationEdge, type RelationExpansionOptions, type ShortestPath, type ShortestPathOptions } from "./query-operators.js";
 export {
   DurableManifestStore,
   MemoryManifestStore,
@@ -87,6 +87,8 @@ export {
   type QueryOperationMetricProbe,
   type QueryOperationResourceMeasurement,
   type QueryOperationTelemetrySummary,
+  type QueryPageMetric,
+  type QueryPageTelemetrySummary,
   type QueryStreamPage,
 } from "./query-execution.js";
 export { buildQueryAdmissionPlan, normalizeQueryRequest, validatePipelineExpression, QueryPlanError, type NormalizedQueryPlan, type QueryAdmissionPlan, type QueryFrontier } from "./query-plan.js";

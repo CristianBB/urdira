@@ -243,6 +243,17 @@ review v4 catalog, lexical, structural, Rust sidecar, CAS, and semantic sizes
 separately. Semantic size must remain zero and semantic-sidecar creation false.
 Compare matched tasks and show every failure.
 
+Transcript context is split into `tool_output_characters`,
+`shell_output_characters`, and `tgrep_output_characters` per run. The report
+also retains lexical `target_attributed_characters` and
+`target_unattributed_characters` proxies, plus protocol-identifiable snippets,
+hydration, evidence, and registry component counts/characters. Component
+values are `null` when the protocol does not identify that payload; unavailable
+method values are never reported as zero. `discovery_adoption` records whether
+MCP preceded shell discovery, whether shell followed MCP, and whether the run
+had zero observed MCP discovery calls. These are observational metrics and do
+not classify arbitrary shell text as a typed protocol component.
+
 The cell runner writes a separate `<run-id>.timing.json` sidecar while each of
 the three Codex turns is running. It timestamps complete JSONL lines using a
 monotonic clock and leaves the original transcript byte-for-byte unchanged.
@@ -309,3 +320,92 @@ See the [preparation record](../evidence/2026-09-09-expanded-agent-campaign-prep
 for current findings and outstanding preflight work. The executable protocol,
 agent CLI compatibility, current v4 host readiness, and grader attribution must
 be exercised before any new performance claim.
+
+## Post-index measurement harness (prepared, not executed)
+
+`release/benchmarks/post-index-measurement.mjs` defines the read-only
+post-index protocol. It accepts a directed repository sample and emits a plan;
+its CLI does not start an indexer, an agent, an MCP server, or a competitor.
+The plan fixes structural readiness as the boundary and asserts
+`URDIRA_SEMANTIC_INDEX=0`, semantic materialization/sidecar off, reconciliation
+sweep `0`, and production `MCP_SERVER_INSTRUCTIONS`. It adds no prompt,
+mandatory pipeline, or tool choice.
+
+The operation matrix measures `core:resolve_symbol` with context, qualified,
+and kind variants; paginated `core:find_records` and `core:search_text`;
+`core:compare_workspaces`; latency; caps and completeness; and separately
+identified snippets, hydration, evidence, and registry bytes. Failures and
+continuation pages remain visible. Missing values are `null`, never an
+imputed zero. MCP/shell ordering is recorded when present. Existing competitor
+reports can be referenced as comparison evidence; they are never rerun by
+this harness.
+
+Create a plan without executing a campaign:
+
+```bash
+node release/benchmarks/post-index-measurement.mjs \
+  --repositories vscode,typescript \
+  --sample 1 \
+  --output /tmp/urdira-post-index-plan.json
+```
+
+After an independently authorized run supplies JSONL events and host metrics,
+render comparable JSON/Markdown without rerunning any arm:
+
+```bash
+node release/benchmarks/render-post-index-measurement.mjs \
+  --plan /tmp/urdira-post-index-plan.json \
+  --events /path/to/events.jsonl \
+  --host-metrics /path/to/host-metrics.json \
+  --output /tmp/urdira-post-index-report
+```
+
+### Real host-only executor (prepared, not executed)
+
+`release/benchmarks/run-post-index-measurement.mjs` composes the existing
+expanded campaign driver and cell runner. It does not duplicate checkout,
+worker, daemon, MCP, readiness, timing, process cleanup, or transcript logic.
+Planning is the default; `--execute` is required to start anything. Execution
+supports one directed repository sample, one Urdira/Luna arm, and no retries.
+The composed runner retains the fresh worktree/data root, structural
+`BENCH_HOST_READY`, semantic-off environment, daemon stderr/timing logs,
+operation/page telemetry, MCP responses, and Luna transcript under the new
+output directory. A failed cell is retained and does not trigger another run.
+
+The executor passes no custom MCP instructions or pipeline requirement. The
+existing MCP entrypoint therefore uses the production `MCP_SERVER_INSTRUCTIONS`
+and the runner's normal MCP response protocol. An optional
+`--comparison-report` is copied only as a hashed, read-only reference; no
+competitor is started.
+
+Plan only:
+
+```bash
+node release/benchmarks/run-post-index-measurement.mjs \
+  --repositories vscode \
+  --repositories-root /absolute/path/to/repos \
+  --output-dir /absolute/path/to/new-output \
+  --plan-output /absolute/path/to/new-output.plan.json
+```
+
+The execution form is deliberately explicit and must use a fresh output
+path:
+
+```bash
+node release/benchmarks/run-post-index-measurement.mjs \
+  --execute \
+  --repositories vscode \
+  --repositories-root /absolute/path/to/repos \
+  --output-dir /absolute/path/to/new-output \
+  --indexing-worker /absolute/path/to/urdira-indexing-worker
+```
+
+The transcript analyzer now parses the retained production Urdira MCP shape:
+`result.content[].text` with `structured_content: null`. It records UTF-8
+`tool_envelope` bytes, model-visible serialized response bytes, identifiable
+source-text bytes, and identifiable result/record metadata bytes. Hydration,
+evidence, and registry bytes remain `null` unless the response carries an
+explicit typed field; the analyzer does not infer them from labels or depend on
+a hypothetical `structuredContent.bytes` object. The same fields are propagated
+through the post-index executor's `post-measurements.json` and the expanded
+report's task-comparison rows.

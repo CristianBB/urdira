@@ -91,4 +91,72 @@ describe("expanded agent transcript metrics", () => {
       assigned_rediscovery_after_each_edit: true,
     });
   });
+
+  it("separates tool and shell output, target attribution, protocol components, and fallback adoption", () => {
+    const events = [
+      { type: "item.completed", item: { type: "mcp_tool_call", server: "urdira", tool: "urdira_query", arguments: { path: "src/services/transpile.ts", query: { snippets: { mode: "inline" }, evidence: { evidence: "summary" }, registry: { registry: "used" } } }, result: { content: [{ type: "text", text: "target snippet evidence registry" }] }, status: "completed" } },
+      { type: "item.completed", item: { type: "command_execution", command: "sed -n '1,20p' src/services/transpile.ts", aggregated_output: "target shell source", exit_code: 0 } },
+      { type: "item.completed", item: { type: "file_change", status: "completed" } },
+    ];
+    expect(analyzeExpandedTranscript(events, "urdira-typescript", task)).toMatchObject({
+      tool_output_characters: 32,
+      shell_output_characters: 19,
+      tgrep_output_characters: null,
+      target_attributed_characters: 51,
+      target_unattributed_characters: 0,
+      output_characters_by_method: { mcp: 32, shell: 19, tgrep: null },
+      context_component_characters: { snippets: 32, evidence: 32, registry: 32, hydration: null },
+      discovery_adoption: { mcp_before_shell: true, shell_after_mcp: true, zero_mcp: false },
+    });
+  });
+
+  it("uses null for unavailable component and method measurements", () => {
+    const metrics = analyzeExpandedTranscript([
+      { type: "item.completed", item: { type: "command_execution", command: "rg -n onDiagnostic src/services/transpile.ts", aggregated_output: "match", exit_code: 0 } },
+    ], "baseline", task);
+    expect(metrics).toMatchObject({
+      tool_output_characters: null,
+      shell_output_characters: 5,
+      tgrep_output_characters: null,
+      target_attributed_characters: 5,
+      target_unattributed_characters: 0,
+      context_component_characters: { snippets: null, hydration: null, evidence: null, registry: null },
+      discovery_adoption: { mcp_before_shell: null, shell_after_mcp: null, zero_mcp: true },
+    });
+  });
+});
+
+import { readFileSync } from "node:fs";
+import { classifyMcpResponseComponents } from "../release/benchmarks/expanded-agent-transcript-metrics.mjs";
+
+describe("real Urdira MCP response component metrics", () => {
+  it("parses the retained production text-content shape and keeps unavailable fields null", () => {
+    const event = JSON.parse(readFileSync(new URL("./fixtures/urdira-mcp-context-real-shape.json", import.meta.url), "utf8"));
+    const components = classifyMcpResponseComponents(event.item)!;
+    expect(components).toMatchObject({
+      tool_envelope: expect.any(Number),
+      model_visible_serialized: expect.any(Number),
+      source_text: expect.any(Number),
+      records: expect.any(Number),
+      hydration: null,
+      evidence: null,
+      registry: null,
+      classification: { source_text: "indented_source_lines", records: "result_headers_and_record_lines" },
+    });
+    expect(components.model_visible_serialized).toBeGreaterThan(components.source_text!);
+  });
+
+  it("propagates component byte metrics through the transcript analyzer", () => {
+    const event = JSON.parse(readFileSync(new URL("./fixtures/urdira-mcp-context-real-shape.json", import.meta.url), "utf8"));
+    const metrics = analyzeExpandedTranscript([event], "urdira-typescript", { required_patterns: [{ path: "src/example.ts", regex: "target" }] });
+    expect(metrics.mcp_component_bytes).toMatchObject({
+      tool_envelope: expect.any(Number),
+      model_visible_serialized: expect.any(Number),
+      source_text: expect.any(Number),
+      records: expect.any(Number),
+      hydration: null,
+      evidence: null,
+      registry: null,
+    });
+  });
 });

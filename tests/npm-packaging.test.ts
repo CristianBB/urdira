@@ -71,10 +71,10 @@ describe("public npm package graph", () => {
       expect(manifest).not.toHaveProperty("scripts");
       expect(JSON.stringify(manifest)).not.toContain("workspace:");
       expect(manifest["files"]).toEqual(["native", "README.md", "LICENSE"]);
-      // S-I bumped NATIVE_API_VERSION 16 -> 17 (resident contiguous vector
+      // S-I bumped NATIVE_API_VERSION 17 -> 18 (resident contiguous vector
       // buffer + single-call native exact top-K); this literal must track
       // scripts/package-npm.mjs's own createNativePlatformPublishManifest.
-      expect(manifest["urdiraNative"]).toMatchObject({ worker_protocol: "urdira.ipc.v2", binding_api: 17, node_api: 10 });
+      expect(manifest["urdiraNative"]).toMatchObject({ worker_protocol: "urdira.ipc.v2", binding_api: 18, node_api: 10 });
     }
     const order = publicationOrder(packages);
     for (const entry of packages) for (const dependency of Object.keys({ ...(entry.manifest.dependencies ?? {}), ...(entry.manifest.optionalDependencies ?? {}) }).filter((name) => versions.has(name))) {

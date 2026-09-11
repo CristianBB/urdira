@@ -218,6 +218,15 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(instructions).toContain("urdira_benchmark_discover");
   });
 
+  it("teaches the public agent workflow without requiring pipelines", () => {
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_context for ordinary task discovery");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_query for one precise lookup");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Narrow broad queries with an exact path, kind, context artifact, or returned entity id");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Continue with the exact cursor and the original scope");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use shell for edits, tests, builds, and git status or diff");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Pipelines are optional");
+  });
+
   it("registers the benchmark-only discovery projection without changing public tools", () => {
     const server = createUrdiraMcpServer({ client: { call: vi.fn(async () => success({})) } }, { benchmark_discover: true }) as unknown as { _registeredTools: Record<string, unknown> };
     expect(server._registeredTools["urdira_benchmark_discover"]).toBeDefined();

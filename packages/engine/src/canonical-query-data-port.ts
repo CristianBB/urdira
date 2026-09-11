@@ -6,7 +6,7 @@ import { mapWithConcurrency } from "./concurrency.js";
 import { EngineError, EngineErrorWithDetails } from "./errors.js";
 import { QueryPlanError } from "./query-plan.js";
 import { toSubjectSelector } from "./recipe-executor.js";
-import { expandRelations, findShortestPaths, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryStreamItem, type RelationEdge } from "./query-operators.js";
+import { expandRelations, findShortestPaths, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryOperationEvaluationTelemetry, type QueryStreamItem, type RelationEdge } from "./query-operators.js";
 import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
 import type { ResolvedSemanticProvider } from "./semantic-provider.js";
@@ -46,6 +46,10 @@ export interface IndexedGraphEdge {
 }
 
 export interface CanonicalQuerySnapshotPort {
+  /** Test-only escape hatch for legacy fixture adapters. Production snapshot
+   * ports must omit this marker: every production operation needs a dedicated
+   * indexed/paginated route and otherwise fails with a typed capability error. */
+  readonly test_only_allow_legacy_full_corpus_fallback?: true;
   /**
    * Query-only fallback for operations whose predicate is not yet expressible
    * as a bounded SQL projection. Implementations must use paginated SQL and
@@ -56,6 +60,11 @@ export interface CanonicalQuerySnapshotPort {
   /** Bounded query reader for graph/set operations. Implementations must not
    * retain the complete decoded corpus while yielding batches. */
   readonly records_for_query_batches?: (scope: QueryScope, batch_size?: number) => AsyncIterable<readonly CanonicalQueryRecord[]>;
+  /** Optional identity-key ordered range reader used by exact comparison. */
+  readonly records_for_query_batches_by_identity?: (scope: QueryScope, batch_size?: number) => AsyncIterable<readonly CanonicalQueryRecord[]>;
+  /** Compare requires this explicit ordering declaration because a bounded
+   * record-id cursor cannot be merged by canonical identity without it. */
+  readonly records_for_query_batches_order?: "identity_key";
   /**
    * Frente Q-2 (2026-09-08, `docs/evidence/2026-09-08-v4-query-gaps-vscode.md`
    * item 4 sweep finding): a cheap (no decode) count of visible records for
@@ -123,6 +132,11 @@ export interface CanonicalQuerySnapshotPort {
    * Visibility-filtered like `records()`.
    */
   readonly records_by_selector?: (scope: QueryScope, selector: RecordColumnSelector, limit: number) => Promise<readonly CanonicalQueryRecord[]>;
+  /** Stable cursor page over the same indexed selector lane. */
+  readonly records_by_selector_page?: (scope: QueryScope, selector: RecordColumnSelector, limit: number, after_record_id?: string) => Promise<{ readonly records: readonly CanonicalQueryRecord[]; readonly next_cursor?: string }>;
+  /** Stable cursor pages over the lexical index. Unsupported means the exact
+   * requested syntax/filter is outside the indexed contract. */
+  readonly search_lexical_page?: (scope: QueryScope, pattern: string, mode: "literal" | "safe_regex", options?: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly filters?: { readonly path_patterns?: readonly string[]; readonly language?: readonly string[]; readonly namespace?: readonly string[]; readonly kind?: readonly string[]; readonly subject_type?: readonly string[] } }, limit?: number, after_cursor?: string) => Promise<{ readonly capability: "indexed" | "unsupported"; readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string; readonly unsupported_reason?: "safe_regex" | "structural_filter" }>;
   /** Resolves container records through indexed artifact identity/path columns. */
   readonly container_records_by_artifact_references?: (scope: QueryScope, references: readonly string[]) => Promise<readonly CanonicalQueryRecord[]>;
   /** Reads the exact visible adjacency slice touching `subject_ids`. Returning
@@ -506,13 +520,13 @@ const SELECTOR_VALUE_CHUNK_SIZE = 200;
 // entirely from the pushdown path, while still bounding worst-case pushdown
 // query/decode cost far under a full corpus load.
 const FIND_RECORDS_PUSHDOWN_LIMIT = 5000;
-// Defensive caps for `core:search_text`'s lexical pushdown (see
-// `trySearchTextPushdown`), applied to `search_literal`'s result BEFORE
-// paying for `records_by_artifact_versions`: at most this many distinct
-// artifacts, and at most this many total offsets summed across them. A
-// search producing more than either is already an unusably large result for
-// a caller to consume; these bound worst-case pushdown cost rather than
-// trying to stay exhaustive up to some higher limit.
+// Defensive bounds for the legacy, non-paginated `core:search_text` lexical
+// pushdown (see `trySearchTextPushdown`), applied to `search_literal`'s result
+// BEFORE paying for `records_by_artifact_versions`: at most this many distinct
+// artifacts, and at most this many total offsets summed across them. The
+// legacy capability cannot continue after a bound, so callers receive a
+// typed completeness error rather than a truncated answer. Ports exposing
+// `search_lexical_page` bypass these bounds and stream every exact page.
 const SEARCH_TEXT_PUSHDOWN_ARTIFACT_CAP = 200;
 const SEARCH_TEXT_PUSHDOWN_OFFSET_CAP = 2000;
 // Frente Q-2 (2026-09-08): well above any real test fixture's record count
@@ -657,6 +671,7 @@ async function mergeSortedByRecordId(base: readonly CanonicalQueryRecord[], addi
 
 /** Durable immutable-snapshot reader used by daemon query composition. */
 export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotPort {
+  readonly records_for_query_batches_order = "identity_key" as const;
   // `bytes` is `approxCorpusBytes`'s reading at load/delta time -- the total
   // relational body byte length visible at `generation` -- feeding
   // `approxWarmBytes()` below (see that method's own doc comment for why
@@ -1111,6 +1126,41 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     }
   }
 
+  async *records_for_query_batches_by_identity(scope: QueryScope, batchSize = ROW_FETCH_BATCH_SIZE): AsyncIterable<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    if (!Number.isSafeInteger(batchSize) || batchSize <= 0 || batchSize > ROW_FETCH_BATCH_SIZE) throw new RangeError("Query record batch size is outside the bounded range.");
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return;
+    let cursorKey: string | undefined;
+    let cursorRecordId: string | undefined;
+    while (true) {
+      const baseSql = `SELECT records.record_id, records.workspace_id, records.category, records.kind, records.universal_kind, records.body_payload,
+              records.owner_artifact_id, records.owner_artifact_version_id,
+              records.primary_source_span_artifact_version_id, records.primary_source_span_start_byte,
+              records.primary_source_span_end_byte, records.primary_source_span_start_line,
+              records.primary_source_span_end_line, identities.identity_id, identities.identity_key
+         FROM record_occurrences AS records
+         JOIN identity_assignments AS identities
+           ON identities.workspace_id = records.workspace_id AND identities.record_id = records.record_id
+          AND identities.valid_from_generation <= ? AND (identities.valid_to_generation IS NULL OR identities.valid_to_generation > ?)
+        WHERE records.workspace_id = ? AND records.valid_from_generation <= ?
+          AND (records.valid_to_generation IS NULL OR records.valid_to_generation > ?)
+          AND identities.identity_key IS NOT NULL`;
+      const cursorSql = cursorKey === undefined || cursorRecordId === undefined ? "" : " AND (identities.identity_key > ? OR (identities.identity_key = ? AND records.record_id > ?))";
+      const params: Array<string | number> = [generation, generation, scope.workspace_id, generation, generation];
+      if (cursorKey !== undefined && cursorRecordId !== undefined) params.push(cursorKey, cursorKey, cursorRecordId);
+      params.push(batchSize);
+      const rows = await this.attachRelationalValues(await this.database.all<RecordRow>(`${baseSql}${cursorSql} ORDER BY identities.identity_key COLLATE BINARY, records.record_id COLLATE BINARY LIMIT ?`, params));
+      if (rows.length === 0) return;
+      yield await this.decodeRows(rows);
+      const last = rows[rows.length - 1]!;
+      cursorKey = String(last.identity_key);
+      cursorRecordId = last.record_id;
+      if (rows.length < batchSize) return;
+      await yieldToEventLoop();
+    }
+  }
+
   /** See `CanonicalQuerySnapshotPort.has_warm_records` -- deliberately never calls `resolveRecords`/`records()`, only the cheap generation lookup, so it can never trigger a load. */
   async has_warm_records(scope: QueryScope): Promise<boolean> {
     if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
@@ -1209,6 +1259,31 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     const extraCondition = conditions.length > 0 ? conditions.join(" AND ") : "1 = 1";
     const rows = await this.queryRecordRows(workspaceId, generation, extraCondition, params, limit);
     return rows.map((row) => this.decodeRow(row));
+  }
+
+  async records_by_selector_page(scope: QueryScope, selector: RecordColumnSelector, limit: number, afterRecordId?: string): Promise<{ readonly records: readonly CanonicalQueryRecord[]; readonly next_cursor?: string }> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > ROW_FETCH_BATCH_SIZE) throw new RangeError("Selector page size is outside the bounded range.");
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return { records: [] };
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+    for (const [column, values] of [["records.category", selector.categories], ["records.universal_kind", selector.universal_kinds], ["records.kind", selector.kinds]] as const) {
+      if (values !== undefined && values.length > 0) {
+        const clauses: string[] = [];
+        for (let start = 0; start < values.length; start += SELECTOR_VALUE_CHUNK_SIZE) {
+          const part = values.slice(start, start + SELECTOR_VALUE_CHUNK_SIZE);
+          clauses.push(`${column} IN (${part.map(() => "?").join(", ")})`);
+          params.push(...part);
+        }
+        conditions.push(clauses.length === 1 ? clauses[0]! : `(${clauses.join(" OR ")})`);
+      }
+    }
+    const cursor = afterRecordId === undefined ? "" : " AND records.record_id > ?";
+    if (afterRecordId !== undefined) params.push(afterRecordId);
+    const rows = await this.queryRecordRows(scope.workspace_id, generation, `${conditions.length > 0 ? conditions.join(" AND ") : "1 = 1"}${cursor}`, params, limit);
+    const records = rows.map((row) => this.decodeRow(row));
+    return { records, ...(records.length === limit ? { next_cursor: records[records.length - 1]!.record_id } : {}) };
   }
 
   async container_records_by_artifact_references(scope: QueryScope, references: readonly string[]): Promise<readonly CanonicalQueryRecord[]> {
@@ -1953,17 +2028,22 @@ function comparisonLocationKey(record: CanonicalQueryRecord): string {
   return `${record.owner_artifact_id} ${record.owner_artifact_version_id} ${JSON.stringify(record.primary_source_span ?? null)}`;
 }
 
+function compareCanonicalIdentity(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function sortComparisonRecords(records: readonly CanonicalQueryRecord[]): readonly CanonicalQueryRecord[] {
-  return [...records].sort((left, right) => (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id));
+  return [...records].sort((left, right) => compareCanonicalIdentity(left.identity_key ?? left.record_id, right.identity_key ?? right.record_id));
 }
 
 function sortComparisonPairs(pairs: readonly ComparisonPair[]): readonly ComparisonPair[] {
-  return [...pairs].sort((left, right) => (left.target.identity_key ?? left.target.record_id).localeCompare(right.target.identity_key ?? right.target.record_id));
+  return [...pairs].sort((left, right) => compareCanonicalIdentity(left.target.identity_key ?? left.target.record_id, right.target.identity_key ?? right.target.record_id));
 }
 
 /**
- * Set-diffs two already-fetched (per-participant) record sets by
- * `identity_key`. `correlationPolicy === "include_possible"` additionally
+ * Diffs two per-participant record sources by `identity_key`. The source
+ * backed by bounded range batches is consumed incrementally; only the base
+ * identity map is retained. `correlationPolicy === "include_possible"` additionally
  * looks for an EXACT content-digest match between an otherwise-`added` and
  * an otherwise-`removed` record (a rename: `identity_key` changed but the
  * record's own content did not) and reports it as a `possible`-tier
@@ -1972,27 +2052,73 @@ function sortComparisonPairs(pairs: readonly ComparisonPair[]): readonly Compari
  * difference, unconditionally; decision 03: "any selected set can be
  * paginated without consuming another set").
  */
-function diffComparisonRecordSets(baseRecords: readonly CanonicalQueryRecord[], targetRecords: readonly CanonicalQueryRecord[], correlationPolicy: "strict" | "include_possible"): ComparisonDiff {
-  const baseByIdentity = new Map<string, CanonicalQueryRecord>();
-  for (const record of baseRecords) { const key = record.identity_key; if (key !== undefined && !baseByIdentity.has(key)) baseByIdentity.set(key, record); }
-  const targetByIdentity = new Map<string, CanonicalQueryRecord>();
-  for (const record of targetRecords) { const key = record.identity_key; if (key !== undefined && !targetByIdentity.has(key)) targetByIdentity.set(key, record); }
+interface ComparisonRecordSource {
+  readonly records: readonly CanonicalQueryRecord[] | AsyncIterable<readonly CanonicalQueryRecord[]>;
+  readonly ordered_by_identity: boolean;
+}
 
+async function* comparisonRecords(source: ComparisonRecordSource): AsyncIterable<CanonicalQueryRecord> {
+  let previousKey: string | undefined;
+  const consume = async function* (records: AsyncIterable<readonly CanonicalQueryRecord[]>): AsyncIterable<CanonicalQueryRecord> {
+    for await (const batch of records) for (const record of batch) {
+      const key = record.identity_key;
+      if (key === undefined) continue;
+      if (previousKey !== undefined && compareCanonicalIdentity(key, previousKey) < 0) {
+        throw new EngineErrorWithDetails(
+          "core:required_capability_unsupported",
+          "core:compare requires records_for_query_batches to be ordered by identity_key; refusing an unordered adapter stream rather than materializing it for sorting.",
+          { capability: "core:records_for_query_batches_order", reason_codes: ["comparison_identity_order_unavailable"] },
+        );
+      }
+      if (key === previousKey) continue;
+      previousKey = key;
+      yield record;
+    }
+  };
+  if (Symbol.asyncIterator in Object(source.records)) yield* consume(source.records as AsyncIterable<readonly CanonicalQueryRecord[]>);
+  else {
+    for (const record of source.records as readonly CanonicalQueryRecord[]) {
+      const key = record.identity_key;
+      if (key === undefined) continue;
+      if (previousKey !== undefined && compareCanonicalIdentity(key, previousKey) < 0) throw new EngineErrorWithDetails("core:required_capability_unsupported", "core:compare requires records_for_query_batches to be ordered by identity_key; refusing an unordered adapter stream rather than materializing it for sorting.", { capability: "core:records_for_query_batches_order", reason_codes: ["comparison_identity_order_unavailable"] });
+      if (key === previousKey) continue;
+      previousKey = key;
+      yield record;
+    }
+  }
+}
+
+async function diffComparisonRecordSources(baseSource: ComparisonRecordSource, targetSource: ComparisonRecordSource, correlationPolicy: "strict" | "include_possible"): Promise<ComparisonDiff> {
+  if (!baseSource.ordered_by_identity || !targetSource.ordered_by_identity) {
+    throw new EngineErrorWithDetails(
+      "core:required_capability_unsupported",
+      "core:compare requires both participants to provide records_for_query_batches ordered by identity_key; refusing an unordered adapter rather than materializing it for sorting.",
+      { capability: "core:records_for_query_batches_order", reason_codes: ["comparison_identity_order_unavailable"] },
+    );
+  }
+  const baseIterator = comparisonRecords(baseSource)[Symbol.asyncIterator]();
+  const targetIterator = comparisonRecords(targetSource)[Symbol.asyncIterator]();
+  let baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined;
+  let targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined;
   const added: CanonicalQueryRecord[] = [];
   const removed: CanonicalQueryRecord[] = [];
   const changed: ComparisonPair[] = [];
   const moved: ComparisonPair[] = [];
   const correlated: ComparisonPair[] = [];
-
-  for (const [key, targetRecord] of targetByIdentity) {
-    const baseRecord = baseByIdentity.get(key);
-    if (baseRecord === undefined) { added.push(targetRecord); continue; }
+  while (baseRecord !== undefined || targetRecord !== undefined) {
+    if (baseRecord === undefined) { added.push(targetRecord!); targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
+    if (targetRecord === undefined) { removed.push(baseRecord); baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
+    const baseKey = baseRecord.identity_key!;
+    const targetKey = targetRecord.identity_key!;
+    const order = compareCanonicalIdentity(baseKey, targetKey);
+    if (order < 0) { removed.push(baseRecord); baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
+    if (order > 0) { added.push(targetRecord); targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
     correlated.push({ base: baseRecord, target: targetRecord });
-    if (comparisonContentDigest(baseRecord) !== comparisonContentDigest(targetRecord)) { changed.push({ base: baseRecord, target: targetRecord }); continue; }
-    if (comparisonLocationKey(baseRecord) !== comparisonLocationKey(targetRecord)) moved.push({ base: baseRecord, target: targetRecord });
+    if (comparisonContentDigest(baseRecord) !== comparisonContentDigest(targetRecord)) changed.push({ base: baseRecord, target: targetRecord });
+    else if (comparisonLocationKey(baseRecord) !== comparisonLocationKey(targetRecord)) moved.push({ base: baseRecord, target: targetRecord });
+    baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined;
+    targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined;
   }
-  for (const [key, baseRecord] of baseByIdentity) if (!targetByIdentity.has(key)) removed.push(baseRecord);
-
   const possibleCorrelated: ComparisonPair[] = [];
   if (correlationPolicy === "include_possible" && added.length > 0 && removed.length > 0) {
     const removedByDigest = new Map<string, CanonicalQueryRecord[]>();
@@ -2011,15 +2137,7 @@ function diffComparisonRecordSets(baseRecords: readonly CanonicalQueryRecord[], 
       possibleCorrelated.push({ base: baseRecord, target: targetRecord });
     }
   }
-
-  return {
-    added: sortComparisonRecords(added),
-    removed: sortComparisonRecords(removed),
-    changed: sortComparisonPairs(changed),
-    moved: sortComparisonPairs(moved),
-    correlated: sortComparisonPairs(correlated),
-    possibleCorrelated: sortComparisonPairs(possibleCorrelated),
-  };
+  return { added: sortComparisonRecords(added), removed: sortComparisonRecords(removed), changed: sortComparisonPairs(changed), moved: sortComparisonPairs(moved), correlated: sortComparisonPairs(correlated), possibleCorrelated: sortComparisonPairs(possibleCorrelated) };
 }
 
 /**
@@ -2169,6 +2287,15 @@ function identityKeyTail(identityKey: string | undefined): string | undefined {
   return index === -1 ? identityKey : identityKey.slice(index + 1);
 }
 
+/** The indexed name lane is keyed by the final symbol segment. A qualified
+ * reference is still exact after the returned rows are rechecked against
+ * `body.qualified_name`; using its tail keeps qualified lookups on the same
+ * bounded index instead of forcing the corpus fallback. */
+function symbolLookupName(reference: string): string {
+  const separator = reference.lastIndexOf(".");
+  return separator === -1 ? reference : reference.slice(separator + 1);
+}
+
 /** Filters `records` down to those matching a `KindSelector`-shaped value's `kinds`/`universal_kinds` (an empty or absent list on either dimension is unrestricted, matching `selected()`'s own convention). Shared by symbol-selector resolution and `core:resolve_symbol`'s own filtering so both apply identical semantics. */
 function filterByKindSelector(records: readonly CanonicalQueryRecord[], kindSelectorValue: unknown): readonly CanonicalQueryRecord[] {
   const kindSelector = object(kindSelectorValue);
@@ -2192,6 +2319,14 @@ function resolveArtifactContainer(reference: string, maps: IdentityMaps): Canoni
   const direct = maps.by_any_id.get(reference);
   if (direct !== undefined && direct.universal_kind === "core:container") return direct;
   return maps.entities.find((record) => record.universal_kind === "core:container" && (record.body["path"] === reference || record.body["name"] === reference || record.owner_artifact_id === reference));
+}
+
+function recordContainsByteOffset(record: CanonicalQueryRecord, offset: number): boolean {
+  const span = record.primary_source_span;
+  if (span === undefined) return false;
+  const start = Number(span.start_byte);
+  const end = Number(span.end_byte);
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= offset && offset <= end;
 }
 
 /**
@@ -2627,6 +2762,24 @@ function result(streams: Readonly<Record<string, readonly QueryStreamItem[]>>, s
   const rank = new Map([["complete", 0], ["partial", 1], ["unknown", 2], ["unsupported", 3], ["stale", 4]]);
   const overall = states.reduce((worst, state) => (rank.get(state.status) ?? 2) > (rank.get(worst) ?? 2) ? state.status : worst, "complete");
   return { streams, completeness: { overall_status: overall, dimensions: completenessDimensions(states) }, diagnostics: [], ...(semanticState === undefined ? {} : { semantic_state: semanticState }) };
+}
+
+function evaluationRowCount(evaluation: OperationEvaluation): number {
+  return Object.values(evaluation.streams).reduce((total, stream) => total + stream.length, 0);
+}
+
+function withEvaluationTelemetry(evaluation: OperationEvaluation, telemetry: QueryOperationEvaluationTelemetry): OperationEvaluation {
+  return { ...evaluation, telemetry: { candidates: evaluationRowCount(evaluation), rows_hydrated: evaluationRowCount(evaluation), ...telemetry } };
+}
+
+function indexedTelemetryIndex(operationId: string): string {
+  if (operationId === "core:search_text") return "lexical_fts";
+  if (operationId === "core:find_records") return "records_by_selector";
+  if (operationId === "core:resolve_symbol") return "records_by_name";
+  if (operationId === "core:get_source") return "records_by_ids_or_artifact_versions";
+  if (["core:get_outline", "core:find_references", "core:expand_relations", "core:find_paths", "core:analyze_impact", "core:find_related_tests", "core:inspect_architecture"].includes(operationId)) return "graph_adjacency";
+  if (["core:search_semantic", "core:search_hybrid"].includes(operationId)) return "semantic_vectors";
+  return "indexed_snapshot_projection";
 }
 
 /**
@@ -3160,7 +3313,6 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   readonly consumes_stage_handles = true;
   /** Relation joins retain only identities and endpoint pairs, never complete
    * decoded records (which would duplicate the corpus in the join cache). */
-  private readonly relationIndexCache = new Map<string, { readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }>();
 
   /**
    * Frente S-I (2026-09-08, `generic-waddling-hartmanis.md` §0): one entry
@@ -3196,6 +3348,25 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
 
   constructor(private readonly snapshots: CanonicalQuerySnapshotPort, private readonly options: { readonly semantic?: ResolvedSemanticProvider; readonly comparison_participants?: ComparisonParticipantResolver } = {}) {}
 
+  /** Resolves symbol selectors through the indexed name lane and retains the
+   * small container lookup needed for context-artifact narrowing. The caller
+   * still applies the canonical exact name/qualified-name and kind predicates
+   * via `resolveSelectorToRecords`, so this is a candidate pushdown, not a
+   * second symbol-resolution implementation. */
+  private async indexedSymbolRows(scope: QueryScope, selectors: readonly { readonly name: string; readonly context_artifact?: string }[]): Promise<readonly CanonicalQueryRecord[] | undefined> {
+    if (selectors.length === 0) return [];
+    if (this.snapshots.records_by_name === undefined) return undefined;
+    const names = [...new Set(selectors.map((selector) => symbolLookupName(selector.name)))];
+    const rows: CanonicalQueryRecord[] = [];
+    for (const name of names) rows.push(...await this.snapshots.records_by_name(scope, name));
+    const references = [...new Set(selectors.flatMap((selector) => selector.context_artifact === undefined ? [] : [selector.context_artifact]))];
+    if (references.length > 0) {
+      if (this.snapshots.container_records_by_artifact_references === undefined) return undefined;
+      rows.push(...await this.snapshots.container_records_by_artifact_references(scope, references));
+    }
+    return [...new Map(rows.map((record) => [record.record_id, record])).values()];
+  }
+
   private async resolveIndexedGraphSelectors(scope: QueryScope, selectorValues: unknown): Promise<readonly CanonicalQueryRecord[] | undefined> {
     const selectors = Array.isArray(selectorValues) ? selectorValues : [];
     const directIds = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
@@ -3204,10 +3375,11 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     if (directIds.length > 0 && this.snapshots.records_by_ids === undefined) return undefined;
     if (symbols.length > 0 && this.snapshots.records_by_name === undefined) return undefined;
     if ((artifacts.length > 0 || symbols.some((selector) => typeof selector["context_artifact"] === "string")) && this.snapshots.container_records_by_artifact_references === undefined) return undefined;
-    if (symbols.some((selector) => String(selector["name"] ?? "").includes("."))) return undefined;
     const rows: CanonicalQueryRecord[] = [];
     if (directIds.length > 0) rows.push(...await this.snapshots.records_by_ids!(scope, directIds));
-    for (const name of [...new Set(symbols.map((selector) => String(selector["name"] ?? "")))]) rows.push(...await this.snapshots.records_by_name!(scope, name));
+    const symbolRows = await this.indexedSymbolRows(scope, symbols.map((selector) => ({ name: String(selector["name"] ?? ""), ...(typeof selector["context_artifact"] === "string" ? { context_artifact: selector["context_artifact"] } : {}) })));
+    if (symbolRows === undefined) return undefined;
+    rows.push(...symbolRows);
     const artifactReferences = [...new Set([
       ...artifacts.flatMap((selector) => [selector["artifact_id"], selector["artifact_version_id"], selector["path"]]),
       ...symbols.map((selector) => selector["context_artifact"]),
@@ -3218,8 +3390,33 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return selectors.flatMap((selector) => resolveSelectorToRecords(selector, maps));
   }
 
+  private async indexedEdges(scope: QueryScope, subjectIds: readonly string[], direction: "inbound" | "outbound" | "both"): Promise<readonly IndexedGraphEdge[] | undefined> {
+    if (this.snapshots.graph_edges_by_subject_ids !== undefined) {
+      const indexed = await this.snapshots.graph_edges_by_subject_ids(scope, subjectIds, direction);
+      if (indexed !== undefined) return indexed;
+    }
+    if (this.snapshots.records_by_selector_page === undefined) return undefined;
+    const aliases = new Set(subjectIds);
+    const edges: IndexedGraphEdge[] = [];
+    let cursor: string | undefined;
+    while (true) {
+      const page = await this.snapshots.records_by_selector_page(scope, { categories: ["relation"] }, ROW_FETCH_BATCH_SIZE, cursor);
+      for (const relation of page.records) {
+        const source = typeof relation.body["source_id"] === "string" ? relation.body["source_id"] : undefined;
+        const target = typeof relation.body["target_id"] === "string" ? relation.body["target_id"] : undefined;
+        if (source === undefined || target === undefined) continue;
+        if ((direction === "outbound" || direction === "both") && aliases.has(source) || (direction === "inbound" || direction === "both") && aliases.has(target)) {
+          edges.push({ edge_id: relation.record_id, source_subject_id: source, target_subject_id: target, relation_record_id: relation.record_id, relation_kind: relation.universal_kind, role: "", evidence_class: "" });
+        }
+      }
+      if (page.next_cursor === undefined || page.records.length === 0) break;
+      cursor = page.next_cursor;
+    }
+    return edges;
+  }
+
   private async indexedGraphRecords(scope: QueryScope, traversalRoots: readonly CanonicalQueryRecord[], retainedRecords: readonly CanonicalQueryRecord[], direction: "inbound" | "outbound" | "both", maxDepth: number): Promise<readonly CanonicalQueryRecord[] | undefined> {
-    if (this.snapshots.graph_edges_by_subject_ids === undefined || this.snapshots.records_by_ids === undefined) return undefined;
+    if (this.snapshots.records_by_ids === undefined) return undefined;
     const records = new Map<string, CanonicalQueryRecord>();
     for (const record of [...traversalRoots, ...retainedRecords]) records.set(record.record_id, record);
     const edgeRows = new Map<string, IndexedGraphEdge>();
@@ -3237,7 +3434,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     };
     for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
       const frontierAliases = new Set(frontier.flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)));
-      const rows = await this.snapshots.graph_edges_by_subject_ids(scope, [...frontierAliases], direction);
+      const rows = await this.indexedEdges(scope, [...frontierAliases], direction);
       if (rows === undefined) return undefined;
       await hydrate(rows);
       const byAlias = aliasMap();
@@ -3257,7 +3454,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // whose endpoints are both reachable, including cycle/back edges touching
     // the final frontier. Fetch that closed adjacency without traversing it.
     const allAliases = [...new Set([...records.values()].flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)))];
-    const closure = await this.snapshots.graph_edges_by_subject_ids(scope, allAliases, "both");
+    const closure = await this.indexedEdges(scope, allAliases, "both");
     if (closure === undefined) return undefined;
     await hydrate(closure);
     return [...records.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
@@ -3279,12 +3476,10 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * lacks either capability, exactly like `indexedGraphRecords`.
    *
    * `maxNodes` bounds the CUMULATIVE count of newly-discovered records
-   * across every depth (checked once per depth, not mid-batch) -- once at or
-   * past it, the BFS stops and returns what it already found rather than
-   * ever scanning the full corpus for more. This is a legitimate, honestly-
-   * labeled partial answer only if a real request's fan-out exceeds the
-   * (generous) cap; every differential test in this frente's own test file
-   * stays far under it.
+   * across every depth. If the bound is reached while a frontier remains,
+   * this method raises a typed completeness error; it never returns the
+   * already-discovered prefix as if it were complete. Every differential test
+   * in this frente's own test file stays far under the bound.
    *
    * Unlike `ancestors()`'s single-chain climb (which takes only the FIRST
    * matching parent per step, via `Array.prototype.find`), this explores
@@ -3298,13 +3493,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * regression risk against real workspaces.
    */
   private async relationClosure(scope: QueryScope, rootRecords: readonly CanonicalQueryRecord[], relationKind: string, direction: "inbound" | "outbound", maxDepth: number, maxNodes: number): Promise<readonly CanonicalQueryRecord[] | undefined> {
-    if (this.snapshots.graph_edges_by_subject_ids === undefined || this.snapshots.records_by_ids === undefined) return undefined;
+    if (this.snapshots.records_by_ids === undefined) return undefined;
     const discovered = new Map<string, CanonicalQueryRecord>();
     const seen = new Set(rootRecords.map((record) => record.record_id));
     let frontier = rootRecords;
     for (let depth = 0; depth < maxDepth && frontier.length > 0 && discovered.size < maxNodes; depth += 1) {
       const frontierAliases = new Set(frontier.flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)));
-      const rows = await this.snapshots.graph_edges_by_subject_ids(scope, [...frontierAliases], direction);
+      const rows = await this.indexedEdges(scope, [...frontierAliases], direction);
       if (rows === undefined) return undefined;
       const endpointIds = new Set<string>();
       for (const edge of rows) {
@@ -3312,7 +3507,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         if (direction === "outbound" && frontierAliases.has(edge.source_subject_id)) endpointIds.add(edge.target_subject_id);
         if (direction === "inbound" && frontierAliases.has(edge.target_subject_id)) endpointIds.add(edge.source_subject_id);
       }
-      if (endpointIds.size === 0) break;
+      if (endpointIds.size === 0) { frontier = []; break; }
       const hydrated = await this.snapshots.records_by_ids(scope, [...endpointIds]);
       const next: CanonicalQueryRecord[] = [];
       for (const record of hydrated) {
@@ -3323,6 +3518,19 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         if (discovered.size >= maxNodes) break;
       }
       frontier = next;
+    }
+    // Reaching maxDepth is the requested complete traversal boundary: the
+    // remaining frontier represents nodes at exactly that depth and must not
+    // be explored. Only a node cap makes the answer incomplete, because it
+    // stops before the requested depth boundary.
+    if (frontier.length > 0 && discovered.size >= maxNodes) {
+      const limitKind = "relation_closure_node_cap";
+      const configuredLimit = maxNodes;
+      throw new EngineErrorWithDetails(
+        "core:execution_resource_limit",
+        `Indexed relation closure exceeded its exact bound (${limitKind}); refusing a silently incomplete result.`,
+        { limit_kind: limitKind, configured_limit: configuredLimit, observed_or_required: discovered.size, relation_kind: relationKind },
+      );
     }
     return [...discovered.values()];
   }
@@ -3411,15 +3619,15 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * `scope`/`views`/`max_relation_depth`/`filter` are accepted arguments the
    * fallback also never applies -- unchanged here, same reason.
    *
-   * UNLIKE every other pushdown in this file, this one truncates instead of
-   * declining above its cap. `core:find_records`'s own pushdown (`tryPushdown`)
-   * fetches `limit + 1` and declines (falls back to the full in-memory path)
-   * the moment that is exceeded, because a `find_records` selector is
-   * caller-narrowed and an incomplete answer would silently misrepresent a
-   * SPECIFIC request. `inspect_architecture` has no such narrowing selector
-   * at all (its own fallback returns literally "every container"/"every
-   * type", unconditionally) -- for a real large workspace that set can be
-   * tens of thousands of records (measured live on n8n: 15,231 `core:
+   * This path probes one row beyond its cap and raises a typed completeness
+   * error when the indexed answer cannot fit. `core:find_records`'s own
+   * pushdown (`tryPushdown`) fetches `limit + 1` and declines (falls back to
+   * the full in-memory path) when exceeded, while this operation has no
+   * continuation capability in the legacy selector API. Neither path may
+   * present a truncated prefix as complete. `inspect_architecture` has no
+   * narrowing selector at all (its fallback returns literally "every
+   * container"/"every type", unconditionally) -- for a real large workspace
+   * that set can be tens of thousands of records (measured live on n8n: 15,231 `core:
    * container` + 14,276 `core:type` entities), and declining would only
    * route to the SAME generic fallback, which the `visible_record_count`
    * guard then rejects outright above `FULL_CORPUS_FALLBACK_RECORD_CAP` --
@@ -3439,9 +3647,36 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * truncate away, not the native store.
    */
   private async tryInspectArchitecturePushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
-    if (operation.operation_id !== "core:inspect_architecture" || this.snapshots.records_by_selector === undefined) return undefined;
-    const containers = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:container"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT);
-    const types = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:type"] }, INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT);
+    if (operation.operation_id !== "core:inspect_architecture") return undefined;
+    if (this.snapshots.records_by_selector_page !== undefined) {
+      const pageSource = (selector: RecordColumnSelector, publicOnly: boolean) => (async function* (port: CanonicalQuerySnapshotPort): AsyncIterable<QueryStreamItem> {
+        let cursor: string | undefined;
+        while (true) {
+          const page = await port.records_by_selector_page!(operation.scope, selector, ROW_FETCH_BATCH_SIZE, cursor);
+          for (const record of page.records) {
+            if (!publicOnly || !String(record.body["name"] ?? "").startsWith("_")) yield item(record);
+          }
+          if (page.next_cursor === undefined || page.records.length === 0) return;
+          cursor = page.next_cursor;
+        }
+      })(this.snapshots);
+      const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+      return { ...result({ entry_points: [], public_surfaces: [], layers: [] }, capabilityStates), stream_sources: {
+        entry_points: pageSource({ categories: ["entity"], universal_kinds: ["core:container"] }, false),
+        public_surfaces: pageSource({ categories: ["entity"], universal_kinds: ["core:type"] }, true),
+      } };
+    }
+    if (this.snapshots.records_by_selector === undefined) return undefined;
+    const pageLimit = INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT + 1;
+    const containers = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:container"] }, pageLimit);
+    const types = await this.snapshots.records_by_selector(operation.scope, { categories: ["entity"], universal_kinds: ["core:type"] }, pageLimit);
+    if (containers.length > INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT || types.length > INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT) {
+      throw new EngineErrorWithDetails(
+        "core:execution_resource_limit",
+        "core:inspect_architecture cannot return an exact indexed overview within its bounded page; refusing silent truncation.",
+        { limit_kind: "inspect_architecture_pushdown_cap", configured_limit: INSPECT_ARCHITECTURE_PUSHDOWN_LIMIT, observed_or_required: { containers: containers.length, types: types.length } },
+      );
+    }
     const publicSurfaces = types.filter((record) => !String(record.body["name"] ?? "").startsWith("_"));
     const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
     return result({ entry_points: containers.map((record) => item(record)), public_surfaces: publicSurfaces.map((record) => item(record)), layers: [] }, capabilityStates);
@@ -3683,39 +3918,6 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return this.evaluateGraphOperation(operation, records, await identityMaps(records), capabilityStates);
   }
 
-  private async relationIndex(scope: QueryScope): Promise<{ readonly byAnyId: ReadonlyMap<string, string>; readonly pairs: ReadonlyMap<string, ReadonlySet<string>> }> {
-    const scopeKey = relationScopeKey(scope);
-    let index = this.relationIndexCache.get(scopeKey);
-    if (index !== undefined) return index;
-    const byAnyId = new Map<string, string>();
-    const relationRows: Array<{ readonly source_id: string; readonly target_id: string; readonly relation_kind: string }> = [];
-    const consume = (records: readonly CanonicalQueryRecord[]): void => {
-      for (const record of records) {
-        for (const id of [record.record_id, record.identity_id, record.identity_key, record.body["entity_id"], record.body["relation_id"]]) if (typeof id === "string") byAnyId.set(id, record.record_id);
-        if (record.category === "relation" && typeof record.body["source_id"] === "string" && typeof record.body["target_id"] === "string") relationRows.push({ source_id: record.body["source_id"], target_id: record.body["target_id"], relation_kind: record.universal_kind });
-      }
-    };
-    if (this.snapshots.records_for_query_batches !== undefined) {
-      for await (const batch of this.snapshots.records_for_query_batches(scope)) consume(batch);
-    } else {
-      consume(this.snapshots.records_for_query !== undefined ? await this.snapshots.records_for_query(scope) : await this.snapshots.records(scope));
-    }
-    const pairs = new Map<string, Set<string>>();
-    for (const relation of relationRows) {
-      const sourceId = byAnyId.get(relation.source_id);
-      const targetId = byAnyId.get(relation.target_id);
-      if (sourceId === undefined || targetId === undefined) continue;
-      const key = `${sourceId}\u0000${targetId}`;
-      const kinds = pairs.get(key) ?? new Set<string>();
-      kinds.add(relation.relation_kind);
-      pairs.set(key, kinds);
-    }
-    index = { byAnyId, pairs };
-    this.relationIndexCache.set(scopeKey, index);
-    while (this.relationIndexCache.size > 4) this.relationIndexCache.delete(this.relationIndexCache.keys().next().value as string);
-    return index;
-  }
-
   /**
    * Indexed relation predicate for pipeline v3 joins.  The method resolves
    * only the two participating subjects and scans the relation slice, so a
@@ -3724,41 +3926,53 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * indexed implementation without changing the public contract.
    */
   readonly relation_exists = async (scope: QueryScope, left: QueryStreamItem, right: QueryStreamItem, relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<boolean> => {
-    // Relation endpoints are separate records. Build one exact, immutable
-    // endpoint index per snapshot scope and reuse it for every pair in a
-    // pipeline join; the old fallback reloaded and rescanned the entire
-    // relation corpus once per left/right pair (quadratic I/O).
-    const index = await this.relationIndex(scope);
-    const leftRecordId = index.byAnyId.get(subjectIdentity(left.value) ?? "");
-    const rightRecordId = index.byAnyId.get(subjectIdentity(right.value) ?? "");
-    if (leftRecordId === undefined || rightRecordId === undefined) return false;
-    const selectorObject = object(relationSelector);
-    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
-    const hasKind = (key: string): boolean => {
-      const available = index!.pairs.get(key);
-      return available !== undefined && (kinds.size === 0 || [...available].some((kind) => kinds.has(kind)));
-    };
-    const outbound = hasKind(`${leftRecordId}\u0000${rightRecordId}`);
-    const inbound = hasKind(`${rightRecordId}\u0000${leftRecordId}`);
-    return direction === "outbound" ? outbound : direction === "inbound" ? inbound : outbound || inbound;
+    const leftId = subjectIdentity(left.value);
+    const rightId = subjectIdentity(right.value);
+    if (leftId === undefined || rightId === undefined) return false;
+    if (this.snapshots.relation_pairs_by_subject_ids === undefined) {
+      throw new EngineErrorWithDetails(
+        "core:required_capability_unsupported",
+        "The snapshot has no indexed relation adjacency capability; refusing an exact relation query that would require a full record scan.",
+        { capability: "core:relation_pairs_by_subject_ids", reason_codes: ["indexed_relation_adjacency_unavailable"] },
+      );
+    }
+    const pairs = await this.snapshots.relation_pairs_by_subject_ids(scope, [leftId], [rightId], relationSelector, direction);
+    if (pairs === undefined) {
+      throw new EngineErrorWithDetails(
+        "core:required_capability_unsupported",
+        "The snapshot relation projection is unavailable for this generation; refusing an exact relation query that would require a full record scan.",
+        { capability: "core:relation_pairs_by_subject_ids", reason_codes: ["indexed_relation_projection_unavailable"] },
+      );
+    }
+    return pairs.has(`${leftId}\u0000${rightId}`);
   };
 
   readonly relation_pairs = async (scope: QueryScope, left: readonly QueryStreamItem[], right: readonly QueryStreamItem[], relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string>> => {
-    const index = await this.relationIndex(scope);
-    const selectorObject = object(relationSelector);
-    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
-    const leftIds = new Map(left.map((item) => [subjectIdentity(item.value) ?? "", item.stable_sort_key]));
-    const rightIds = new Map(right.map((item) => [subjectIdentity(item.value) ?? "", item.stable_sort_key]));
+    const leftIds = new Map(left.flatMap((item) => subjectIdentities(item.value).map((id) => [id, item.stable_sort_key] as const)));
+    const rightIds = new Map(right.flatMap((item) => subjectIdentities(item.value).map((id) => [id, item.stable_sort_key] as const)));
+    if (leftIds.size === 0 || rightIds.size === 0) return new Set();
+    if (this.snapshots.relation_pairs_by_subject_ids === undefined) {
+      throw new EngineErrorWithDetails(
+        "core:required_capability_unsupported",
+        "The snapshot has no indexed relation adjacency capability; refusing an exact relation query that would require a full record scan.",
+        { capability: "core:relation_pairs_by_subject_ids", reason_codes: ["indexed_relation_adjacency_unavailable"] },
+      );
+    }
+    const pairs = await this.snapshots.relation_pairs_by_subject_ids(scope, [...leftIds.keys()], [...rightIds.keys()], relationSelector, direction);
+    if (pairs === undefined) {
+      throw new EngineErrorWithDetails(
+        "core:required_capability_unsupported",
+        "The snapshot relation projection is unavailable for this generation; refusing an exact relation query that would require a full record scan.",
+        { capability: "core:relation_pairs_by_subject_ids", reason_codes: ["indexed_relation_projection_unavailable"] },
+      );
+    }
     const output = new Set<string>();
-    for (const [key, available] of index.pairs) {
-      if (kinds.size > 0 && ![...available].some((kind) => kinds.has(kind))) continue;
-      const [source, target] = key.split("\u0000");
-      const add = (leftId: string | undefined, rightId: string | undefined) => {
-        const leftKey = leftIds.get(leftId ?? ""); const rightKey = rightIds.get(rightId ?? "");
-        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
-      };
-      if (direction === "outbound" || direction === "both") add(source, target);
-      if (direction === "inbound" || direction === "both") add(target, source);
+    for (const pair of pairs) {
+      const separator = pair.indexOf("\u0000");
+      if (separator <= 0) continue;
+      const leftKey = leftIds.get(pair.slice(0, separator));
+      const rightKey = rightIds.get(pair.slice(separator + 1));
+      if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
     }
     return output;
   };
@@ -3779,7 +3993,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     for await (const item of right.iterate()) for (const id of subjectIdentities(item.value)) rightIds.set(id, item.stable_sort_key);
     if (this.snapshots.relation_pairs_by_subject_ids !== undefined) {
       const ids = await this.snapshots.relation_pairs_by_subject_ids(scope, [...leftIds.keys()], [...rightIds.keys()], relationSelector, direction);
-      if (ids === undefined) return this.relationPairsFromCachedIndex(scope, leftIds, rightIds, relationSelector, direction);
+      if (ids === undefined) {
+        throw new EngineErrorWithDetails(
+          "core:required_capability_unsupported",
+          "The snapshot relation projection is unavailable for this generation; refusing an exact relation query that would require a full record scan.",
+          { capability: "core:relation_pairs_by_subject_ids", reason_codes: ["indexed_relation_projection_unavailable"] },
+        );
+      }
       const output = new Set<string>();
       for (const pair of ids) {
         const separator = pair.indexOf("\u0000");
@@ -3790,40 +4010,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       }
       return output;
     }
-    const index = await this.relationIndex(scope);
-    const selectorObject = object(relationSelector);
-    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
-    const output = new Set<string>();
-    for (const [key, available] of index.pairs) {
-      if (kinds.size > 0 && ![...available].some((kind) => kinds.has(kind))) continue;
-      const [source, target] = key.split("\u0000");
-      const add = (leftId: string | undefined, rightId: string | undefined) => {
-        const leftKey = leftIds.get(leftId ?? ""); const rightKey = rightIds.get(rightId ?? "");
-        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
-      };
-      if (direction === "outbound" || direction === "both") add(source, target);
-      if (direction === "inbound" || direction === "both") add(target, source);
-    }
-    return output;
+    throw new EngineErrorWithDetails(
+      "core:required_capability_unsupported",
+      "The snapshot has no indexed relation adjacency capability; refusing an exact relation query that would require a full record scan.",
+      { capability: "core:relation_pairs_by_subject_ids", reason_codes: ["indexed_relation_adjacency_unavailable"] },
+    );
   };
 
-  private async relationPairsFromCachedIndex(scope: QueryScope, leftIds: ReadonlyMap<string, string>, rightIds: ReadonlyMap<string, string>, relationSelector: unknown, direction: "inbound" | "outbound" | "both"): Promise<ReadonlySet<string>> {
-    const index = await this.relationIndex(scope);
-    const selectorObject = object(relationSelector);
-    const kinds = Array.isArray(selectorObject["universal_kinds"]) ? new Set(selectorObject["universal_kinds"].filter((value): value is string => typeof value === "string")) : new Set<string>();
-    const output = new Set<string>();
-    for (const [key, available] of index.pairs) {
-      if (kinds.size > 0 && ![...available].some((kind) => kinds.has(kind))) continue;
-      const [source, target] = key.split("\u0000");
-      const add = (leftId: string | undefined, rightId: string | undefined) => {
-        const leftKey = leftIds.get(leftId ?? ""); const rightKey = rightIds.get(rightId ?? "");
-        if (leftKey !== undefined && rightKey !== undefined) output.add(`${leftKey}\u0000${rightKey}`);
-      };
-      if (direction === "outbound" || direction === "both") add(source, target);
-      if (direction === "inbound" || direction === "both") add(target, source);
-    }
-    return output;
-  }
 
   /**
    * Pre-loads this scope's records and capability states (paying whatever a
@@ -3936,11 +4129,11 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * (`core:resolve_symbol`, `core:get_source`, and column-only
    * `core:find_records` selectors), tries to answer directly against the
    * snapshot port's optional `records_by_*` methods. Returns `undefined`
-   * when the operation isn't one of these three, when the port doesn't
-   * implement the needed method (non-SQLite ports simply don't have one),
-   * or when `core:find_records`'s pushdown can't prove completeness (see
-   * `FIND_RECORDS_PUSHDOWN_LIMIT`) -- in every `undefined` case the caller
-   * falls back to the full in-memory path. Never touches `this.snapshots.records`,
+   * when the operation isn't one of these three or when the port doesn't
+   * implement the needed method (non-SQLite ports simply don't have one).
+   * A legacy non-paginated `core:find_records` port receives a typed
+   * completeness error when its `FIND_RECORDS_PUSHDOWN_LIMIT` is exceeded.
+   * Never touches `this.snapshots.records`,
    * so it can never trigger or wait on a full corpus load or delta, and never
    * writes into the corpus cache.
    */
@@ -3956,29 +4149,27 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     if (architecture !== undefined) return architecture;
     if (operation.operation_id === "core:resolve_symbol" && this.snapshots.records_by_name !== undefined) {
       const reference = String(args["reference"] ?? "");
-      // A record's plain `name` never contains "." for any known producer,
-      // while `qualified_name` always does (it is built as
-      // `${parent.qualified_name ?? parent.name}.${name}`) -- so a
-      // dotted `reference` can only resolve via a qualified_name match,
-      // which `identity_key`'s tail (plain name only) cannot see. Fall back
-      // to the full path rather than risk an incomplete pushdown answer.
-      if (reference.includes(".")) return undefined;
-      // A present `context_artifact` (narrowing by owner_artifact_id) or
-      // `kind_selector` both need the full record set this pushdown does
-      // not fetch -- fall back to the full in-memory path, which
-      // implements them. `resolution_scope` alone never needs a bail-out:
-      // absent a `context_artifact` to narrow by, `visible`/`exports`
-      // degrade to exactly `workspace`'s unfiltered result (see the
-      // in-memory handler below), so pushdown stays correct regardless of
-      // which scope value is requested.
-      if (args["context_artifact"] !== undefined || args["kind_selector"] !== undefined) return undefined;
-      const rows = await this.snapshots.records_by_name(operation.scope, reference);
-      // Mirrors the in-memory path's exact predicate (declarations are
-      // entities whose `name` or `qualified_name` equals `reference`) as a
-      // safety re-check over the name-tail-matched rows pushdown fetched;
-      // `resolution_scope`/`context_artifact`/`kind_selector` are accepted
-      // arguments the in-memory path itself does not filter on either.
-      const declarations = rows.filter((record) => record.category === "entity" && (record.body["name"] === reference || record.body["qualified_name"] === reference));
+      const rows = await this.indexedSymbolRows(operation.scope, [{ name: reference, ...(typeof args["context_artifact"] === "string" ? { context_artifact: args["context_artifact"] } : {}) }]);
+      if (rows === undefined) return undefined;
+      let declarations: readonly CanonicalQueryRecord[] = rows.filter((record) => record.category === "entity" && (record.body["name"] === reference || record.body["qualified_name"] === reference));
+      declarations = filterByKindSelector(declarations, args["kind_selector"]);
+      const contextArtifact = typeof args["context_artifact"] === "string" ? args["context_artifact"] : undefined;
+      const contextByteOffset = typeof args["context_byte_offset"] === "number" ? args["context_byte_offset"] : undefined;
+      const resolutionScope = typeof args["resolution_scope"] === "string" ? args["resolution_scope"] : "visible";
+      if (contextArtifact !== undefined && resolutionScope === "visible") {
+        const containers = await this.snapshots.container_records_by_artifact_references?.(operation.scope, [contextArtifact]);
+        if (containers === undefined) return undefined;
+        const ownerIds = new Set(containers.map((record) => record.owner_artifact_id));
+        if (ownerIds.size === 0) {
+          // An unresolved context must not widen a visibility query to the
+          // whole workspace. Retain only an explicit path/owner match.
+          declarations = declarations.filter((record) => record.body["path"] === contextArtifact || record.body["name"] === contextArtifact || record.owner_artifact_id === contextArtifact || record.owner_artifact_version_id === contextArtifact);
+        } else {
+          const sameArtifact = declarations.filter((record) => ownerIds.has(record.owner_artifact_id));
+          if (sameArtifact.length > 0) declarations = sameArtifact;
+        }
+      }
+      if (contextByteOffset !== undefined) declarations = declarations.filter((record) => recordContainsByteOffset(record, contextByteOffset));
       const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
       return result({ declarations: declarations.map((record) => item(record)), candidates: [] }, capabilityStates);
     }
@@ -4005,7 +4196,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const ids = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
       const symbolNames = selectors.flatMap((selector) => {
         const value = object(selector);
-        return value["subject_type"] === "symbol" && typeof value["name"] === "string" ? [value["name"]] : [];
+        return value["subject_type"] === "symbol" && typeof value["name"] === "string" ? [symbolLookupName(value["name"])] : [];
       });
       if (selectors.some((selector) => object(selector)["subject_type"] === "symbol") && this.snapshots.records_by_name === undefined) return undefined;
       // Frente Q-2 (2026-09-08): mirrors `tryBuildContextPushdown`'s own
@@ -4039,19 +4230,50 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const resolved = [...new Map([...subjects, ...hydratedArtifacts].map((record) => [record.record_id, record])).values()];
       return result(await buildGetSourceStreams(this.snapshots, operation.scope, resolved, args), capabilityStates);
     }
-    if (operation.operation_id === "core:find_records" && this.snapshots.records_by_selector !== undefined) {
+    if (operation.operation_id === "core:find_records") {
       const selectorArg = object(args["selector"]);
       const categories = strings(selectorArg["record_categories"]);
       const kindSelector = object(selectorArg["kind_selector"]);
       const universalKinds = strings(kindSelector["universal_kinds"]);
       const kinds = strings(kindSelector["kinds"]);
-      const rows = await this.snapshots.records_by_selector(operation.scope, { categories, universal_kinds: universalKinds, kinds }, FIND_RECORDS_PUSHDOWN_LIMIT + 1);
-      if (rows.length > FIND_RECORDS_PUSHDOWN_LIMIT) return undefined;
-      // Re-applies the full in-memory `selected()` predicate (category/kind
-      // redundantly, plus `filter.languages`, which lives in the decoded
-      // body and has no column of its own) over the pushdown-fetched rows.
-      const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
-      return result({ records: rows.filter((record) => selected(record, selectorArg)).map((record) => item(record)) }, capabilityStates);
+      const selector = { categories, universal_kinds: universalKinds, kinds };
+      // Body-only filters cannot be expressed by the selector page index.
+      // Keep this bounded compatibility lane for small filtered answers; the
+      // unfiltered path below remains the paginated stream route.
+      const languageFilter = strings(object(selectorArg["filter"])["languages"]);
+      if (languageFilter.length > 0 && this.snapshots.records_by_selector !== undefined) {
+        const rows = await this.snapshots.records_by_selector(operation.scope, selector, FIND_RECORDS_PUSHDOWN_LIMIT + 1);
+        if (rows.length > FIND_RECORDS_PUSHDOWN_LIMIT) throw new EngineErrorWithDetails("core:execution_resource_limit", "core:find_records language-filtered selector exceeded its exact bounded route; narrow the selector or use a paginated structural selector.", { limit_kind: "find_records_pushdown_cap", configured_limit: FIND_RECORDS_PUSHDOWN_LIMIT, observed_or_required: rows.length });
+        const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+        return result({ records: rows.filter((record) => selected(record, selectorArg)).map((record) => item(record)) }, capabilityStates);
+      }
+      if (this.snapshots.records_by_selector_page !== undefined) {
+        const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+        const source = (async function* (port: CanonicalQuerySnapshotPort): AsyncIterable<QueryStreamItem> {
+          let cursor: string | undefined;
+          while (true) {
+            const page = await port.records_by_selector_page!(operation.scope, selector, ROW_FETCH_BATCH_SIZE, cursor);
+            for (const record of page.records) if (selected(record, selectorArg)) yield item(record);
+            if (page.next_cursor === undefined || page.records.length === 0) return;
+            cursor = page.next_cursor;
+          }
+        })(this.snapshots);
+        return { ...result({ records: [] }, capabilityStates), stream_sources: { records: source } };
+      }
+      if (this.snapshots.records_by_selector !== undefined) {
+        const rows = await this.snapshots.records_by_selector(operation.scope, selector, FIND_RECORDS_PUSHDOWN_LIMIT + 1);
+        if (rows.length > FIND_RECORDS_PUSHDOWN_LIMIT) {
+          throw new EngineErrorWithDetails(
+            "core:execution_resource_limit",
+            "core:find_records legacy indexed selector exceeded its exact bound; use the paginated selector capability or narrow the selector.",
+            { limit_kind: "find_records_pushdown_cap", configured_limit: FIND_RECORDS_PUSHDOWN_LIMIT, observed_or_required: rows.length },
+          );
+        }
+        // Re-applies the full in-memory `selected()` predicate over the
+        // bounded pushdown rows; the paginated capability handles larger sets.
+        const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+        return result({ records: rows.filter((record) => selected(record, selectorArg)).map((record) => item(record)) }, capabilityStates);
+      }
     }
     return undefined;
   }
@@ -4080,8 +4302,66 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * `undefined` (lexical projection not yet complete for this generation).
    */
   private async trySearchTextPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
-    if (operation.operation_id !== "core:search_text" || this.snapshots.search_literal === undefined || this.snapshots.records_by_artifact_versions === undefined) return undefined;
+    if (operation.operation_id !== "core:search_text") return undefined;
     const args = object(operation.arguments);
+    if (this.snapshots.search_lexical_page !== undefined && this.snapshots.records_by_artifact_versions !== undefined) {
+      const syntax = args["syntax"] === "safe_regex" ? "safe_regex" : "literal";
+      const filter = object(args["filter"]);
+      const filters = {
+        path_patterns: strings(filter["paths"]),
+        language: strings(filter["languages"]),
+        namespace: strings(filter["namespaces"]),
+        kind: strings(object(filter["kind_selector"])["kinds"]),
+        subject_type: strings(filter["subject_types"]),
+      };
+      const pattern = String(args["pattern"] ?? "");
+      const caseSensitive = args["case_sensitive"] !== false;
+      const wordMode = args["word_mode"] === "identifier" || args["word_mode"] === "token" ? args["word_mode"] : "substring";
+      const readPage = async (cursor: string | undefined): Promise<{ readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string }> => {
+        const page = await this.snapshots.search_lexical_page!(operation.scope, pattern, syntax, { case_sensitive: caseSensitive, word_mode: wordMode, filters }, ROW_FETCH_BATCH_SIZE, cursor);
+        if (page.capability === "unsupported") {
+          throw new EngineErrorWithDetails(
+            "core:required_capability_unsupported",
+            `core:search_text lexical index does not support the requested ${page.unsupported_reason ?? "query"} exactly; refusing a corpus fallback that would hide the capability boundary.`,
+            { capability: "core:search_lexical_page", reason_codes: [page.unsupported_reason ?? "indexed_lexical_lane_unavailable"] },
+          );
+        }
+        return page;
+      };
+      const pageItems = async (page: { readonly matches: readonly LexicalSearchMatch[] }): Promise<{ readonly matches: readonly QueryStreamItem[]; readonly subjects: readonly QueryStreamItem[] }> => {
+        const bounded = page.matches.filter((match) => match.offsets.length > 0);
+        const records = await this.snapshots.records_by_artifact_versions!(operation.scope, [...new Set(bounded.map((match) => match.artifact_version_id))]);
+        const byVersionId = new Map(records.map((record) => [record.owner_artifact_version_id, record]));
+        const matchItems: QueryStreamItem[] = [];
+        const subjectItems: QueryStreamItem[] = [];
+        for (const match of bounded) {
+          const record = byVersionId.get(match.artifact_version_id);
+          if (record === undefined) continue;
+          const recordIdentity = record.identity_key ?? record.record_id;
+          const recordBody = recordValue(record);
+          for (const [offsetIndex, offset] of match.offsets.entries()) {
+            const lineSpan = match.line_spans?.[offsetIndex];
+            matchItems.push({ value: { ...recordBody, source_span: { artifact_version_id: match.artifact_version_id, start_byte: String(offset), end_byte: String(offset + pattern.length), ...(lineSpan ?? {}) } }, stable_sort_key: `confirmed\0${recordIdentity}\0${String(offset).padStart(12, "0")}` });
+          }
+          const firstOffset = match.offsets[0];
+          if (firstOffset !== undefined) subjectItems.push({ value: { ...recordBody, source_span: { artifact_version_id: match.artifact_version_id, start_byte: String(firstOffset), end_byte: String(firstOffset + pattern.length), ...(match.line_spans?.[0] ?? {}) } }, stable_sort_key: `confirmed\0${recordIdentity}` });
+        }
+        return { matches: matchItems, subjects: subjectItems };
+      };
+      const source = (stream: "matches" | "subjects") => (async function* (): AsyncIterable<QueryStreamItem> {
+        let cursor: string | undefined;
+        while (true) {
+          const page = await readPage(cursor);
+          const items = await pageItems(page);
+          for (const item of items[stream]) yield item;
+          if (page.next_cursor === undefined || page.matches.length === 0) return;
+          cursor = page.next_cursor;
+        }
+      })();
+      const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
+      return { ...result({ matches: [], subjects: [] }, capabilityStates), stream_sources: { matches: source("matches"), subjects: source("subjects") } };
+    }
+    if (this.snapshots.search_literal === undefined || this.snapshots.records_by_artifact_versions === undefined) return undefined;
     const syntax = args["syntax"];
     if (syntax !== undefined && syntax !== "literal") return undefined;
     const wordMode = args["word_mode"] === "identifier" || args["word_mode"] === "token" ? args["word_mode"] : "substring";
@@ -4102,15 +4382,15 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     });
     if (matches === undefined) return undefined;
 
-    const cappedArtifacts = matches.slice(0, SEARCH_TEXT_PUSHDOWN_ARTIFACT_CAP);
-    let offsetBudget = SEARCH_TEXT_PUSHDOWN_OFFSET_CAP;
-    const boundedMatches = cappedArtifacts
-      .map((match) => {
-        const offsets = match.offsets.slice(0, Math.max(0, offsetBudget));
-        offsetBudget -= offsets.length;
-        return { ...match, offsets, line_spans: match.line_spans?.slice(0, offsets.length) };
-      })
-      .filter((match) => match.offsets.length > 0);
+    const totalOffsets = matches.reduce((total, match) => total + match.offsets.length, 0);
+    if (matches.length > SEARCH_TEXT_PUSHDOWN_ARTIFACT_CAP || totalOffsets > SEARCH_TEXT_PUSHDOWN_OFFSET_CAP) {
+      throw new EngineErrorWithDetails(
+        "core:execution_resource_limit",
+        `core:search_text lexical pushdown exceeded its exact candidate bound (${matches.length} artifacts, ${totalOffsets} offsets); refusing silent truncation.`,
+        { limit_kind: "lexical_pushdown_candidate_cap", configured_limits: { artifacts: SEARCH_TEXT_PUSHDOWN_ARTIFACT_CAP, offsets: SEARCH_TEXT_PUSHDOWN_OFFSET_CAP }, observed_or_required: { artifacts: matches.length, offsets: totalOffsets } },
+      );
+    }
+    const boundedMatches = matches.filter((match) => match.offsets.length > 0);
 
     const versionIds = [...new Set(boundedMatches.map((match) => match.artifact_version_id))];
     const records = await this.snapshots.records_by_artifact_versions(operation.scope, versionIds);
@@ -4892,7 +5172,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       this.recordsForComparisonParticipant(base.port, base.scope, selection),
       this.recordsForComparisonParticipant(target.port, target.scope, selection),
     ]);
-    const diff = diffComparisonRecordSets(baseRecords, targetRecords, correlationPolicy);
+    const diff = await diffComparisonRecordSources(baseRecords, targetRecords, correlationPolicy);
 
     const streams: Record<string, QueryStreamItem[]> = {};
     if (requestedKinds.has("added")) streams["added"] = diff.added.map((record) => compareParticipantItem(record, targetParticipant.role));
@@ -4957,11 +5237,11 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   }
 
   /**
-   * Fetches one comparison participant's own entity/relation records,
-   * bounded exactly like every other non-pushdown operation
-   * (`FULL_CORPUS_FALLBACK_RECORD_CAP`) -- `core:compare` gets no special
-   * exemption from that guard just because it evaluates two sides instead
-   * of one. A non-empty `selection` resolves through the SAME indexed
+   * Fetches one comparison participant's own entity/relation records.
+   * Native/storage ports use bounded cursor ranges and the diff consumes the
+   * target side incrementally; compatibility ports without that range reader
+   * receive a typed capability error rather than a full-corpus fallback. A
+   * non-empty `selection` resolves through the SAME indexed
    * selector resolution `tryBuildContextPushdown`/`tryGraphPushdown` already
    * use (`resolveIndexedGraphSelectors`, called here on a throwaway sibling
    * port bound to THIS participant so its private helper methods run
@@ -4969,28 +5249,33 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * declining to resolve is a typed `core:execution_resource_limit`, never
    * a silent full-corpus scan.
    */
-  private async recordsForComparisonParticipant(port: CanonicalQuerySnapshotPort, scope: SingleWorkspaceScope, selection: readonly unknown[] | undefined): Promise<readonly CanonicalQueryRecord[]> {
+  private async recordsForComparisonParticipant(port: CanonicalQuerySnapshotPort, scope: SingleWorkspaceScope, selection: readonly unknown[] | undefined): Promise<ComparisonRecordSource> {
     const structural = (records: readonly CanonicalQueryRecord[]): readonly CanonicalQueryRecord[] => records.filter((record) => record.category === "entity" || record.category === "relation");
     if (selection !== undefined) {
       const sibling = new CanonicalRecordQueryDataPort(port, this.options);
       const resolved = await sibling.resolveIndexedGraphSelectors(scope, selection);
-      if (resolved !== undefined) return structural(resolved);
+      if (resolved !== undefined) return { records: sortComparisonRecords(structural(resolved)), ordered_by_identity: true };
       throw new EngineErrorWithDetails(
         "core:execution_resource_limit",
         `core:compare's "selection" could not be resolved to an indexed lookup for workspace "${scope.workspace_id}"; narrow it to record_id/entity_id/relation_id or symbol selectors.`,
         { limit_kind: "comparison_selection_unresolvable", configured_limit: 0, observed_or_required: selection.length },
       );
     }
-    const visibleCount = await port.visible_record_count?.(scope);
-    if (visibleCount !== undefined && visibleCount > FULL_CORPUS_FALLBACK_RECORD_CAP) {
-      throw new EngineErrorWithDetails(
-        "core:execution_resource_limit",
-        `core:compare with no "selection" would require decoding all ${visibleCount} visible records for workspace "${scope.workspace_id}" (over the ${FULL_CORPUS_FALLBACK_RECORD_CAP}-record cap) -- narrow with "selection".`,
-        { limit_kind: "full_corpus_decode_record_count", configured_limit: FULL_CORPUS_FALLBACK_RECORD_CAP, observed_or_required: visibleCount },
-      );
+    // Native/storage ports expose the same visibility query as bounded cursor
+    // ranges. Compare consumes one side incrementally, so a large corpus does
+    // not require two complete decoded participant arrays.
+    const identityBatches = port.records_for_query_batches_by_identity;
+    const batches = identityBatches === undefined ? port.records_for_query_batches?.call(port, scope) : identityBatches.call(port, scope);
+    if (batches !== undefined) {
+      return { records: (async function* (): AsyncIterable<readonly CanonicalQueryRecord[]> {
+        for await (const batch of batches) yield structural(batch);
+      })(), ordered_by_identity: identityBatches !== undefined || port.records_for_query_batches_order === "identity_key" };
     }
-    const records = port.records_for_query !== undefined ? await port.records_for_query(scope) : await port.records(scope);
-    return structural(records);
+    throw new EngineErrorWithDetails(
+      "core:required_capability_unsupported",
+      `core:compare requires the indexed identity-ordered records_for_query_batches capability for workspace "${scope.workspace_id}"; refusing a legacy full-corpus fallback that could decode the complete participant into memory.`,
+      { capability: "core:records_for_query_batches", reason_codes: ["bounded_comparison_ranges_unavailable"] },
+    );
   }
 
   async execute(operation: OperationInvocation): Promise<OperationEvaluation> {
@@ -5003,24 +5288,25 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // called unconditionally a few lines down regardless of operation_id)
     // throws a raw `TypeError` for a non-`single_workspace` scope, so this
     // must be handled before any of them ever sees the scope.
-    if (boundOperation.operation_id === "core:compare") return this.executeCompare(boundOperation);
+    const annotate = (evaluation: OperationEvaluation, route: string, indexUsed?: string, extra: QueryOperationEvaluationTelemetry = {}): OperationEvaluation => withEvaluationTelemetry(evaluation, { route, ...(indexUsed === undefined ? {} : { index_used: indexUsed }), ...extra });
+    if (boundOperation.operation_id === "core:compare") return annotate(await this.executeCompare(boundOperation), "indexed_compare_ranges", "records_for_query_batches");
     const pushedSearchText = await this.trySearchTextPushdown(boundOperation);
-    if (pushedSearchText !== undefined) return pushedSearchText;
+    if (pushedSearchText !== undefined) return annotate(pushedSearchText, "indexed_pushdown", "lexical_fts");
     const pushedContext = await this.tryBuildContextPushdown(boundOperation);
-    if (pushedContext !== undefined) return pushedContext;
+    if (pushedContext !== undefined) return annotate(pushedContext, "indexed_pushdown", "context_index");
     const pushedSemantic = await this.trySemanticSearch(boundOperation);
-    if (pushedSemantic !== undefined) return pushedSemantic;
+    if (pushedSemantic !== undefined) return annotate(pushedSemantic, "indexed_pushdown", "semantic_vectors");
     const pushedAffectedPage = await this.trySemanticAffectedPage(boundOperation);
-    if (pushedAffectedPage !== undefined) return pushedAffectedPage;
+    if (pushedAffectedPage !== undefined) return annotate(pushedAffectedPage, "indexed_pushdown", "semantic_affected_artifacts");
     const warm = (await this.snapshots.has_warm_records?.(boundOperation.scope)) ?? false;
     if (!warm) {
       const pushed = await this.tryPushdown(boundOperation);
-      if (pushed !== undefined) return pushed;
+      if (pushed !== undefined) return annotate(pushed, "indexed_pushdown", indexedTelemetryIndex(boundOperation.operation_id));
     }
     if (boundOperation.operation_id === "core:find_artifacts" && this.snapshots.artifacts_by_filter !== undefined) {
       const artifacts = await this.snapshots.artifacts_by_filter(boundOperation.scope, object(boundOperation.arguments)["filter"] as StructuralFilter | undefined);
       const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
-      return result({ artifacts: artifacts.map((record) => item(record)) }, capabilityStates);
+      return annotate(result({ artifacts: artifacts.map((record) => item(record)) }, capabilityStates), "indexed_pushdown", "artifact_catalog");
     }
     // Frente Q-3 (2026-09-08): `core:discover_definitions` matches against
     // the REGISTRY definition inventory (`discoverDefinitions` below), never
@@ -5033,8 +5319,17 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // large corpus -- it was never corpus-dependent in the first place.
     if (boundOperation.operation_id === "core:discover_definitions") {
       const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
-      return result(discoverDefinitions(object(boundOperation.arguments)), capabilityStates);
+      return annotate(result(discoverDefinitions(object(boundOperation.arguments)), capabilityStates), "registry_lookup", "core_registry");
     }
+    if (this.snapshots.test_only_allow_legacy_full_corpus_fallback !== true) {
+      throw new EngineErrorWithDetails(
+        "core:required_capability_unsupported",
+        `${boundOperation.operation_id} has no dedicated indexed or paginated execution route; refusing a hidden full-corpus compatibility scan.`,
+        { capability: "core:operation_pushdown", reason_codes: ["bounded_query_route_unavailable", "full_corpus_fallback_disabled"] },
+      );
+    }
+    // Test-only compatibility path. Production ports are rejected above;
+    // this remains solely for small fixture adapters that explicitly opt in.
     // Frente Q-2 (2026-09-08, item 4 sweep finding): refuse an unbounded
     // full-corpus decode BEFORE attempting it, for whichever operation
     // reaches this point with no dedicated pushdown (today: `core:compare`
@@ -5061,7 +5356,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       ? await this.snapshots.records_for_query(boundOperation.scope)
       : await this.snapshots.records(boundOperation.scope);
     const capabilityStates = await this.snapshots.capability_states?.(boundOperation.scope) ?? [];
-    const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
+    const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => withEvaluationTelemetry(result(streams, capabilityStates), { route: warm ? "warm_corpus" : "corpus_fallback", decline_reason: warm ? "indexed_pushdown_skipped_for_warm_snapshot" : "indexed_pushdown_unavailable_or_incomplete", fallback_reason: warm ? "warm_snapshot_reused" : "bounded_pushdown_unavailable" });
     const maps = await cachedIdentityMaps(records);
     const args = object(boundOperation.arguments);
     const graphEvaluation = await this.evaluateGraphOperation(boundOperation, records, maps, capabilityStates);
@@ -5081,23 +5376,22 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       // carry `resolution_scope` in their own argument models) get the same
       // correct behavior rather than an implicit empty-visible-scope trap.
       const resolutionScope = typeof args["resolution_scope"] === "string" ? args["resolution_scope"] : contextArtifact !== undefined ? "visible" : "workspace";
+      const contextByteOffset = typeof args["context_byte_offset"] === "number" ? args["context_byte_offset"] : undefined;
       if (resolutionScope !== "workspace" && contextArtifact !== undefined) {
         const container = resolveArtifactContainer(contextArtifact, maps);
         if (container !== undefined) {
           const sameArtifact = declarations.filter((record) => record.owner_artifact_id === container.owner_artifact_id);
           // `exports`: exportedness is not recorded on stored entity records
-          // today, so it cannot be distinguished from an ordinary
-          // same-artifact declaration -- per this bug group's own guidance,
-          // an undeliverable `exports` narrowing degrades to `workspace`
-          // (the full candidate set) rather than silently under-reporting.
-          // `visible`: prefer same-artifact declarations; when none exist,
-          // fall back to the full candidate set (a sane approximation of
-          // "+ exported declarations elsewhere" absent an exportedness
-          // signal to distinguish "elsewhere and exported" from "elsewhere
-          // and private").
+          // today, so it degrades to workspace semantics. `visible` prefers
+          // same-artifact declarations and falls back globally only when the
+          // container itself is known but has no matching declaration.
           if (resolutionScope === "visible" && sameArtifact.length > 0) declarations = sameArtifact;
+        } else if (resolutionScope === "visible") {
+          // An unresolved context is not permission to widen visibility.
+          declarations = declarations.filter((record) => record.body["path"] === contextArtifact || record.body["name"] === contextArtifact || record.owner_artifact_id === contextArtifact || record.owner_artifact_version_id === contextArtifact);
         }
       }
+      if (contextByteOffset !== undefined) declarations = declarations.filter((record) => recordContainsByteOffset(record, contextByteOffset));
       return evaluated({ declarations: declarations.map((record) => item(record)), candidates: [] });
     }
     if (boundOperation.operation_id === "core:get_source") {

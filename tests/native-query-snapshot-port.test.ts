@@ -17,12 +17,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { digestBytes, encodeCanonical } from "@urdira/canonical";
-import type { QueryScope } from "@urdira/contracts";
+import type { QueryRequest, QueryScope } from "@urdira/contracts";
 import { createDurableStorage } from "../packages/storage/src/index.js";
 import { toSubjectSelector } from "../packages/engine/src/recipe-executor.js";
 import {
   CanonicalRecordQueryDataPort,
+  CursorCache,
+  MemoryManifestStore,
   NativeCanonicalQuerySnapshotPort,
+  QueryEngine,
   SqliteCanonicalQuerySnapshotPort,
   convertV3WorkspaceToNativeStore,
   loadNativeStructuralStoreAddon,
@@ -213,6 +216,10 @@ maybeDescribe("NativeStoreBuilder / NativeStructuralStoreHandle round trip", () 
 
       expect(handle.recordsByName("myFunc", 1)).toHaveLength(1);
       expect(handle.recordsByKindExact("core:function", "entity", "function_declaration", 1, 10)).toHaveLength(1);
+      const selectorPage = handle.recordsBySelectorPage(["core:function"], ["entity"], [], 1, 1);
+      expect(selectorPage.rows).toHaveLength(1);
+      const selectorPageAfter = handle.recordsBySelectorPage(["core:function"], ["entity"], [], 1, 1, selectorPage.nextCursor);
+      expect(selectorPageAfter.rows).toHaveLength(0);
 
       const edges = handle.adjacency(["jsts:function:src/index.ts:10:myFunc"], "outbound", 1);
       expect(edges).toHaveLength(1);
@@ -238,6 +245,40 @@ maybeDescribe("NativeStoreBuilder / NativeStructuralStoreHandle round trip", () 
 
       const depOrdinal = dicts.artifacts.findIndex((pair) => pair.artifactVersionId === "artv-2");
       expect(handle.depsReverse(depOrdinal, 1)).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("merges and resumes a selector page without retaining the corpus", async () => {
+    const addon = loadNativeStructuralStoreAddon();
+    const root = await mkdtemp(join(tmpdir(), "urdira-native-selector-pages-"));
+    try {
+      const dir = join(root, "store");
+      const builder = new addon.NativeStoreBuilder();
+      builder.create(dir, 1);
+      builder.addRecords(Array.from({ length: 5_001 }, (_, index) => ({
+        recordIdHex: index.toString(16).padStart(64, "0"), ownerArtifactId: `artifact-${index}`, ownerArtifactVersionId: `version-${index}`, validFrom: 1, validTo: 0,
+        category: "entity" as const, kind: "function_declaration", universalKind: "core:function", facets: [], bodyPayload: encodeCanonical({ name: `f${index}` }),
+      })));
+      builder.finish();
+      const handle = addon.NativeStructuralStoreHandle.open(dir);
+      const seen = new Set<string>();
+      let cursor: string | undefined;
+      let pages = 0;
+      for (;;) {
+        const page = handle.recordsBySelectorPage(["core:function"], ["entity"], [], 1, 257, cursor);
+        expect(page.rows.length).toBeLessThanOrEqual(257);
+        for (const row of page.rows) {
+          expect(seen.has(row.recordId)).toBe(false);
+          seen.add(row.recordId);
+        }
+        pages += 1;
+        if (page.nextCursor === undefined) break;
+        cursor = page.nextCursor;
+      }
+      expect(seen.size).toBe(5_001);
+      expect(pages).toBeGreaterThan(5);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -333,6 +374,32 @@ maybeDescribe("NativeStoreBuilder / NativeStructuralStoreHandle round trip", () 
 });
 
 maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotPort", () => {
+  it("exposes identity-key keyset batches with stable record-id ties and duplicate keys", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      // Two different records intentionally share one identity_key.  The
+      // record_id tie-breaker must keep both rows when the page size is one.
+      await opened.database.run(
+        "INSERT INTO identity_assignments (identity_assignment_id, workspace_id, identity_type, identity_id, assignment_kind, identity_key, identity_key_digest, record_id, previous_record_id, owner_artifact_id, owner_artifact_version_id, valid_from_generation, valid_to_generation) VALUES (?, ?, 'entity', ?, 'created', ?, ?, ?, NULL, 'art-1', ?, ?, NULL)",
+        ["ia-duplicate-key", workspace.workspace_id, "identity:" + "3".repeat(64), "jsts:function:src/other.ts:5:otherFunc", "digest-duplicate-key", "record:" + "a".repeat(64), "artv-1", 1],
+      );
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      expect(native.records_for_query_batches_order).toBe("identity_key");
+
+      const rows: CanonicalQueryRecord[] = [];
+      for await (const batch of native.records_for_query_batches_by_identity(scope, 1)) {
+        expect(batch).toHaveLength(1);
+        rows.push(...batch);
+      }
+      const pairs = rows.map((row) => [row.identity_key, row.record_id] as const);
+      expect(pairs).toEqual([...pairs].sort(([leftKey, leftId], [rightKey, rightId]) => leftKey! < rightKey! || (leftKey === rightKey && leftId < rightId) ? -1 : 1));
+      expect(rows.filter((row) => row.identity_key === "jsts:function:src/other.ts:5:otherFunc")).toHaveLength(2);
+      expect(new Set(rows.map((row) => `${row.identity_key}\0${row.record_id}`)).size).toBe(rows.length);
+    });
+  });
+
   it("records_by_ids returns identical records for record_id, identity_id, and identity_key forms", async () => {
     await withWorkspace(async (opened, storeDir) => {
       await seedFixture(opened);
@@ -449,6 +516,27 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
     });
   });
 
+  it("rejects an unbounded native selector instead of scanning the visible corpus", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const addon = loadNativeStructuralStoreAddon();
+      const iterVisibleBatchSpy = vi.spyOn(addon.NativeStructuralStoreHandle.prototype, "iterVisibleBatch");
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      try {
+        const universalKinds = Array.from({ length: 513 }, (_, index) => `core:kind:${index}`);
+        await expect(native.records_by_selector(scope, { categories: ["entity"], universal_kinds: universalKinds }, 100)).rejects.toMatchObject({
+          code: "core:execution_resource_limit",
+          details: { limit_kind: "native_selector_combinations", observed_or_required: 513 },
+        });
+        expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
+      } finally {
+        iterVisibleBatchSpy.mockRestore();
+      }
+    });
+  });
+
   it("container_records_by_artifact_references matches", async () => {
     await withWorkspace(async (opened, storeDir) => {
       await seedFixture(opened);
@@ -480,22 +568,28 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       );
       await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
       const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const addon = loadNativeStructuralStoreAddon();
+      const iterVisibleBatchSpy = vi.spyOn(addon.NativeStructuralStoreHandle.prototype, "iterVisibleBatch");
       const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      try {
+        const sqliteEdges = await sqlite.graph_edges_by_subject_ids!(scope, ["jsts:function:src/index.ts:10:myFunc"], "outbound");
+        const nativeEdges = await native.graph_edges_by_subject_ids(scope, ["jsts:function:src/index.ts:10:myFunc"], "outbound");
+        expect(nativeEdges).toBeDefined();
+        expect(sqliteEdges).toBeDefined();
+        expect(nativeEdges?.map((e) => ({ ...e, edge_id: undefined }))).toEqual(sqliteEdges?.map((e) => ({ ...e, edge_id: undefined })));
 
-      const sqliteEdges = await sqlite.graph_edges_by_subject_ids!(scope, ["jsts:function:src/index.ts:10:myFunc"], "outbound");
-      const nativeEdges = await native.graph_edges_by_subject_ids(scope, ["jsts:function:src/index.ts:10:myFunc"], "outbound");
-      expect(nativeEdges).toBeDefined();
-      expect(sqliteEdges).toBeDefined();
-      expect(nativeEdges?.map((e) => ({ ...e, edge_id: undefined }))).toEqual(sqliteEdges?.map((e) => ({ ...e, edge_id: undefined })));
-
-      const sqlitePairs = await sqlite.relation_pairs_by_subject_ids!(scope, ["jsts:function:src/index.ts:10:myFunc"], ["jsts:function:src/other.ts:5:otherFunc"], { universal_kinds: ["core:call"] }, "outbound");
-      const nativePairs = await native.relation_pairs_by_subject_ids(scope, ["jsts:function:src/index.ts:10:myFunc"], ["jsts:function:src/other.ts:5:otherFunc"], { universal_kinds: ["core:call"] }, "outbound");
-      expect([...(nativePairs ?? [])]).toEqual([...(sqlitePairs ?? [])]);
-      expect(nativePairs?.size).toBe(1);
+        const sqlitePairs = await sqlite.relation_pairs_by_subject_ids!(scope, ["jsts:function:src/index.ts:10:myFunc"], ["jsts:function:src/other.ts:5:otherFunc"], { universal_kinds: ["core:call"] }, "outbound");
+        const nativePairs = await native.relation_pairs_by_subject_ids(scope, ["jsts:function:src/index.ts:10:myFunc"], ["jsts:function:src/other.ts:5:otherFunc"], { universal_kinds: ["core:call"] }, "outbound");
+        expect([...(nativePairs ?? [])]).toEqual([...(sqlitePairs ?? [])]);
+        expect(nativePairs?.size).toBe(1);
+        expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
+      } finally {
+        iterVisibleBatchSpy.mockRestore();
+      }
     });
   });
 
-  it("records()/records_for_query_batches() over the full corpus match", async () => {
+  it("streams records_for_query_batches without an unbounded native batch", async () => {
     await withWorkspace(async (opened, storeDir) => {
       await seedFixture(opened);
       await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
@@ -505,7 +599,6 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       const nativeAll = await native.records(scope);
       expectSameRecords(nativeAll, sqliteAll);
       expect(nativeAll.length).toBeGreaterThanOrEqual(4);
-
       const nativeBatches: CanonicalQueryRecord[] = [];
       for await (const batch of native.records_for_query_batches!(scope, 1)) nativeBatches.push(...batch);
       expectSameRecords(nativeBatches, sqliteAll);
@@ -586,24 +679,28 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       await seedFixture(opened);
       await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
       const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const addon = loadNativeStructuralStoreAddon();
+      const iterVisibleBatchSpy = vi.spyOn(addon.NativeStructuralStoreHandle.prototype, "iterVisibleBatch");
       const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      try {
+        const sqliteCounts = await sqlite.semantic_entity_scope_counts!(scope);
+        const firstNativeCounts = await native.semantic_entity_scope_counts!(scope);
+        expect(firstNativeCounts).toEqual(sqliteCounts);
+        expect(firstNativeCounts.entity_count).toBeGreaterThan(0);
+        expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
 
-      const sqliteCounts = await sqlite.semantic_entity_scope_counts!(scope);
-      const firstNativeCounts = await native.semantic_entity_scope_counts!(scope);
-      expect(firstNativeCounts).toEqual(sqliteCounts);
-      expect(firstNativeCounts.entity_count).toBeGreaterThan(0);
+        // A second call for the SAME generation is served from the bounded
+        // per-generation count cache.
+        const secondNativeCounts = await native.semantic_entity_scope_counts!(scope);
+        expect(secondNativeCounts).toEqual(firstNativeCounts);
 
-      // A second call for the SAME generation -- whether served from
-      // `entityScopeCountCache` (the fast path this frente added) or
-      // recomputed, the answer must be identical.
-      const secondNativeCounts = await native.semantic_entity_scope_counts!(scope);
-      expect(secondNativeCounts).toEqual(firstNativeCounts);
-
-      // `evictWarmRecords()` drops the cache -- a call after eviction must
-      // still return the identical (recomputed) count.
-      native.evictWarmRecords();
-      const thirdNativeCounts = await native.semantic_entity_scope_counts!(scope);
-      expect(thirdNativeCounts).toEqual(firstNativeCounts);
+        native.evictWarmRecords();
+        const thirdNativeCounts = await native.semantic_entity_scope_counts!(scope);
+        expect(thirdNativeCounts).toEqual(firstNativeCounts);
+        expect(iterVisibleBatchSpy).not.toHaveBeenCalled();
+      } finally {
+        iterVisibleBatchSpy.mockRestore();
+      }
     });
   });
 
@@ -621,10 +718,33 @@ maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotP
       const nativeSource = await nativePort.execute(getSource);
       expect(nativeSource.streams["source"]).toEqual(sqliteSource.streams["source"]);
 
-      const findRecords = { operation_id: "core:find_records" as const, operation_version: 1, result_streams: ["records"], arguments: { selector: { category: "entity", universal_kind: "core:function" } }, scope };
-      const sqliteFound = await sqlitePort.execute(findRecords);
-      const nativeFound = await nativePort.execute(findRecords);
-      expect(nativeFound.streams["records"]).toEqual(sqliteFound.streams["records"]);
+      const findRecords = { operation_id: "core:find_records" as const, operation_version: 1, result_streams: ["records"], arguments: { selector: { record_categories: ["entity"] as const, kind_selector: { universal_kinds: ["core:function"] as const } } }, scope };
+      const findThroughQueryEngine = async (port: CanonicalRecordQueryDataPort): Promise<readonly QueryStreamItem[]> => {
+        const engine = new QueryEngine({ data_port: port, cursor_cache: new CursorCache({ signing_secret: "native-query-snapshot-port" }), manifest_store: new MemoryManifestStore(), now: () => now });
+        const request: QueryRequest = {
+          api_version: 3,
+          scope,
+          expression: { expression_type: "operation", operation: "core:find_records", arguments: findRecords.arguments },
+          options: {
+            freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported",
+            evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "none", diagnostic_detail: false },
+            snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 },
+            registry: { registry: "none", include_payload_schemas: false }, response_budget: { max_items: 1_000, max_characters: 1_000_000 },
+          },
+        };
+        const first = await engine.execute(request);
+        const items: QueryStreamItem[] = [...(first.streams["records"]?.items ?? [])];
+        let cursor = first.streams["records"]?.next_cursor;
+        while (cursor !== undefined) {
+          const page = await engine.continue({ cursor, response_budget: { max_items: 1_000, max_characters: 1_000_000 } });
+          items.push(...(page.streams["records"]?.items ?? []));
+          cursor = page.streams["records"]?.next_cursor;
+        }
+        return items;
+      };
+      const sqliteFound = await findThroughQueryEngine(sqlitePort);
+      const nativeFound = await findThroughQueryEngine(nativePort);
+      expect(nativeFound).toEqual(sqliteFound);
     });
   });
 

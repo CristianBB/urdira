@@ -4615,7 +4615,10 @@ export class DaemonRuntime {
             const hydrationStartedAt = Date.now();
             try {
               const page = attachIndexFreshness(await engine.execute(queryRequest, context.signal), registry.get(workspaceId));
-              if (cachedQuery.operation_telemetry !== undefined) emitTiming("operation_metrics", `operation_metrics=${JSON.stringify(cachedQuery.operation_telemetry.snapshot())}`);
+              if (cachedQuery.operation_telemetry !== undefined) {
+                emitTiming("operation_metrics", `operation_metrics=${JSON.stringify(cachedQuery.operation_telemetry.snapshot())}`);
+                emitTiming("operation_page_metrics", `operation_page_metrics=${JSON.stringify(cachedQuery.operation_telemetry.pageSnapshot())}`);
+              }
               emitTiming("hydration", `hydration_ms=${Math.max(0, Date.now() - hydrationStartedAt)}`);
               emitTiming("execution", `execution_ms=${Math.max(0, Date.now() - executionStartedAt)}`);
               return page;

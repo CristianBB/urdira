@@ -480,8 +480,9 @@ delegated to a wrapped `SqliteCanonicalQuerySnapshotPort`).
 through native indexes. Identity batches retain a 1,000-selector cap and
 fail with `core:selector_unresolvable` above it. Kind/category listing uses
 `by_kind_universal` when no concrete kind is supplied; complex selector
-combinations retain an exact visible-batch fallback rather than a claim that
-every query shape has a dedicated index. See the
+combinations are bounded by the native index-combination cap and fail with
+`core:execution_resource_limit` rather than falling back to a hidden
+full-visible-corpus decode. See the
 [identity/compare evidence](../evidence/2026-09-08-v4-identity-lookup-and-compare.md)
 and [pushdown catalog](../evidence/2026-09-08-v4-full-pushdown-catalog.md).
 Port selection is per-workspace: the daemon reads `workspace_meta.structural_store`

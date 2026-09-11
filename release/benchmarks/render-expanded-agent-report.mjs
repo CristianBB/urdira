@@ -302,6 +302,17 @@ const summaries = Object.fromEntries(Object.entries(groups).map(([key, rows]) =>
     mcp_useful_discovery_calls: { median: percentile(numeric("mcp_useful_discovery_calls"), 0.5), mean: mean(numeric("mcp_useful_discovery_calls")) },
     repository_read_calls: { median: percentile(numeric("repository_read_calls"), 0.5), mean: mean(numeric("repository_read_calls")) },
     repository_context_characters: { median: percentile(numeric("repository_context_characters"), 0.5), mean: mean(numeric("repository_context_characters")) },
+    tool_output_characters: { median: percentile(numeric("tool_output_characters"), 0.5), mean: mean(numeric("tool_output_characters")) },
+    shell_output_characters: { median: percentile(numeric("shell_output_characters"), 0.5), mean: mean(numeric("shell_output_characters")) },
+    tgrep_output_characters: { median: percentile(numeric("tgrep_output_characters"), 0.5), mean: mean(numeric("tgrep_output_characters")) },
+    target_attributed_characters: { median: percentile(numeric("target_attributed_characters"), 0.5), mean: mean(numeric("target_attributed_characters")) },
+    target_unattributed_characters: { median: percentile(numeric("target_unattributed_characters"), 0.5), mean: mean(numeric("target_unattributed_characters")) },
+    context_component_characters: Object.fromEntries(["snippets", "hydration", "evidence", "registry"].map((component) => [component, { median: percentile(rows.map((row) => Number(row.metrics?.context_component_characters?.[component] ?? NaN)), 0.5), mean: mean(rows.map((row) => Number(row.metrics?.context_component_characters?.[component] ?? NaN))) }])),
+    discovery_adoption: {
+      zero_mcp_runs: rows.filter((row) => row.metrics?.discovery_adoption?.zero_mcp === true).length,
+      mcp_before_shell_runs: rows.filter((row) => row.metrics?.discovery_adoption?.mcp_before_shell === true).length,
+      shell_after_mcp_runs: rows.filter((row) => row.metrics?.discovery_adoption?.shell_after_mcp === true).length,
+    },
     context_calls_unattributed_to_declared_targets: { median: percentile(numeric("context_calls_unattributed_to_declared_targets"), 0.5), mean: mean(numeric("context_calls_unattributed_to_declared_targets")) },
     test_attempts: { median: percentile(numeric("test_attempts"), 0.5), mean: mean(numeric("test_attempts")) },
     test_passes: { median: percentile(numeric("test_passes"), 0.5), mean: mean(numeric("test_passes")) },
@@ -332,6 +343,10 @@ const report = {
     evidence_grounded_plan: "An observational flag indicating whether configured discovery evidence appeared before the first edit and again after edit batches; it is not a correctness gate.",
     composition_metrics: "For Urdira, the report records pipeline, recipe, direct-operation, dependency, and malformed-composition usage observationally. Each is valid when appropriate, and no choice is required.",
     repository_context_characters: "Characters returned by observed repository-discovery calls. This is tool-response context, not source-only bytes.",
+    transcript_output_breakdown: "tool_output_characters, shell_output_characters, and tgrep_output_characters split observed discovery response characters by method. Missing methods remain null. context_component_* counts only protocol-identifiable snippets, hydration, evidence, or registry payloads; unidentifiable components remain null.",
+    mcp_component_bytes: "For real Urdira MCP text-content responses, tool_envelope is the UTF-8 JSON request/status envelope, model_visible_serialized is the UTF-8 response content visible to the model, source_text is identifiable indented source text, records is identifiable result/header metadata, and hydration/evidence/registry remain null unless the response carries an explicit typed byte field. These are lower-bound protocol classifications and never use structuredContent.bytes as a required shape.",
+    target_attributed_characters: "Characters from observed discovery responses whose request or response contains a declared task path/file/required-pattern marker. This is a lexical attribution proxy, not a semantic relevance judgment; it is null when the task declares no patterns.",
+    discovery_adoption: "mcp_before_shell records ordering only when both methods occur; shell_after_mcp records a shell discovery after an MCP discovery. zero_mcp is true when no observed MCP discovery occurred. Non-applicable ordering values are null.",
     unattributed_context: "A proxy: observed discovery calls or returned characters containing none of the task's declared path/file/required-pattern markers. It is not a semantic irrelevance judgment.",
     tests: "Test attempts are parsed from command events. A pass or failure requires a numeric process exit code; missing exit codes remain unknown.",
     resources: "process_tree_peak_rss_kib covers the benchmark cell runner and all descendants, including the agent and any configured MCP. Urdira host-only RSS is retained separately for readiness diagnostics.",
@@ -365,6 +380,17 @@ const report = {
     command_timing: run.timing_metrics?.aggregates?.commands_by_command ?? null,
     repository_read_calls: run.metrics?.repository_read_calls ?? null,
     repository_context_characters: run.metrics?.repository_context_characters ?? null,
+    tool_output_characters: run.metrics?.tool_output_characters ?? null,
+    shell_output_characters: run.metrics?.shell_output_characters ?? null,
+    tgrep_output_characters: run.metrics?.tgrep_output_characters ?? null,
+    output_characters_by_method: run.metrics?.output_characters_by_method ?? null,
+    mcp_component_bytes: run.metrics?.mcp_component_bytes ?? null,
+    mcp_component_classification: run.metrics?.mcp_component_classification ?? null,
+    target_attributed_characters: run.metrics?.target_attributed_characters ?? null,
+    target_unattributed_characters: run.metrics?.target_unattributed_characters ?? null,
+    context_component_characters: run.metrics?.context_component_characters ?? null,
+    context_component_calls: run.metrics?.context_component_calls ?? null,
+    discovery_adoption: run.metrics?.discovery_adoption ?? null,
     context_calls_unattributed_to_declared_targets: run.metrics?.context_calls_unattributed_to_declared_targets ?? null,
     context_characters_unattributed_to_declared_targets: run.metrics?.context_characters_unattributed_to_declared_targets ?? null,
     declared_unsafe_omissions: run.correctness?.declared_unsafe_omissions ?? null,
@@ -407,7 +433,9 @@ const resourceRows = runs.map((run) => `| ${run.repository} | ${run.task} | ${ru
 const evidenceRows = runs.map((run) => {
   const omissions = run.correctness?.declared_unsafe_omissions;
   const omissionText = Array.isArray(omissions) ? (omissions.length === 0 ? "none" : omissions.join(", ")) : "—";
-  return `| ${run.repository} | ${run.task} | ${run.arm} | ${run.correctness?.evidence_grounded_plan === true ? "yes" : run.correctness?.evidence_grounded_plan === false ? "no" : "—"} | ${omissionText.replaceAll("|", "/")} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.context_calls_unattributed_to_declared_targets)} | ${number(run.metrics?.mcp_calls)} | ${number(run.metrics?.mcp_failed_calls)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} |`;
+  const adoption = run.metrics?.discovery_adoption;
+  const adoptionText = adoption ? (adoption.zero_mcp ? "zero-mcp" : adoption.mcp_before_shell === true ? "mcp-before-shell" : adoption.shell_after_mcp === true ? "shell-after-mcp" : "mixed") : "—";
+  return `| ${run.repository} | ${run.task} | ${run.arm} | ${run.correctness?.evidence_grounded_plan === true ? "yes" : run.correctness?.evidence_grounded_plan === false ? "no" : "—"} | ${omissionText.replaceAll("|", "/")} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.tool_output_characters)} | ${number(run.metrics?.shell_output_characters)} | ${number(run.metrics?.tgrep_output_characters)} | ${number(run.metrics?.target_attributed_characters)} | ${number(run.metrics?.target_unattributed_characters)} | ${adoptionText} | ${number(run.metrics?.mcp_calls)} | ${number(run.metrics?.mcp_failed_calls)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} |`;
 });
 const urdiraRuns = runs.filter((run) => run.arm === "urdira-typescript");
 const urdiraDiscoveryCalls = urdiraRuns.reduce((sum, run) => sum + Number(run.metrics?.mcp_discovery_calls ?? 0), 0);
@@ -460,8 +488,10 @@ agent elapsed; \`Agent elapsed ms\` starts at the first instruction.
 
 The test column is attempts/passes/failures/unknown. Repository reads and
 context characters cover observed discovery calls and the tools selected by
-the agent. The
-unattributed-call count is a declared-target proxy defined in the JSON report.
+the agent. Tool, shell, and tgrep output columns split those response
+characters by method. Target-attributed characters are a lexical declared-
+target proxy; component fields remain null when the protocol does not identify
+snippets, hydration, evidence, or registry payloads.
 
 | Repository | Task | Scenario | Option | Grader | Setup ms | Agent ms | Total ms | Total tokens | Cost USD | Turns | Repository reads | Context chars | Unattributed calls | Tests A/P/F/? | Process-tree peak RSS KiB |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -483,8 +513,8 @@ ${viabilityAssessment ? `## Viability assessment\n\n${viabilityAssessment}\n` : 
 
 ## Discovery, omissions, and verification
 
-| Repository | Task | Arm | Evidence grounded | Declared omissions | Repository reads | Context chars | Unattributed calls | MCP calls | Failed MCP | Tests A/P/F/? |
-|---|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| Repository | Task | Arm | Evidence grounded | Declared omissions | Repository reads | Context chars | Tool chars | Shell chars | tgrep chars | Target chars | Unattributed chars | Adoption | MCP calls | Failed MCP | Tests A/P/F/? |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|
 ${evidenceRows.join("\n")}
 
 ## Resource and storage measurements

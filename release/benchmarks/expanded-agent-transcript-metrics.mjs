@@ -1,3 +1,4 @@
+/* global Buffer */
 const SHELL_SOURCE_READ = /(?:^|[\s;&|('"])(?:rg|grep|find|cat|bat|less|more|nl|strings|xxd|od)(?=\s)|(?:^|[\s;&|('"])ls\s+-|git\s+ls-files|sed\s+-n|(?<![|]\s)(?:head|tail|awk)\s+|(?:python3?\s+-c|node\s+-e).*(?:open\(|readFileSync\(|readFile\()/mu;
 const isShellSourceReadCommand = (command) => {
   const text = String(command);
@@ -124,6 +125,57 @@ const itemText = (item) => {
   return "";
 };
 
+const DISCOVERY_COMPONENTS = ["snippets", "hydration", "evidence", "registry"];
+const MCP_COMPONENT_BYTE_FIELDS = ["tool_envelope", "model_visible_serialized", "source_text", "hydration", "records", "evidence", "registry"];
+const utf8Bytes = (value) => Buffer.byteLength(String(value ?? ""), "utf8");
+const mcpText = (item) => itemText(item);
+const requestedComponent = (item, component) => {
+  const encoded = JSON.stringify(item?.arguments ?? {}).toLowerCase();
+  if (component === "snippets") return /"snippets"\s*:/u.test(encoded) && !/"mode"\s*:\s*"none"/u.test(encoded);
+  if (component === "evidence") return /"evidence"\s*:/u.test(encoded);
+  if (component === "registry") return /"registry"\s*:/u.test(encoded);
+  return false;
+};
+const classifyMcpResponseComponents = (item) => {
+  if (item?.type !== "mcp_tool_call") return null;
+  const text = mcpText(item);
+  const lines = text.split("\n");
+  // Urdira's production MCP response is currently text content with result
+  // headings and indented source bodies; structured_content is null in the
+  // retained transcripts. Count only lines whose wire shape is identifiable.
+  const source = lines.filter((line) => /^\s{4,}\S/u.test(line) && !/^\s*:\d+/u.test(line));
+  const records = lines.filter((line) => /^(?:== .* ==|:?\S[^\n]*:\d+|[^\s].*\bcore:[a-z_]+)/u.test(line));
+  const explicit = (component) => {
+    const structured = item.result?.structuredContent ?? item.result?.structured_content;
+    const value = structured?.bytes?.[component] ?? structured?.[`${component}_bytes`];
+    return Number.isFinite(Number(value)) ? Number(value) : null;
+  };
+  const component = {
+    tool_envelope: utf8Bytes(JSON.stringify({ server: item.server ?? null, tool: item.tool ?? null, arguments: item.arguments ?? null, status: item.status ?? null, error: item.error ?? null })),
+    model_visible_serialized: utf8Bytes(text),
+    source_text: source.length === 0 ? null : source.reduce((sum, line) => sum + utf8Bytes(`${line}\n`), 0),
+    hydration: explicit("hydration"),
+    records: records.length === 0 ? null : records.reduce((sum, line) => sum + utf8Bytes(`${line}\n`), 0),
+    evidence: explicit("evidence"),
+    registry: explicit("registry"),
+  };
+  // A requested component with no protocol marker is unavailable, not zero.
+  for (const key of ["hydration", "evidence", "registry"]) {
+    if (component[key] === null && requestedComponent(item, key)) component[key] = null;
+  }
+  return { ...component, classification: { source_text: source.length > 0 ? "indented_source_lines" : null, records: records.length > 0 ? "result_headers_and_record_lines" : null, structured_components: Object.fromEntries(["hydration", "evidence", "registry"].map((key) => [key, explicit(key) !== null])) } };
+};
+const componentMarkers = {
+  snippets: /(?:source_)?snippets?\b|snippet_text/u,
+  hydration: /hydr(?:at|ation)|hydrate\b/u,
+  evidence: /\bevidence\b|diagnostic_detail|evidence_chain/u,
+  registry: /\bregistry\b|payload_schema|registry_snapshot/u,
+};
+const componentMatches = (item) => {
+  const encoded = JSON.stringify(item).toLowerCase();
+  return DISCOVERY_COMPONENTS.filter((component) => componentMarkers[component].test(encoded));
+};
+
 const commandExitCode = (item) => {
   for (const candidate of [item?.exit_code, item?.exitCode, item?.status_code]) {
     const number = Number(candidate);
@@ -188,6 +240,11 @@ export function analyzeExpandedTranscript(events, arm, task) {
       request: item?.type === "command_execution" ? command : JSON.stringify(item?.arguments ?? {}),
       response,
       response_characters: response.length,
+      // Component accounting is intentionally protocol-only. Shell text can
+      // mention these words without exposing a typed snippets/hydration/
+      // evidence/registry payload.
+      components: item?.type === "mcp_tool_call" ? componentMatches(item) : [],
+      mcp_components: item?.type === "mcp_tool_call" ? classifyMcpResponseComponents(item) : null,
     }];
   });
   const observedDiscoveryIndices = observedReads.map((read) => read.event_index);
@@ -204,11 +261,55 @@ export function analyzeExpandedTranscript(events, arm, task) {
     return [{ kind, command, exit_code: exitCode, passed: exitCode === null ? null : exitCode === 0, output_characters: itemText(item).length }];
   });
   const testAttempts = verificationAttempts.filter((attempt) => attempt.kind === "test");
+  const methodReads = (method) => observedReads.filter((read) => read.method === method);
+  const methodCharacters = (method) => {
+    const readsForMethod = methodReads(method);
+    return readsForMethod.length === 0 ? null : readsForMethod.reduce((sum, read) => sum + read.response_characters, 0);
+  };
+  const targetReads = patterns.length === 0 ? null : observedReads.filter((read) => patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`)));
+  const componentCharacters = Object.fromEntries(DISCOVERY_COMPONENTS.map((component) => {
+    const matching = observedReads.filter((read) => read.components.includes(component));
+    return [component, matching.length === 0 ? null : matching.reduce((sum, read) => sum + read.response_characters, 0)];
+  }));
+  const componentCalls = Object.fromEntries(DISCOVERY_COMPONENTS.map((component) => {
+    const matching = observedReads.filter((read) => read.components.includes(component));
+    return [component, matching.length === 0 ? null : matching.length];
+  }));
+  const mcpIndices = observedReads.filter((read) => read.method === "mcp").map((read) => read.event_index);
+  const shellIndices = observedReads.filter((read) => read.method === "shell").map((read) => read.event_index);
+  const firstMcp = mcpIndices.at(0);
+  const firstShell = shellIndices.at(0);
+  const mcpBeforeShell = firstMcp === undefined || firstShell === undefined ? null : firstMcp < firstShell;
+  const shellAfterMcp = firstMcp === undefined || firstShell === undefined ? null : shellIndices.some((index) => index > firstMcp);
+  const mcpComponentReads = observedReads.filter((read) => read.method === "mcp" && read.mcp_components !== null);
+  const mcpComponentBytes = Object.fromEntries(MCP_COMPONENT_BYTE_FIELDS.map((field) => {
+    const values = mcpComponentReads.map((read) => read.mcp_components?.[field]).filter((value) => Number.isFinite(value));
+    return [field, values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0)];
+  }));
+  const mcpComponentClassification = Object.fromEntries(["source_text", "records", "hydration", "evidence", "registry"].map((field) => {
+    const values = mcpComponentReads.map((read) => read.mcp_components?.classification?.[field]).filter(Boolean);
+    return [field, values.length === 0 ? null : [...new Set(values)]];
+  }));
+  const outputCharactersByMethod = {
+    mcp: methodCharacters("mcp"),
+    shell: methodCharacters("shell"),
+    tgrep: methodCharacters("tgrep"),
+  };
   return {
     repository_read_calls: observedReads.length,
     configured_repository_read_calls: reads.length,
     assigned_tgrep_calls: arm === "tgrep" ? reads.length : 0,
     repository_context_characters: observedReads.reduce((sum, read) => sum + read.response_characters, 0),
+    tool_output_characters: outputCharactersByMethod.mcp,
+    shell_output_characters: outputCharactersByMethod.shell,
+    tgrep_output_characters: outputCharactersByMethod.tgrep,
+    output_characters_by_method: outputCharactersByMethod,
+    mcp_component_bytes: mcpComponentBytes,
+    mcp_component_classification: mcpComponentClassification,
+    target_attributed_characters: targetReads === null ? null : targetReads.reduce((sum, read) => sum + read.response_characters, 0),
+    target_unattributed_characters: targetReads === null ? null : observedReads.filter((read) => !targetReads.includes(read)).reduce((sum, read) => sum + read.response_characters, 0),
+    context_component_characters: componentCharacters,
+    context_component_calls: componentCalls,
     context_calls_attributed_to_declared_targets: patterns.length === 0 ? null : observedReads.filter((read) => patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`))).length,
     context_calls_unattributed_to_declared_targets: patterns.length === 0 ? null : observedReads.filter((read) => !patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`))).length,
     context_characters_unattributed_to_declared_targets: patterns.length === 0 ? null : observedReads.filter((read) => !patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`))).reduce((sum, read) => sum + read.response_characters, 0),
@@ -221,6 +322,13 @@ export function analyzeExpandedTranscript(events, arm, task) {
       shell_calls: observedReads.filter((read) => read.method === "shell").length,
       tgrep_calls: observedReads.filter((read) => read.method === "tgrep").length,
     },
+    discovery_adoption: {
+      mcp_before_shell: mcpBeforeShell,
+      shell_after_mcp: shellAfterMcp,
+      zero_mcp: mcpIndices.length === 0,
+      mcp_calls: mcpIndices.length,
+      shell_calls: shellIndices.length,
+    },
     assigned_discovery_before_edit: discoveryIndices.length > 0 && (firstEdit === undefined || discoveryIndices[0] < firstEdit),
     assigned_rediscovery_after_each_edit: edits.every((edit) => discoveryIndices.some((discovery) => discovery > edit)),
     verification_attempts: verificationAttempts,
@@ -231,4 +339,4 @@ export function analyzeExpandedTranscript(events, arm, task) {
   };
 }
 
-export { SHELL_SOURCE_READ, isShellSourceReadCommand };
+export { SHELL_SOURCE_READ, isShellSourceReadCommand, classifyMcpResponseComponents };

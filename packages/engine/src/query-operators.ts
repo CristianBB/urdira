@@ -12,6 +12,9 @@ export interface QueryStreamItem {
 
 export interface OperationEvaluation {
   readonly streams: Readonly<Record<string, ReadonlyArray<QueryStreamItem | unknown>>>;
+  /** Optional bounded execution metadata supplied by a query data port. It is
+   * consumed only by internal telemetry and never crosses the query/MCP page. */
+  readonly telemetry?: QueryOperationEvaluationTelemetry;
   /** Internal lazy streams. These never cross the MCP boundary; the pipeline
    * executor seals them into its execution-local spool before another stage
    * can consume them. `streams` remains populated for legacy ports and final
@@ -23,6 +26,15 @@ export interface OperationEvaluation {
   readonly diagnostics?: ReadonlyArray<unknown>;
   readonly semantic_state?: "ready" | "updating" | "partial" | "failed" | "unsupported";
   readonly stage_handles?: ReadonlyMap<string, unknown>;
+}
+
+export interface QueryOperationEvaluationTelemetry {
+  readonly route?: string;
+  readonly index_used?: string;
+  readonly candidates?: number;
+  readonly rows_hydrated?: number;
+  readonly decline_reason?: string;
+  readonly fallback_reason?: string;
 }
 
 export interface OperationInvocation {

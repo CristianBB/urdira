@@ -27,7 +27,7 @@ use urdira_native_core::{
     verify_logical_value_batch as core_verify_logical_value_batch,
 };
 
-const NATIVE_API_VERSION: u32 = 17;
+const NATIVE_API_VERSION: u32 = 18;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

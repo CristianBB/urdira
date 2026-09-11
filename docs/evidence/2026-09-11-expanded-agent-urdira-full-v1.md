@@ -229,6 +229,73 @@ and agent behavior are not conflated.
 The 200,000-record safety fuse remains a last-resort guard. It is not a target
 to raise and it is not the mechanism used to control response size.
 
+## Implementation status of the nine improvements
+
+This section records implementation evidence after the pushdown and measurement
+work. It does not add a new benchmark result; the repository verification result
+is recorded below. Structural cold indexing remains owned by the existing native
+worker and readiness contract; the changes below are query, adapter, telemetry,
+MCP presentation, and measurement capabilities. Structural readiness runs keep
+`URDIRA_SEMANTIC_INDEX=0`, semantic materialization disabled, and no semantic
+sidecar creation.
+
+1. **Indexed symbol resolution.** `core:resolve_symbol` now uses indexed name,
+   identity, qualified-name, context-artifact, byte-offset, kind-selector, and
+   resolution-scope paths where the native snapshot exposes them. Cold/warm
+   parity and unresolved-context tests are retained in
+   `tests/phase-canonical-query-data-port.test.ts`.
+2. **Response-component reduction and measurement.** The web MCP profile keeps
+   the complete typed page in `structuredContent` and removes duplicated source
+   snippets, source text, hydration, evidence, and registry payloads from its
+   companion text block while retaining labels, completeness, and opaque cursors.
+   The transcript harness measures tool-envelope, model-visible serialized,
+   source-text, and record bytes from the real `content[].text` shape; hydration,
+   evidence, and registry remain `null` unless a typed wire field exposes them.
+3. **MCP adoption and shell fallback accounting.** Transcripts now report MCP
+   before shell, shell after MCP, zero-MCP rows, method-specific output bytes,
+   target-attributed bytes, and component classifications. This is measurement
+   instrumentation; it does not claim to change an agent's tool choice.
+4. **Indexed public pagination.** Selector and lexical lanes expose bounded
+   pages and continuation cursors through lazy stream sources. `find_records`,
+   `search_text`, and architecture streams retain immutable query pagination;
+   the native selector path uses existing kind ranges and does not decode the
+   visible corpus to form a page.
+5. **Lexical pushdown coverage.** Literal search and structural filters use the
+   lexical page capability when available, and unsupported requests fail with a
+   typed capability error instead of silently switching to record-body search.
+   `safe_regex` is deliberately documented as an exact artifact/CAS paged scan
+   in the current native implementation: it is bounded and cursorable, but it
+   is not yet a regex index. No stronger indexed-regex claim is made here.
+6. **Indexed comparison.** `core:compare` performs an identity-key ordered
+   merge over participant batches, retains only bounded working state, and
+   rejects adapters without the declared ordering capability. The public
+   `core:compare_workspaces` recipe maps to this stage without a second
+   comparison count.
+7. **Cap audit.** Selector, architecture, relation-closure, lexical legacy,
+   and generic full-corpus safety bounds now report typed resource-limit or
+   capability errors rather than presenting a truncated prefix as complete.
+   Immutable page-capable lanes bypass the legacy non-paginated bounds.
+8. **Compatibility-path removal.** Native relation predicates and joins use
+   subject-indexed relation pairs or return an actionable capability error;
+   they do not construct a corpus-wide JavaScript relation index. Identity and
+   selector lookups likewise use native indexes where available.
+9. **Pushdown telemetry.** Operation telemetry records route, selected index,
+   candidates, hydrated rows, decline/fallback reasons, and page timing and
+   serialized-byte metrics. The daemon preserves operation and page telemetry
+   in its timing output for later publication.
+
+Focused verification passed for the changed measurement and MCP surfaces: the
+post-index measurement, transcript-metrics, expanded-report, MCP
+response-separation, web-profile, and workspace-control test files passed their
+targeted Vitest runs, with ESLint, MCP TypeScript checking, and `git diff
+--check` also passing. `CI=true pnpm verify` subsequently passed end to end:
+155 test files passed, 2,335 tests passed, 15 tests were skipped, and the
+coverage gate and publication gate passed.
+
+`pnpm package:release` remains limited on this host because the local
+`darwin-x64` release closures are absent. This is a release-artifact
+availability limitation, not a functional verification failure of the change.
+
 ## Retained failures
 
 - `typescript/transpile-diagnostic-callback`, sample 1: the agent passed an

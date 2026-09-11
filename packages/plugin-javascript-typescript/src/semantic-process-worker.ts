@@ -182,11 +182,8 @@ async function handleHandshake(message: HostEnvelope): Promise<void> {
     // Must track NATIVE_API_VERSION in packages/native/src/loader.ts (and
     // crates/urdira-native-node/src/lib.rs); this process worker can't
     // import that constant across the child-process boundary, so the
-    // literal is duplicated here. S-I bumped it 16 -> 17 (resident
-    // contiguous vector buffer + single-call native exact top-K) and this
-    // literal was left behind (same gap as rust-semantic-worker.ts's own
-    // copy of this check).
-    if (typeof loaded.nativeApiVersion !== "function" || loaded.nativeApiVersion() !== 17
+    // literal is duplicated here. The literal is 18 to match the native selector-page and indexed-count API.
+    if (typeof loaded.nativeApiVersion !== "function" || loaded.nativeApiVersion() !== 18
       || typeof loaded.structuralKernelBatch !== "function" || typeof loaded.structuralKernelCanonicalBatch !== "function"
       || typeof loaded.structuralObservationBatch !== "function") {
       throw new Error("Semantic process structural kernel binding is incompatible.");

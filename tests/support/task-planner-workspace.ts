@@ -289,7 +289,10 @@ export async function buildTaskPlannerWorkspace(language: "javascript" | "typesc
   };
   await opened.candidates.insert(publication.candidate, frozenBase);
   await opened.publishCandidate(publication);
-  const engine = new QueryEngine({ data_port: new CanonicalRecordQueryDataPort(new SqliteCanonicalQuerySnapshotPort(opened.database)), cursor_cache: new CursorCache({ signing_secret: `secret:${workspaceId}` }), now: () => now });
+  // This fixture intentionally exercises legacy body-search compatibility;
+  // production adapters must keep the explicit capability boundary.
+  const snapshot = Object.assign(new SqliteCanonicalQuerySnapshotPort(opened.database), { test_only_allow_legacy_full_corpus_fallback: true as const });
+  const engine = new QueryEngine({ data_port: new CanonicalRecordQueryDataPort(snapshot), cursor_cache: new CursorCache({ signing_secret: `secret:${workspaceId}` }), now: () => now });
   return {
     workspaceId,
     engine,

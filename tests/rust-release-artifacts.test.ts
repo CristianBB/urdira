@@ -29,10 +29,10 @@ describe("Rust release artifact closure", () => {
     await mkdir(source);
     for (const name of Object.values(nativeArtifactNames("darwin-arm64"))) await writeFile(join(source, name), `fixture:${name}`);
     const manifest = await stageNativeArtifacts({ artifactRoot: source, stageRoot: stage, target: "darwin-arm64" });
-    // S-I bumped NATIVE_API_VERSION 16 -> 17 (resident contiguous vector
+    // S-I bumped NATIVE_API_VERSION 17 -> 18 (resident contiguous vector
     // buffer + single-call native exact top-K); this must track
     // scripts/native-release.mjs's own stageNativeArtifacts.
-    expect(manifest).toMatchObject({ target: "darwin-arm64", rust_target: "aarch64-apple-darwin", binding_api: 17, node_api: 10, worker_protocol: "urdira.ipc.v2", build_id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u) });
+    expect(manifest).toMatchObject({ target: "darwin-arm64", rust_target: "aarch64-apple-darwin", binding_api: 18, node_api: 10, worker_protocol: "urdira.ipc.v2", build_id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u) });
     expect((await inspectNativeArtifacts(source, "darwin-arm64")).errors).toEqual([]);
   });
 });
