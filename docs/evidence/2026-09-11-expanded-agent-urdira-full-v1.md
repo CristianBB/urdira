@@ -115,6 +115,65 @@ paired 448 command calls, totaling 101,655.3 ms; 404 completed and 44 failed.
 Historical comparator sidecars do not expose equivalent timing, so no
 cross-arm latency claim is made.
 
+## Follow-up: pagination boundary and Urdira versus tgrep context
+
+The 200,000-record limit observed in the failed Playwright pipeline is not a
+page size or response limit. Query execution evaluates an operation before it
+materializes the immutable result streams used by public pagination. The
+failed request asked `core:resolve_symbol` for the simple name `Multiplexer`
+with both `context_artifact` and workspace resolution. The current exact
+`records_by_name` pushdown declines whenever `context_artifact` is present, so
+execution reached the generic full-corpus fallback. That fallback rejected the
+request before decoding all 612,496 visible records.
+
+Raising the 200,000-record fuse would only permit a larger in-memory decode;
+it would not make this request paginated. The appropriate optimization is an
+exact indexed resolution path that supports `context_artifact`,
+`kind_selector`, qualified names, and resolution scope. Public pagination can
+then page the already bounded, ordered result manifest. The fuse should remain
+as protection for query shapes that still cannot prove bounded execution.
+
+The current report's `repository_context_characters` counts all observed
+repository discovery responses, including Urdira/tgrep output and subsequent
+shell reads. Re-rendering the retained tgrep transcripts with that same current
+definition gives the following successful-sample medians:
+
+| Task | Urdira grader | Urdira context chars | Urdira tokens | tgrep grader | tgrep context chars | tgrep tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| Playwright affected tests | 3/3 | 99,355 | 985,753 | 2/3 | 29,899 | 1,089,350 |
+| Playwright reporter isolation | 2/3 | 729,699 | 1,484,496 | 3/3 | 17,868 | 1,038,725 |
+| Prisma wire validation | 3/3 | 71,395 | 1,302,740 | 3/3 | 20,731 | 1,078,133 |
+| Prisma Mongo transform | 3/3 | 78,873 | 947,875 | 3/3 | 66,257 | 1,204,650 |
+| TypeScript transpile diagnostic | 2/3 | 117,421 | 1,419,537 | 3/3 | 62,852 | 1,282,504 |
+| TypeScript session hook | 3/3 | 112,586 | 2,039,046 | 3/3 | 123,630 | 1,891,920 |
+| VS Code registry notification | 3/3 | 1,258,854 | 2,608,178 | 3/3 | 13,612 | 1,403,952 |
+| VS Code provider registration | 3/3 | 140,041 | 1,355,825 | 3/3 | 86,107 | 1,011,210 |
+
+Across all attempts, direct Urdira discovery responses contributed 110,946
+characters over 25 calls; direct tgrep command output contributed 22,834
+characters over 92 calls. Urdira therefore returned about 4.9 times as many
+tool-output characters in total and about 17.9 times as many per configured
+discovery call. The payloads serve different purposes: Urdira can return
+structured relations and source snippets, while tgrep usually returns compact
+locations or matching lines.
+
+The larger campaign-level difference is mainly outside those direct tool
+responses. Urdira rows recorded 8,153,162 repository-context characters in
+total, versus 1,563,080 for tgrep. Approximately 8.04 million characters in
+the Urdira transcripts came from shell discovery commands after or instead of
+MCP use; direct Urdira payloads were only about 1.4% of the recorded discovery
+context. Fourteen of 24 Urdira rows made no repository-reading MCP call at all,
+whereas every tgrep row invoked tgrep.
+
+This is evidence of an integration/adoption problem as well as a payload-size
+problem. Urdira's direct responses are larger per call, but simply reducing
+their page size cannot explain or remove the dominant shell context. The next
+controlled campaign should use the same natural-selection protocol for both
+arms and separately record tool-output characters, shell-output characters,
+hydrated source characters, and target-attributed characters. The present
+historical tgrep campaign was prompt-directed, so the success and context
+figures remain descriptive rather than causal.
+
 ## Retained failures
 
 - `typescript/transpile-diagnostic-callback`, sample 1: the agent passed an
