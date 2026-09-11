@@ -174,6 +174,61 @@ hydrated source characters, and target-attributed characters. The present
 historical tgrep campaign was prompt-directed, so the success and context
 figures remain descriptive rather than causal.
 
+## Prioritized improvement backlog
+
+The benchmark findings and the subsequent pushdown audit produce one combined
+backlog. Each item needs an isolated measurement so indexing, response size,
+and agent behavior are not conflated.
+
+1. **Implement exact indexed symbol resolution.** Extend the native query
+   surface beyond the current plain-name lookup so `core:resolve_symbol`
+   remains indexed for `context_artifact`, `context_byte_offset`,
+   `kind_selector`, qualified names, and every resolution scope. Reuse the
+   same resolver for graph-operation selectors, `core:get_source`, and recipes
+   that begin with symbol resolution. Acceptance requires exact parity with
+   the reference evaluator and zero full-corpus fallback for these shapes.
+2. **Reduce and measure snippets and hydration separately.** Record result
+   metadata, source snippets, evidence, registry material, and hydration bytes
+   as separate response components. Measure requested, produced, serialized,
+   and model-visible characters. Tune defaults from those measurements while
+   preserving explicit caller budgets and cursor completeness.
+3. **Investigate agent adoption and shell fallback.** Determine why Luna made
+   no repository-reading Urdira call in 14/24 rows and why it often returned
+   to large shell reads after an MCP result. Measure discovery choice, first
+   useful result, follow-up tool choice, duplicated source, target attribution,
+   and shell bytes. Compare Urdira and tgrep under the same natural-selection
+   protocol before attributing the behavior to either tool.
+4. **Connect indexed streams directly to public pagination.** Let broad
+   `core:find_records` and `core:search_text` executions build their immutable
+   ordered manifests incrementally from indexed iterators. Crossing the
+   current 5,000-record candidate boundary must issue cursors rather than
+   abandon the index and decode the corpus.
+5. **Complete lexical pushdown coverage.** Add indexed execution for
+   `safe_regex` and structural filters including language, namespace, kind,
+   and subject type. A large-workspace search must not change from source-text
+   search to record-body scanning merely because one filter is present.
+6. **Implement indexed comparison.** Evaluate `core:compare` as a deterministic
+   merge over ordered participant streams, including the unselected full-scope
+   form. Large comparisons must remain bounded without requiring a manually
+   supplied `selection`.
+7. **Audit every pre-pagination cap.** Review the search-text artifact/offset
+   caps, the architecture-result cap, and impact/test traversal limits. Every
+   exhaustive result must either continue through an immutable cursor or
+   report explicit typed incompleteness; no internal cap may silently define
+   the public result set.
+8. **Remove full-corpus compatibility paths from production query execution.**
+   Native v4 relation joins should always use subject-indexed relation pairs.
+   Any unsupported selector or legacy adapter should fail with a typed,
+   actionable error instead of building a corpus-wide JavaScript index.
+9. **Expose pushdown telemetry.** Record the selected access path, index,
+   candidate count, hydrated count, decline reason, fallback prevention, and
+   page/materialization cost per operation. This is required to prove in the
+   next campaign that an indexed repository is actually being queried through
+   its indexes.
+
+The 200,000-record safety fuse remains a last-resort guard. It is not a target
+to raise and it is not the mechanism used to control response size.
+
 ## Retained failures
 
 - `typescript/transpile-diagnostic-callback`, sample 1: the agent passed an
