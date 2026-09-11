@@ -1,5 +1,10 @@
 # Expanded agent benchmark: tool-assigned comparator campaign with frozen Urdira
 
+> Historical snapshot. The fresh three-sample Urdira rerun and the current
+> descriptive comparison are recorded in
+> [the 2026-09-11 refresh](2026-09-11-expanded-agent-urdira-full-v1.md). The
+> frozen Urdira column below remains unchanged to preserve campaign provenance.
+
 This evidence joins the fresh comparator campaigns with the last permitted
 Urdira smoke rows. Urdira was not executed in this campaign. Comparator cells
 have `n=3` samples per task; frozen Urdira has at most `n=1` per task. Values
