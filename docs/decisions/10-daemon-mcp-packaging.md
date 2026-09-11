@@ -68,6 +68,36 @@ The daemon is normally started on demand by the first `urdira mcp` or CLI reques
 
 Before forwarding a request, CLI, `urdira mcp`, and `urdira web` verify that the live daemon belongs to the same operating-system user and data root and matches the required engine build, transport protocol, private-interface version, and RPC capabilities. Missing fields on a legacy descriptor or status response are incompatibility, not permission to try an administrative call. When no live daemon exists, the caller starts the daemon from its own exact engine installation and waits for verified readiness. Compatible concurrent clients share it.
 
+### MCP query selection and scope reuse
+
+The MCP presentation teaches one deterministic selection rule. When the client
+has no `query_scope`, it calls `urdira_index_status` once with the explicit
+workspace root and reuses the returned scope object byte-for-byte for all later
+source-reading requests. A direct operation is the normal choice for one exact
+subject, path, symbol, or intention. `urdira_context` is used for multifaceted
+discovery; a registered recipe is used for a catalogued workflow; and a
+pipeline is preferred only when a real dependency connects stages. Independent
+operations do not need to be wrapped in a pipeline.
+
+The adapter presents Urdira as the first tool for repository discovery and
+source reading. Because the surface is read-only, shell tools remain the
+boundary for editing, tests, builds, and Git inspection. Query pages continue
+with the complete continuation envelope emitted by `MORE`: `api_version`, the
+original scope, and the opaque cursor are required. `response_budget` is
+optional; clients preserve it when emitted or add it only to override the
+default. Clients never decode, reconstruct, or substitute an MCP catalog
+cursor.
+
+The copyable examples exposed by the adapter are part of its agent-facing
+contract. `urdira_context` is top-level, with `api_version`, `scope`, `task`,
+and `facets` beside one another and optional top-level `seeds` and `options`;
+it is never a `request_type: "context"` wrapper or nested `context` object. A
+known path uses direct `core:get_source` with an artifact selector containing
+`subject_type` and `path`, plus complete `SourceIncludeOptions`: `mode`,
+`max_characters_per_snippet`, `max_total_characters`, and `context_lines`.
+Operation `arguments` remains generic so the selected registry entry can
+validate its fields without duplicating a massive all-operations schema.
+
 The engine build ID is the exact runtime release identity
 `urdira-core-<runtime-semver>`, not a long-lived compatibility-series label.
 Consequently, installing a new Urdira release can never make its CLI silently

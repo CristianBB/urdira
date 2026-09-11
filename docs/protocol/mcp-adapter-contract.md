@@ -38,6 +38,49 @@ The initial adapter advertises only the MCP `tools` server capability. It does n
 
 The adapter also sets the top-level `instructions` field of the initialize/discover result. It is a deterministic, progressively disclosed agent manual in this order: a four-step quick start, a five-tool decision guide, expression selection, a minimal direct query, the pipeline mental model and executable examples, readiness and result guidance, then the exact operation and recipe catalogs. The pipeline section defines `arguments` as static inputs, `bindings` as typed edges from an earlier `{stage_id, output}` to a downstream argument, `outputs` as the final exposed streams, complete-set propagation, topological ordering, and scalar-cardinality failure. It includes tested `search -> source`, `resolve -> references`, and `resolve -> references -> source` examples plus recovery guidance for invalid output names, selector shapes, readiness, and cursors.
 
+The decision guide uses the following public workflow. When a client has no
+`query_scope`, it calls `urdira_index_status` once with the exact workspace
+root and reuses the returned scope byte-for-byte thereafter. A direct
+`urdira_query` operation is the normal choice for one exact subject, path,
+symbol, or intention. `urdira_context` is the discovery choice when several
+facets must be gathered into one bounded context. A registered recipe is the
+choice for a named workflow in the catalog. A pipeline is used when one stage
+actually depends on another stage's output; it is preferred for that
+composition, but is not required for independent operations. Repository
+discovery and source reading use Urdira first; editing, tests, builds, and Git
+inspection remain outside this read-only adapter.
+
+These copyable examples are part of the agent-facing contract. The
+`urdira_context` input is top-level: `api_version`, `scope`, `task`, and
+`facets` are direct fields, with optional top-level `seeds` and `options`.
+Never wrap it in `request_type: "context"` or a nested `context` object. For a
+known path, use this direct `core:get_source` operation with an artifact
+selector and the complete `SourceIncludeOptions` object:
+
+```json
+{
+  "request_type": "query",
+  "query": {
+    "api_version": 3,
+    "scope": { "scope_type": "single_workspace", "workspace_id": "<workspace_id>" },
+    "expression": {
+      "expression_type": "operation",
+      "operation": "core:get_source",
+      "arguments": {
+        "subjects": [{ "subject_type": "artifact", "path": "src/example.ts" }],
+        "source": { "mode": "relevant", "max_characters_per_snippet": 2000, "max_total_characters": 20000, "context_lines": 2 }
+      }
+    }
+  }
+}
+```
+
+Operation `arguments` intentionally remains generic: the selected operation's
+authoritative registry validates its fields, avoiding an unwieldy schema that
+duplicates every operation. Direct, context, recipe, and pipeline examples
+copied from that authority are therefore contract guidance, not illustrative
+implementation prose.
+
 The exact operation signatures and recipe catalog in `instructions` are generated directly from the same registries used to validate requests. Every registered operation must appear once in the categorized usage guide; missing guidance or duplicate coverage fails server construction. `instructions` is plain descriptive text, not a capability, and advertising it does not imply resources, prompts, or any other extension.
 
 The tool set is static for the lifetime of an adapter release and is returned in deterministic name order. The adapter explicitly advertises `tools.listChanged: false`; it does not rely on the SDK default, because registering the first tool otherwise enables list-change support. Tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
@@ -110,6 +153,22 @@ Urdira result pagination is application-level state carried through explicit too
 - Query and status cursors have disjoint kinds. Passing either token to the other tool returns `core:cursor_kind_mismatch` without attempting hydration.
 - Registry mode `used` gives each hydrated parent slice one immutable `registry_usage_set_id`; its cursor continues that exact definition set even when all parent result streams are summary-only. Mode `none` disables only registry hydration, while every other selected stream remains pageable.
 - The agent must not decode, edit, compare semantically, or confuse these tokens with MCP `tools/list` cursors.
+
+The continuation envelope emitted by `MORE` is copied as a complete request.
+`api_version`, `scope`, and `cursor` are required. `response_budget` is
+optional: preserve it when emitted, or add it only to override the default.
+
+```json
+{
+  "request_type": "continuation",
+  "continuation": {
+    "api_version": 3,
+    "scope": { "scope_type": "single_workspace", "workspace_id": "<copied opaque workspace id>" },
+    "cursor": "<opaque cursor from the previous page>",
+    "response_budget": { "max_items": 50, "max_characters": 20000 }
+  }
+}
+```
 
 This explicit-handle design is required by modern MCP because protocol connections have no session state. Adapter restarts do not invalidate a ready Urdira execution that remains retained by the daemon.
 

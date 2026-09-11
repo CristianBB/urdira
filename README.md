@@ -452,10 +452,67 @@ Its companion text block keeps labels, completeness, and opaque continuation
 cursors but omits repeated source snippets and hydration/evidence/registry
 payloads, so browser clients do not pay for the same response data twice.
 
-Agents should first call `urdira_index_status` with the exact workspace root,
-then reuse its returned `query_scope` object byte-for-byte on every
-source-reading request. A returned cursor is opaque and must be continued with
-the same scope.
+When no `query_scope` is available, agents call `urdira_index_status` once with
+the exact workspace root. They then reuse the returned `query_scope` object
+byte-for-byte on every source-reading request; they do not rediscover status or
+reconstruct the scope between calls. A returned cursor is opaque and must be
+continued with the same scope and the complete `ContinuationRequest` shape.
+
+Choose a direct `urdira_query` operation for one exact subject, path, symbol,
+or intention. Use `urdira_context` when discovery needs several related facets
+in one bounded task context. Use a registered recipe for a named workflow
+already defined by the public catalog. Use a pipeline when a real dependency
+exists between stages, such as resolving one entity before retrieving its
+source; pipelines are preferred for that composition and are not required for
+independent queries. Use Urdira before shell tools for repository discovery and
+source reading. Shell remains the place for editing, tests, builds, and Git
+inspection because Urdira is read-only.
+
+`urdira_context` is a top-level tool call: send `api_version`, `scope`,
+`task`, and `facets` directly, with optional top-level `seeds` and `options`.
+Never put it in a `request_type: "context"` wrapper or a nested `context`
+object. For a known path, use a direct query such as this authoritative
+`core:get_source` example:
+
+```json
+{
+  "request_type": "query",
+  "query": {
+    "api_version": 3,
+    "scope": { "scope_type": "single_workspace", "workspace_id": "<workspace_id>" },
+    "expression": {
+      "expression_type": "operation",
+      "operation": "core:get_source",
+      "arguments": {
+        "subjects": [{ "subject_type": "artifact", "path": "src/example.ts" }],
+        "source": { "mode": "relevant", "max_characters_per_snippet": 2000, "max_total_characters": 20000, "context_lines": 2 }
+      }
+    }
+  }
+}
+```
+
+Operation `arguments` stays generic because the selected operation registry
+validates its fields; a single all-operations schema would duplicate that
+registry and become unwieldy. Examples copied from that authority are part of
+the agent-facing contract.
+
+For a paginated response, copy the complete continuation envelope emitted by
+`MORE`, including its required `api_version`, `scope`, and `cursor`. Preserve
+`response_budget` when it is present; it is optional and may be added only when
+you want to override the default budget.
+
+```json
+{
+  "request_type": "continuation",
+  "continuation": {
+    "api_version": 3,
+    "scope": { "scope_type": "single_workspace", "workspace_id": "<copied opaque id>" },
+    "cursor": "<copied opaque cursor>",
+    "response_budget": { "max_items": 50, "max_characters": 20000 }
+  }
+}
+```
 
 For a multi-step coding task, prefer `urdira_context` or an API v3 pipeline
 with explicit stage bindings. Dependent stages execute inside one snapshot and

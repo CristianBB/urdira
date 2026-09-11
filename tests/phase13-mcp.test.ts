@@ -208,7 +208,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(instructions).toContain("discover_definitions.matcher={text:<non-empty string>,mode:exact|prefix|contains|semantic|hybrid}");
     expect(instructions).toContain("get_outline.container accepts only an artifact or entity selector");
     expect(queryTool?.description).toContain("get_outline.container accepts only an artifact or entity selector");
-    expect(queryTool?.description).toContain("get_source source.mode must be signature, relevant, or body; never none");
+    expect(queryTool?.description).toContain("get_source requires source.mode, max_characters_per_snippet, max_total_characters, and context_lines");
     expect(queryTool?.description).toContain("search_text pipeline outputs are only matches and subjects, never artifacts");
     expect(contextTool?.description).toContain("definitions | implementations | callers | callees | dependencies | contracts | effects | tests | configuration | analogues | extension_points");
     expect(contextTool?.description).toContain("api_version: 3 is a required top-level field");
@@ -221,11 +221,13 @@ describe("Phase 13 Urdira MCP adapter", () => {
   });
 
   it("teaches the public agent workflow without requiring pipelines", () => {
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_context for ordinary task discovery");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_query for one precise lookup");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_query for a known subject or operation");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_context for broad task discovery");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("it is not required before urdira_query");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("call once when query_scope is missing");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Narrow broad queries with an exact path, kind, context artifact, or returned entity id");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Continue with the exact cursor and the original scope");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use shell for edits, tests, builds, and git status or diff");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use Urdira before shell for scoped repository discovery and source reading");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Pipelines are optional");
   });
 
@@ -702,7 +704,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const args = {
       request_type: "query",
       render: "json",
-      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } }, options: { response_budget: { max_items: 7, max_characters: 1234 } } },
     };
     const result = standard.validate(args);
     expect(result.issues).toBeUndefined();
@@ -872,8 +874,36 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text.match(/^MORE:/gm)).toHaveLength(1);
-    expect(text.trim().split("\n").at(-1)).toBe(cursorValue);
-    expect(text.split(cursorValue)).toHaveLength(2); // exactly one occurrence: the full cursor line at the end
+    expect(text).toContain(`"cursor":"${cursorValue}"`);
+    expect(text).toContain('"request_type":"continuation"');
+    expect(text).toContain('"scope":{"scope_type":"single_workspace","workspace_id":"workspace-1"}');
+    expect(text).toContain('"response_budget":{"max_characters":20000,"max_items":50}');
+    expect(text.split(cursorValue)).toHaveLength(2); // exactly one occurrence in the complete continuation request
+  });
+
+  it("renders a complete continuation for the web profile with the original scope and budget", () => {
+    const cursor = "web.cursor.full.value";
+    const result = formatUrdiraResult({
+      returned_items: 1,
+      result_sets: [{ result_set: "subjects", confirmed: { result_bundles: [{ primary_result: { subject_type: "artifact", body: { path: "src/a.ts" } }, assessment: { classification: "confirmed" } }], has_next: true, next_cursor: cursor }, possible: { result_bundles: [], has_next: false } }],
+    }, {
+      presentation_profile: "web",
+      continuation_scope: { scope_type: "single_workspace", workspace_id: "web-workspace" },
+      continuation_response_budget: { max_items: 3, max_characters: 900 },
+    });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain('"request_type":"continuation"');
+    expect(text).toContain('"scope":{"scope_type":"single_workspace","workspace_id":"web-workspace"}');
+    expect(text).toContain('"response_budget":{"max_characters":900,"max_items":3}');
+    expect(text).toContain(`"cursor":"${cursor}"`);
+    expect(result.structuredContent).toBeDefined();
+  });
+
+  it("does not emit an executable continuation with a fictitious scope", () => {
+    const result = formatUrdiraResult({ returned_items: 1, result_sets: [{ result_set: "subjects", confirmed: { result_bundles: [{ primary_result: { body: { path: "src/a.ts" } }, assessment: { classification: "confirmed" } }], has_next: true, next_cursor: "cursor-without-scope" }, possible: { result_bundles: [], has_next: false } }] });
+    const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
+    expect(text).toContain("continuation unavailable because the original query scope is not available");
+    expect(text).not.toContain("<workspace_id>");
   });
 
   it("renders a TRUNCATED note with a dropped-item count when the response budget sheds bundles", async () => {

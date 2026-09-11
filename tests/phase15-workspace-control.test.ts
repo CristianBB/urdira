@@ -11,7 +11,7 @@ import {
   WorkspaceWatcherManager,
   type WorkspaceDetectionInput,
 } from "../packages/engine/src/index.js";
-import { createUrdiraMcpServer, createUrdiraToolDefinitions, MCP_SERVER_INSTRUCTIONS } from "../packages/mcp/src/index.js";
+import { createUrdiraMcpServer, createUrdiraToolDefinitions, MCP_SERVER_INSTRUCTIONS, URDIRA_CONTEXT_EXAMPLE, URDIRA_QUERY_GET_SOURCE_EXAMPLE } from "../packages/mcp/src/index.js";
 import { operationErrorDefinitions } from "../packages/contracts/src/index.js";
 import { parseCliArgs, runCli } from "../packages/cli/src/index.js";
 import { WorkspaceRegistry } from "../packages/engine/src/index.js";
@@ -106,6 +106,23 @@ describe("MCP index status v3", () => {
     expect((await validate({ workspace_root: "/absolute/repository/root" })).issues).toBeUndefined();
     expect((await validate({ workspace_root: "/absolute/repository/root", response_budget: { max_items: 50, max_characters: 20_000 } })).issues).toBeUndefined();
     expect((await validate({ workspace_root: "/absolute/repository/root", response_budget: 50 })).issues?.length).toBeGreaterThan(0);
+  });
+
+  test("keeps the canonical context and direct get_source examples aligned with tool schemas", async () => {
+    const definitions = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
+    const registered = createUrdiraMcpServer({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } }) as unknown as { _registeredTools: Record<string, { inputSchema: { "~standard": { validate: (input: unknown) => Promise<{ issues?: readonly { message: string }[] }> } } }> };
+    const context = definitions.find((tool) => tool.name === "urdira_context")!;
+    const query = definitions.find((tool) => tool.name === "urdira_query")!;
+    const contextValidation = await (registered._registeredTools["urdira_context"]!.inputSchema["~standard"].validate(URDIRA_CONTEXT_EXAMPLE));
+    const queryValidation = await (registered._registeredTools["urdira_query"]!.inputSchema["~standard"].validate(URDIRA_QUERY_GET_SOURCE_EXAMPLE));
+    expect(contextValidation.issues).toBeUndefined();
+    expect(queryValidation.issues).toBeUndefined();
+    expect(context.description).toContain(`workspace_id":"${URDIRA_CONTEXT_EXAMPLE.scope.workspace_id}`);
+    expect(context.description).toContain(URDIRA_CONTEXT_EXAMPLE.task);
+    expect(query.description).toContain(URDIRA_QUERY_GET_SOURCE_EXAMPLE.query.expression.operation);
+    expect(query.description).toContain(URDIRA_QUERY_GET_SOURCE_EXAMPLE.query.expression.arguments.source.mode);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain(URDIRA_CONTEXT_EXAMPLE.task);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain(URDIRA_QUERY_GET_SOURCE_EXAMPLE.query.expression.operation);
   });
 
   test("keeps the documented query continuation example aligned with the schema", async () => {
