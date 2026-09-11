@@ -341,6 +341,33 @@ retried. Their manifests, transcripts, host logs, and timing sidecars remain in
 the raw campaign directory. The campaign gate is therefore false despite the
 successful 8/8 smoke gate.
 
+## Post-contract smoke v2
+
+One fresh, single-sample Urdira-only smoke was run from HEAD
+`41a4017514c320dbfc59da2aead779fca20b34a4` and retained at
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-11-post-improvements/smoke-urdira-v2`.
+All eight distinct tasks reached structural `complete/current/ready`; semantic
+indexing, semantic materialization, and sidecar creation were false for every
+row. Five graders passed and three were retained as failures:
+`typescript/transpile-diagnostic-callback`, `prisma/mongo-value-set-transform`,
+and `vscode/language-registry-change-notification`.
+
+The three failed transcripts share the same concrete protocol mistake: the
+agent's first `urdira_index_status` call supplied `response_budget` as a number
+(`4000`, `2000`, or `2000`) instead of an object. The schema correctly rejected
+it with `data/response_budget must be object`; each transcript then contains a
+valid object-shaped status call and reaches readiness. Target coverage and
+focused-test evidence were complete, with no tool-call, coverage, or IPC error.
+This is a caller protocol/grader validation failure, not a structural indexing
+or semantic-off failure. No benchmark retry or competitor run was performed.
+
+The production description and `MCP_SERVER_INSTRUCTIONS` now show the primary
+bootstrap example without `response_budget`, a secondary object example with
+only `max_items` and `max_characters`, and explicitly state that a numeric
+`response_budget` is invalid. The schema remains authoritative with
+`additionalProperties: false`. The v2 audit SHA-256 is
+`908567b4fb37b99dcdb1a65e5679616967c852137ca851639a68a1d31d1782cd`.
+
 ## Reproducibility
 
 - Urdira campaign ID: `expanded-typescript-agent-2026-09-11T00:30:59.441Z`.

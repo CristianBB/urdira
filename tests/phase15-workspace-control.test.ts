@@ -86,9 +86,26 @@ describe("MCP index status v3", () => {
     expect(schema.properties).not.toHaveProperty("api_version");
     expect(schema.properties).not.toHaveProperty("scope");
     expect(schema.properties).not.toHaveProperty("options");
+    const responseBudget = schema.properties?.["response_budget"] as { type?: string; additionalProperties?: boolean; properties?: Record<string, unknown> };
+    expect(responseBudget.type).toBe("object");
+    expect(responseBudget.additionalProperties).toBe(false);
+    expect(Object.keys(responseBudget.properties ?? {}).sort()).toEqual(["max_characters", "max_items"]);
     expect(status.description).toContain("bootstrap form accepts no api_version, scope, options, or other query fields");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Call urdira_index_status with exactly {workspace_root:\"/absolute/repository/root\"} and optional response_budget");
+    expect(status.description).toContain("response_budget is an object, never a number");
+    expect(status.description).toContain("max_items\":50,\"max_characters\":20000");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Call urdira_index_status with exactly {\"workspace_root\":\"/absolute/repository/root\"}");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("this primary bootstrap example omits response_budget");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("use an object, never a number");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Do not send api_version, scope, options, or query fields");
+  });
+
+  test("keeps the documented bootstrap examples aligned with the input schema", async () => {
+    const server = createUrdiraMcpServer({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
+    const registered = (server as unknown as { _registeredTools: Record<string, { inputSchema: { "~standard": { validate: (input: unknown) => Promise<{ issues?: readonly { message: string }[] }> } } }> })._registeredTools;
+    const validate = registered["urdira_index_status"]!.inputSchema["~standard"].validate;
+    expect((await validate({ workspace_root: "/absolute/repository/root" })).issues).toBeUndefined();
+    expect((await validate({ workspace_root: "/absolute/repository/root", response_budget: { max_items: 50, max_characters: 20_000 } })).issues).toBeUndefined();
+    expect((await validate({ workspace_root: "/absolute/repository/root", response_budget: 50 })).issues?.length).toBeGreaterThan(0);
   });
 
   test("advertises the closed build-context facets and repeats them in SDK validation errors", async () => {
