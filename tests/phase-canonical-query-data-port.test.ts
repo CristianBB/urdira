@@ -1987,6 +1987,23 @@ describe("SqliteCanonicalQuerySnapshotPort D6 pushdown methods", () => {
 });
 
 describe("CanonicalRecordQueryDataPort core:search_text lexical pushdown", () => {
+  it("reports the provider route and index for literal and safe_regex pages", async () => {
+    const record = stubRecord("rec-lexical", "artv-lexical", { path: "src/a.ts", name: "needle" });
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records_by_artifact_versions: async () => [record],
+      search_lexical_page: async (_scope, _pattern, mode) => ({
+        capability: "indexed",
+        route: mode === "safe_regex" ? "artifact_cas_paged" : "fts",
+        index_used: mode === "safe_regex" ? "artifact_versions_keyset" : "lexical_fts",
+        matches: [{ artifact_id: "art-1", artifact_version_id: "artv-lexical", offsets: [0] }],
+      }),
+    }));
+    const literal = await port.execute(searchTextOperation({ syntax: "literal" }));
+    const regex = await port.execute(searchTextOperation({ syntax: "safe_regex" }));
+    expect(literal.telemetry).toMatchObject({ route: "fts", index_used: "lexical_fts" });
+    expect(regex.telemetry).toMatchObject({ route: "artifact_cas_paged", index_used: "artifact_versions_keyset" });
+  });
+
   it("reports an exact typed error instead of truncating lexical candidates above the cap", async () => {
     const matches = Array.from({ length: 201 }, (_, index) => ({ artifact_id: `art-${index}`, artifact_version_id: `artv-${index}`, offsets: [index] }));
     const port = new CanonicalRecordQueryDataPort(stubPort({

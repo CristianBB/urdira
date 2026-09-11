@@ -108,6 +108,17 @@ describe("MCP index status v3", () => {
     expect((await validate({ workspace_root: "/absolute/repository/root", response_budget: 50 })).issues?.length).toBeGreaterThan(0);
   });
 
+  test("keeps the documented query continuation example aligned with the schema", async () => {
+    const server = createUrdiraMcpServer({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
+    const registered = (server as unknown as { _registeredTools: Record<string, { inputSchema: { "~standard": { validate: (input: unknown) => Promise<{ issues?: readonly { message: string }[] }> } } }> })._registeredTools;
+    const validate = registered["urdira_query"]!.inputSchema["~standard"].validate;
+    const example = { request_type: "continuation", continuation: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, cursor: "<signed_cursor>" } };
+    expect((await validate(example)).issues).toBeUndefined();
+    expect((await validate({ ...example, continuation: { ...example.continuation, scope: undefined } })).issues?.length).toBeGreaterThan(0);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('request_type":"continuation"');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('cursor":"<signed_cursor>"');
+  });
+
   test("advertises the closed build-context facets and repeats them in SDK validation errors", async () => {
     const client = { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) };
     const tools = createUrdiraToolDefinitions({ client });

@@ -136,7 +136,7 @@ export interface CanonicalQuerySnapshotPort {
   readonly records_by_selector_page?: (scope: QueryScope, selector: RecordColumnSelector, limit: number, after_record_id?: string) => Promise<{ readonly records: readonly CanonicalQueryRecord[]; readonly next_cursor?: string }>;
   /** Stable cursor pages over the lexical index. Unsupported means the exact
    * requested syntax/filter is outside the indexed contract. */
-  readonly search_lexical_page?: (scope: QueryScope, pattern: string, mode: "literal" | "safe_regex", options?: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly filters?: { readonly path_patterns?: readonly string[]; readonly language?: readonly string[]; readonly namespace?: readonly string[]; readonly kind?: readonly string[]; readonly subject_type?: readonly string[] } }, limit?: number, after_cursor?: string) => Promise<{ readonly capability: "indexed" | "unsupported"; readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string; readonly unsupported_reason?: "safe_regex" | "structural_filter" }>;
+  readonly search_lexical_page?: (scope: QueryScope, pattern: string, mode: "literal" | "safe_regex", options?: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly filters?: { readonly path_patterns?: readonly string[]; readonly language?: readonly string[]; readonly namespace?: readonly string[]; readonly kind?: readonly string[]; readonly subject_type?: readonly string[] } }, limit?: number, after_cursor?: string) => Promise<{ readonly capability: "indexed" | "unsupported"; readonly route?: "fts" | "artifact_cas_paged"; readonly index_used?: "lexical_fts" | "artifact_versions_keyset"; readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string; readonly unsupported_reason?: "safe_regex" | "structural_filter" }>;
   /** Resolves container records through indexed artifact identity/path columns. */
   readonly container_records_by_artifact_references?: (scope: QueryScope, references: readonly string[]) => Promise<readonly CanonicalQueryRecord[]>;
   /** Reads the exact visible adjacency slice touching `subject_ids`. Returning
@@ -2769,7 +2769,9 @@ function evaluationRowCount(evaluation: OperationEvaluation): number {
 }
 
 function withEvaluationTelemetry(evaluation: OperationEvaluation, telemetry: QueryOperationEvaluationTelemetry): OperationEvaluation {
-  return { ...evaluation, telemetry: { candidates: evaluationRowCount(evaluation), rows_hydrated: evaluationRowCount(evaluation), ...telemetry } };
+  const state = evaluation.telemetry ?? {};
+  Object.assign(state, { candidates: evaluationRowCount(evaluation), rows_hydrated: evaluationRowCount(evaluation), ...telemetry });
+  return { ...evaluation, telemetry: state };
 }
 
 function indexedTelemetryIndex(operationId: string): string {
@@ -4317,6 +4319,9 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const pattern = String(args["pattern"] ?? "");
       const caseSensitive = args["case_sensitive"] !== false;
       const wordMode = args["word_mode"] === "identifier" || args["word_mode"] === "token" ? args["word_mode"] : "substring";
+      const telemetry: { route?: string; index_used?: string } = syntax === "safe_regex"
+        ? { route: "artifact_cas_paged", index_used: "artifact_versions_keyset" }
+        : { route: "fts", index_used: "lexical_fts" };
       const readPage = async (cursor: string | undefined): Promise<{ readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string }> => {
         const page = await this.snapshots.search_lexical_page!(operation.scope, pattern, syntax, { case_sensitive: caseSensitive, word_mode: wordMode, filters }, ROW_FETCH_BATCH_SIZE, cursor);
         if (page.capability === "unsupported") {
@@ -4326,6 +4331,8 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
             { capability: "core:search_lexical_page", reason_codes: [page.unsupported_reason ?? "indexed_lexical_lane_unavailable"] },
           );
         }
+        if (page.route !== undefined) telemetry.route = page.route;
+        if (page.index_used !== undefined) telemetry.index_used = page.index_used;
         return page;
       };
       const pageItems = async (page: { readonly matches: readonly LexicalSearchMatch[] }): Promise<{ readonly matches: readonly QueryStreamItem[]; readonly subjects: readonly QueryStreamItem[] }> => {
@@ -4359,7 +4366,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         }
       })();
       const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
-      return { ...result({ matches: [], subjects: [] }, capabilityStates), stream_sources: { matches: source("matches"), subjects: source("subjects") } };
+      return { ...result({ matches: [], subjects: [] }, capabilityStates), telemetry, stream_sources: { matches: source("matches"), subjects: source("subjects") } };
     }
     if (this.snapshots.search_literal === undefined || this.snapshots.records_by_artifact_versions === undefined) return undefined;
     const syntax = args["syntax"];
@@ -5288,10 +5295,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     // called unconditionally a few lines down regardless of operation_id)
     // throws a raw `TypeError` for a non-`single_workspace` scope, so this
     // must be handled before any of them ever sees the scope.
-    const annotate = (evaluation: OperationEvaluation, route: string, indexUsed?: string, extra: QueryOperationEvaluationTelemetry = {}): OperationEvaluation => withEvaluationTelemetry(evaluation, { route, ...(indexUsed === undefined ? {} : { index_used: indexUsed }), ...extra });
+    const annotate = (evaluation: OperationEvaluation, route?: string, indexUsed?: string, extra: QueryOperationEvaluationTelemetry = {}): OperationEvaluation => withEvaluationTelemetry(evaluation, { ...(route === undefined ? {} : { route }), ...(indexUsed === undefined ? {} : { index_used: indexUsed }), ...extra });
     if (boundOperation.operation_id === "core:compare") return annotate(await this.executeCompare(boundOperation), "indexed_compare_ranges", "records_for_query_batches");
     const pushedSearchText = await this.trySearchTextPushdown(boundOperation);
-    if (pushedSearchText !== undefined) return annotate(pushedSearchText, "indexed_pushdown", "lexical_fts");
+    if (pushedSearchText !== undefined) {
+      const searchTelemetry = pushedSearchText.telemetry;
+      return annotate(pushedSearchText, searchTelemetry?.route === undefined ? "indexed_pushdown" : undefined, searchTelemetry?.index_used === undefined ? "lexical_fts" : undefined);
+    }
     const pushedContext = await this.tryBuildContextPushdown(boundOperation);
     if (pushedContext !== undefined) return annotate(pushedContext, "indexed_pushdown", "context_index");
     const pushedSemantic = await this.trySemanticSearch(boundOperation);

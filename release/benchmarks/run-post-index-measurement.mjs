@@ -85,7 +85,9 @@ export function collectPostMeasurements({ audit, output }) {
     const measurement = analyzePostMeasurement({ events, plan, hostMetrics: manifest?.host_metrics ?? null });
     const task = corpus.repositories?.find((repository) => repository.id === run.repository)?.tasks?.find((candidate) => candidate.id === run.task) ?? null;
     const transcriptMetrics = analyzeExpandedTranscript(events, run.arm, task);
-    runs.push({ run_id: runId, repository_id: run.repository, task_id: run.task, arm: run.arm, sample: run.sample, completed_successfully: manifest?.completed_successfully ?? false, failure: run.failure ?? manifest?.error ?? null, measurement, transcript_metrics: transcriptMetrics, daemon_telemetry: extractDaemonTelemetry(hostLog), raw: { manifest: manifestPath, transcript: eventsPath, host_log: hostPath, timing_sidecar: manifest?.timing_sidecar ?? join(base, `${runId}.timing.json`) } });
+    const completedSuccessfully = manifest?.completed_successfully ?? false;
+    const failure = run.failure ?? manifest?.error ?? (!completedSuccessfully ? `run failed (exit_code=${manifest?.exit_code ?? run.exit_code ?? "unknown"}, grader_exit_code=${manifest?.grader_exit_code ?? "unknown"})` : null);
+    runs.push({ run_id: runId, repository_id: run.repository, task_id: run.task, arm: run.arm, sample: run.sample, completed_successfully: completedSuccessfully, failure, measurement, transcript_metrics: transcriptMetrics, daemon_telemetry: extractDaemonTelemetry(hostLog), raw: { manifest: manifestPath, transcript: eventsPath, host_log: hostPath, timing_sidecar: manifest?.timing_sidecar ?? join(base, `${runId}.timing.json`) } });
   }
   return { schema_version: 1, generated_at: new Date().toISOString(), rerun_competitors: false, runs };
 }

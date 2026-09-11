@@ -118,6 +118,14 @@ describe("post index executor composition", () => {
     expect(post.runs[0]).toMatchObject({ completed_successfully: false, failure: "host failed", daemon_telemetry: { operation_metrics: [], operation_page_metrics: [] } });
   });
 
+  it("retains grader and process failure status when the manifest has no failure text", () => {
+    const post = collectPostMeasurements({
+      audit: { runs: [{ run_id: "prisma-task-urdira-typescript-1", repository: "prisma", task: "x", arm: "urdira-typescript", sample: 1, exit_code: 0, manifest: { completed_successfully: false, exit_code: 0, grader_exit_code: 1, host_metrics: null } }] },
+      output: "/tmp/does-not-exist-post-index",
+    });
+    expect(post.runs[0]).toMatchObject({ completed_successfully: false, failure: "run failed (exit_code=0, grader_exit_code=1)" });
+  });
+
   it("propagates protocol-aware MCP component bytes from a real transcript fixture", () => {
     const output = mkdtempSync(join(tmpdir(), "post-index-transcript-"));
     mkdirSync(join(output, "runs"));

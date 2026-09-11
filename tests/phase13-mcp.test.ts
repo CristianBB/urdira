@@ -187,7 +187,9 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(instructions).toContain("subjects must be closed selector objects, never bare path strings");
     expect(instructions).toContain("arguments.filter.paths (an array)");
     expect(instructions).toContain("core:find_artifacts exposes output artifacts (not subjects)");
-    expect(instructions).toContain("urdira_index_status does not accept api_version or scope");
+    expect(instructions).toContain("Do not send api_version, scope, options, or query fields to urdira_index_status");
+    expect(instructions).toContain('The primary bootstrap call is exactly {"workspace_root":"<repository root>"}');
+    expect(instructions).toContain("response_budget is an object, never a number");
     expect(instructions).toContain("Every urdira_context call requires top-level api_version:3");
     expect(instructions).toContain("urdira_context overrides belong under the single top-level options object");
     expect(instructions).toContain("Every freshness object requires mode, required_frontier, and timeout_ms together");

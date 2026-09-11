@@ -368,6 +368,24 @@ only `max_items` and `max_characters`, and explicitly state that a numeric
 `additionalProperties: false`. The v2 audit SHA-256 is
 `908567b4fb37b99dcdb1a65e5679616967c852137ca851639a68a1d31d1782cd`.
 
+## Post-index measurement v1
+
+The post-improvement measurement is retained at
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-11-post-improvements/measurement-v1`.
+It executed one Urdira sample for each of the eight directed tasks, with
+semantic indexing/materialization/sidecar disabled and no competitor reruns.
+The result was 7/8 successful rows. The retained
+`prisma/mongo-value-set-transform` failure reached structural
+`complete/current/ready`, but the agent sent a malformed `urdira_query`
+continuation without the required nested `query` shape; the grader recorded a
+tool-call and validation failure. `post-measurements.json` now propagates that
+non-success state and grader exit code instead of leaving `failure` null.
+
+The measurement audit SHA-256 is
+`30657c5cfb6535e74d6cbbb3f7c818f3ab5d26054b8b647bc361c79916b45741`; the
+post-measurements SHA-256 is
+`b745666f4ab11d7c41df4500d49cb6af1cf3fc630b227f78e8e26b81b44fd7f8`.
+
 ## Reproducibility
 
 - Urdira campaign ID: `expanded-typescript-agent-2026-09-11T00:30:59.441Z`.
@@ -399,3 +417,129 @@ remain under `luna-campaign-20260910T0807/full-comparators-sm-v3` and
 `full-comparators-l-v1`. See the
 [campaign runbook](../benchmarks/expanded-agent-campaign.md) and the
 [historical combined evidence](2026-09-10-expanded-agent-combined-comparators.md).
+
+## Final post-improvement evidence from retained raw
+
+This final section is calculated from retained raw only; it does not launch a
+runner, query, competitor, or benchmark. The reproducibility inputs are the
+measurement audit and post-measurements above, the historical Urdira report
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-09/luna-urdira-refresh-20260911/full-urdira-v1/report/urdira-full-v1.json`, and the comparator reports under
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-09/luna-campaign-20260910T0807/`.
+The calculations were reproduced with `/tmp/recalc_final.js`, whose output
+was retained at `/tmp/final_recalc_output.txt`; the intermediate per-task
+comparison is `/tmp/compare3.json`. Missing values are kept as `null`.
+
+### Smoke and measurement gates
+
+Smoke v3 is the valid 8/8 structural smoke. Its retained audit is
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-11-post-improvements/smoke-urdira-v3/audit.json`, SHA-256
+`d9e5e03ec6692fda41929e5fe08edb71ee8d268f113c4927b28a746ae2d67478`, from
+HEAD `cc31b33b513213e268b01158d713a79d112ffa3c`. All eight rows passed, each
+reported `complete/current/ready`, and semantic index, semantic materialization,
+and sidecar were false. Readiness was TypeScript 7,027/7,006 ms, Playwright
+4,950/4,936 ms, Prisma 5,431/5,445 ms, and VS Code 33,689/35,659 ms. Cleanup
+reported zero processes and zero worktrees.
+
+Measurement v1 is a separate single sample per task at
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-11-post-improvements/measurement-v1`:
+7/8 successful, with the Prisma `mongo-value-set-transform` row retained as a
+failure. Its audit SHA-256 is
+`30657c5cfb6535e74d6cbbb3f7c818f3ab5d26054b8b647bc361c79916b45741`; the
+post-measurements SHA-256 is
+`b745666f4ab11d7c41df4500d49cb6af1cf3fc630b227f78e8e26b81b44fd7f8`. The
+failure is the agent's malformed continuation payload; readiness still reached
+structural `complete/current/ready`. The executor exited 1 to retain that
+failure. No retry occurred. Host raw contains timing, semantic-perf, storage,
+materialization/write/publish and byte telemetry, but no `operation_metrics` or
+`page_metrics`; those metrics are therefore not reported.
+
+### Current versus historical Urdira
+
+The table uses milliseconds for setup, agent, total and readiness; RSS is KiB;
+CPU is the captured mean percent; `reads` and `context` are repository reads and
+returned context characters. “Previous” is the median across the three retained
+historical samples for the same task. Tokens and cost are reconstructed below from raw `turn.completed.usage` records;
+missing values remain `null`.
+
+| repo/task | current success | setup / agent / total | previous total | delta total | reads / context | RSS / CPU / processes | readiness |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TypeScript transpile | 1 | 7,737 / 273,083 / 280,820 | 279,384 | +1,436 (+0.5%) | 14 / 94,296 | 4,176,880 / 40.6 / 11 | 7,071 |
+| TypeScript session | 1 | 7,926 / 318,326 / 326,252 | 292,687 | +33,565 (+11.5%) | 15 / 136,754 | 4,084,704 / 56.5 / 16 | 7,005 |
+| Playwright affected | 1 | 5,896 / 258,466 / 264,362 | 210,493 | +53,869 (+25.6%) | 13 / 90,843 | 3,788,720 / 11.1 / 12 | 4,952 |
+| Playwright reporter | 1 | 5,189 / 273,882 / 279,071 | 258,389 | +20,682 (+8.0%) | 11 / 586,193 | 3,333,664 / 10.3 / 15 | 4,942 |
+| Prisma wire | 1 | 6,158 / 205,590 / 211,748 | 243,033 | -31,285 (-12.9%) | 10 / 97,921 | 5,572,464 / 22.0 / 16 | 5,420 |
+| Prisma mongo (failed) | 0 | 5,771 / 171,411 / 177,182 | 187,144 | -9,962 (-5.3%) | 9 / 62,097 | 5,782,080 / 28.9 / 8 | 4,939 |
+| VS Code registry | 1 | 36,943 / 325,563 / 362,506 | 587,250 | -224,744 (-38.3%) | 18 / 175,340 | 15,668,944 / 62.0 / 17 | 35,578 |
+| VS Code provider | 1 | 37,083 / 240,475 / 277,558 | 301,475 | -23,917 (-7.9%) | 25 / 279,776 | 15,415,136 / 78.2 / 16 | 35,640 |
+| **median across rows** | **7/8** | **6,947.5 / 265,774.5 / 278,314.5** | **268,886.5** | **+9,428 (+3.5%)** | **13.5 / 117,337.5** | **4,874,672 / 34.7 / 15.5** | **6,212.5** |
+
+The current aggregate versus historical median is: setup +149 ms (+2.2%),
+agent +6,731 ms (+2.6%), total +9,428 ms (+3.5%), reads -2.5 (-15.6%), context
++9,615 (+8.9%), RSS +180,424 KiB (+3.8%), CPU +3.8 points (+12.3%), processes
++1.5 (+10.7%), and readiness -24 ms (-0.4%). Current token/cost medians are `1,451,522.5` / `$2.960645`; historical
+medians are `1,357,931.5` / `$2.809460`, a delta of `+93,591` (+6.9%) and
+`+$0.151185` (+5.4%). Current component medians are `tool_envelope=2,181`,
+`model_visible_serialized=12,385.5`, `source_text=6,961.5`, and
+`records=1,071.5`; hydration, evidence and registry remain `null`, as do the
+historical component bytes. Current adoption is 14 MCP calls, 101 shell calls, and two
+rows with zero MCP calls; historical MCP fields are not schema-equivalent to the
+corrected transcript extraction and are not treated as a direct byte comparison.
+
+### Tier comparison with frozen competitors
+
+Current tier medians (S=Playwright, M=Prisma, L=TypeScript/VS Code) are shown
+against the frozen comparator report medians. Comparator runs were not rerun.
+The comparator report has no equivalent per-query component bytes, RSS/CPU/process
+values in its published groups, or current Urdira component fields, so those
+columns are `null`; total is setup plus agent. Values are
+`setup/agent/total ms; tokens; cost USD; reads/context chars`.
+
+| tier | current Urdira | baseline | codebase-memory | codegraph | tgrep |
+|---|---|---|---|---|---|
+| S (Playwright) | 2/2; 5,542.5 / 266,174 / 271,716.5 ms; 1,434,525 tokens; $2.938422 | 6/6; 403 / 201,111 / 201,514 ms; 858,014; $1.764802 | 5/6; 5,466 / 189,066 / 194,532 ms; 1,454,280; $2.985966 | 6/6; 10,760 / 196,313 / 207,073 ms; 864,960; $1.798770 | 5/6; 844 / 241,267 / 242,111 ms; 1,073,352; $2.241180 |
+| M (Prisma) | 1/2; 5,964.5 / 188,500.5 / 194,465 ms; 1,272,912.5 tokens; $2.592109 | 6/6; 403 / 164,314 / 164,717 ms; 858,014; $1.764802 | 6/6; 7,883 / 189,066 / 196,949 ms; 1,454,280; $2.985966 | 6/6; 10,988 / 168,474 / 179,462 ms; 997,540; $2.045240 | 6/6; 844 / 225,757 / 226,601 ms; 1,078,133; $2.252758 |
+| L (TypeScript + VS Code) | 4/4; 22,434.5 / 295,704.5 / 303,536 ms; 1,861,772.5 tokens; $3.801818 | 12/12; 680 / 242,124 / 242,804 ms; 1,299,610; $2.678930 | 12/12; 42,767 / 317,760 / 360,527 ms; 2,350,061; $4.796914 | 11/12; 76,472 / 241,448 / 317,920 ms; 1,430,741; $2.945608 | 12/12; 3,158 / 268,730 / 271,888 ms; 1,282,504; $2.651798 |
+
+These are medians of the available task groups, not matched per-row causal
+comparisons. Success, missing rows, host resource telemetry, and differing
+setup/indexing contracts must be retained when using them; no competitor result
+is silently imputed.
+
+### Cold readiness and query micro evidence
+
+Smoke v3 readiness is the fresh structural-only gate above. The fresh
+measurement-v1 values were TypeScript 7,071/7,005, Playwright 4,952/4,942,
+Prisma 5,420/4,939, and VS Code 35,578/35,640 ms. The older baseline `setup: none, indexed: false` rows are not used for this
+readiness comparison. The directed structural baseline uses the equivalent
+boundary: Playwright 6,706 ms, TypeScript 22,809 ms, Prisma 49,197 ms, and
+VS Code 820,366 ms. Against smoke-v3 medians, deltas are respectively -1,763
+ms (-26.3%), -15,802 ms (-69.3%), -43,758 ms (-89.0%), and -785,692 ms
+(-95.8%).
+
+Retained query-micro raw confirms semantic index/materialization off. The
+Playwright `query-micro-v3/playwright-final` rows were
+`find-records page 1=3,324 ms`, page 2=5 ms, literal page 1=797 ms, and
+safe-regex page 1=695 ms. TypeScript `query-micro-v3/typescript` measured
+resolve context/qualified/kind = 248/10/9 ms, find-records pages 1/2 =
+2,952/4 ms, literal/safe-regex = 545/520 ms, and the boundedness test
+`wide-continuation-error=15,559 ms`. Prisma and VS Code are in
+`query-micro-v2`: Prisma resolve=280/10/9 ms, page 1=2,823 ms,
+literal/safe-regex=2,026/1,898 ms, wide continuation=18,658 ms; VS Code
+resolve=4,106/52/42 ms, page 1=2,220 ms, literal/safe-regex=13,426/9,626 ms,
+wide continuation=19,419 ms. The micro v2 TypeScript row failed checkout
+materialization and is retained as a failure, not as zero data. The large
+selector page 1 and wide-continuation paths remain expensive.
+
+The corrected safe-regex gate is evidenced by the bounded raw rows and their
+responses; these rows only demonstrate measured cost and empty responses and did not exercise the 200,000-record cap.
+`safe_regex` final routing is
+`artifact_cas_paged/artifact_versions_keyset`; the measured rows demonstrate
+latency and empty responses only. No operation-level
+telemetry is fabricated where the raw host logs contain none. Competitor reports
+have no equivalent per-query micro rows, so that comparison is unavailable.
+
+The historical Urdira comparison and this section preserve the 7/8 measurement
+failure, the 8/8 smoke gate, semantic-off invariants, raw hashes, and the fact
+that competitors were not rerun. `CI=true pnpm verify` remains OK (155 files,
+2,335 passed, 15 skipped, coverage and publication gates); local
+`pnpm package:release` remains limited only by missing darwin-x64 closures.
