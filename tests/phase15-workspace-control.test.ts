@@ -11,7 +11,7 @@ import {
   WorkspaceWatcherManager,
   type WorkspaceDetectionInput,
 } from "../packages/engine/src/index.js";
-import { createUrdiraMcpServer, createUrdiraToolDefinitions } from "../packages/mcp/src/index.js";
+import { createUrdiraMcpServer, createUrdiraToolDefinitions, MCP_SERVER_INSTRUCTIONS } from "../packages/mcp/src/index.js";
 import { operationErrorDefinitions } from "../packages/contracts/src/index.js";
 import { parseCliArgs, runCli } from "../packages/cli/src/index.js";
 import { WorkspaceRegistry } from "../packages/engine/src/index.js";
@@ -78,6 +78,19 @@ describe("workspace configuration impact", () => {
 });
 
 describe("MCP index status v3", () => {
+  test("advertises the bootstrap index-status contract without query fields", () => {
+    const tools = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
+    const status = tools.find((tool) => tool.name === "urdira_index_status")!;
+    const schema = status.input_schema as { additionalProperties?: boolean; properties?: Record<string, unknown> };
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties).not.toHaveProperty("api_version");
+    expect(schema.properties).not.toHaveProperty("scope");
+    expect(schema.properties).not.toHaveProperty("options");
+    expect(status.description).toContain("bootstrap form accepts no api_version, scope, options, or other query fields");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Call urdira_index_status with exactly {workspace_root:\"/absolute/repository/root\"} and optional response_budget");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Do not send api_version, scope, options, or query fields");
+  });
+
   test("advertises the closed build-context facets and repeats them in SDK validation errors", async () => {
     const client = { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) };
     const tools = createUrdiraToolDefinitions({ client });

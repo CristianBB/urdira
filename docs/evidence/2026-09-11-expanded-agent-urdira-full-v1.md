@@ -296,6 +296,35 @@ coverage gate and publication gate passed.
 `darwin-x64` release closures are absent. This is a release-artifact
 availability limitation, not a functional verification failure of the change.
 
+## Post-improvement smoke diagnostic
+
+The later single-arm smoke is retained at
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-11-post-improvements/smoke-urdira-v1`.
+It covered all eight distinct tasks with seven successful graders and one
+retained VS Code grader failure. The failed row reached structural
+`current/ready` in 37.795 seconds with semantic index, materialization, and
+sidecar creation all disabled. Its implementation evidence was complete: both
+target files changed, the required pattern was present, and the focused test
+file was added.
+
+The grader failure was caused by the agent's first MCP call sending
+`api_version`, `scope`, and `options` to `urdira_index_status`. The production
+tool rejected that malformed request; the agent then sent a valid status call
+and a successful `urdira_context` call. The grader marked `validation=true`
+with no tool-call, coverage, or IPC error. This is an agent protocol error, not
+a Urdira indexing, pagination, or readiness regression. The MCP production
+description and server instructions now state the bootstrap contract
+unambiguously: `{workspace_root:<repository root>}` with optional
+`response_budget`, with query fields excluded.
+
+The production MCP contract test covers the schema's rejection of
+`api_version`, `scope`, and `options` as top-level index-status fields and the
+published tool description/server instructions. The focused MCP suites pass
+(35 tests), as does `pnpm typecheck`.
+
+Because one of eight smoke rows failed validation, this 7/8 smoke does not
+qualify or validate the full campaign. No rerun was performed.
+
 ## Retained failures
 
 - `typescript/transpile-diagnostic-callback`, sample 1: the agent passed an
