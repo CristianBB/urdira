@@ -1787,6 +1787,8 @@ describe("CanonicalRecordQueryDataPort core:build_context", () => {
         lookedUp.push(name);
         return name === "LanguageFeatureRegistry" ? [registry] : name === "onDidChange" ? [event] : [];
       },
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => id === registry.record_id ? [registry] : id === event.record_id ? [event] : []),
+      graph_edges_by_subject_ids: async () => [],
     }));
 
     const evaluation = await port.execute({
@@ -1808,6 +1810,129 @@ describe("CanonicalRecordQueryDataPort core:build_context", () => {
     expect(bundles.map((bundle) => bundle.primary_result.record_id)).toEqual(["rec-registry", "rec-event"]);
     expect(bundles.every((bundle) => bundle.result_set === "context")).toBe(true);
     expect(bundles.every((bundle) => bundle.optional_source_snippets.length > 0)).toBe(true);
+  });
+
+  it("expands the tests facet through indexed covers edges with stable deduplication and ordering", async () => {
+    const subject = stubRecord("rec-subject", "artv-1", { path: "src/feature.ts", name: "Feature", start: 0, end: 8 });
+    const testA = stubRecord("rec-test-a", "artv-1", { path: "test/a.ts", name: "feature test a", start: 0, end: 8 });
+    const testB = stubRecord("rec-test-b", "artv-1", { path: "test/b.ts", name: "feature test b", start: 0, end: 8 });
+    const records = new Map([subject, testA, testB].map((record) => [record.record_id, record]));
+    let graphCalls = 0;
+    const edges = [testB, testA, testA].map((test, index) => ({
+      edge_id: `edge-${index}`,
+      source_subject_id: test.record_id,
+      target_subject_id: subject.record_id,
+      relation_record_id: `rel-${index}`,
+      relation_kind: "core:covers",
+      role: "",
+      evidence_class: "confirmed",
+    }));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async () => [subject],
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      graph_edges_by_subject_ids: async (_scope, ids, direction) => {
+        graphCalls += 1;
+        return direction === "inbound" && ids.includes(subject.record_id) ? edges : [];
+      },
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Feature", query_class: "identifier", facets: ["tests"] },
+      scope,
+    });
+
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual(["rec-test-a", "rec-test-b", "rec-subject"]);
+    expect(graphCalls).toBe(2);
+    expect(items.slice(1).every((item) => item.value.provenance_path.length === 0)).toBe(true);
+    expect(items.slice(1).every((item) => item.value.optional_source_snippets.length > 0)).toBe(true);
+  });
+
+  it("finds tests through an indexed caller when the resolved subject has no direct coverage", async () => {
+    const subject = stubRecord("rec-subject-indirect", "artv-1", { path: "src/feature.ts", name: "Feature", start: 0, end: 8 });
+    const caller = { ...stubRecord("rec-caller-indirect", "artv-1", { path: "src/consumer.ts", name: "consume", start: 0, end: 8 }), kind: "call_expression", universal_kind: "core:call" };
+    const test = stubRecord("rec-test-indirect", "artv-1", { path: "test/feature.ts", name: "feature test", start: 0, end: 8 });
+    const records = new Map([subject, caller, test].map((record) => [record.record_id, record]));
+    const edges = [
+      { edge_id: "edge-call", source_subject_id: caller.record_id, target_subject_id: subject.record_id, relation_record_id: "rel-call", relation_kind: "core:call", role: "", evidence_class: "confirmed" },
+      { edge_id: "edge-cover", source_subject_id: test.record_id, target_subject_id: caller.record_id, relation_record_id: "rel-cover", relation_kind: "core:covers", role: "", evidence_class: "confirmed" },
+    ];
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async () => [subject],
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      graph_edges_by_subject_ids: async (_scope, ids, direction) => edges.filter((edge) =>
+        (direction === "inbound" && ids.includes(edge.target_subject_id)) ||
+        (direction === "outbound" && ids.includes(edge.source_subject_id)) ||
+        (direction === "both" && (ids.includes(edge.source_subject_id) || ids.includes(edge.target_subject_id)))),
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Feature", query_class: "identifier", facets: ["tests"] },
+      scope,
+    });
+
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+    expect(items.map((item) => item.value.primary_result.record_id)).toContain(test.record_id);
+  });
+
+  it("fails explicitly when the tests facet has no indexed graph capability", async () => {
+    const port = new CanonicalRecordQueryDataPort(stubPort({ records_by_name: async () => [stubRecord("rec-subject", "artv-1", { name: "Feature" })] }) );
+    await expect(port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Feature", query_class: "identifier", facets: ["tests"] },
+      scope,
+    })).rejects.toMatchObject({
+      code: "core:required_capability_unsupported",
+      details: {
+        capability: "relatedTestsPushdown",
+        workspace_snapshot_binding_ids: [workspace.workspace_id],
+        reason_codes: ["indexed_graph_projection_unavailable"],
+      },
+    });
+  });
+
+  it("uses one containment frontier for many resolved subjects", async () => {
+    const subjects = Array.from({ length: 8 }, (_, index) => stubRecord(`rec-subject-${index}`, "artv-1", { name: `Feature${index}`, path: "src/feature.ts", start: 0, end: 8 }));
+    const test = stubRecord("rec-shared-test", "artv-1", { name: "shared test", path: "test/shared.ts", start: 0, end: 8 });
+    const records = new Map([...subjects, test].map((record) => [record.record_id, record]));
+    const edges = subjects.map((subject, index) => ({ edge_id: `edge-${index}`, source_subject_id: test.record_id, target_subject_id: subject.record_id, relation_record_id: `rel-${index}`, relation_kind: "core:covers", role: "", evidence_class: "confirmed" }));
+    let graphCalls = 0;
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async () => subjects,
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      graph_edges_by_subject_ids: async () => { graphCalls += 1; return edges; },
+    }));
+    const evaluation = await port.execute({ operation_id: "core:build_context", operation_version: 1, result_streams: ["context"], arguments: { task: "Feature0", query_class: "identifier", facets: ["tests"] }, scope });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([test.record_id, ...subjects.map((subject) => subject.record_id)]);
+    expect(graphCalls).toBe(2);
+  });
+
+  it("keeps explicit seeds, definitions, and indexed tests ahead of callers", async () => {
+    const seed = stubRecord("rec-seed", "artv-1", { name: "Target", path: "src/target.ts", start: 0, end: 8 });
+    const caller = { ...stubRecord("rec-caller", "artv-1", { name: "caller", path: "src/caller.ts", start: 0, end: 8 }), kind: "call_expression", universal_kind: "core:call" };
+    const test = stubRecord("rec-test", "artv-1", { name: "target test", path: "test/target.ts", start: 0, end: 8 });
+    const records = new Map([seed, caller, test].map((record) => [record.record_id, record]));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      records_by_name: async (_scope, name) => name === "Caller" ? [caller] : [],
+      graph_edges_by_subject_ids: async (_scope, ids) => ids.includes(seed.record_id) ? [{ edge_id: "edge-test", source_subject_id: test.record_id, target_subject_id: seed.record_id, relation_record_id: "rel-test", relation_kind: "core:covers", role: "", evidence_class: "confirmed" }] : [],
+    }));
+    const evaluation = await port.execute({ operation_id: "core:build_context", operation_version: 1, result_streams: ["context"], arguments: { task: "Caller", query_class: "identifier", seeds: [{ subject_type: "record", record_id: seed.record_id }], facets: ["definitions", "tests"] }, scope });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([seed.record_id, test.record_id, caller.record_id]);
   });
 
   it("returns a bounded empty context when no point-lookup capability is available", async () => {

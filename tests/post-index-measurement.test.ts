@@ -59,6 +59,15 @@ describe("post indexing measurement harness", () => {
     expect(merged.runs[0].post_measurement.operations.resolve_symbol).toBeNull();
   });
 
+  it("keeps non-MCP actions visible without turning them into reads", () => {
+    const plan = buildPostMeasurementPlan({ repositoryIds: ["vscode"], corpus: { repositories: [{ id: "vscode", repository: "microsoft/vscode", commit: "abc", tasks: [] }] } });
+    const result = analyzePostMeasurement({ plan, events: [
+      ...Array.from({ length: 2 }, () => ({ type: "item.completed", item: { type: "web_search", query: "source" } })),
+      ...Array.from({ length: 3 }, () => ({ type: "item.completed", item: { type: "file_change", status: "completed" } })),
+    ] });
+    expect(result).toMatchObject({ web_search_calls: 2, file_change_actions: 3, first_action_type: "web_search", adoption: { zero_mcp: true } });
+  });
+
   it("parses compact agent text and counts compare recipe/stage once", () => {
     const compact = { content: [{ type: "text", text: "# 1 result\ncoverage: complete\nTRUNCATED: dropped 2 items (response_budget)\nMORE: pass cursor cursor:opaque via request_type=continuation\n\ncursor:opaque" }] };
     expect(resultObject({ result: compact })).toMatchObject({ completeness: "complete", cap: { applied: true, truncated: true }, pagination: { has_next: true } });

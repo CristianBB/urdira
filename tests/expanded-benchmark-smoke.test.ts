@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { analyzeUrdiraPipelineContract } from "../release/benchmarks/expanded-agent-transcript-metrics.mjs";
+import { writeUrdiraIsolatedShim } from "../release/benchmarks/urdira-isolated-shim.mjs";
 
 const corpus = JSON.parse(readFileSync(resolve("release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8")) as {
   repositories: { id: string; tasks: { id: string }[] }[];
@@ -29,6 +30,27 @@ function probe(ids: string[], rows: ReturnType<typeof rowsFor>, failedRuns = 0) 
 }
 
 describe("expanded campaign smoke scope", () => {
+  it("runs version without a daemon and fails runtime hooks closed without the cell socket", () => {
+    const dir = mkdtempSync(join(tmpdir(), "expanded-shim-test-"));
+    try {
+      const shim = join(dir, "urdira");
+      writeUrdiraIsolatedShim(shim, {
+        node: process.execPath,
+        cli: resolve("apps/urdira/dist/cli.js"),
+        dataRoot: join(dir, "data"),
+        worker: join(dir, "worker"),
+        endpoint: join(dir, "data", "daemon.sock"),
+      });
+      const version = spawnSync(shim, ["--version"], { encoding: "utf8" });
+      expect(version.status).toBe(0);
+      expect(version.stdout.trim()).toBe("0.3.3");
+      const hook = spawnSync(shim, ["agent", "hook", "--client", "codex", "--payload", "{}"], { encoding: "utf8" });
+      expect(hook.status).toBe(78);
+      expect(hook.stderr).toContain("daemon endpoint is unavailable");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   const pipelineCall = (pattern: string) => ({
     type: "item.completed",
     item: {
@@ -117,6 +139,40 @@ describe("expanded campaign smoke scope", () => {
     for (const tool of ["urdira_query", "urdira_context", "urdira_analyze_change", "urdira_build_context", "urdira_index_status"]) {
       expect(mcp).toContain(`"${tool}"`);
     }
+  });
+
+  it("uses the production Codex installer in an isolated user root for the Urdira arm", () => {
+    const runner = readFileSync(resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "utf8");
+    expect(runner).toContain('const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");');
+    expect(runner).toContain('installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome })');
+    expect(runner).toContain('mkdtempSync(join("/tmp", "urdira-expanded-codex-home-"))');
+    expect(runner).toContain('CODEX_HOME: join(codexIntegrationHome, ".codex")');
+    expect(runner).toContain('const userAuthPath = join(homedir(), ".codex", "auth.json")');
+    expect(runner).toContain('symlinkSync(userAuthPath, isolatedAuthPath)');
+    expect(runner).toContain('auth: authMode');
+    expect(runner.indexOf("let codexIntegrationHome;")).toBeLessThan(runner.indexOf("const recordFailure"));
+    expect(runner.indexOf("const cleanupCodexIntegration")).toBeLessThan(runner.indexOf("const recordFailure"));
+    expect(runner).toContain('mcp: "runner-configured-per-process"');
+    expect(runner).toContain('ignore_user_config: false');
+    expect(runner).toContain('hook_trust: "dangerously-bypass-hook-trust"');
+    expect(runner).toContain('"--dangerously-bypass-hook-trust"');
+    expect(runner).toContain('const urdiraShimPath = join(urdiraBinDir, "urdira")');
+    expect(runner).toContain('writeUrdiraIsolatedShim(urdiraShimPath');
+    const shim = readFileSync(resolve("release/benchmarks/urdira-isolated-shim.mjs"), "utf8");
+    expect(shim).toContain('exec "$NODE" "$CLI" "$@"');
+    expect(shim).toContain('if [ "\\${1:-}" = "--version" ]');
+    expect(runner).toContain('spawnSync(urdiraShimPath, ["--version"]');
+    expect(runner).toContain('cli_sha256: cliFingerprint');
+    expect(runner).toContain('const urdiraEndpoint = join(effectiveDataRoot, "daemon.sock")');
+    expect(runner).toContain('endpoint: urdiraEndpoint');
+    expect(runner).toContain('PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`');
+    expect(runner).toContain('URDIRA_ENDPOINT: codexIntegration.endpoint');
+    expect(shim).toContain('[ -S "$ENDPOINT" ]');
+    expect(shim).toContain('export URDIRA_ENDPOINT="$ENDPOINT"');
+    expect(runner).toContain('...(codexIntegration === undefined ? ["--ignore-user-config"] : [])');
+    expect(runner).toContain("cleanupCodexIntegration();");
+    const promptSource = runner.slice(runner.indexOf("const initialInstruction"), runner.indexOf("let host;"));
+    expect(promptSource).not.toMatch(/Use Urdira MCP|urdira_context|urdira_query|call urdira_index_status/u);
   });
 
   it("captures Codex timing in a sidecar without changing the transcript", () => {

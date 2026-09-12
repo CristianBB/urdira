@@ -1,6 +1,6 @@
-import { readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { installAgent, runIsolatedDiscoveryDigest, runAgentHook, translateAgentSearch, uninstallAgent } from "../packages/cli/src/agent-integration.js";
+import { agentStatus, installAgent, runIsolatedDiscoveryDigest, runAgentHook, translateAgentSearch, uninstallAgent } from "../packages/cli/src/agent-integration.js";
 
 describe("coding-agent bridge", () => {
   it("fails open for unsupported Grep modes", async () => {
@@ -30,9 +30,52 @@ describe("coding-agent bridge", () => {
       expect(installed.changed).toBe(true);
       const hooks = JSON.parse(await readFile(`${home}/.codex/hooks.json`, "utf8"));
       expect(hooks.hooks.PreToolUse[0]).toMatchObject({ matcher: "^(Grep|Glob|Bash)$", hooks: [{ type: "command" }] });
+      const globalInstructions = await readFile(`${home}/.codex/AGENTS.md`, "utf8");
+      expect(globalInstructions).toContain("<!-- urdira-managed-agent-integration-v1:global-instructions -->");
+      expect(globalInstructions).toContain("begin with Urdira");
+      expect(globalInstructions).toContain("first repository action must be Urdira");
+      expect(globalInstructions).toContain("Do not use shell to inspect repository files or repository guidance before that Urdira call");
+      expect(globalInstructions).toContain("Host-provided skill guidance may be read");
+      await expect(agentStatus("codex", { home })).resolves.toMatchObject({ installed: true, managed_files: expect.arrayContaining([`${home}/.codex/AGENTS.md`]) });
+      const explorer = await readFile(`${home}/.codex/agents/urdira_explorer.toml`, "utf8");
+      const skill = await readFile(`${home}/.codex/skills/urdira-discovery/SKILL.md`, "utf8");
+      expect(explorer).toMatch(/^# urdira-managed-agent-integration-v1\nname = "urdira_explorer"\ndescription = "Read-only bounded repository discovery via Urdira\."\ndeveloper_instructions = """\n[\s\S]+\n"""\n$/u);
+      const instructionBlock = explorer.match(/^developer_instructions = """\n([\s\S]+)\n"""\n$/mu);
+      expect(instructionBlock?.[1]).toContain("Start repository discovery with Urdira");
+      expect(instructionBlock?.[1]).toContain("Before declaring Urdira unavailable, call the visible urdira_index_status tool");
+      expect(instructionBlock?.[1]).toContain("Decide availability from that tool response only");
+      expect(instructionBlock?.[1]).toContain("preserve its exact error");
+      expect(skill).toMatch(/^---\nname: urdira-discovery\ndescription: .+\n---\n/u);
+      expect(explorer).toContain("Start repository discovery with Urdira");
+      expect(explorer).toContain("continue pagination");
+      expect(explorer).toContain("coverage is complete");
+      expect(explorer).toContain("shell only when indexed data is absent or incomplete");
+      expect(skill).toContain("Start repository discovery with Urdira");
+      expect(skill).toContain("Before declaring Urdira unavailable, call the visible urdira_index_status tool");
+      expect(skill).toContain("Decide availability from that tool response only");
+      expect(skill).toContain("preserve its exact error");
+      expect(skill).toContain("continue pagination");
+      expect(skill).toContain("coverage is complete");
+      expect(skill).toContain("editing, testing, building, or git");
       const removed = await uninstallAgent("codex", { dry_run: false, confirm: true, home });
       expect(removed.changed).toBe(true);
       expect(JSON.parse(await readFile(`${home}/.codex/hooks.json`, "utf8")).hooks.PreToolUse).toEqual([]);
+      await expect(readFile(`${home}/.codex/AGENTS.md`, "utf8")).resolves.not.toContain("global-instructions");
+    } finally { await rm(home, { recursive: true, force: true }); }
+  });
+
+  it("preserves unrelated global Codex instructions and replaces its managed block idempotently", async () => {
+    const home = `/tmp/urdira-codex-global-test-${process.pid}`;
+    try {
+      await mkdir(`${home}/.codex`, { recursive: true });
+      await writeFile(`${home}/.codex/AGENTS.md`, "USER_GLOBAL_RULE\n", { mode: 0o600 });
+      await installAgent("codex", { dry_run: false, confirm: true, home });
+      await installAgent("codex", { dry_run: false, confirm: true, home });
+      const content = await readFile(`${home}/.codex/AGENTS.md`, "utf8");
+      expect(content).toContain("USER_GLOBAL_RULE");
+      expect(content.match(/global-instructions -->/g)).toHaveLength(2);
+      await uninstallAgent("codex", { dry_run: false, confirm: true, home });
+      await expect(readFile(`${home}/.codex/AGENTS.md`, "utf8")).resolves.toBe("USER_GLOBAL_RULE\n");
     } finally { await rm(home, { recursive: true, force: true }); }
   });
 

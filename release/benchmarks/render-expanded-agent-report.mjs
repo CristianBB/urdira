@@ -300,6 +300,11 @@ const summaries = Object.fromEntries(Object.entries(groups).map(([key, rows]) =>
     mcp_unexpected_failed_calls: { median: percentile(numeric("mcp_unexpected_failed_calls"), 0.5), mean: mean(numeric("mcp_unexpected_failed_calls")) },
     mcp_empty_discovery_calls: { median: percentile(numeric("mcp_empty_discovery_calls"), 0.5), mean: mean(numeric("mcp_empty_discovery_calls")) },
     mcp_useful_discovery_calls: { median: percentile(numeric("mcp_useful_discovery_calls"), 0.5), mean: mean(numeric("mcp_useful_discovery_calls")) },
+    web_search_calls: { median: percentile(numeric("web_search_calls"), 0.5), mean: mean(numeric("web_search_calls")) },
+    file_change_actions: { median: percentile(numeric("file_change_actions"), 0.5), mean: mean(numeric("file_change_actions")) },
+    integration_warning_count: { median: percentile(numeric("integration_warning_count"), 0.5), mean: mean(numeric("integration_warning_count")) },
+    hook_error_count: { median: percentile(numeric("hook_error_count"), 0.5), mean: mean(numeric("hook_error_count")) },
+    unclassified_action_count: { median: percentile(numeric("unclassified_action_count"), 0.5), mean: mean(numeric("unclassified_action_count")) },
     repository_read_calls: { median: percentile(numeric("repository_read_calls"), 0.5), mean: mean(numeric("repository_read_calls")) },
     repository_context_characters: { median: percentile(numeric("repository_context_characters"), 0.5), mean: mean(numeric("repository_context_characters")) },
     tool_output_characters: { median: percentile(numeric("tool_output_characters"), 0.5), mean: mean(numeric("tool_output_characters")) },
@@ -343,6 +348,7 @@ const report = {
     evidence_grounded_plan: "An observational flag indicating whether configured discovery evidence appeared before the first edit and again after edit batches; it is not a correctness gate.",
     composition_metrics: "For Urdira, the report records pipeline, recipe, direct-operation, dependency, and malformed-composition usage observationally. Each is valid when appropriate, and no choice is required.",
     repository_context_characters: "Characters returned by observed repository-discovery calls. This is tool-response context, not source-only bytes.",
+    action_telemetry: "Completed Codex action counts include MCP calls, shell commands, web searches, file changes, agent messages, and errors. Web searches and file changes are reported separately and never contribute to repository reads or repository context characters; unknown completed item types are counted as unclassified actions.",
     transcript_output_breakdown: "tool_output_characters, shell_output_characters, and tgrep_output_characters split observed discovery response characters by method. Missing methods remain null. context_component_* counts only protocol-identifiable snippets, hydration, evidence, or registry payloads; unidentifiable components remain null.",
     mcp_component_bytes: "For real Urdira MCP text-content responses, tool_envelope is the UTF-8 JSON request/status envelope, model_visible_serialized is the UTF-8 response content visible to the model, source_text is identifiable indented source text, records is identifiable result/header metadata, and hydration/evidence/registry remain null unless the response carries an explicit typed byte field. These are lower-bound protocol classifications and never use structuredContent.bytes as a required shape.",
     target_attributed_characters: "Characters from observed discovery responses whose request or response contains a declared task path/file/required-pattern marker. This is a lexical attribution proxy, not a semantic relevance judgment; it is null when the task declares no patterns.",
@@ -375,6 +381,13 @@ const report = {
     estimated_cost_usd: run.metrics?.estimated_cost_usd ?? null,
     outer_turns: run.metrics?.outer_turns ?? null,
     mcp_calls: run.metrics?.mcp_calls ?? null,
+    action_counts: run.metrics?.action_counts ?? null,
+    web_search_calls: run.metrics?.web_search_calls ?? null,
+    file_change_actions: run.metrics?.file_change_actions ?? null,
+    first_action_type: run.metrics?.first_action_type ?? null,
+    integration_warning_count: run.metrics?.integration_warning_count ?? null,
+    hook_error_count: run.metrics?.hook_error_count ?? null,
+    unclassified_action_count: run.metrics?.unclassified_action_count ?? null,
     timing_metrics: run.timing_metrics ?? null,
     mcp_timing: run.timing_metrics?.aggregates?.mcp_by_tool ?? null,
     command_timing: run.timing_metrics?.aggregates?.commands_by_command ?? null,
@@ -437,6 +450,7 @@ const evidenceRows = runs.map((run) => {
   const adoptionText = adoption ? (adoption.zero_mcp ? "zero-mcp" : adoption.mcp_before_shell === true ? "mcp-before-shell" : adoption.shell_after_mcp === true ? "shell-after-mcp" : "mixed") : "—";
   return `| ${run.repository} | ${run.task} | ${run.arm} | ${run.correctness?.evidence_grounded_plan === true ? "yes" : run.correctness?.evidence_grounded_plan === false ? "no" : "—"} | ${omissionText.replaceAll("|", "/")} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.tool_output_characters)} | ${number(run.metrics?.shell_output_characters)} | ${number(run.metrics?.tgrep_output_characters)} | ${number(run.metrics?.target_attributed_characters)} | ${number(run.metrics?.target_unattributed_characters)} | ${adoptionText} | ${number(run.metrics?.mcp_calls)} | ${number(run.metrics?.mcp_failed_calls)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} |`;
 });
+const actionRows = runs.map((run) => `| ${run.repository} | ${run.task} | ${run.arm} | ${number(run.metrics?.web_search_calls)} | ${number(run.metrics?.file_change_actions)} | ${run.metrics?.first_action_type ?? "—"} | ${number(run.metrics?.integration_warning_count)} | ${number(run.metrics?.hook_error_count)} | ${number(run.metrics?.unclassified_action_count)} |`);
 const urdiraRuns = runs.filter((run) => run.arm === "urdira-typescript");
 const urdiraDiscoveryCalls = urdiraRuns.reduce((sum, run) => sum + Number(run.metrics?.mcp_discovery_calls ?? 0), 0);
 const urdiraDiscoverySuccesses = urdiraRuns.reduce((sum, run) => sum + Number(run.metrics?.mcp_discovery_successful_calls ?? 0), 0);
@@ -516,6 +530,16 @@ ${viabilityAssessment ? `## Viability assessment\n\n${viabilityAssessment}\n` : 
 | Repository | Task | Arm | Evidence grounded | Declared omissions | Repository reads | Context chars | Tool chars | Shell chars | tgrep chars | Target chars | Unattributed chars | Adoption | MCP calls | Failed MCP | Tests A/P/F/? |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|
 ${evidenceRows.join("\n")}
+
+## Codex action telemetry
+
+These completed-action counters are separate from repository-read metrics. Web
+searches and file changes are actions, but their counts do not become MCP,
+shell, repository-read, or context-character measurements.
+
+| Repository | Task | Arm | Web searches | File changes | First action | Integration warnings | Hook errors | Unclassified actions |
+|---|---|---|---:|---:|---|---:|---:|---:|
+${actionRows.join("\n")}
 
 ## Resource and storage measurements
 

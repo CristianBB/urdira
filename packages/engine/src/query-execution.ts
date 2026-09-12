@@ -357,6 +357,7 @@ class MemoryManifestStore implements QueryManifestStore {
   };
 }
 
+
 const MANIFEST_SEGMENT_ROWS = 512;
 const MANIFEST_SEGMENT_BYTES = 1024 * 1024;
 
@@ -519,6 +520,7 @@ export class DurableManifestStore implements QueryManifestStore {
     },
   };
 }
+
 
 const EMPTY_RESOURCE_MEASUREMENT: QueryOperationResourceMeasurement = Object.freeze({});
 
@@ -769,7 +771,7 @@ export class QueryEngine {
     const pageStarted = this.metricClock();
     let read: ReadPageResult<QueryStreamItem>;
     try {
-      read = await this.cursorCache.readPage({ cursor: request.cursor, limit: request.response_budget.max_items, max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, now: this.now() });
+      read = await this.cursorCache.readPage({ cursor: request.cursor, expected_response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.response_budget), limit: request.response_budget.max_items, max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, now: this.now() });
       let serializedBytes = 0;
       try { serializedBytes = canonicalBytes(read.items).byteLength; } catch { /* Internal telemetry remains best-effort. */ }
       this.reportPage({ page_kind: "continuation", stream: claims.result_stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: read.items.length, rows_hydrated: read.items.length, serialized_bytes: serializedBytes, success: true });

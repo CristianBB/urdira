@@ -2,6 +2,7 @@
 /* global URL, structuredClone */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { analyzeCodexActions } from "./expanded-agent-transcript-metrics.mjs";
 
 const OPS = ["core:resolve_symbol", "core:find_records", "core:search_text", "core:compare_workspaces"];
 const operationKey = (operation) => String(operation).replace(/^core:/u, "");
@@ -78,6 +79,7 @@ export function analyzePostMeasurement({ events = [], plan, hostMetrics = null }
   const durationsByOperation = Object.fromEntries(OPS.map((op) => [operationKey(op), []]));
   let lastPaginatedOperation = null;
   const failures = [];
+  const actionMetrics = analyzeCodexActions(events.filter((event) => event?.type === "item.completed"));
   for (const event of events.filter((entry) => entry?.type === "item.completed")) {
     const item = event.item ?? event;
     if (item?.type !== "mcp_tool_call" || !["urdira_query", "urdira_context"].includes(item.tool)) continue;
@@ -104,7 +106,7 @@ export function analyzePostMeasurement({ events = [], plan, hostMetrics = null }
   const shellIndices = events.map((event, index) => event?.type === "item.completed" && event.item?.type === "command_execution" ? index : -1).filter((i) => i >= 0);
   const adoption = { mcp_before_shell: mcpIndices.length && shellIndices.length ? Math.min(...mcpIndices) < Math.min(...shellIndices) : null, shell_after_mcp: mcpIndices.length && shellIndices.length ? Math.max(...shellIndices) > Math.min(...mcpIndices) : null, zero_mcp: mcpIndices.length === 0 };
   const readiness = hostMetrics ? { structural_readiness_ms: finite(hostMetrics.structural_readiness_ms), semantic_index: hostMetrics.semantic_index ?? false, semantic_materialization: hostMetrics.semantic_materialization ?? false, semantic_sidecar: hostMetrics.semantic_sidecar_created ?? false } : null;
-  return { schema_version: 1, repository_ids: selectedPlan.repositories.map((repo) => repo.id), readiness, operations, adoption, failures, limitations: ["latency p95 requires per-call duration samples in the supplied raw events", "byte fields are reported only when the production response identifies them", "no competitor is executed by this harness"] };
+  return { schema_version: 1, repository_ids: selectedPlan.repositories.map((repo) => repo.id), readiness, operations, adoption, failures, ...actionMetrics, limitations: ["latency p95 requires per-call duration samples in the supplied raw events", "byte fields are reported only when the production response identifies them", "no competitor is executed by this harness"] };
 }
 
 export function mergePostMeasurements(report, postReport) {

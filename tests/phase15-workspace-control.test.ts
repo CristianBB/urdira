@@ -11,7 +11,7 @@ import {
   WorkspaceWatcherManager,
   type WorkspaceDetectionInput,
 } from "../packages/engine/src/index.js";
-import { createUrdiraMcpServer, createUrdiraToolDefinitions, MCP_SERVER_INSTRUCTIONS, URDIRA_CONTEXT_EXAMPLE, URDIRA_QUERY_GET_SOURCE_EXAMPLE } from "../packages/mcp/src/index.js";
+import { createUrdiraMcpServer, createUrdiraToolDefinitions, MCP_SERVER_INSTRUCTIONS, URDIRA_CONTEXT_EXAMPLE, URDIRA_QUERY_CONTINUATION_EXAMPLE, URDIRA_QUERY_GET_SOURCE_EXAMPLE } from "../packages/mcp/src/index.js";
 import { operationErrorDefinitions } from "../packages/contracts/src/index.js";
 import { parseCliArgs, runCli } from "../packages/cli/src/index.js";
 import { WorkspaceRegistry } from "../packages/engine/src/index.js";
@@ -78,6 +78,20 @@ describe("workspace configuration impact", () => {
 });
 
 describe("MCP index status v3", () => {
+  test("registers discovery tools before specialized tools", () => {
+    const tools = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
+    expect(tools.map((tool) => tool.name)).toEqual([
+      "urdira_index_status",
+      "urdira_context",
+      "urdira_query",
+      "urdira_build_context",
+      "urdira_analyze_change",
+    ]);
+    expect(tools[0]?.description).toContain("make this the first call for repository discovery or source reading");
+    expect(tools[1]?.description).toContain("broad, multi-facet repository discovery");
+    expect(tools[2]?.description).toContain("Run an exact Urdira query");
+  });
+
   test("advertises the bootstrap index-status contract without query fields", () => {
     const tools = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
     const status = tools.find((tool) => tool.name === "urdira_index_status")!;
@@ -91,12 +105,25 @@ describe("MCP index status v3", () => {
     expect(responseBudget.additionalProperties).toBe(false);
     expect(Object.keys(responseBudget.properties ?? {}).sort()).toEqual(["max_characters", "max_items"]);
     expect(status.description).toContain("bootstrap form accepts no api_version, scope, options, or other query fields");
+    expect(status.description).toContain("make this the first call for repository discovery or source reading");
     expect(status.description).toContain("response_budget is an object, never a number");
     expect(status.description).toContain("max_items\":50,\"max_characters\":20000");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Call urdira_index_status with exactly {\"workspace_root\":\"/absolute/repository/root\"}");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("this primary bootstrap example omits response_budget");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("use an object, never a number");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Do not send api_version, scope, options, or query fields");
+  });
+
+  test("puts generic first-call source-discovery guidance immediately after the title", () => {
+    const lines = MCP_SERVER_INSTRUCTIONS.split("\n");
+    expect(lines[0]).toBe("URDIRA AGENT QUICK START");
+    expect(lines[1]).toContain("For any repository discovery or source reading");
+    expect(lines[1]).toContain("first call urdira_index_status");
+    expect(lines[1]).toContain("page_coverage as incomplete");
+    expect(lines[1]).toContain("urdira_context for broad discovery");
+    expect(lines[1]).toContain("urdira_query for a known subject or direct operation");
+    expect(lines[1]).toContain("incomplete or unsupported coverage");
+    expect(lines[1]).toContain("edits, tests, builds, and Git");
   });
 
   test("keeps the documented bootstrap examples aligned with the input schema", async () => {
@@ -131,9 +158,77 @@ describe("MCP index status v3", () => {
     const validate = registered["urdira_query"]!.inputSchema["~standard"].validate;
     const example = { request_type: "continuation", continuation: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, cursor: "<signed_cursor>" } };
     expect((await validate(example)).issues).toBeUndefined();
+    expect((await validate(URDIRA_QUERY_CONTINUATION_EXAMPLE)).issues).toBeUndefined();
+    expect((await validate({ ...URDIRA_QUERY_CONTINUATION_EXAMPLE, continuation: { ...URDIRA_QUERY_CONTINUATION_EXAMPLE.continuation, cursor: "<signed_cursor>" } })).issues?.length).toBeGreaterThan(0);
+    expect((await validate({ ...example, continuation: { ...example.continuation, continuation_ref: "<continuation_ref>" } })).issues?.length).toBeGreaterThan(0);
     expect((await validate({ ...example, continuation: { ...example.continuation, scope: undefined } })).issues?.length).toBeGreaterThan(0);
     expect(MCP_SERVER_INSTRUCTIONS).toContain('request_type":"continuation"');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('cursor":"<signed_cursor>"');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("copy the complete MORE object literally");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('continuation_ref":"<continuation_ref>"');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Copy it literally without rebuilding it; it contains exactly one");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Index coverage and page coverage are separate");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("context_artifact");
+  });
+
+  test("requires exactly one portable cursor or server-local continuation_ref and round-trips the ref on one client", async () => {
+    const calls: string[] = [];
+    const client = { call: vi.fn(async (call: string) => {
+      calls.push(call);
+      return { protocol_version: 1, request_id: `request-${calls.length}`, outcome: "success" as const, payload: {
+        streams: { artifacts: { items: [], has_next: call === "core:query", next_cursor: call === "core:query" ? "cursor:next" : undefined } },
+        completeness: { overall_status: "complete", dimensions: [] }, diagnostics: [],
+      } };
+    }) };
+    const server = createUrdiraMcpServer({ client });
+    const registered = (server as unknown as { _registeredTools: Record<string, { inputSchema: { "~standard": { validate: (input: unknown) => Promise<{ issues?: readonly { message: string }[] }> } } }> })._registeredTools;
+    const validate = registered["urdira_query"]!.inputSchema["~standard"].validate;
+    const base = { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" } };
+    expect((await validate({ request_type: "continuation", continuation: base })).issues?.length).toBeGreaterThan(0);
+    expect((await validate({ request_type: "continuation", continuation: { ...base, cursor: "cursor", continuation_ref: "ref.sig" } })).issues?.length).toBeGreaterThan(0);
+
+    const query = createUrdiraToolDefinitions({ client }).find((tool) => tool.name === "urdira_query")!;
+    const first = await query.invoke({ request_type: "query", query: { api_version: 3, scope: base.scope, expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: {} } } });
+    const firstText = first.content.find((entry): entry is { type: "text"; text: string } => entry.type === "text")!.text;
+    const ref = JSON.parse(firstText.match(/^MORE: (\{.*\})$/mu)![1]!).continuation.continuation_ref as string;
+    await query.invoke({ request_type: "continuation", continuation: { api_version: 3, continuation_ref: ref } });
+    expect(calls).toEqual(["core:query", "core:query_continue"]);
+    await expect(query.invoke({ request_type: "continuation", continuation: { api_version: 3, scope: { ...base.scope, workspace_id: "workspace-2" }, continuation_ref: ref } })).rejects.toThrow(/self-contained.*omit scope/iu);
+    await expect(query.invoke({ request_type: "continuation", continuation: { api_version: 3, response_budget: { max_items: 1, max_characters: 20_000 }, continuation_ref: ref } })).rejects.toThrow(/self-contained.*omit scope/iu);
+    await expect(query.invoke({ request_type: "continuation", continuation: { api_version: 3, continuation_ref: `${ref.slice(0, -1)}x` } })).rejects.toThrow(/unknown or expired/iu);
+    const restartedClient = { call: client.call };
+    const restartedQuery = createUrdiraToolDefinitions({ client: restartedClient }).find((tool) => tool.name === "urdira_query")!;
+    await expect(restartedQuery.invoke({ request_type: "continuation", continuation: { api_version: 3, continuation_ref: ref } })).rejects.toThrow(/unknown or expired/iu);
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(15 * 60 * 1000 + 1);
+      await expect(query.invoke({ request_type: "continuation", continuation: { api_version: 3, continuation_ref: ref } })).rejects.toThrow(/unknown or expired/iu);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("documents the closed StructuralFilter fields and diagnoses an invalid include_globs path", async () => {
+    const client = { call: vi.fn(async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} })) };
+    const query = createUrdiraToolDefinitions({ client }).find((tool) => tool.name === "urdira_query")!;
+    expect(query.description).toContain("filter.paths");
+    expect(query.description).toContain("filter.kind_selector");
+    expect(query.description).toContain("filter.include_generated");
+    expect(query.description).toContain("Do not use filter.include_globs");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("StructuralFilter is closed");
+
+    await expect(query.invoke({
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        expression: {
+          expression_type: "operation",
+          operation: "core:find_artifacts",
+          arguments: { filter: { include_globs: ["src/**"] } },
+        },
+      },
+    })).rejects.toThrow(/StructuralFilter is closed.*filter\.include_external.*filter\.paths.*include_globs/iu);
+    expect(client.call).not.toHaveBeenCalled();
   });
 
   test("advertises the closed build-context facets and repeats them in SDK validation errors", async () => {

@@ -8,6 +8,10 @@ const isShellSourceReadCommand = (command) => {
   if (/\bgit\s+diff\b[\s\S]*\|\s*sed\s+-n\b/u.test(text)) return false;
   return SHELL_SOURCE_READ.test(text);
 };
+// Reads of the isolated Codex skill/configuration tree are host setup work,
+// not repository discovery. Keep them in total command_execution counts while
+// excluding their output from repository context measurements.
+const isHostInstructionReadCommand = (command) => /(?:\/\.codex\/(?:skills|AGENTS\.md)(?:\/|\b))/u.test(String(command));
 const TEST_COMMAND = /(?:^|\s)(?:cargo\s+(?:nextest\s+run|test)|go\s+test|pytest|python3?\s+-m\s+pytest|vitest|jest|mocha|ava|pnpm\s+(?:exec\s+)?(?:vitest|test)|npm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|bun\s+test)(?:\s|$)/iu;
 const TYPECHECK_COMMAND = /(?:^|\s)(?:tsc(?:\s|$)|pnpm\s+(?:exec\s+)?(?:tsc|typecheck)(?:\s|$)|npm\s+run\s+typecheck(?:\s|$))/iu;
 const LINT_COMMAND = /(?:^|\s)(?:eslint(?:\s|$)|pnpm\s+(?:exec\s+)?lint(?:\s|$)|npm\s+run\s+lint(?:\s|$))/iu;
@@ -125,6 +129,32 @@ const itemText = (item) => {
   return "";
 };
 
+const CODEX_ACTION_TYPES = new Set(["mcp_tool_call", "command_execution", "web_search", "file_change"]);
+const CODEX_KNOWN_COMPLETED_TYPES = new Set([...CODEX_ACTION_TYPES, "agent_message", "error"]);
+export const analyzeCodexActions = (completed) => {
+  const actionCounts = {};
+  for (const event of completed) {
+    const type = event.item?.type;
+    if (typeof type === "string") actionCounts[type] = (actionCounts[type] ?? 0) + 1;
+  }
+  const actionEvents = completed.filter((event) => CODEX_ACTION_TYPES.has(event.item?.type));
+  const unknown = completed.filter((event) => {
+    const type = event.item?.type;
+    return typeof type === "string" && !CODEX_KNOWN_COMPLETED_TYPES.has(type);
+  });
+  const errors = completed.filter((event) => event.item?.type === "error");
+  const hookErrors = errors.filter((event) => /hook|trust|skill|integration/iu.test(String(event.item?.message ?? "")));
+  return {
+    action_counts: actionCounts,
+    web_search_calls: actionCounts.web_search ?? 0,
+    file_change_actions: actionCounts.file_change ?? 0,
+    first_action_type: actionEvents[0]?.item?.type ?? null,
+    integration_warning_count: errors.length,
+    hook_error_count: hookErrors.length,
+    unclassified_action_count: unknown.length,
+  };
+};
+
 const DISCOVERY_COMPONENTS = ["snippets", "hydration", "evidence", "registry"];
 const MCP_COMPONENT_BYTE_FIELDS = ["tool_envelope", "model_visible_serialized", "source_text", "hydration", "records", "evidence", "registry"];
 const utf8Bytes = (value) => Buffer.byteLength(String(value ?? ""), "utf8");
@@ -212,11 +242,12 @@ const relevancePatterns = (task) => (task?.required_patterns ?? []).flatMap(({ p
 
 export function analyzeExpandedTranscript(events, arm, task) {
   const completed = events.filter((event) => event?.type === "item.completed");
+  const codexActions = analyzeCodexActions(completed);
   const reads = completed.flatMap((event, eventIndex) => {
     const item = event.item;
     const command = item?.type === "command_execution" ? String(item.command ?? "") : "";
     const configured = arm === "baseline"
-      ? item?.type === "command_execution" && isShellSourceReadCommand(command)
+      ? item?.type === "command_execution" && isShellSourceReadCommand(command) && !isHostInstructionReadCommand(command)
       : arm === "tgrep"
         ? configuredTgrepCall(item, arm)
         : configuredMcpCall(item, arm);
@@ -226,11 +257,19 @@ export function analyzeExpandedTranscript(events, arm, task) {
   });
   const patterns = relevancePatterns(task);
   const edits = completed.map((event, index) => /apply_patch|file_change|write_file|git\s+apply|editor_action/iu.test(JSON.stringify(event)) ? index : -1).filter((index) => index >= 0);
+  const hostInstructionReads = completed.flatMap((event, eventIndex) => {
+    const item = event.item;
+    const command = item?.type === "command_execution" ? String(item.command ?? "") : "";
+    if (!isHostInstructionReadCommand(command)) return [];
+    const response = itemText(item);
+    return [{ event_index: eventIndex, response_characters: response.length }];
+  });
   const observedReads = completed.flatMap((event, eventIndex) => {
     const item = event.item;
     const command = item?.type === "command_execution" ? String(item.command ?? "") : "";
     const isMcpDiscovery = item?.type === "mcp_tool_call" && String(item.tool ?? "").toLowerCase() !== "urdira_index_status";
-    const isShellDiscovery = item?.type === "command_execution" && isShellSourceReadCommand(command);
+    const isHostInstructionRead = item?.type === "command_execution" && isHostInstructionReadCommand(command);
+    const isShellDiscovery = item?.type === "command_execution" && isShellSourceReadCommand(command) && !isHostInstructionRead;
     const isTgrepDiscovery = item?.type === "command_execution" && /(?:^|[\s;&|('"`])tgrep(?:\s|$)/u.test(command);
     if (!isMcpDiscovery && !isShellDiscovery && !isTgrepDiscovery) return [];
     const response = itemText(item);
@@ -296,10 +335,13 @@ export function analyzeExpandedTranscript(events, arm, task) {
     tgrep: methodCharacters("tgrep"),
   };
   return {
+    ...codexActions,
     repository_read_calls: observedReads.length,
     configured_repository_read_calls: reads.length,
     assigned_tgrep_calls: arm === "tgrep" ? reads.length : 0,
     repository_context_characters: observedReads.reduce((sum, read) => sum + read.response_characters, 0),
+    host_instruction_read_calls: hostInstructionReads.length,
+    host_instruction_context_characters: hostInstructionReads.reduce((sum, read) => sum + read.response_characters, 0),
     tool_output_characters: outputCharactersByMethod.mcp,
     shell_output_characters: outputCharactersByMethod.shell,
     tgrep_output_characters: outputCharactersByMethod.tgrep,
@@ -321,6 +363,7 @@ export function analyzeExpandedTranscript(events, arm, task) {
       mcp_calls: observedReads.filter((read) => read.method === "mcp").length,
       shell_calls: observedReads.filter((read) => read.method === "shell").length,
       tgrep_calls: observedReads.filter((read) => read.method === "tgrep").length,
+      host_instruction_reads: hostInstructionReads.length,
     },
     discovery_adoption: {
       mcp_before_shell: mcpBeforeShell,

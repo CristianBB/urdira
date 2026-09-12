@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 /* global URL, setTimeout, clearTimeout, setInterval, clearInterval */
 /* One isolated repository/task/arm run for the expanded benchmark. */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { createTimingCapture, summarizeTimingCaptures } from "./expanded-agent-timing.mjs";
 import { findWorkerStartupAttestation } from "./urdira-worker-attestation.mjs";
+import { writeUrdiraIsolatedShim } from "./urdira-isolated-shim.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -49,7 +52,7 @@ function validateRuntimePreflight() {
   const major = Number(match?.[1]); const minor = Number(match?.[2]); const patch = Number(match?.[3]);
   if (!match || major < 24 || (major === 24 && (minor < 18 || minor === 18 && patch < 1))) throw new Error(`Urdira benchmark preflight: Node >=24.18.1 is required, found ${(version.stdout ?? "").trim()}.`);
   if (!model || model.trim().length === 0) throw new Error("Urdira benchmark preflight: --model must be non-empty.");
-  for (const requiredPath of ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json", "packages/mcp/dist/index.js"]) {
+  for (const requiredPath of ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json", "packages/mcp/dist/index.js", "packages/cli/dist/agent-integration.js", "apps/urdira/dist/cli.js", "apps/urdira/package.json"]) {
     if (!existsSync(join(root, requiredPath))) throw new Error(`Urdira benchmark preflight: required project artifact is missing: ${requiredPath}`);
   }
   if (arm === "urdira-typescript" && !existsSync(indexingWorkerBin)) throw new Error(`Urdira benchmark preflight: indexing worker is missing: ${indexingWorkerBin}`);
@@ -78,17 +81,23 @@ const codexTimingCaptures = [];
 const timingSummary = () => summarizeTimingCaptures(codexTimingCaptures);
 const writeTimingSidecar = () => writeFileSync(timingSidecar, `${JSON.stringify(timingSummary(), null, 2)}\n`, "utf8");
 writeTimingSidecar();
+const setupStartedAt = Date.now();
+let codexIntegrationHome;
+let codexIntegration;
+const cleanupCodexIntegration = () => {
+  if (codexIntegrationHome !== undefined) rmSync(codexIntegrationHome, { recursive: true, force: true });
+};
 const recordFailure = (reason) => {
   const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
   try {
-    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
+    cleanupCodexIntegration();
+    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
   } catch { /* retain the original failure when the output directory is unavailable */ }
   process.stderr.write(`${message}\n`);
   process.exit(1);
 };
 process.on("uncaughtException", recordFailure);
 process.on("unhandledRejection", recordFailure);
-const setupStartedAt = Date.now();
 
 async function waitForSemanticPerfAttestation() {
   const deadline = Date.now() + benchmarkTimeoutMs;
@@ -133,6 +142,47 @@ if (argv.includes("--host")) await hostMain();
 await git("reset", "--hard", commit);
 await git("clean", "-fd");
 const setup = await prepareArm();
+if (arm === "urdira-typescript") {
+  codexIntegrationHome = mkdtempSync(join("/tmp", "urdira-expanded-codex-home-"));
+  const urdiraCliPath = join(root, "apps/urdira/dist/cli.js");
+  const urdiraCliVersion = JSON.parse(readFileSync(join(root, "apps/urdira/package.json"), "utf8")).version;
+  const urdiraBinDir = join(codexIntegrationHome, "bin");
+  const urdiraShimPath = join(urdiraBinDir, "urdira");
+  const urdiraEndpoint = join(effectiveDataRoot, "daemon.sock");
+  mkdirSync(urdiraBinDir, { recursive: true });
+  writeUrdiraIsolatedShim(urdiraShimPath, { node: nodeBin, cli: urdiraCliPath, dataRoot: effectiveDataRoot, worker: indexingWorkerBin, endpoint: urdiraEndpoint });
+  const shimVersion = spawnSync(urdiraShimPath, ["--version"], { encoding: "utf8", env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: urdiraEndpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin } });
+  if (shimVersion.status !== 0) throw new Error(`isolated urdira --version failed: ${shimVersion.stderr}`);
+  const cliFingerprint = createHash("sha256").update(readFileSync(urdiraCliPath)).digest("hex");
+  const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");
+  const installed = await installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome });
+  const userAuthPath = join(homedir(), ".codex", "auth.json");
+  const isolatedAuthPath = join(codexIntegrationHome, ".codex", "auth.json");
+  let authMode = "external-or-missing";
+  if (existsSync(userAuthPath)) {
+    // Keep authentication available without copying credentials into the
+    // disposable configuration root or changing the user's Codex directory.
+    symlinkSync(userAuthPath, isolatedAuthPath);
+    authMode = "user-auth-symlink";
+  }
+  codexIntegration = {
+    mode: "installed-integration",
+    client: "codex",
+    home: codexIntegrationHome,
+    files: installed.files,
+    changed: installed.changed,
+    mcp: "runner-configured-per-process",
+    ignore_user_config: false,
+    hook_trust: "dangerously-bypass-hook-trust",
+    auth: authMode,
+    executable: urdiraShimPath,
+    executable_version: String(shimVersion.stdout ?? "").trim(),
+    cli_version: urdiraCliVersion,
+    cli_sha256: cliFingerprint,
+    path_prepend: urdiraBinDir,
+    endpoint: urdiraEndpoint,
+  };
+}
 
 const initialInstruction = `You are working in the frozen ${repo.repository} checkout at commit ${commit}, in ${worktree}. This is an authorized internal benchmark change; treat it as an accepted maintenance/API task and do not pause to request repository-maintainer confirmation. Complete the first implementation phase of this coding task:
 
@@ -160,7 +210,7 @@ if (arm === "urdira-typescript") {
 }
 const setupElapsedMs = Date.now() - setupStartedAt;
 
-const codexArgs = ["-m", model, "-s", "danger-full-access", "-a", "never", "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-C", worktree];
+const codexArgs = ["-m", model, "-s", "danger-full-access", "-a", "never", ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"]), "exec", "--json", "--skip-git-repo-check", "-C", worktree];
 const addMcp = (args) => {
   if (arm === "urdira-typescript") {
     const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
@@ -175,7 +225,8 @@ const addMcp = (args) => {
 };
 addMcp(codexArgs);
 const firstInstructionMs = Date.now();
-let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, input: initialInstruction, timing_label: "turn-1" });
+const codexEnvironment = codexIntegration === undefined ? undefined : { HOME: codexIntegrationHome, CODEX_HOME: join(codexIntegrationHome, ".codex"), PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: codexIntegration.endpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin };
+let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, env: codexEnvironment, input: initialInstruction, timing_label: "turn-1" });
 if (first.timing) { codexTimingCaptures.push(first.timing); writeTimingSidecar(); }
 writeFileSync(transcript, first.stdout, "utf8");
 let exitCode = first.code;
@@ -249,14 +300,14 @@ if (first.code === 0) {
   if (!sessionId) throw new Error("Codex transcript did not expose a resumable session id");
   const resume = ["-m", model, "-s", "danger-full-access", "-a", "never", "-C", worktree];
   addMcp(resume);
-  resume.push("exec", "resume", sessionId, "--json", "--ignore-user-config", "--skip-git-repo-check");
-  const second = await run(codex, [...resume, "-"], { cwd: worktree, input: followUpInstruction, timing_label: "turn-2" });
+  resume.push(...(codexIntegration === undefined ? [] : ["--dangerously-bypass-hook-trust"]), "exec", "resume", sessionId, "--json", ...(codexIntegration === undefined ? ["--ignore-user-config"] : []), "--skip-git-repo-check");
+  const second = await run(codex, [...resume, "-"], { cwd: worktree, env: codexEnvironment, input: followUpInstruction, timing_label: "turn-2" });
   if (second.timing) { codexTimingCaptures.push(second.timing); writeTimingSidecar(); }
   appendFileSync(transcript, second.stdout, "utf8");
   exitCode = second.code;
   if (second.code === 0) {
     interTurnFreshnessWaitsMs.push(await waitForCurrentStructuralFrontier(2));
-    const third = await run(codex, [...resume, "-"], { cwd: worktree, input: finalInstruction, timing_label: "turn-3" });
+    const third = await run(codex, [...resume, "-"], { cwd: worktree, env: codexEnvironment, input: finalInstruction, timing_label: "turn-3" });
     if (third.timing) { codexTimingCaptures.push(third.timing); writeTimingSidecar(); }
     appendFileSync(transcript, third.stdout, "utf8");
     exitCode = third.code;
@@ -271,7 +322,8 @@ if (hostMetrics?.semantic_sidecar_created === true) {
 const grade = await run(nodeBin, [join(root, "release/benchmarks/expanded-agent-benchmark-grader.mjs"), "--worktree", worktree, "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--transcript", transcript], { cwd: root });
 let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
-const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+cleanupCodexIntegration();
+const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;

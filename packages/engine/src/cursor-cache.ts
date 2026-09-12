@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { EngineError } from "./errors.js";
 
 export type CursorDirection = "forward" | "backward";
@@ -129,22 +130,34 @@ export class CursorCache {
   }
 
   encode(claims: QueryCursorClaims): string {
-    // Cursor tokens are local opaque handles. Hexadecimal framing keeps them
-    // self-contained without adding an encoded-byte representation to the runtime.
-    const payload = Buffer.from(stableJson(claims), "utf8").toString("hex");
-    const signature = createHmac("sha256", this.secret).update(payload).digest("hex");
-    return `${payload}.${signature}`;
+    return this.encodeV2(claims);
+  }
+
+  private encodeV2(claims: QueryCursorClaims): string {
+    // Keep every immutable claim in the token so it remains valid after a
+    // daemon restart, but compress the JSON before framing. The old hex JSON
+    // representation routinely exceeded 2 KB for source positions and digests.
+    const payload = Buffer.from(deflateRawSync(Buffer.from(stableJson(claims), "utf8"))).toString("hex");
+    const signed = `v2.${payload}`;
+    const signature = createHmac("sha256", this.secret).update(signed).digest("hex");
+    return `${signed}.${signature}`;
   }
 
   decode(token: string): QueryCursorClaims {
     if (typeof token !== "string") throw new CursorCacheError("core:cursor_invalid", "Cursor must be a string.");
     const parts = token.split(".");
-    if (parts.length !== 2 || parts[0]!.length === 0 || parts[1]!.length === 0) throw new CursorCacheError("core:cursor_invalid", "Cursor encoding is invalid.");
-    const expected = Buffer.from(createHmac("sha256", this.secret).update(parts[0]!).digest("hex"), "utf8");
-    const provided = Buffer.from(parts[1]!, "utf8");
+    const legacy = parts.length === 2;
+    const compact = parts.length === 3 && parts[0] === "v2";
+    if ((!legacy && !compact) || parts.some((part) => part.length === 0)) throw new CursorCacheError("core:cursor_invalid", "Cursor encoding is invalid.");
+    const signed = compact ? `${parts[0]}.${parts[1]}` : parts[0]!;
+    const expected = Buffer.from(createHmac("sha256", this.secret).update(signed).digest("hex"), "utf8");
+    const provided = Buffer.from(parts.at(-1)!, "utf8");
     if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) throw new CursorCacheError("core:cursor_invalid", "Cursor authentication failed.");
     let value: unknown;
-    try { value = JSON.parse(Buffer.from(parts[0]!, "hex").toString("utf8")); } catch { throw new CursorCacheError("core:cursor_invalid", "Cursor payload is not valid JSON."); }
+    try {
+      const encoded = compact ? inflateRawSync(Buffer.from(parts[1]!, "hex")).toString("utf8") : Buffer.from(parts[0]!, "hex").toString("utf8");
+      value = JSON.parse(encoded);
+    } catch { throw new CursorCacheError("core:cursor_invalid", "Cursor payload is not valid JSON."); }
     if (!isRecord(value) || value["cursor_kind"] !== "query" || typeof value["execution_id"] !== "string" || typeof value["scope_digest"] !== "string" || typeof value["result_stream"] !== "string" || typeof value["stable_position"] !== "string" || !["forward", "backward"].includes(String(value["direction"])) || typeof value["projection_digest"] !== "string" || typeof value["ordering_digest"] !== "string" || typeof value["response_budget_ceiling_digest"] !== "string" || typeof value["frozen_snapshot_digest"] !== "string" || typeof value["frozen_status_digest"] !== "string" || typeof value["expires_at"] !== "string") throw new CursorCacheError("core:cursor_invalid", "Cursor claims are incomplete.");
     return value as unknown as QueryCursorClaims;
   }
@@ -192,7 +205,7 @@ export class CursorCache {
     const hasMore = result.has_more || result.items.length > request.limit || characterTruncated;
     const firstPosition = items.length === 0 ? undefined : safePosition(items[0]!, 0, request.position_of);
     const lastPosition = items.length === 0 ? undefined : safePosition(items[items.length - 1]!, items.length - 1, request.position_of);
-    const make = (direction: CursorDirection, position: string): string => this.encode({ ...claims, direction, stable_position: position });
+    const make = (direction: CursorDirection, position: string): string => this.encodeV2({ ...claims, direction, stable_position: position });
     const page: ReadPageResult<T> = { items, has_next: hasMore, has_previous: claims.stable_position.length > 0 };
     if (hasMore && lastPosition) (page as { next_cursor?: string }).next_cursor = make(claims.direction, lastPosition);
     if (claims.stable_position.length > 0 && firstPosition) (page as { previous_cursor?: string }).previous_cursor = make(claims.direction === "forward" ? "backward" : "forward", firstPosition);

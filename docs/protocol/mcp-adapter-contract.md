@@ -83,15 +83,15 @@ implementation prose.
 
 The exact operation signatures and recipe catalog in `instructions` are generated directly from the same registries used to validate requests. Every registered operation must appear once in the categorized usage guide; missing guidance or duplicate coverage fails server construction. `instructions` is plain descriptive text, not a capability, and advertising it does not imply resources, prompts, or any other extension.
 
-The tool set is static for the lifetime of an adapter release and is returned in deterministic name order. The adapter explicitly advertises `tools.listChanged: false`; it does not rely on the SDK default, because registering the first tool otherwise enables list-change support. Tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
+The tool set is static for the lifetime of an adapter release and is returned in deterministic discovery order. The SDK preserves registration order, so the catalog starts with `urdira_index_status`, then `urdira_context`, then `urdira_query`; this makes the bootstrap and discovery flow visible before specialized tools. The adapter explicitly advertises `tools.listChanged: false`; it does not rely on the SDK default, because registering the first tool otherwise enables list-change support. Tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
 
-The five tool names are:
+The five tool names, in discovery order, are:
 
-- `urdira_query`
-- `urdira_context`
-- `urdira_analyze_change`
-- `urdira_build_context`
 - `urdira_index_status`
+- `urdira_context`
+- `urdira_query`
+- `urdira_build_context`
+- `urdira_analyze_change`
 
 Names are unique, case-sensitive, stable within the API major, and restricted to MCP's portable tool-name character set.
 
@@ -107,8 +107,9 @@ Every tool definition contains:
 In the default `agent` profile no tool declares an `outputSchema`. A 2026-08-14 benchmark found that Claude Code's MCP client reads only `structuredContent` -- never the `content[0].text` block below -- whenever a tool's `tools/list` entry carries an `outputSchema`. The compact agent rendering therefore remains the complete compatibility surface. In the `web` profile, the same internal successful-or-operation-error union is passed to `registerTool` as `outputSchema`, and calls return the matching validated `structuredContent` for browser consumption. Profiles never change tool names, input schemas, domain requests, or result semantics.
 
 `urdira_index_status` defaults to Index Status API v3. Its readiness fields are
-actionable: `source_ready` means a complete equivalent source catalog,
-`structural_ready` means complete structural facts based on that source, and
+actionable: `source_ready` means that a source index is available; it does not
+by itself claim current or complete coverage. `structural_ready` means complete
+structural facts based on that source, and
 `semantic_ready` means complete semantic materialization based on the current
 structural snapshot. `availability`, `completeness`, `freshness`, and
 `build_state` use the closed values documented by the source-first readiness
@@ -129,6 +130,7 @@ On a modern connection, `tools/call` follows the MCP `2026-07-28` result model:
 - A completed call returns `resultType: "complete"`.
 - In the agent profile no result carries `structuredContent`, so a client is guaranteed to find the full result in `content`. In the web profile `structuredContent` is the complete wrapper. The companion `content` text is a bounded summary that keeps result labels, counts, completeness, and full opaque continuation cursors while omitting source snippets and repeated hydration/evidence/registry payloads; typed clients must use `structuredContent` for those details.
 - `content` contains exactly one text block. By default it is Urdira's compact, grep-like plain-text rendering of the public wrapper value; an undocumented `render: "json"` debug argument (accepted at runtime but never advertised in any schema, description, or the server instructions) instead puts the complete JSON-serialized wrapper in that same text block.
+- The compact text rendering always states index coverage and page coverage separately and, when present, freshness and non-complete capability dimensions. It also states how many items are shown and whether any stream has more pages. `coverage: complete` with `page_coverage: incomplete; action=continue` means the index covers the scope but the requested result page is not complete; clients must follow the exact cursor with the original scope before using another discovery method. `page_coverage: complete` together with `more=no` means that page is complete. `partial`, `stale`, `unknown`, or `unsupported` requires following the reported operation availability or recovery guidance.
 - The compact text rendering can include a short inline source snippet for each result through an equally hidden `snippet_lines` argument (an integer `0`-`3`, accepted at runtime but never advertised in any schema, description, or the server instructions). It defaults to `0` (no inline snippet): a 2026-09-08 benchmark measured a cheaper but less reliable agent run with snippets enabled, so the default keeps them off. Setting `snippet_lines` only changes the rendered response size; it never changes which results are returned or their evidence, and it composes with `render: "json"`.
 - A successful Urdira operation sets `isError: false` or omits it when the SDK's exact type permits omission.
 - A recoverable Urdira `OperationError` returns the typed error wrapper as compact JSON in `content[0].text` and sets `isError: true`. The agent therefore receives the registered diagnostic code, retryability, recovery actions, and closed details needed to correct the call.
@@ -154,18 +156,28 @@ Urdira result pagination is application-level state carried through explicit too
 - Registry mode `used` gives each hydrated parent slice one immutable `registry_usage_set_id`; its cursor continues that exact definition set even when all parent result streams are summary-only. Mode `none` disables only registry hydration, while every other selected stream remains pageable.
 - The agent must not decode, edit, compare semantically, or confuse these tokens with MCP `tools/list` cursors.
 
-The continuation envelope emitted by `MORE` is copied as a complete request.
-`api_version`, `scope`, and `cursor` are required. `response_budget` is
-optional: preserve it when emitted, or add it only to override the default.
+Query cursors are emitted in a compact signed wire form to keep the complete
+opaque value copyable in an agent response. The token still carries all
+execution, stream, position, scope, snapshot, ordering, projection, budget,
+status, completeness, and expiry bindings and remains valid across daemon
+restart while the persisted execution is retained. Legacy self-contained hex
+cursors remain accepted during the compatibility window. A malformed or
+partially copied value fails closed with `core:cursor_invalid`.
+
+The continuation envelope emitted by `MORE` is a complete executable
+`ContinuationRequest` and must be copied literally; clients must not rebuild
+or edit it. It contains exactly one of `cursor` or `continuation_ref`. The
+portable cursor form carries `api_version`, `scope`, cursor, and any emitted
+`response_budget`. The compact server-local reference form carries only
+`api_version` and `continuation_ref`; the store resolves the original scope and
+budget internally:
 
 ```json
 {
   "request_type": "continuation",
   "continuation": {
     "api_version": 3,
-    "scope": { "scope_type": "single_workspace", "workspace_id": "<copied opaque workspace id>" },
-    "cursor": "<opaque cursor from the previous page>",
-    "response_budget": { "max_items": 50, "max_characters": 20000 }
+    "continuation_ref": "<continuation_ref>"
   }
 }
 ```

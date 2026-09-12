@@ -38,6 +38,19 @@ Multi-query discovery executes in a child context and returns only a bounded
 locations, truncation, semantic coverage, and follow-up hints. One-shot search
 calls remain inline.
 
+The Codex installer also provisions a managed block in the user-level
+`~/.codex/AGENTS.md`, which Codex loads as global developer instructions, so
+the discovery rule is active even when a named agent or skill is not selected.
+It also provisions the `urdira_explorer` agent and the `urdira-discovery` skill
+with product guidance that starts read-heavy discovery
+through explicitly scoped Urdira MCP calls, follows opaque continuation cursors
+when requested facets are incomplete, and accepts current complete coverage as
+sufficient. Before declaring Urdira unavailable, the guidance requires an
+explicit `urdira_index_status` call and bases availability only on its concrete
+response; any exact error is preserved before fallback. Native shell discovery is reserved for absent or incomplete indexed
+data; editing, testing, building, and Git remain native task actions. This
+guidance does not require a pipeline or alter the public MCP contract.
+
 Installation owns only entries marked with the Urdira managed-version marker,
 preserves unrelated configuration, refuses unmanaged OpenCode tool collisions,
 and removes an entry only when it still matches the managed shape.

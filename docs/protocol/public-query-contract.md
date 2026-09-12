@@ -53,6 +53,11 @@ For coding-agent discovery, a pipeline should normally bind an upstream `subject
 
 Filters are hard eligibility constraints applied before ordering. They cannot relax workspace inclusion or security policy.
 
+`StructuralFilter` is a closed object. Clients must use the fields listed above;
+`filter.include_globs` is not an alias for `filter.paths` and is rejected. MCP
+validation errors identify the offending filter path and enumerate the valid
+fields so a caller can correct the request without guessing.
+
 ### Relation selector
 
 | Field | Presence | Exact meaning |
@@ -294,7 +299,9 @@ Outputs preserve both participant-bound subjects. Correlations never become cano
 | `facets` | required non-empty subset of `definitions`, `implementations`, `callers`, `callees`, `dependencies`, `contracts`, `effects`, `tests`, `configuration`, `analogues`, `extension_points` | Context categories requested. |
 | `filter` | optional `StructuralFilter` | Hard context scope. |
 
-Output `context` is a deduplicated ordered set of result bundles. Response and source budgets control hydration only; operation work limits are server-advertised and exact failure replaces truncation of logical membership.
+Output `context` is a deduplicated ordered set of result bundles. When `tests` is requested, the indexed `core:contains`/`core:covers` projection expands the resolved seeds and subjects. If a resolved subject has no direct covering test, the same indexed graph is used for a bounded inbound `core:call` step and the callers' covering tests are considered. The expansion honors the supplied structural filters and the operation's advertised work limits. If that projection is unavailable, the operation returns the typed `core:required_capability_unsupported` error rather than silently omitting the facet. Response and source budgets control hydration only; operation work limits are server-advertised and exact failure replaces truncation of logical membership.
+
+For deterministic first-page usefulness, context ordering prioritizes explicit seeds, then declaration/definition/type/callable records when `definitions` is requested, then records obtained through the indexed `tests` facet, followed by other resolved subjects. Ties retain the indexed resolution order; this changes presentation only and does not change membership or completeness.
 
 Without a configured semantic lane, task discovery is conservative and bounded: explicit `seeds` and identifier-shaped task terms are resolved through exact indexed subject lookups. A prose-only task with no resolvable seed returns an empty context instead of widening into a complete-corpus scan. Returned subjects can be expanded with the ordinary structural operations. This keeps absence of relevance ranking explicit and prevents context construction from materializing an entire large workspace merely to produce no useful result.
 
@@ -309,10 +316,11 @@ Without a configured semantic lane, task discovery is conservative and bounded: 
 
 Index Status API v3 adds derived `source_ready`, `structural_ready`, and
 `semantic_ready` booleans plus per-layer availability, completeness, freshness,
-and build-state fields. `source_ready` means a complete equivalent source
-catalog; `structural_ready` means complete structural facts based on the
-current source snapshot; `semantic_ready` means complete semantic materialized
-against the current structural snapshot. `partial` is queryable partial data;
+and build-state fields. `source_ready` means that a source index is available;
+it does not by itself claim current or complete coverage. `structural_ready`
+means complete structural facts based on the current source snapshot;
+`semantic_ready` means complete semantic materialized against the current
+structural snapshot. `partial` is queryable partial data;
 `unknown` is not queryable. `operation_availability` lists source-safe
 operations and blocked structural operations with a required layer, reason
 code, retryability, and optional retry delay. Only API v3 is accepted on the
@@ -359,7 +367,26 @@ No operator accepts arbitrary ranking, score, profile, SQL, graph query, script,
 
 ## MCP wrapper schemas
 
-`urdira_query` accepts exactly one of `query` (`QueryRequest`) or `continuation` (`ContinuationRequest`). The discriminator is `request_type = query | continuation`. Its public wrapper value is exactly one of `page` (`QueryResultPage`) or `error` (`OperationError`). The MCP adapter returns that wrapper as the single `content[0].text` block (compact plain text by default, or complete JSON for the undocumented debug renderer); source bundles preserve every snippet line admitted by the query's explicit per-snippet, total-snippet, and serialized-response budgets and are not subject to a second renderer-only line cap. The adapter does not emit `structuredContent` because the tools intentionally declare no `outputSchema`. A page is a successful tool result; an `OperationError` is an `isError: true` tool result, not a JSON-RPC protocol error.
+`urdira_query` accepts exactly one of `query` (`QueryRequest`) or `continuation` (`ContinuationRequest`). For an initial request, `scope` is inside `query` alongside `api_version` and `expression`, never beside `query`. The discriminator is `request_type = query | continuation`. Its public wrapper value is exactly one of `page` (`QueryResultPage`) or `error` (`OperationError`). The MCP adapter returns that wrapper as the single `content[0].text` block (compact plain text by default, or complete JSON for the undocumented debug renderer); source bundles preserve every snippet line admitted by the query's explicit per-snippet, total-snippet, and serialized-response budgets and are not subject to a second renderer-only line cap. The adapter does not emit `structuredContent` because the tools intentionally declare no `outputSchema`. A page is a successful tool result; an `OperationError` is an `isError: true` tool result, not a JSON-RPC protocol error.
+
+Compact agent rendering emits a complete executable `ContinuationRequest` in
+`MORE`; clients copy it literally and never reconstruct it. It contains exactly
+one of `cursor` or `continuation_ref`. The compact server-local form is:
+
+```json
+{"request_type":"continuation","continuation":{"api_version":3,"continuation_ref":"<continuation_ref>"}}
+```
+
+The server retains the complete cursor and binds the reference to the original
+scope, response budget, and expiry in a bounded, server-local TTL store. The
+reference has an authenticated random identifier and is checked with a
+constant-time signature comparison; it is never a portable replacement for
+the cursor. A continuation must provide exactly one of `cursor` or
+`continuation_ref`; unknown, expired, tampered, or scope/budget-mismatched
+portable requests fail closed as typed request errors with recovery to the complete
+portable cursor. References do not survive a server restart. The full cursor
+remains available in structured output for clients that require portability or
+restart.
 
 `urdira_analyze_change` requires `api_version`, `scope`, `target`, `change`, and `options`; it optionally accepts `include_transitive`, `include_tests`, and `filter`. It normalizes byte-for-byte to `core:analyze_impact` and returns the ordinary query page/error union.
 

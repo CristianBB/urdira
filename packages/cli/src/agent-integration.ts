@@ -20,7 +20,14 @@ export interface DiscoveryChildContext {
 export interface AgentBridgeClient { readonly call: (call: string, payload: unknown) => Promise<{ readonly outcome: string; readonly payload?: unknown; readonly error?: unknown }>; }
 
 const MANAGED = "urdira-managed-agent-integration-v1";
+const CODEX_GLOBAL_START = `<!-- ${MANAGED}:global-instructions -->`;
+const CODEX_GLOBAL_END = `<!-- /${MANAGED}:global-instructions -->`;
 export const AGENT_CLIENTS: readonly AgentClient[] = ["claude-code", "codex", "opencode", "cursor", "vscode", "cline", "roo", "claude-desktop"];
+
+const CODEX_EXPLORER_INSTRUCTIONS = `Start repository discovery with Urdira using the explicitly scoped MCP tools. Before declaring Urdira unavailable, call the visible urdira_index_status tool with the exact workspace_root. Decide availability from that tool response only; never infer it from package, dependency, or runtime state. If the tool fails, preserve its exact error and use the permitted native fallback. When coverage is complete and freshness is current, accept the response as sufficient evidence; do not repeat that discovery with shell. If the response says more results remain or marks a requested facet incomplete, continue pagination with the returned opaque cursor and the original scope before using another discovery method. Use shell only when indexed data is absent or incomplete after pagination, or when the task requires editing, testing, building, or git. Urdira is read-only and never replaces those task actions. Keep every source-reading request scoped to the workspace and preserve the reported completeness and provenance in your handoff.`;
+const CODEX_GLOBAL_INSTRUCTIONS = `For repository discovery or source reading, begin with Urdira: your first repository action must be Urdira. When scope is missing, call urdira_index_status once with the exact workspace root, then use urdira_context or a direct operation. Do not use shell to inspect repository files or repository guidance before that Urdira call. Use shell discovery only when Urdira reports incomplete or unsupported coverage, when no suitable operation exists, or when a specific datum is missing. Reuse complete Urdira paths and snippets instead of repeating discovery; continue or narrow partial results using their cursor and original scope. Shell remains appropriate for editing, tests, builds, and git. Host-provided skill guidance may be read as part of agent setup.`;
+
+const CODEX_DISCOVERY_SKILL = `---\nname: urdira-discovery\ndescription: Read-only, explicitly scoped repository discovery through Urdira.\n---\n<!-- ${MANAGED} -->\n\nStart repository discovery with Urdira using the explicitly scoped MCP tools. Before declaring Urdira unavailable, call the visible urdira_index_status tool with the exact workspace_root. Decide availability from that tool response only; never infer it from package, dependency, or runtime state. If the tool fails, preserve its exact error and use the permitted native fallback. When coverage is complete and freshness is current, accept the response as sufficient evidence and avoid duplicate shell discovery. When a response reports more results or incomplete requested facets, continue pagination with its opaque cursor, original scope, and the documented continuation operation. Use shell only when indexed data is absent or incomplete after pagination, and for editing, testing, building, or git work. Never infer workspace scope, hide truncation, or claim completeness without the response's coverage state.`;
 
 export function normalizeAgentClient(value: string | undefined): AgentClient | "all" {
   if (value === "all") return "all";
@@ -225,11 +232,27 @@ function mcpConfigPath(client: AgentClient, root: string): string | undefined {
 }
 function configFiles(client: AgentClient, root: string): string[] {
   if (client === "claude-code") return [join(root, ".claude", "settings.json"), join(root, ".claude", "agents", "urdira-discovery.md")];
-  if (client === "codex") return [join(root, ".codex", "hooks.json"), join(root, ".codex", "agents", "urdira_explorer.toml"), join(root, ".codex", "skills", "urdira-discovery", "SKILL.md")];
+  if (client === "codex") return [join(root, ".codex", "hooks.json"), join(root, ".codex", "AGENTS.md"), join(root, ".codex", "agents", "urdira_explorer.toml"), join(root, ".codex", "skills", "urdira-discovery", "SKILL.md")];
   if (client === "cursor") return [join(root, ".cursor", "hooks.json")];
   if (client === "vscode") return [join(root, ".copilot", "hooks", "urdira.json")];
   if (client === "opencode") return [join(root, ".config", "opencode", "tools", "grep.ts"), join(root, ".config", "opencode", "tools", "glob.ts"), join(root, ".config", "opencode", "agents", "urdira-discovery.md")];
   const mcp = mcpConfigPath(client, root); return mcp === undefined ? [] : [mcp];
+}
+
+function withCodexGlobalInstructions(existing: string): string {
+  const block = `${CODEX_GLOBAL_START}\n${CODEX_GLOBAL_INSTRUCTIONS}\n${CODEX_GLOBAL_END}`;
+  const escapedStart = CODEX_GLOBAL_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedEnd = CODEX_GLOBAL_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const managed = new RegExp(`${escapedStart}[\\s\\S]*?${escapedEnd}\\n?`, "u");
+  if (managed.test(existing)) return existing.replace(managed, `${block}\n`);
+  return `${existing.replace(/\s*$/u, "")}${existing.trim().length === 0 ? "" : "\n\n"}${block}\n`;
+}
+
+function withoutCodexGlobalInstructions(existing: string): string {
+  const escapedStart = CODEX_GLOBAL_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedEnd = CODEX_GLOBAL_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const managed = new RegExp(`\\n?${escapedStart}[\\s\\S]*?${escapedEnd}\\n?`, "u");
+  return existing.replace(managed, "").replace(/^\n+|\n+$/g, "\n");
 }
 
 export interface AgentInstallResult { readonly client: AgentClient; readonly changed: boolean; readonly files: ReadonlyArray<string>; readonly conflicts: ReadonlyArray<string>; readonly dry_run: boolean; }
@@ -243,8 +266,9 @@ export async function installAgent(client: AgentClient, options: { readonly dry_
   } else if (client === "codex") {
     const path = join(root, ".codex", "hooks.json"); const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.PreToolUse) ? [...hooks.PreToolUse] : [];
     if (!pre.some((entry) => JSON.stringify(entry).includes(MANAGED))) pre.push({ matcher: "^(Grep|Glob|Bash)$", hooks: [{ type: "command", command: `${managedCommand(client)} # ${MANAGED}`, timeout: 30 }] });
-    files.push(path); const agentPath = join(root, ".codex", "agents", "urdira_explorer.toml"); files.push(agentPath); const skillPath = join(root, ".codex", "skills", "urdira-discovery", "SKILL.md"); files.push(skillPath);
-    if (!options.dry_run) { if (!options.confirm) throw new Error("--confirm is required to install agent hooks"); await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, PreToolUse: pre } }); await mkdir(dirname(agentPath), { recursive: true }); await writeFile(agentPath, `# ${MANAGED}\nname = "urdira_explorer"\ndescription = "Read-only bounded repository discovery via Urdira."\n`, { mode: 0o600 }); await mkdir(dirname(skillPath), { recursive: true }); await writeFile(skillPath, `<!-- ${MANAGED} -->\nDelegate multi-step repository discovery to the urdira_explorer agent and return only its bounded digest.\n`, { mode: 0o600 }); }
+    files.push(path); const globalPath = join(root, ".codex", "AGENTS.md"); files.push(globalPath); const agentPath = join(root, ".codex", "agents", "urdira_explorer.toml"); files.push(agentPath); const skillPath = join(root, ".codex", "skills", "urdira-discovery", "SKILL.md"); files.push(skillPath);
+    let globalInstructions = ""; try { globalInstructions = await readFile(globalPath, "utf8"); } catch { /* new global instructions file */ }
+    if (!options.dry_run) { if (!options.confirm) throw new Error("--confirm is required to install agent hooks"); await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, PreToolUse: pre } }); await mkdir(dirname(globalPath), { recursive: true }); await writeFile(globalPath, withCodexGlobalInstructions(globalInstructions), { mode: 0o600 }); await mkdir(dirname(agentPath), { recursive: true }); await writeFile(agentPath, `# ${MANAGED}\nname = "urdira_explorer"\ndescription = "Read-only bounded repository discovery via Urdira."\ndeveloper_instructions = """\n${CODEX_EXPLORER_INSTRUCTIONS}\n"""\n`, { mode: 0o600 }); await mkdir(dirname(skillPath), { recursive: true }); await writeFile(skillPath, `${CODEX_DISCOVERY_SKILL}\n`, { mode: 0o600 }); }
   } else if (client === "cursor") {
     const path = join(root, ".cursor", "hooks.json"); const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.preToolUse) ? [...hooks.preToolUse] : [];
     if (!pre.some((entry) => JSON.stringify(entry).includes(MANAGED))) pre.push({ matcher: "^(Grep|Search Files|Codebase)$", command: `${managedCommand(client)} # ${MANAGED}`, timeout: 30 });
@@ -275,7 +299,15 @@ export async function uninstallAgent(client: AgentClient, options: { readonly dr
   const root = options.home ?? homedir(); const files = client === "roo" && options.workspace !== undefined ? [mcpConfigPath(client, options.workspace)!] : configFiles(client, root);
   if (!options.dry_run && !options.confirm) throw new Error("--confirm is required to uninstall agent hooks");
   for (const path of files) {
-    if (client === "claude-code" || client === "codex" || client === "cursor" || client === "vscode") {
+    if (client === "codex") {
+      if (path.endsWith("/AGENTS.md")) {
+        let existing = ""; try { existing = await readFile(path, "utf8"); } catch { continue; }
+        if (!options.dry_run) { await writeFile(path, withoutCodexGlobalInstructions(existing), { mode: 0o600 }); }
+      } else if (path.endsWith("/hooks.json")) {
+        const settings = await readJson(path); const hooks = record(settings.hooks); const pre = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse.filter((entry) => !JSON.stringify(entry).includes(MANAGED)) : [];
+        if (!options.dry_run) { await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, PreToolUse: pre } }); }
+      } else await removeManagedFile(path, options.dry_run);
+    } else if (client === "claude-code" || client === "cursor" || client === "vscode") {
       const settings = await readJson(path); const hooks = record(settings.hooks); const hookName = client === "cursor" ? "preToolUse" : "PreToolUse"; const pre = Array.isArray(hooks[hookName]) ? hooks[hookName].filter((entry) => !JSON.stringify(entry).includes(MANAGED)) : [];
       if (!options.dry_run) { await backupJson(path); await writeJson(path, { ...settings, hooks: { ...hooks, [hookName]: pre } }); }
     } else if (client === "opencode") await removeManagedFile(path, options.dry_run);

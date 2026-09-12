@@ -131,3 +131,70 @@ full verification passed with exit 0:
 - Coverage: 156 files; 2,344 tests passed; 15 skipped.
 - Lines: 90.34%; critical branches: 100%; semantic regions: 100%.
 - Publication check: 1,112 files.
+
+## v12 continuation contract failure retained
+
+The v12 review retained a failed MCP integration result rather than converting
+it to a success. Its failure had two contract causes: the rendered `MORE`
+value was not presented consistently as a complete executable
+`ContinuationRequest` (the renderer used the server-local `continuation_ref`
+form while visible guidance/tests described a cursor-only form), and the
+initial direct-query guidance did not make the nesting of `scope` inside
+`query` sufficiently explicit. The resulting remediation keeps the schema
+closed, requires exactly one of `cursor` or `continuation_ref`, and instructs
+agents to copy the complete `MORE` JSON literally, preserving its original
+scope and response budget. The direct `core:get_source` example now shows
+`scope` inside `query` and all four required source fields. No benchmark was
+rerun for this documentation/renderer correction.
+
+## Retained v12 and v13 comparison
+
+The retained follow-up samples are under
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-12-post-improvements/agent-installed-integration-v12/`
+and `agent-installed-integration-v13/`. Both use VS Code commit
+`038b9225c82c6b75172beda6081c64887692538c`, the installed CLI fingerprint
+`59315e9d2545640f431484cd445f4e91960a271cbbb6d157dd75f7701cdb8ed5`,
+structural-only readiness (`semantic_index=false`,
+`semantic_materialization=false`, `semantic_sqlite_bytes=0`), and the same
+production worker executable recorded by the host attestation. Raw file hashes
+and source paths are recorded in each directory's `hashes.sha256`.
+
+| Sample | Grader | Readiness ms | First-instruction total ms | Repository reads | Context chars | MCP chars | Shell chars | Input tokens | Output tokens | Estimated cost |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v10 | pass | 35,579 | n/a | 18 | 1,223,925 | 38,202 | 1,185,723 | n/a | n/a | n/a |
+| v11 | fail | 45,903 | n/a | 26 | 1,190,358 | 58,965 | 1,131,393 | n/a | n/a | n/a |
+| v12 | fail | 39,784 | 588,544 | 23 | 287,015 | 33,838 | 253,177 | 3,749,272 | 14,954 | $7.618176 |
+| v13 | pass | 35,076 | 512,393 | 14 | 150,953 | 17,111 | 133,842 | 2,228,892 | 14,587 | $4.574480 |
+
+Host process metrics are retained in the per-run JSON and timing sidecars:
+v12 duration 628,929 ms, peak RSS 4,128,112 KiB, mean CPU 11.9742%, 1,254
+samples; v13 duration 548,059 ms, peak RSS 3,642,944 KiB, mean CPU 11.6536%,
+1,092 samples. V13 preserves a passing grader result while reducing readiness
+by 4,708 ms and first-instruction total by 76,151 ms versus v12.
+
+The causal chain is retained as evidence, not as a benchmark claim: v12
+failed because continuation output and guidance did not consistently expose a
+copyable complete request and the direct-query example left `scope` nesting
+ambiguous. V13 includes the complete MORE envelope, exact-one cursor/ref
+guidance, original scope and response budget, and the corrected direct query
+example; its grader passed. The v13 transcript still contains shell activity:
+14 repository reads, 17,111 MCP output characters, and 133,842 shell output
+characters. The evidence does not support a zero-shell claim. The available
+classification distinguishes repository discovery/read calls from all shell
+commands, but does not prove that every shell call was editing, testing, or
+Git; those categories remain unmeasured where the transcript lacks a reliable
+command classification.
+
+## v14 retained failure and follow-up contract
+
+The retained v14 attempt is preserved under
+`/Users/Cristian/BenchmarkResults/urdira-expanded-2026-09-12-post-improvements/agent-installed-integration-v14/`.
+Its grader failure is retained as evidence of the continuation contract pressure
+introduced by the previous compact rendering: the extra pending-continuation
+metadata increased the visible response and contributed to excessive tool
+activity. The bounded indexed caller-to-covers expansion remains in production
+because its focused test demonstrates exact graph-backed membership without a
+corpus scan. The pending labels/action line is removed; `page_coverage:
+incomplete; action=continue` and the literal MORE object remain the canonical
+signals. The server-local ref branch is now self-contained (`api_version` plus
+`continuation_ref`); only the portable cursor branch carries scope and budget.

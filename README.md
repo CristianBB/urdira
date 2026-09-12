@@ -403,6 +403,19 @@ the index is not current:
 All integrations are opt-in and idempotent. The same command writes the
 native hook or MCP configuration appropriate for the selected client:
 
+For Codex, installation also writes a managed block to the user-level
+`~/.codex/AGENTS.md`; Codex loads this file as global developer instructions,
+so the discovery rule applies even when the named agent or skill is not
+selected. It also writes the `urdira_explorer` agent and the
+`urdira-discovery` skill. Both direct read-heavy discovery to Urdira first,
+require an explicit `urdira_index_status` call before declaring Urdira
+unavailable, and preserve any exact tool error before falling back,
+continue a paginated response when requested facets are incomplete, and accept
+current complete coverage as sufficient. They leave shell discovery for
+missing or incomplete indexed data; editing, testing, building, and Git remain
+native task actions. The generated guidance does not require a pipeline or
+change Urdira's read-only MCP contract.
+
 ```bash
 urdira agent install --client claude-code --confirm
 urdira agent install --client codex --confirm
@@ -451,12 +464,25 @@ The web MCP profile returns the complete typed page in `structuredContent`.
 Its companion text block keeps labels, completeness, and opaque continuation
 cursors but omits repeated source snippets and hydration/evidence/registry
 payloads, so browser clients do not pay for the same response data twice.
+The compact text also reports freshness, non-complete capability coverage, the
+number of items shown, and whether another page exists. Treat `coverage:
+complete` with `page: shown=N; more=no` as complete for the declared query
+scope; continue the opaque cursor or follow the reported recovery when
+coverage is partial, stale, unknown, or unsupported.
 
 When no `query_scope` is available, agents call `urdira_index_status` once with
 the exact workspace root. They then reuse the returned `query_scope` object
 byte-for-byte on every source-reading request; they do not rediscover status or
 reconstruct the scope between calls. A returned cursor is opaque and must be
 continued with the same scope and the complete `ContinuationRequest` shape.
+The signed cursor is compact so the complete value remains practical to copy;
+it remains bound to the persisted execution, stream, position, scope, snapshot,
+ordering, projection, budget, and expiry. Never decode or edit it. Legacy
+self-contained cursors remain accepted during the compatibility window.
+Compact agent text may render a bounded server-side `continuation_ref` that
+retains the full cursor and binds it to the original scope, budget, and expiry.
+Use exactly one of `cursor` or `continuation_ref`; clients requiring
+portability or restart should copy the complete cursor from structured output.
 
 Choose a direct `urdira_query` operation for one exact subject, path, symbol,
 or intention. Use `urdira_context` when discovery needs several related facets
@@ -465,8 +491,13 @@ already defined by the public catalog. Use a pipeline when a real dependency
 exists between stages, such as resolving one entity before retrieving its
 source; pipelines are preferred for that composition and are not required for
 independent queries. Use Urdira before shell tools for repository discovery and
-source reading. Shell remains the place for editing, tests, builds, and Git
+source reading. Use shell for source discovery only when Urdira reports
+incomplete or unsupported coverage, has no operation for the request, or lacks a
+concrete datum. Shell remains the place for editing, tests, builds, and Git
 inspection because Urdira is read-only.
+
+For the `tests` facet, indexed context discovery includes direct covering tests
+and, when needed, a bounded caller step followed by the callers' covering tests.
 
 `urdira_context` is a top-level tool call: send `api_version`, `scope`,
 `task`, and `facets` directly, with optional top-level `seeds` and `options`.
@@ -498,19 +529,16 @@ registry and become unwieldy. Examples copied from that authority are part of
 the agent-facing contract.
 
 For a paginated response, copy the complete continuation envelope emitted by
-`MORE`, including its required `api_version`, `scope`, and `cursor`. Preserve
-`response_budget` when it is present; it is optional and may be added only when
-you want to override the default budget.
+`MORE` literally. Do not reconstruct it. A portable cursor request includes
+`api_version`, the original `scope`, the cursor, and the original
+`response_budget` when present. A `continuation_ref` request is self-contained
+and contains only `api_version` and `continuation_ref` inside `continuation`;
+the server resolves its original scope and budget.
 
 ```json
 {
   "request_type": "continuation",
-  "continuation": {
-    "api_version": 3,
-    "scope": { "scope_type": "single_workspace", "workspace_id": "<copied opaque id>" },
-    "cursor": "<copied opaque cursor>",
-    "response_budget": { "max_items": 50, "max_characters": 20000 }
-  }
+  "continuation": { "api_version": 3, "continuation_ref": "<copied continuation_ref>" }
 }
 ```
 

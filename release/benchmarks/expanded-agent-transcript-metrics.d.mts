@@ -19,6 +19,7 @@ export interface McpResponseComponents extends McpComponentBytes {
 }
 
 export function analyzeExpandedTranscript(events: unknown[], arm: string, task?: unknown): ExpandedTranscriptMetrics;
+export function analyzeCodexActions(events: unknown[]): Record<string, unknown>;
 export function classifyMcpResponseComponents(item: unknown): McpResponseComponents | null;
 export function isShellSourceReadCommand(command: string): boolean;
 export function analyzeUrdiraPipelineContract(events: unknown[]): any;

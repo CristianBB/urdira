@@ -78,6 +78,21 @@ describe("expanded agent transcript metrics", () => {
     expect(isShellSourceReadCommand("sed -n '1,120p' src/foo.ts")).toBe(true);
   });
 
+  it("excludes isolated Codex skill reads from repository context while retaining shell actions", () => {
+    const metrics = analyzeExpandedTranscript([
+      { type: "item.completed", item: { type: "command_execution", command: "sed -n '1,120p' /private/tmp/codex-home/.codex/skills/urdira-discovery/SKILL.md", aggregated_output: "skill guidance", exit_code: 0 } },
+      { type: "item.completed", item: { type: "command_execution", command: "rg onDiagnostic src/services/transpile.ts", aggregated_output: "repo source", exit_code: 0 } },
+    ], "baseline", task);
+    expect(metrics).toMatchObject({
+      repository_read_calls: 1,
+      repository_context_characters: 11,
+      host_instruction_read_calls: 1,
+      host_instruction_context_characters: 14,
+      observed_tool_usage: { shell_calls: 1, host_instruction_reads: 1 },
+      action_counts: { command_execution: 2 },
+    });
+  });
+
   it("counts tgrep searches as the assigned repository discovery method", () => {
     const events = [
       { type: "item.completed", item: { type: "command_execution", command: "tgrep onDiagnostic . --stats", aggregated_output: "src/services/transpile.ts:10:onDiagnostic", exit_code: 0 } },
@@ -122,6 +137,44 @@ describe("expanded agent transcript metrics", () => {
       target_unattributed_characters: 0,
       context_component_characters: { snippets: null, hydration: null, evidence: null, registry: null },
       discovery_adoption: { mcp_before_shell: null, shell_after_mcp: null, zero_mcp: true },
+    });
+  });
+
+  it("reports completed Codex actions separately from repository reads", () => {
+    const v6Like = [
+      ...Array.from({ length: 6 }, () => ({ type: "item.completed", item: { type: "error", message: "hook trust warning" } })),
+      ...Array.from({ length: 9 }, () => ({ type: "item.completed", item: { type: "web_search", query: "https://example.test/source" } })),
+      ...Array.from({ length: 9 }, () => ({ type: "item.completed", item: { type: "file_change", status: "completed" } })),
+    ];
+    expect(analyzeExpandedTranscript(v6Like, "urdira-typescript", task)).toMatchObject({
+      action_counts: { error: 6, web_search: 9, file_change: 9 },
+      web_search_calls: 9,
+      file_change_actions: 9,
+      first_action_type: "web_search",
+      integration_warning_count: 6,
+      hook_error_count: 6,
+      unclassified_action_count: 0,
+      repository_read_calls: 0,
+      observed_tool_usage: { mcp_calls: 0, shell_calls: 0 },
+    });
+  });
+
+  it("keeps legacy reads stable while counting v5-like actions and unknown types", () => {
+    const v5Like = [
+      ...Array.from({ length: 2 }, () => ({ type: "item.completed", item: { type: "web_search", query: "source" } })),
+      ...Array.from({ length: 6 }, () => ({ type: "item.completed", item: { type: "file_change", status: "completed" } })),
+      ...Array.from({ length: 18 }, () => ({ type: "item.completed", item: { type: "command_execution", command: "rg -n target src/example.ts", aggregated_output: "src/example.ts:1:target", exit_code: 0 } })),
+      { type: "item.completed", item: { type: "future_action", payload: { opaque: true } } },
+    ];
+    const metrics = analyzeExpandedTranscript(v5Like, "baseline", task);
+    expect(metrics).toMatchObject({
+      action_counts: { web_search: 2, file_change: 6, command_execution: 18, future_action: 1 },
+      web_search_calls: 2,
+      file_change_actions: 6,
+      first_action_type: "web_search",
+      unclassified_action_count: 1,
+      repository_read_calls: 18,
+      observed_tool_usage: { mcp_calls: 0, shell_calls: 18 },
     });
   });
 });

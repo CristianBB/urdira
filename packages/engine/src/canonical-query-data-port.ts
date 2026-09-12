@@ -551,6 +551,10 @@ const IMPACT_CALLER_MAX_NODES = 20_000;
 const CONTAINMENT_ANCESTOR_MAX_DEPTH = 64;
 const CONTAINMENT_ANCESTOR_MAX_NODES = 4_096;
 const RELATED_TESTS_MAX_NODES = 20_000;
+// The batched containment walk has one explicit global ceiling. This keeps
+// many seeds from turning the optimization into an unbounded hydration job;
+// relationClosure raises the registered resource-limit error at the boundary.
+const CONTAINMENT_BATCH_MAX_NODES = RELATED_TESTS_MAX_NODES;
 // Deliberately much smaller than the other caps above: unlike a BFS closure
 // or a caller-narrowed selector, `inspect_architecture` truncates (see
 // `tryInspectArchitecturePushdown`'s own doc comment) rather than declining,
@@ -3548,11 +3552,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   private async relatedTestsPushdown(scope: QueryScope, subjects: readonly CanonicalQueryRecord[]): Promise<readonly CanonicalQueryRecord[] | undefined> {
     const covered = new Map<string, CanonicalQueryRecord>();
     for (const subject of subjects) covered.set(subject.record_id, subject);
-    for (const subject of subjects) {
-      const ancestorRecords = await this.relationClosure(scope, [subject], "core:contains", "inbound", CONTAINMENT_ANCESTOR_MAX_DEPTH, CONTAINMENT_ANCESTOR_MAX_NODES);
-      if (ancestorRecords === undefined) return undefined;
-      for (const ancestor of ancestorRecords) covered.set(ancestor.record_id, ancestor);
-    }
+    // Traverse the containment frontier as one bounded union. Calling the
+    // indexed adjacency route once per subject made a context with many
+    // resolved seeds pay the same depth walk repeatedly; the shared frontier
+    // preserves the relation closure while deduplicating common ancestors.
+    const ancestorRecords = await this.relationClosure(scope, subjects, "core:contains", "inbound", CONTAINMENT_ANCESTOR_MAX_DEPTH, Math.min(CONTAINMENT_BATCH_MAX_NODES, CONTAINMENT_ANCESTOR_MAX_NODES * Math.max(1, subjects.length)));
+    if (ancestorRecords === undefined) return undefined;
+    for (const ancestor of ancestorRecords) covered.set(ancestor.record_id, ancestor);
     const coveredRecords = [...covered.values()];
     if (coveredRecords.length === 0) return [];
     const tests = await this.relationClosure(scope, coveredRecords, "core:covers", "inbound", 1, RELATED_TESTS_MAX_NODES);
@@ -4056,6 +4062,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const args = object(operation.arguments);
     const task = String(args["task"] ?? "");
     const selectors = Array.isArray(args["seeds"]) ? args["seeds"] : [];
+    const requestedFacets = Array.isArray(args["facets"]) ? args["facets"].filter((facet): facet is string => typeof facet === "string") : [];
     const records: CanonicalQueryRecord[] = [];
 
     const directIds = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
@@ -4089,6 +4096,12 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     }
 
     const unique = [...new Map(records.map((record) => [record.record_id, record])).values()];
+    const explicitSeedIds = new Set(directIds);
+    const explicitSeedNames = new Set(seedNames);
+    for (const record of unique) {
+      const name = typeof record.body["name"] === "string" ? record.body["name"] : undefined;
+      if (name !== undefined && explicitSeedNames.has(name)) explicitSeedIds.add(record.record_id);
+    }
     const filter = object(args["filter"]);
     const paths = strings(filter["paths"]);
     const languages = strings(filter["languages"]);
@@ -4104,9 +4117,91 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       return true;
     });
 
+    // `tests` is a relation facet, so expand only the already-resolved
+    // subjects through the indexed covers/contains projection. This keeps
+    // discovery bounded by the seed fan-out and preserves the snapshot bound
+    // carried by `operation.scope`; it never widens into the corpus reader.
+    let contextRecords = filtered;
+    const contextSubjectIds = new Set(filtered.map((record) => record.record_id));
+    let testRecordIds = new Set<string>();
+    const workspaceSnapshotBindingIds = operation.scope.scope_type === "single_workspace" ? [operation.scope.workspace_id] : operation.scope.participants.map((participant) => participant.workspace_id);
+    if (requestedFacets.includes("tests")) {
+      if (this.snapshots.graph_edges_by_subject_ids === undefined) {
+        throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed graph projection.", {
+          capability: "relatedTestsPushdown",
+          workspace_snapshot_binding_ids: workspaceSnapshotBindingIds,
+          reason_codes: ["indexed_graph_projection_unavailable"],
+        });
+      }
+      let relatedTests = await this.relatedTestsPushdown(operation.scope, filtered);
+      if (relatedTests === undefined) {
+        throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed graph projection.", {
+          capability: "relatedTestsPushdown",
+          workspace_snapshot_binding_ids: workspaceSnapshotBindingIds,
+          reason_codes: ["indexed_graph_projection_unavailable"],
+        });
+      }
+      // A test may cover a callable that invokes the resolved subject without
+      // covering the subject itself.  Use the existing indexed call adjacency
+      // only for that empty direct result; this keeps the common path bounded
+      // while recovering the contractual indirect caller/test relationship.
+      if (relatedTests.length === 0 && filtered.length > 0) {
+        const callers = await this.relationClosure(operation.scope, filtered, "core:call", "inbound", 1, IMPACT_CALLER_MAX_NODES);
+        if (callers === undefined) {
+          throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed call graph projection.", {
+            capability: "relatedTestsPushdown",
+            workspace_snapshot_binding_ids: workspaceSnapshotBindingIds,
+            reason_codes: ["indexed_graph_projection_unavailable"],
+          });
+        }
+        const indirectTests = await this.relatedTestsPushdown(operation.scope, callers);
+        if (indirectTests === undefined) {
+          throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed call graph projection.", {
+            capability: "relatedTestsPushdown",
+            workspace_snapshot_binding_ids: workspaceSnapshotBindingIds,
+            reason_codes: ["indexed_graph_projection_unavailable"],
+          });
+        }
+        relatedTests = indirectTests;
+      }
+      testRecordIds = new Set(relatedTests.map((record) => record.record_id));
+      {
+        let orderedTests = [...relatedTests]
+          .filter((record) => !contextSubjectIds.has(record.record_id))
+          .sort((left, right) => (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id) || left.record_id.localeCompare(right.record_id));
+        if (languages.length > 0) orderedTests = orderedTests.filter((record) => languages.includes(String(record.body["language"] ?? "")));
+        if (paths.length > 0) {
+          const testArtifactPaths = this.snapshots.records_by_artifact_versions === undefined ? new Map<string, string>() : new Map(
+            (await this.snapshots.records_by_artifact_versions(operation.scope, [...new Set(orderedTests.map((record) => record.owner_artifact_version_id))])).map((record) => [record.owner_artifact_version_id, String(record.body["path"] ?? "")]),
+          );
+          orderedTests = orderedTests.filter((record) => {
+            const path = typeof record.body["path"] === "string" ? record.body["path"] : testArtifactPaths.get(record.owner_artifact_version_id);
+            return path !== undefined && paths.some((pattern) => matchesArtifactGlob(path, pattern));
+          });
+        }
+        contextRecords = [...filtered, ...orderedTests];
+      }
+    }
+    const definitionsRequested = requestedFacets.includes("definitions");
+    const definitionRecord = (record: CanonicalQueryRecord): boolean => {
+      const descriptor = `${record.kind} ${record.universal_kind}`.toLocaleLowerCase("en-US");
+      return /declaration|definition|type|callable/.test(descriptor);
+    };
+    // Keep the first page useful for orientation without changing membership:
+    // explicit seeds lead, then definition-like records, indexed tests, and
+    // the remaining resolved subjects. Array order is the stable tie-breaker
+    // from the indexed point lookups, while the priority itself is generic.
+    contextRecords = contextRecords
+      .map((record, index) => ({ record, index }))
+      .sort((left, right) => {
+        const priority = (record: CanonicalQueryRecord): number => explicitSeedIds.has(record.record_id) ? 0 : definitionsRequested && definitionRecord(record) ? 1 : testRecordIds.has(record.record_id) ? 2 : 3;
+        return priority(left.record) - priority(right.record) || left.index - right.index;
+      })
+      .map(({ record }) => record);
+
     let remainingSnippetBudget = 20_000;
     const context: QueryStreamItem[] = [];
-    for (const record of filtered) {
+    for (const record of contextRecords) {
       const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "relevant", 2_000, 2, remainingSnippetBudget);
       if (snippet !== undefined) remainingSnippetBudget -= snippet.text.length;
       context.push({

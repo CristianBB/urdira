@@ -200,6 +200,14 @@ After complete discovery, traversal, classification, ranking, and ordering, Urdi
 
 The server persists execution state, not a mutable client cursor position. Tokens are opaque authenticated locators over persisted claims, may be issued repeatedly, and contain no source content. A continuation repeats the original explicit scope and may reduce either hydration-budget component relative to the initial normalized ceiling. That reduction is page-local: a later continuation may again request any budget up to the original ceiling. It cannot change snippets, evidence, diagnostics, registry mode, projection, filters, or operation arguments.
 
+The wire token uses a compact, signed representation of those claims so that a
+copy-ready continuation remains practical for agent clients. The compact form
+retains execution, stream, position, scope, snapshot, ordering, projection,
+budget, status, completeness, and expiry bindings and is valid after daemon
+restart while its persisted execution remains retained. Readers accept the
+previous self-contained hex representation during the compatibility window;
+neither form may be decoded or edited by a client.
+
 Execution expiry releases every snapshot lease atomically. An expired, evicted, unknown, scope-mismatched, or projection-mismatched cursor fails with its distinct operation code and never reruns the query. Previous tokens remain valid until the execution expires; navigating backward and then forward reaches the identical manifest entries.
 
 ## Complete operation-error families

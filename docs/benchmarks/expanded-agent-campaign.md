@@ -47,8 +47,31 @@ cold/warm matrix or an OS page-cache eviction experiment.
    expose them directly. Preserve unrelated working-tree changes. Use a
    reproducible built checkout.
 2. Follow [AGENTS.md](../../AGENTS.md) for dependencies, native builds, and the
-   complete `pnpm verify` gate. Confirm `apps/urdira/dist/index.js` and native
-   artifacts match the recorded checkout. The global Urdira install is not used.
+   complete `pnpm verify` gate. Confirm `apps/urdira/dist/index.js`,
+   `packages/cli/dist/agent-integration.js`, and native artifacts match the
+   recorded checkout. The global Urdira install is not used. The Urdira arm
+   invokes the production `installAgent("codex", { dry_run: false, confirm: true,
+   home: <isolated-root> })` path, so its Codex hooks, explorer, and skill are
+   the same artifacts as `urdira agent install --client codex`. The runner sets
+   `HOME` and `CODEX_HOME` to that disposable root, removes
+   `--ignore-user-config` for this arm so those installed artifacts are loaded,
+   and passes `--dangerously-bypass-hook-trust` because the runner has just
+   generated the managed hook in that disposable root. Authentication remains
+   available through a temporary `auth.json` symlink when the user's Codex
+   auth file exists; no credential bytes are copied or recorded. The runner
+   deletes the root after the cell (including failure cleanup). The MCP
+   server remains an explicit per-process Codex configuration because the
+   production Codex installer currently owns hooks, explorer, and skill files;
+   this is recorded as `installed-integration` with
+   `mcp: runner-configured-per-process`, rather than being reported as MCP-only.
+   The runner also places a disposable `bin/urdira` shim first on the Codex
+   `PATH`. It delegates to the frozen `apps/urdira/dist/cli.js` through the
+   frozen Node executable, exports the cell's `URDIRA_DATA_ROOT` and indexing
+   worker path, and is checked with `urdira --version` before the agent starts.
+   The manifest records the CLI version, executable path, and SHA-256 of the
+   measured CLI artifact. The hook command remains the literal installed
+   `urdira agent hook`; if the measured CLI is unavailable the shim exits
+   safely instead of falling through to an unrelated host executable.
 3. Prepare four repository clones under one dedicated root, named `typescript`,
    `playwright`, `prisma`, and `vscode`; ensure each corpus SHA exists locally.
    Record test dependencies available in the actual fresh worktrees. The agent
@@ -409,3 +432,11 @@ explicit typed field; the analyzer does not infer them from labels or depend on
 a hypothetical `structuredContent.bytes` object. The same fields are propagated
 through the post-index executor's `post-measurements.json` and the expanded
 report's task-comparison rows.
+
+Completed Codex action telemetry is reported separately from repository
+discovery. The analyzer inventories action item types and exposes web-search,
+file-change, integration-warning, hook-error, first-action, and unclassified
+counts. These actions do not contribute to MCP, shell, repository-read, or
+context-character measurements; those historical fields continue to count only
+their existing protocol-defined sources. Started and completed events are
+deduplicated by counting completed items only.

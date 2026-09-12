@@ -12,6 +12,7 @@ import {
   createUrdiraMcpServer,
   createUrdiraToolDefinitions,
   formatUrdiraResult,
+  URDIRA_QUERY_CONTINUATION_EXAMPLE,
   type UrdiraMcpToolDefinition,
 } from "../packages/mcp/src/index.js";
 
@@ -61,12 +62,18 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(definitions.map((definition) => definition.input_schema.type)).toEqual(["object", "object", "object", "object", "object"]);
     expect(definitions.map((definition) => definition.input_schema.properties?.["scope"]).filter((value) => value !== undefined)).toHaveLength(3);
     expect(definitions.map((definition) => definition.input_schema.additionalProperties)).toEqual([false, false, false, false, false]);
-    expect(definitions[0]?.input_schema.properties?.["request_type"]).toBeDefined();
-    expect(definitions[1]?.input_schema.required).not.toContain("options");
-    const contextSeeds = definitions[1]?.input_schema.properties?.["seeds"] as { items?: { oneOf?: Array<{ oneOf?: unknown; properties?: Record<string, unknown> }> } };
+    const queryDefinition = definitions.find((definition) => definition.name === "urdira_query");
+    const contextDefinition = definitions.find((definition) => definition.name === "urdira_context");
+    expect(queryDefinition?.input_schema.properties?.["request_type"]).toBeDefined();
+    expect(contextDefinition?.input_schema.required).not.toContain("options");
+    const contextSeeds = contextDefinition?.input_schema.properties?.["seeds"] as { items?: { oneOf?: Array<{ oneOf?: unknown; properties?: Record<string, unknown> }> } };
     expect(contextSeeds.items?.oneOf).toHaveLength(6);
     expect(contextSeeds.items?.oneOf?.some((variant) => variant.oneOf !== undefined)).toBe(false);
     expect(contextSeeds.items?.oneOf?.some((variant) => variant.properties?.["path"] !== undefined)).toBe(true);
+    expect(queryDefinition?.description).toContain("scope is inside query");
+    expect(queryDefinition?.description).toContain("exactly one of cursor or continuation_ref");
+    expect(queryDefinition?.description).toContain('"continuation_ref":"<continuation_ref>"');
+    expect(queryDefinition?.description).toContain("continuation_ref MORE request is self-contained");
   });
 
   it("rejects malformed v3 expressions before opening the IPC client", async () => {
@@ -226,7 +233,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(MCP_SERVER_INSTRUCTIONS).toContain("it is not required before urdira_query");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("call once when query_scope is missing");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Narrow broad queries with an exact path, kind, context artifact, or returned entity id");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Continue with the exact cursor and the original scope");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("MORE is a complete ContinuationRequest");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Use Urdira before shell for scoped repository discovery and source reading");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Pipelines are optional");
   });
@@ -860,7 +867,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(text).not.toContain("optional_source_snippets");
   });
 
-  it("renders exactly one MORE line with the full cursor appearing once, at the end", async () => {
+  it("renders exactly one MORE line with a self-contained continuation reference", async () => {
     const cursorValue = "signed.cursor.abcdefghijklmnopqrstuvwxyz0123456789";
     const call = vi.fn(async () => success({
       query_execution_id: "execution-1",
@@ -874,14 +881,16 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text.match(/^MORE:/gm)).toHaveLength(1);
-    expect(text).toContain(`"cursor":"${cursorValue}"`);
+    expect(text).toMatch(/"continuation_ref":"[0-9a-f]+\.[0-9a-f]+"/u);
     expect(text).toContain('"request_type":"continuation"');
-    expect(text).toContain('"scope":{"scope_type":"single_workspace","workspace_id":"workspace-1"}');
-    expect(text).toContain('"response_budget":{"max_characters":20000,"max_items":50}');
-    expect(text.split(cursorValue)).toHaveLength(2); // exactly one occurrence in the complete continuation request
+    expect(text).toContain('{"continuation":{"api_version":3,"continuation_ref":"');
+    expect(text).toContain('"request_type":"continuation"');
+    expect(text).not.toContain('"scope":{"scope_type":"single_workspace","workspace_id":"workspace-1"}');
+    expect(text).not.toContain('"response_budget":{"max_characters":20000,"max_items":50}');
+    expect(text).not.toContain(cursorValue); // compact agent text carries only the server-local ref
   });
 
-  it("renders a complete continuation for the web profile with the original scope and budget", () => {
+  it("renders a self-contained continuation reference for the web profile", () => {
     const cursor = "web.cursor.full.value";
     const result = formatUrdiraResult({
       returned_items: 1,
@@ -893,10 +902,13 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain('"request_type":"continuation"');
-    expect(text).toContain('"scope":{"scope_type":"single_workspace","workspace_id":"web-workspace"}');
-    expect(text).toContain('"response_budget":{"max_characters":900,"max_items":3}');
-    expect(text).toContain(`"cursor":"${cursor}"`);
+    expect(text).toContain('{"continuation":{"api_version":3,"continuation_ref":"');
+    expect(text).toContain('"request_type":"continuation"');
+    expect(text).not.toContain('"scope":{"scope_type":"single_workspace","workspace_id":"web-workspace"}');
+    expect(text).not.toContain('"response_budget":{"max_characters":900,"max_items":3}');
+    expect(text).toMatch(/"continuation_ref":"[0-9a-f]+\.[0-9a-f]+"/u);
     expect(result.structuredContent).toBeDefined();
+    expect((result.structuredContent as { page: { result_sets: Array<{ confirmed: { next_cursor?: string } }> } }).page.result_sets[0]!.confirmed.next_cursor).toBe(cursor);
   });
 
   it("does not emit an executable continuation with a fictitious scope", () => {
@@ -956,7 +968,6 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("coverage: partial (600 files affected)");
     expect(text).not.toContain("sha256:");
-    expect(text.match(/coverage:/g)).toHaveLength(1);
   });
 
   // Plan 2026-09-06 (Frente S-A, §4.3): `semantic_coverage`'s raw
@@ -997,7 +1008,8 @@ describe("Phase 13 Urdira MCP adapter", () => {
     // be shortened with a "..." ellipsis.
     expect(text).toContain("set sha256:abcdef0123456789affectedsetid");
     expect(text).toContain("next: eyJzZXQiOiJzaGEyNTY6YWJjZGVmMDEyMzQ1Njc4OSJ9");
-    expect(text.match(/coverage:/g)).toHaveLength(1);
+    expect(text.match(/^coverage: covered /gm)).toHaveLength(1);
+    expect(text).toContain("coverage: complete");
   });
 
   // Plan 2026-09-06 (Frente S-A, §4.3): `core:semantic_affected_page`'s
