@@ -15,6 +15,82 @@ comes from the [driver](../../release/benchmarks/run-expanded-agent-benchmark.mj
 [grader](../../release/benchmarks/expanded-agent-benchmark-grader.mjs).
 This document introduces no public API or architecture changes.
 
+## Current optimization and verification decision
+
+The current objective is to reduce discovery fallback and duplicated reading
+while preserving every legitimate piece of information requested by the task.
+The agent chooses `response_budget` from the task's needs. A budget is a
+response-shaping control, not a campaign success criterion: this procedure
+does not impose an absolute character, token, or quota threshold. A smaller
+response is useful only when it remains correct, complete for its page, and
+adequately hydrated for the stated request.
+
+Correctness is evaluated first. Results must have deterministic membership,
+ordering, provenance, hydration declarations, deduplicated unique records,
+and explicit completeness and pagination state. A page may be incomplete only
+when it exposes a continuation that can be followed exactly. The result
+ordering should maximize first-page usefulness and diversity across the
+requested facets (for example definitions, callers, and tests), while keeping
+the canonical ordering and cursor contract intact. Hydration is explicit:
+source snippets, evidence, and registry data count only when the response
+declares them and their budgets permit them.
+
+After equal correctness and coverage are established, compare relative
+time-to-first-useful-result, total time, input/output tokens, estimated cost,
+context characters, and fallback behavior. Record, per task and arm, the
+usefulness and duplication observations, fallback reason, number of turns,
+MCP calls by operation, direct-operation/recipe/pipeline counts, page and
+cursor outcomes, hydration/evidence/registry components, and host readiness
+and process measurements. These metrics explain behavior; none is an
+absolute pass threshold by itself.
+
+Tool attribution must keep three quantities separate: direct tool output,
+shell output, and total context delivered to the agent. For `tgrep`, report
+the direct tgrep call/output separately from shell commands that invoke or
+inspect tgrep, and report their sum only as a derived total. The same rule
+applies to Urdira and other MCP tools. A command classified as shell must not
+be counted as a direct tool call merely because it ran a tool binary. This
+prevents tgrep-vs-Urdira comparisons from confusing tool output with command
+or transcript context. The grader remains a task-contract and integration
+check; it does not measure semantic quality, prove tool causality, or replace
+manual attribution review.
+
+The post-v14 source state is intentionally unbenchmarked. The retained v13
+and v14 artifacts are evidence for the continuation and discovery decisions,
+not new baseline samples. V13 passed with structural semantic-off settings;
+v14 remains a retained failure. The indexed bounded caller-to-covers
+expansion is retained because it improves the tests facet through existing
+graph indexes with explicit limits and exact deduplication. The temporary
+`pending_continuations` label/action is removed because it added response
+pressure without changing the canonical page/completeness contract. The
+canonical signal is `page_coverage` plus `more` and a literal continuation
+request. No result from these retained attempts should be rewritten or
+replaced by a rerun.
+
+### Offline replay and fresh validation protocol
+
+When tuning measurement or attribution, replay the retained raw transcripts,
+timing sidecars, manifests, host logs, and hashes offline. Replay must not
+start an agent, mutate a workspace, alter a transcript, or launch a competitor
+run. Use it to validate parsing, direct-tool versus shell attribution,
+continuation extraction, usefulness/duplication annotations, and report
+rendering. Keep the original raw files and retain failures in the derived
+report.
+
+Only after focused tests and the complete `CI=true pnpm verify` gate pass may
+the root coordinator run a fresh validation. That validation is Urdira-only,
+one sample per size tier: one small repository, one medium repository, and one
+large repository, using the current production install path and the frozen
+structural semantic-off environment. Luna agents drive the runs; the root
+agent coordinates worktrees, output retention, and review. Do not rerun
+competitors during this validation. Preserve each raw transcript, timing
+sidecar, manifest, host log, process sample, and hash, and record the exact
+commit and built worker used. A fresh sample is accepted by equal task
+correctness/coverage first, then compared with the retained observations on
+relative time, tokens, cost, context, usefulness, duplication, and fallback
+reason. There is no absolute time, token, character, or tool-count success
+threshold.
+
 ## Frozen matrix
 
 - Arms: `baseline`, `urdira-typescript`, `codebase-memory`, `codegraph`, `tgrep`.

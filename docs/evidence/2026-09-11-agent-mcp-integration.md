@@ -198,3 +198,30 @@ corpus scan. The pending labels/action line is removed; `page_coverage:
 incomplete; action=continue` and the literal MORE object remain the canonical
 signals. The server-local ref branch is now self-contained (`api_version` plus
 `continuation_ref`); only the portable cursor branch carries scope and budget.
+
+## Authoritative post-v14 validation decision
+
+The governing comparison decision is recorded in the expanded campaign
+[runbook](../benchmarks/expanded-agent-campaign.md#current-optimization-and-verification-decision).
+It defines response budgets as agent-selected task controls, without absolute
+character, token, or quota thresholds; requires deterministic completeness,
+pagination, ordering, explicit hydration, and deduplicated unique records;
+and compares usefulness, duplication, time-to-first-useful-result, fallback
+reason, turns, time, tokens, cost, context, and host metrics only after equal
+correctness and coverage. It also separates direct tgrep output, shell output,
+and derived total context so command invocation is not misattributed as direct
+tgrep use.
+
+V13 and V14 remain retained raw evidence. V13 passed under structural
+semantic-off settings; V14 is a retained failure. The post-V14 source state
+has not been benchmarked. Indexed bounded caller-to-covers expansion remains
+because it uses existing graph indexes, explicit limits, and exact
+deduplication. The temporary `pending_continuations` response label/action
+was removed; `page_coverage`, `more`, and the literal continuation request are
+the canonical signals. Future tuning starts with offline replay of retained
+transcripts and sidecars, with no agent or competitor rerun during tuning.
+After focused tests and `CI=true pnpm verify`, the root coordinator may run
+one fresh Urdira-only sample for each small, medium, and large repository size
+tier. Luna agents drive those runs; raw artifacts and failures remain
+retained, and acceptance is based on equal correctness/coverage followed by
+relative comparisons rather than absolute thresholds.
