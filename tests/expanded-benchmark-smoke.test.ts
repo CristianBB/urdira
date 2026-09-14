@@ -133,18 +133,19 @@ describe("expanded campaign smoke scope", () => {
 
   it("inherits the production Urdira MCP server presentation", () => {
     const entry = readFileSync(resolve("release/benchmarks/expanded-urdira-mcp-entry.mjs"), "utf8");
-    expect(entry).toMatch(/runUrdiraMcp\(\{\s*data_root: process\.env\.URDIRA_DATA_ROOT,\s*\}\)/u);
+    expect(entry).toMatch(/runUrdiraMcp\(\{\s*data_root: process\.env\.URDIRA_DATA_ROOT,\s*endpoint: process\.env\.URDIRA_ENDPOINT,\s*\}\)/u);
     expect(entry).not.toMatch(/tool_names|compact|instructions|MCP_BENCHMARK_INSTRUCTIONS/u);
     const mcp = readFileSync(resolve("packages/mcp/src/index.ts"), "utf8");
-    for (const tool of ["urdira_query", "urdira_context", "urdira_analyze_change", "urdira_build_context", "urdira_index_status"]) {
+    for (const tool of ["urdira_query", "urdira_context", "urdira_index_status"]) {
       expect(mcp).toContain(`"${tool}"`);
     }
+    expect(mcp).not.toMatch(/^\s*"urdira_(?:analyze_change|build_context)",$/mu);
   });
 
-  it("uses the production Codex installer in an isolated user root for the Urdira arm", () => {
+  it("uses the production Codex hook-first installer without a duplicate MCP catalog", () => {
     const runner = readFileSync(resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "utf8");
     expect(runner).toContain('const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");');
-    expect(runner).toContain('installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome })');
+    expect(runner).toContain('installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome, launcher: [urdiraShimPath] })');
     expect(runner).toContain('mkdtempSync(join("/tmp", "urdira-expanded-codex-home-"))');
     expect(runner).toContain('CODEX_HOME: join(codexIntegrationHome, ".codex")');
     expect(runner).toContain('const userAuthPath = join(homedir(), ".codex", "auth.json")');
@@ -152,7 +153,8 @@ describe("expanded campaign smoke scope", () => {
     expect(runner).toContain('auth: authMode');
     expect(runner.indexOf("let codexIntegrationHome;")).toBeLessThan(runner.indexOf("const recordFailure"));
     expect(runner.indexOf("const cleanupCodexIntegration")).toBeLessThan(runner.indexOf("const recordFailure"));
-    expect(runner).toContain('mcp: "runner-configured-per-process"');
+    expect(runner).toContain('mcp: "hook-first-cli-continuations"');
+    expect(runner).not.toContain('mcp_servers.urdira.env.URDIRA_ENDPOINT=${JSON.stringify(codexIntegration.endpoint)}');
     expect(runner).toContain('ignore_user_config: false');
     expect(runner).toContain('hook_trust: "dangerously-bypass-hook-trust"');
     expect(runner).toContain('"--dangerously-bypass-hook-trust"');
@@ -166,6 +168,13 @@ describe("expanded campaign smoke scope", () => {
     expect(runner).toContain('const urdiraEndpoint = join(effectiveDataRoot, "daemon.sock")');
     expect(runner).toContain('endpoint: urdiraEndpoint');
     expect(runner).toContain('PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`');
+    expect(runner).toContain('const shellRuntimeProfile = join(codexIntegrationHome, ".zprofile")');
+    expect(runner).toContain('export PATH=${JSON.stringify(urdiraBinDir)}:${JSON.stringify(dirname(nodeBin))}:$PATH');
+    expect(runner).toContain('writeFileSync(shellRuntimeProfile');
+    expect(runner).toContain('ZDOTDIR: codexIntegrationHome');
+    expect(runner).toContain('shell_runtime_profile: shellRuntimeProfile');
+    expect(runner).toContain('const isolatedShellRuntime = spawnSync("/bin/zsh", ["-lc", "node --version"]');
+    expect(runner).toContain('isolated shell resolved');
     expect(runner).toContain('URDIRA_ENDPOINT: codexIntegration.endpoint');
     expect(shim).toContain('[ -S "$ENDPOINT" ]');
     expect(shim).toContain('export URDIRA_ENDPOINT="$ENDPOINT"');
@@ -200,6 +209,9 @@ describe("expanded campaign smoke scope", () => {
     expect(grader).toMatch(/compositionMetrics/u);
     expect(grader).toMatch(/const discoveryPass = !Object\.values\(unexpectedErrors\)\.some\(Boolean\)/u);
     expect(grader).not.toMatch(/const discoveryPass = transcriptMetrics\.assigned_discovery_before_edit/u);
+    expect(grader).toMatch(/value\("--hook-audit"\)/u);
+    expect(grader).toMatch(/analyzeExpandedTranscript\(transcript, arm, task, \{ hook_audit: hookAudit \}\)/u);
+    expect(runner).toMatch(/"--hook-audit", hookAuditPath/u);
   });
 
   it("gates each selected arm with its own completed smoke audit", () => {
@@ -243,6 +255,19 @@ describe("expanded campaign smoke scope", () => {
     expect(handoff).toContain("affected-tests-deterministic");
     expect(handoff).toContain("wire-name-validation");
     expect(handoff).toContain("language-provider-registration-idempotence");
+    expect(handoff).toContain("cleanup checkpoint");
+    expect(handoff).toContain("one active checkout/index/data root");
+    expect(handoff).toContain("finally");
+    expect(handoff).toContain("df");
+    expect(handoff).toContain("space-free threshold");
+    expect(handoff).toContain("cleanup manifest");
+    expect(handoff).toContain("block the next execution");
+    expect(handoff).toContain("after each complete cell or before transfer to another worker");
+    expect(handoff).toContain("three internal turns");
+    expect(handoff).toContain("Phase 0");
+    expect(handoff).toContain("only records cleanup booleans");
+    expect(handoff).toContain("release archive binding");
+    expect(handoff).toContain("must not start a model");
   });
 
   it.each(["playwright", "prisma", "vscode"])("accepts the two-task smoke for %s", (id) => {

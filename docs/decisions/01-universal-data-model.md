@@ -6179,7 +6179,11 @@ Operation arguments use the approved `SubjectSelector` union, `StructuralFilter`
 
 `ResponseBudget.max_items` and `max_characters` are positive server-bounded limits. Both apply; the first limit reached ends hydration without altering total counts or result membership. `max_characters` uses the fixed compact-JSON counting convention defined by the API contract.
 
-Inline source snippets rendered alongside a discovery result (a trimmed, capped preview line under a match) are a presentational concern of the text-rendering adapter, not a canonical field of this model: they are computed at render time from `optional_source_snippets`/`primary_source_span` hydration, never stored, and controlled by a hidden, MCP-adapter-only option (`snippet_lines`, a top-level MCP argument, default `0`, opt-in) that never reaches this canonical `QueryOptions`/`ResponseBudget` contract. See [Change history](#change-history) for the mechanism and the acceptance evidence.
+Source snippets admitted by an explicit query projection remain visible in the
+agent rendering. The legacy adapter-only `snippet_lines` option cannot suppress
+that requested content. Page-local sharing may avoid repeated identical owned
+ranges while preserving all bundle associations and distinct information.
+Projection truncation remains explicit and distinct from page coverage.
 
 `ContinuationRequest` never contains the original expression. Its opaque `cursor` selects an already materialized execution stream. `scope` must repeat the original ordered workspace IDs, comparison roles, and explicit snapshot selectors exactly; `response_budget` may be smaller than the original budget but cannot change result projection, snippet mode, evidence mode, or membership. A cursor cannot be used to recompute an expired execution.
 

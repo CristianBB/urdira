@@ -78,16 +78,14 @@ describe("workspace configuration impact", () => {
 });
 
 describe("MCP index status v3", () => {
-  test("registers discovery tools before specialized tools", () => {
+  test("advertises only the three non-overlapping agent tools", () => {
     const tools = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
     expect(tools.map((tool) => tool.name)).toEqual([
       "urdira_index_status",
       "urdira_context",
       "urdira_query",
-      "urdira_build_context",
-      "urdira_analyze_change",
     ]);
-    expect(tools[0]?.description).toContain("make this the first call for repository discovery or source reading");
+    expect(tools[0]?.description).toContain("Make this the first call for repository discovery or source reading");
     expect(tools[1]?.description).toContain("broad, multi-facet repository discovery");
     expect(tools[2]?.description).toContain("Run an exact Urdira query");
   });
@@ -104,10 +102,8 @@ describe("MCP index status v3", () => {
     expect(responseBudget.type).toBe("object");
     expect(responseBudget.additionalProperties).toBe(false);
     expect(Object.keys(responseBudget.properties ?? {}).sort()).toEqual(["max_characters", "max_items"]);
-    expect(status.description).toContain("bootstrap form accepts no api_version, scope, options, or other query fields");
-    expect(status.description).toContain("make this the first call for repository discovery or source reading");
-    expect(status.description).toContain("response_budget is an object, never a number");
-    expect(status.description).toContain("max_items\":50,\"max_characters\":20000");
+    expect(status.description).toContain("Make this the first call for repository discovery or source reading");
+    expect(status.description).toContain("Optional response_budget is an object");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Call urdira_index_status with exactly {\"workspace_root\":\"/absolute/repository/root\"}");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("this primary bootstrap example omits response_budget");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("use an object, never a number");
@@ -119,7 +115,8 @@ describe("MCP index status v3", () => {
     expect(lines[0]).toBe("URDIRA AGENT QUICK START");
     expect(lines[1]).toContain("For any repository discovery or source reading");
     expect(lines[1]).toContain("first call urdira_index_status");
-    expect(lines[1]).toContain("page_coverage as incomplete");
+    expect(lines[1]).toContain("page_coverage is incomplete");
+    expect(lines[1]).toContain("start working once the supplied context is sufficient");
     expect(lines[1]).toContain("urdira_context for broad discovery");
     expect(lines[1]).toContain("urdira_query for a known subject or direct operation");
     expect(lines[1]).toContain("incomplete or unsupported coverage");
@@ -144,12 +141,22 @@ describe("MCP index status v3", () => {
     const queryValidation = await (registered._registeredTools["urdira_query"]!.inputSchema["~standard"].validate(URDIRA_QUERY_GET_SOURCE_EXAMPLE));
     expect(contextValidation.issues).toBeUndefined();
     expect(queryValidation.issues).toBeUndefined();
-    expect(context.description).toContain(`workspace_id":"${URDIRA_CONTEXT_EXAMPLE.scope.workspace_id}`);
-    expect(context.description).toContain(URDIRA_CONTEXT_EXAMPLE.task);
-    expect(query.description).toContain(URDIRA_QUERY_GET_SOURCE_EXAMPLE.query.expression.operation);
-    expect(query.description).toContain(URDIRA_QUERY_GET_SOURCE_EXAMPLE.query.expression.arguments.source.mode);
+    expect(context.description).toContain("validated request example");
+    expect(query.description).toContain("validated request examples");
     expect(MCP_SERVER_INSTRUCTIONS).toContain(URDIRA_CONTEXT_EXAMPLE.task);
     expect(MCP_SERVER_INSTRUCTIONS).toContain(URDIRA_QUERY_GET_SOURCE_EXAMPLE.query.expression.operation);
+  });
+
+  test("advertises each copy-paste request once instead of repeating it in every tool description", () => {
+    const definitions = createUrdiraToolDefinitions({ client: { call: async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} }) } });
+    const advertised = [MCP_SERVER_INSTRUCTIONS, ...definitions.map((definition) => definition.description)].join("\n");
+    const stable = (value: unknown): unknown => Array.isArray(value) ? value.map(stable) : value !== null && typeof value === "object"
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable((value as Record<string, unknown>)[key])]))
+      : value;
+    for (const example of [URDIRA_CONTEXT_EXAMPLE, URDIRA_QUERY_GET_SOURCE_EXAMPLE, URDIRA_QUERY_CONTINUATION_EXAMPLE]) {
+      const serialized = JSON.stringify(stable(example));
+      expect(advertised.split(serialized)).toHaveLength(2);
+    }
   });
 
   test("keeps the documented query continuation example aligned with the schema", async () => {
@@ -210,11 +217,10 @@ describe("MCP index status v3", () => {
   test("documents the closed StructuralFilter fields and diagnoses an invalid include_globs path", async () => {
     const client = { call: vi.fn(async () => ({ protocol_version: 1, request_id: "request-1", outcome: "success" as const, payload: {} })) };
     const query = createUrdiraToolDefinitions({ client }).find((tool) => tool.name === "urdira_query")!;
-    expect(query.description).toContain("filter.paths");
-    expect(query.description).toContain("filter.kind_selector");
-    expect(query.description).toContain("filter.include_generated");
-    expect(query.description).toContain("Do not use filter.include_globs");
+    expect(query.description).toContain("Filters and selectors are closed by the advertised schema");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("StructuralFilter is closed");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("languages");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("do not send include_globs or language_selector");
 
     await expect(query.invoke({
       request_type: "query",

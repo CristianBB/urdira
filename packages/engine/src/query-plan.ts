@@ -175,13 +175,14 @@ function normalizePipelineV3(expression: PipelineV3Expression): QueryExpression 
       return { subject_type: "stage_output", stage_id: binding["stage_id"], output: binding["output"] };
     };
     const args: Record<string, unknown> = clone(stage.arguments as Record<string, unknown>);
+    const sequenceFields = ["subjects", "sources", "targets", "containers", "artifacts"];
     for (const [field, binding] of Object.entries(bindings)) {
       const selector = bindingSelector(binding);
       // Registered operation schemas distinguish sequence selectors from
       // scalar selectors.  A v3 binding denotes the whole upstream set, so
       // plural/batchable fields receive a one-element stage-output sequence;
       // the executor expands that sequence lazily into the downstream batch.
-      args[field] = ["subjects", "sources", "targets", "containers", "artifacts"].includes(field) ? [selector] : selector;
+      args[field] = sequenceFields.includes(field) ? [selector] : selector;
     }
     const operator = stage.stage_type === "operation" ? (stage.operation === undefined ? "" : "source.operation") : stage.operator;
     if (typeof operator !== "string" || operator.length === 0) invalid("core:request_invalid", `Stage ${stage.stage_id} must declare operation or operator.`);
@@ -195,6 +196,16 @@ function normalizePipelineV3(expression: PipelineV3Expression): QueryExpression 
       // v3 definition, an explicit @3 selects the current registered
       // implementation while preserving the wire-level version in the plan.
       const effectiveVersion = stage.operation_version === 3 && registered.operation_version !== 3 ? registered.operation_version : stage.operation_version;
+      const scalarBatchBindings = Object.keys(bindings).filter((field) => registered.batchable_fields.includes(field) && !sequenceFields.includes(field));
+      if (scalarBatchBindings.length > 1) invalid("core:stage_type_mismatch", `Stage ${stage.stage_id} cannot bind multiple scalar batch inputs in one expansion.`);
+      const batchField = scalarBatchBindings[0];
+      if (batchField !== undefined) {
+        // Preserve whole-set semantics through the existing expansion port;
+        // direct operation arguments and stored executions remain unchanged.
+        const binding = bindings[batchField] as { stage_id: string; output: string };
+        delete args[batchField];
+        return { stage_id: stage.stage_id, operator: "expand.operation", inputs: [{ stage_id: binding.stage_id, output: binding.output }], arguments: { operation: stage.operation, operation_arguments: args, input_argument: batchField }, ...(effectiveVersion === undefined ? {} : { operation_version: effectiveVersion }) } as QueryStage;
+      }
       return { stage_id: stage.stage_id, operator: "source.operation", inputs: [], arguments: { operation: stage.operation, operation_arguments: args }, ...(effectiveVersion === undefined ? {} : { operation_version: effectiveVersion }) } as QueryStage;
     }
     const inputs = Array.isArray(stage.inputs) ? stage.inputs : Object.values(bindings);

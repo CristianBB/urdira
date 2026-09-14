@@ -15,6 +15,7 @@ const repositoryId = value("--repository-id");
 const taskId = value("--task-id");
 const arm = value("--arm", "baseline");
 const transcriptPath = value("--transcript");
+const hookAuditPath = value("--hook-audit");
 const repo = corpus.repositories.find((entry) => entry.id === repositoryId);
 const task = repo?.tasks.find((entry) => entry.id === taskId);
 if (!repo || !task) throw new Error(`Unknown repository/task: ${repositoryId}/${taskId}`);
@@ -54,6 +55,9 @@ const diffClean = diffText.split("\n").filter((line) => line.startsWith("+") && 
 const transcript = transcriptPath && existsSync(transcriptPath)
   ? readFileSync(transcriptPath, "utf8").split("\n").filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } })
   : [];
+const hookAudit = hookAuditPath && existsSync(hookAuditPath)
+  ? readFileSync(hookAuditPath, "utf8").split("\n").filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } })
+  : [];
 const eventText = transcript.map((event) => JSON.stringify(event)).join("\n");
 const shellCommandText = transcript
   .flatMap((event) => event?.type === "item.completed" && event.item?.type === "command_execution" ? [String(event.item.command ?? "")] : [])
@@ -79,7 +83,7 @@ const failedUrdiraDiscoveryCall = completedTranscriptItems.some((event) => {
   if (encoded.includes("core:selector_ambiguous") || encoded.includes("core:execution_resource_limit")) return false;
   return true;
 });
-const transcriptMetrics = analyzeExpandedTranscript(transcript, arm, task);
+const transcriptMetrics = analyzeExpandedTranscript(transcript, arm, task, { hook_audit: hookAudit });
 const compositionMetrics = arm === "urdira-typescript" ? analyzeUrdiraPipelineContract(transcript) : undefined;
 // Discovery method and timing are observational. The arm configures one
 // integration, but the agent remains free to use it, another available tool,

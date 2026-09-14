@@ -3759,7 +3759,7 @@ impl ResidualDebug {
 mod tests {
     use super::*;
     use crate::v4::{catalog, scan, state::WorkerState};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use urdira_jsts_syntax_worker::SyntaxWorkerState;
     use urdira_worker_protocol::ScanPriority;
@@ -4286,14 +4286,48 @@ mod tests {
 
     static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn scratch_dir(label: &str) -> PathBuf {
+    struct ScratchDir(PathBuf);
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch_dir(label: &str) -> ScratchDir {
         let counter = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("v4-residual-test")
             .join(format!("{label}-{}-{counter}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch dir creation succeeds");
-        dir
+        ScratchDir(dir)
+    }
+
+    #[test]
+    fn scratch_directory_is_removed_when_a_test_scope_ends() {
+        let path;
+        {
+            let scratch = scratch_dir("cleanup-guard");
+            path = scratch.to_path_buf();
+            std::fs::write(scratch.join("sentinel"), b"temporary").unwrap();
+            assert!(path.exists());
+        }
+        assert!(!path.exists());
     }
 
     fn fixture_root() -> PathBuf {

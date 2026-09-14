@@ -30,6 +30,11 @@ See [current state](docs/current-state.md) for evidence and remaining limits.
   detection and explicit purge, and wired v4 pack export/import with destination
   reconciliation and export progress/deadlines.
 - Compact MCP output keeps inline snippets opt-in (`snippet_lines=0` default).
+- Agent context now uses explicit roots, deterministic definition/caller/test
+  ordering, exact page-local source sharing, envelope-aware pagination and
+  portable continuations. Supported prompt and pre-tool hooks inject this
+  context before model work, preserve focused native fallback, and count served
+  interceptions as Urdira use without double-counting shell output.
 - Documentation reconciled across README, architecture, decisions, contracts,
   release guidance and versioning; measured performance is separated from
   unfulfilled cold/memory and release qualification targets.

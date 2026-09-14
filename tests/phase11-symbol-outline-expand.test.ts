@@ -35,6 +35,7 @@ describe("symbol selectors, get_outline containers, and inbound expand_relations
       source: { mode: "signature", max_characters_per_snippet: 2000, max_total_characters: 20000, context_lines: 0 },
     }));
     expect(page.streams["sources"]?.items.length ?? 0).toBeGreaterThan(0);
+    expect(JSON.stringify(page.streams["sources"]?.items)).toContain("class TaskService");
   });
 
   it("core:get_outline resolves an artifact-by-path container to the owning module and lists its members", async () => {

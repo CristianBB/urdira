@@ -3,7 +3,7 @@
 Status: Implemented, v4 structural store (default) with v3 retained as an
 opt-out legacy path (`URDIRA_V4=0`, see [docs/versioning.md](versioning.md))
 
-Last updated: 2026-09-09
+Last updated: 2026-09-14
 
 This guide is the implementation map for the current Urdira codebase. It does
 not introduce product behavior: the linked decisions and protocols remain
@@ -348,10 +348,10 @@ the original request.
 
 ## Public MCP operation paths
 
-The MCP adapter exposes five read-only tools. All paths validate API v3 and
-explicit scope before local IPC. The two convenience tools lower to registered
-core operations, while `urdira_context` uses the same `core:build_context`
-intent with a structural wait default. MCP formatting is a concise projection
+The MCP adapter exposes three read-only tools. All paths validate API v3 and
+explicit scope before local IPC. `urdira_context` lowers to the registered
+`core:build_context` intent with a structural wait default, while every other
+operation and pipeline is available through `urdira_query`. MCP formatting is a concise projection
 of the public result and does not change query semantics; an opt-in,
 hidden `snippet_lines` request field (0-3 lines, default 0) additionally
 projects a bounded literal excerpt per matched source line.
@@ -361,16 +361,10 @@ flowchart TD
   Agent["coding agent"] --> Status["urdira_index_status"]
   Agent --> QueryTool["urdira_query"]
   Agent --> Context["urdira_context"]
-  Agent --> Impact["urdira_analyze_change"]
-  Agent --> Build["urdira_build_context"]
   Status --> IndexCall["core:index_status\nlast_scan, orphaned_workspace_data"]
   QueryTool --> QueryCall["core:query or core:query_continue"]
   Context --> ContextIntent["core:build_context\ndefault structural wait"]
-  Impact --> ImpactIntent["core:analyze_impact"]
-  Build --> BuildIntent["core:build_context"]
   ContextIntent --> QueryCall
-  ImpactIntent --> QueryCall
-  BuildIntent --> QueryCall
   IndexCall --> IPC["local authenticated IPC"]
   QueryCall --> IPC
   IPC --> DaemonRuntime["daemon admission, readiness, execution"]
@@ -378,12 +372,18 @@ flowchart TD
   Render --> Agent
 ```
 
-The recommended agent sequence is to call `urdira_index_status` with the exact
-workspace root, reuse the returned `workspace_id` in every source-reading
-request, prefer `urdira_context` or a bound pipeline for multi-step tasks, and
-continue opaque cursors with the same scope. Native source-reading tools are
-not a substitute for an available Urdira operation when validating Urdira
-itself.
+Without injected context, the recommended agent sequence is to call
+`urdira_index_status` with the exact workspace root, reuse the returned
+`query_scope` in every source-reading request, prefer `urdira_context` or a
+bound pipeline for multi-step tasks, and copy continuation envelopes literally.
+For an installed prompt hook, a populated Urdira context block is already the
+first scoped query and the agent starts from its source. Focused native reads
+remain valid for changed, generated or unindexed state, identified gaps and
+validation; unchanged source already supplied by Urdira should be reused. The
+host-specific bridge, seed selection, source-safe recovery and same-session
+prompt-cache behavior are defined by [Decision 19](decisions/19-agent-search-integration.md)
+and implemented at `packages/cli/src/agent-integration.ts`; they do not add
+fields or state to the public query protocol.
 
 ## Workspace lifecycle: orphans and index packs (v4)
 
@@ -411,10 +411,12 @@ for measured export/import timings.
 `CursorCache.readPage` limits cumulative serialized item characters as well as
 item count. Multi-stream query execution shares the character allowance across
 streams. The daemon clamps the requested character allowance against its IPC
-frame limit before execution and continuation. The paginator always admits a
-first item for progress: this is not a guarantee that an individually oversized
-item or the complete encoded envelope fits the transport. Remaining framing
-failures stay explicit; no result is silently discarded.
+frame limit before execution and continuation. MCP presentation then measures
+the complete rendered envelope and, when necessary, exposes a smaller prefix
+of the same immutable execution without changing its public budget, snapshot,
+ordering or logical membership. An individually oversized projection fails
+explicitly with its required minimum and recovery options. No result is
+silently discarded or presented as complete.
 
 ## Code landmarks
 
@@ -435,6 +437,7 @@ failures stay explicit; no result is silently discarded.
 | Atomic storage publication | `packages/storage/src/publication-authority.ts` | Bounded command streams, phase checkpoints, immutable-row assertions, and current-pointer swap (v3). |
 | Query admission | `packages/engine/src/query-plan.ts` | API v3 normalization, stage dependency validation, operation versions, budgets, and plan digest. |
 | Query lifecycle | `packages/engine/src/query-execution.ts` | `QueryEngine.execute` evaluates once, persists both manifest directions, pages, and cleans up the spool. |
+| Coding-agent bridge | `packages/cli/src/agent-integration.ts` | Explicit-scope prompt/pre-tool hooks, deterministic seed selection, typed source-safe recovery, and client-local prompt-context reuse; see [Decision 19](decisions/19-agent-search-integration.md). |
 | Pipeline execution | `packages/engine/src/pipeline-executor.ts` | `executePipeline` schedules ready frontiers and seals every output as a `StageSetHandle`. |
 | Canonical operations | `packages/engine/src/canonical-query-data-port.ts` | `CanonicalRecordQueryDataPort` implements language-neutral operations with indexed pushdown (v4) and bounded fallback paths. |
 | MCP surface | `packages/mcp/src/index.ts` | `createUrdiraToolDefinitions`, request lowering, IPC invocation, result dieting, and deterministic rendering. |

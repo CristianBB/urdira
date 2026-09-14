@@ -1,9 +1,11 @@
-import { operationRegistry, type OperationDefinition, type QueryScope } from "@urdira/contracts";
+import { operationRegistry, type OperationDefinition, type QueryScope, type SourceIncludeOptions } from "@urdira/contracts";
 import { EngineError } from "./errors.js";
 import type { StageSetHandle } from "./stage-set-handle.js";
 
 export interface QueryStreamItem {
   readonly value: unknown;
+  /** Internal immutable page hydration request; never exposed in public results. */
+  readonly source_hydration?: unknown;
   readonly stable_sort_key: string;
   readonly result_classification?: "confirmed" | "possible" | "unclassified";
   readonly provenance_path?: readonly unknown[];
@@ -38,6 +40,7 @@ export interface QueryOperationEvaluationTelemetry {
 }
 
 export interface OperationInvocation {
+  readonly source_options?: SourceIncludeOptions;
   readonly operation_id: string;
   readonly operation_version?: number;
   readonly result_streams: readonly string[];
@@ -50,6 +53,7 @@ export interface OperationInvocation {
 }
 
 export interface QueryDataPort {
+  readonly hydrate_item?: (item: QueryStreamItem, source_characters: number) => Promise<QueryStreamItem | undefined>;
   /** When true, the adapter understands stage_output tokens paired with
    * `input_handles` and can resolve them without executor-side arrays. */
   readonly consumes_stage_handles?: boolean;

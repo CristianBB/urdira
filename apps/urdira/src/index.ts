@@ -11,6 +11,7 @@ import {
   candidateTargetRegistryFromSnapshot,
   configureNativeExactVectorTopKPort,
   configureNativeLogicalDigestPort,
+  configureNativeStructuralStoreAddonPath,
   configureResidentVectorTopKPort,
   createCanonicalPluginDigestAuthority,
   EngineError,
@@ -134,7 +135,7 @@ export interface UrdiraMcpRunOptions {
   readonly request_timeout_ms?: number;
   readonly stdio?: ServeUrdiraStdioOptions;
   /** Optional narrowed MCP projection used by focused benchmark clients. */
-  readonly tool_names?: readonly ("urdira_query" | "urdira_context" | "urdira_analyze_change" | "urdira_build_context" | "urdira_index_status")[];
+  readonly tool_names?: readonly ("urdira_query" | "urdira_context" | "urdira_index_status")[];
   /** Optional compact instructions paired with a narrowed tool projection. */
   readonly instructions?: string;
   /** Optional compact input schemas for a focused benchmark projection. */
@@ -2394,6 +2395,7 @@ export async function defaultDaemonOptions(dataRoot = process.env["URDIRA_DATA_R
   // Engine receives only a pure synchronous port after target/API validation
   // succeeds; a selected binding is never downgraded to TypeScript on failure.
   const nativeBinding = nativeRuntime === undefined ? undefined : loadNativeBinding({ artifact_path: nativeRuntime.closure.addon_path });
+  configureNativeStructuralStoreAddonPath(nativeRuntime?.closure.addon_path);
   configureNativeLogicalDigestPort(nativeBinding === undefined ? undefined : createNativeLogicalDigestPort(nativeBinding));
   configureNativeExactVectorTopKPort(nativeBinding === undefined ? undefined : createNativeExactVectorTopKPort(nativeBinding));
   // Frente S-I (2026-09-08): the resident-buffer exact top-k kernel --
@@ -2804,7 +2806,17 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   }
   const previewOnlyLifecycle = (command.name === "start" || command.name === "stop") && command.options.dry_run;
   const explicitLifecycleControl = command.name === "stop" || command.name === "restart";
-  const daemon = command.name === "stop" || command.name === "restart" || previewOnlyLifecycle
+  const hookPayload = command.options.payload !== null && typeof command.options.payload === "object" ? command.options.payload as Readonly<Record<string, unknown>> : {};
+  // A hook probe without the prompt or workspace cannot request indexed
+  // context. Keep that incomplete payload cheap; real Claude and Codex prompt
+  // hooks carry both values and must resolve the daemon before model admission.
+  const staticPromptHook = command.name === "agent-hook"
+    && hookPayload["hook_event_name"] === "UserPromptSubmit"
+    && (typeof hookPayload["prompt"] !== "string"
+      || (typeof hookPayload["cwd"] !== "string" && typeof hookPayload["working_directory"] !== "string"));
+  const daemon = staticPromptHook
+    ? undefined
+    : command.name === "stop" || command.name === "restart" || previewOnlyLifecycle
     ? await resolveDaemon(options.daemon, options.endpoint, false, options.on_startup_progress, options.on_progress, explicitLifecycleControl, requiredRpcCapabilities(command))
     : await resolveDaemon(options.daemon, options.endpoint, true, options.on_startup_progress, options.on_progress, explicitLifecycleControl, requiredRpcCapabilities(command));
   const prompt = options.prompt ?? (process.stdin.isTTY && process.stdout.isTTY ? async (question: string) => {
@@ -2838,6 +2850,7 @@ export async function runUrdira(argv: ReadonlyArray<string>, options: UrdiraRunO
   try {
     const result = await runCli(argv, {
       client,
+      agent_launcher: [process.execPath, fileURLToPath(new URL("./cli.js", import.meta.url))],
       preview_admin: async (command) => {
         if (command.name !== "workspace-add") return { command: command.name, args: command.args, values: command.options.values };
         const response = await client.call("core:workspace_preview", { args: command.args, values: command.options.values });

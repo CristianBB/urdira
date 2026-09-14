@@ -42,7 +42,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const N_NIBBLES: usize = 16;
 
@@ -318,37 +318,10 @@ fn create_sized(path: &Path, len: u64) -> std::io::Result<File> {
     Ok(f)
 }
 
-/// P2-2m: force REAL (non-sparse) block allocation for every byte of a
-/// freshly `create_sized` file, single-threaded, before this function's
-/// caller hands the same `File` to several threads/rayon tasks that will
-/// each `write_all_at` a DISJOINT byte range of it CONCURRENTLY.
-///
-/// `create_sized` above is `set_len`-only (a pure `ftruncate`): on most
-/// filesystems this creates a SPARSE hole, with no real disk blocks
-/// allocated yet -- allocation happens lazily, on first write into a given
-/// range. This crate's writer then routinely hands that one sparse file to
-/// `N_NIBBLES` (or `n_threads`) independent workers, each writing its own
-/// disjoint slice concurrently. Root-caused live against the real n8n
-/// corpus (see this task's evidence doc): under load, a rare filesystem-
-/// level race in concurrent lazy block allocation for a single sparse file
-/// can leave ONE worker's own bytes unmaterialized -- silently reverted to
-/// the pre-`set_len` hole (all-zero) -- even though that worker's own
-/// `write_at`/`write_all_at` call reported success. The signature this bug
-/// produces (a field decoding as all-zero bytes of the CORRECT length,
-/// silently, no error) is indistinguishable from a real all-zero value
-/// without independent knowledge of what should have been there, which is
-/// exactly what made it so hard to pin down.
-///
-/// Writing real content across the WHOLE file exactly ONCE, single-
-/// threaded, before any concurrent writer starts, forces every block to
-/// be genuinely allocated up front. Every later `write_at` call then only
-/// OVERWRITES already-allocated blocks -- ordinary in-place overwrites,
-/// which (unlike extending a sparse file) never need to update any
-/// allocation/extent metadata, so there is no allocation race left for
-/// concurrent writers to lose. This closes the bug regardless of the exact
-/// kernel/filesystem mechanism behind it (not root-caused deeper than
-/// "concurrent sparse-file allocation" -- doing so would require
-/// instrumenting the kernel/filesystem itself, out of this crate's reach).
+/// Initializes a file with real zero writes when physical reservation is
+/// unavailable. Neither allocation nor initialization is used as permission
+/// for concurrent writes: `HotFile` serializes each file's positional writes
+/// because disjoint partitions can share a physical boundary block.
 fn materialize_real(file: &File, len: u64) -> std::io::Result<()> {
     const CHUNK: usize = 8 * 1024 * 1024;
     if len == 0 {
@@ -366,8 +339,8 @@ fn materialize_real(file: &File, len: u64) -> std::io::Result<()> {
 
 /// Reserves physical blocks without writing a full zero image when the host
 /// exposes a real allocation primitive. The zero-write path remains the
-/// correctness fallback: callers never hand a sparse file to concurrent
-/// positional writers.
+/// correctness fallback. Reservation is an allocation optimization, not a
+/// guarantee that partially shared boundary blocks are initialized.
 fn physical_preallocate_or_materialize(file: &File, len: u64) -> std::io::Result<()> {
     if len == 0 {
         return Ok(());
@@ -387,20 +360,32 @@ fn physical_preallocate_or_materialize(file: &File, len: u64) -> std::io::Result
     materialize_real(file, len)
 }
 
-/// P2-2m: [`create_sized`] + [`materialize_real`] for exactly the five
-/// `records.*` hot files this module's two writers (`write_hot_and_
-/// secondary_files`/`_partitioned`) both build, with materialization done
-/// in PARALLEL across the five (independent) files rather than serially --
-/// each file's own materialization is single-threaded internally (that is
-/// what closes the race), but nothing prevents the five different files
-/// from being materialized at the same time as each other.
-fn create_sized_hot_files(specs: [(&Path, u64); 5]) -> Result<[Arc<File>; 5]> {
-    let files: Vec<Arc<File>> = specs
+// Logical partitions can share a physical boundary block even when their
+// byte ranges are disjoint. Allocation alone does not initialize those blocks.
+// Keep the complete positional write (including short-write retries) exclusive
+// per file; independent files, encoding and hashing remain parallel.
+struct HotFile {
+    file: Mutex<File>,
+}
+
+impl HotFile {
+    fn write_all_at(&self, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| std::io::Error::other("hot-file write lock poisoned"))?
+            .write_all_at(bytes, offset)
+    }
+}
+
+fn create_sized_hot_files(specs: [(&Path, u64); 5]) -> Result<[Arc<HotFile>; 5]> {
+    let files: Vec<Arc<HotFile>> = specs
         .par_iter()
-        .map(|(path, len)| -> Result<Arc<File>> {
+        .map(|(path, len)| -> Result<Arc<HotFile>> {
             let file = create_sized(path, *len)?;
             physical_preallocate_or_materialize(&file, *len)?;
-            Ok(Arc::new(file))
+            Ok(Arc::new(HotFile {
+                file: Mutex::new(file),
+            }))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(files.try_into().unwrap_or_else(|_| unreachable!()))
@@ -410,6 +395,67 @@ fn create_sized_hot_files(specs: [(&Path, u64); 5]) -> Result<[Arc<File>; 5]> {
 mod physical_preallocation_tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn hot_file_unaligned_partition_writes_preserve_every_byte() {
+        assert_unaligned_hot_writes(8 * 1024 * 1024, 8);
+    }
+
+    #[test]
+    #[ignore = "large filesystem boundary stress; writes 10 GiB"]
+    fn hot_file_unaligned_partition_writes_large_stress() {
+        assert_unaligned_hot_writes(80 * 1024 * 1024, 8);
+    }
+
+    fn assert_unaligned_hot_writes(partition_bytes: usize, rounds: usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "urdira-hot-boundaries-{}-{partition_bytes}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<_> = (0..5).map(|i| dir.join(format!("hot-{i}"))).collect();
+        // Disjoint logical ranges share physical boundary blocks. Checking
+        // only the first byte of aligned writes misses lost boundary tails.
+        let lengths: Vec<usize> = (0..16).map(|i| partition_bytes + i * 160 + 32).collect();
+        let mut offsets = vec![64u64];
+        for len in &lengths {
+            offsets.push(offsets.last().unwrap() + *len as u64);
+        }
+        for _ in 0..rounds {
+            let files = create_sized_hot_files([
+                (&paths[0], 64),
+                (&paths[1], 64),
+                (&paths[2], *offsets.last().unwrap()),
+                (&paths[3], 64),
+                (&paths[4], 64),
+            ])
+            .unwrap();
+            let barrier = std::sync::Barrier::new(16);
+            std::thread::scope(|scope| {
+                for i in 0..16 {
+                    let file = &files[2];
+                    let barrier = &barrier;
+                    let offset = offsets[i];
+                    let len = lengths[i];
+                    scope.spawn(move || {
+                        let bytes = vec![i as u8 + 1; len];
+                        barrier.wait();
+                        file.write_all_at(&bytes, offset).unwrap();
+                    });
+                }
+            });
+            let bytes = std::fs::read(&paths[2]).unwrap();
+            for i in 0..16 {
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                assert!(
+                    bytes[start..end].iter().all(|b| *b == i as u8 + 1),
+                    "partition {i} lost bytes"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn physical_preallocation_supports_parallel_disjoint_overwrites() {
@@ -1079,7 +1125,7 @@ pub fn write_hot_and_secondary_files(
 
     let mut bytes = std::collections::BTreeMap::new();
     let mut xxh3s = std::collections::BTreeMap::new();
-    let header_jobs: [(&'static str, &Arc<File>, u64); 5] = [
+    let header_jobs: [(&'static str, &Arc<HotFile>, u64); 5] = [
         ("records.keys", &keys_file, (n * KEYS_STRIDE) as u64),
         ("records.meta", &meta_file, (n * META_STRIDE) as u64),
         (
@@ -1749,7 +1795,7 @@ pub fn write_hot_and_secondary_files_partitioned(
     // describes. One `rayon` task per file (five total) purely to write
     // the five headers concurrently; the hash itself is already computed.
     let header_hash_started = std::time::Instant::now();
-    let header_jobs: Vec<(&'static str, &Arc<File>, u64, usize)> = vec![
+    let header_jobs: Vec<(&'static str, &Arc<HotFile>, u64, usize)> = vec![
         ("records.keys", &keys_file, (n * KEYS_STRIDE) as u64, 0),
         ("records.meta", &meta_file, (n * META_STRIDE) as u64, 1),
         (

@@ -70,7 +70,7 @@ export class CliError extends Error {
 export interface CliOptions { readonly json: boolean; readonly dry_run: boolean; readonly confirm: boolean; readonly debug_timing: boolean; readonly payload?: unknown; readonly proposal_id?: string; readonly values: Readonly<Record<string, string>>; }
 export interface CliCommand { readonly name: CliCommandName; readonly args: ReadonlyArray<string>; readonly options: CliOptions; }
 export interface CliDaemonClient { readonly call: (call: string, payload: unknown) => Promise<{ readonly outcome: string; readonly payload?: unknown; readonly error?: unknown }>; }
-export interface CliDependencies { readonly client: CliDaemonClient; readonly preview_admin?: (command: CliCommand) => Promise<unknown>; readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>; readonly prompt?: (question: string) => Promise<string | boolean>; readonly read_stdin?: () => Promise<string>; readonly home_directory?: string; }
+export interface CliDependencies { readonly client: CliDaemonClient; readonly preview_admin?: (command: CliCommand) => Promise<unknown>; readonly execute_admin?: (command: CliCommand, preview: unknown) => Promise<unknown>; readonly prompt?: (question: string) => Promise<string | boolean>; readonly read_stdin?: () => Promise<string>; readonly home_directory?: string; readonly agent_launcher?: readonly string[]; }
 export interface CliResult { readonly exit_code: number; readonly data: unknown; readonly stdout: string; }
 
 const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "payload", "proposal-id", "workspace", "workspace-root", "path", "value", "vcs-identity", "engine-build-id", "client", "scope", "index-pack", "out", "require-git-clean", "all", "timeout"]);
@@ -90,9 +90,9 @@ function interactiveAgentSelection(value: string | boolean): { readonly native: 
   for (const token of text.split(/[\s,;]+/u).filter(Boolean)) { const client = aliases[token]; if (client === undefined) unknown.push(token); else native.push(client); }
   return { native: [...new Set(native)], unknown: [...new Set(unknown)] };
 }
-async function configureInteractiveAgents(answer: string | boolean, home: string | undefined, workspace: string | undefined): Promise<unknown> {
+async function configureInteractiveAgents(answer: string | boolean, home: string | undefined, workspace: string | undefined, launcher?: readonly string[]): Promise<unknown> {
   const selection = interactiveAgentSelection(answer);
-  const installed = await Promise.all(selection.native.map(async (client) => { try { return await installAgent(client, { dry_run: false, confirm: true, ...(home === undefined ? {} : { home }), ...(workspace === undefined ? {} : { workspace }) }); } catch (error) { return { client, changed: false, error: error instanceof Error ? error.message : String(error) }; } }));
+  const installed = await Promise.all(selection.native.map(async (client) => { try { return await installAgent(client, { dry_run: false, confirm: true, ...(launcher === undefined ? {} : { launcher }), ...(home === undefined ? {} : { home }), ...(workspace === undefined ? {} : { workspace }) }); } catch (error) { return { client, changed: false, error: error instanceof Error ? error.message : String(error) }; } }));
   return { installed, unknown: selection.unknown };
 }
 function parsePayload(value: string): unknown { try { return JSON.parse(value); } catch { throw new CliError("cli:payload_invalid", "--payload must contain valid JSON."); } }
@@ -378,7 +378,7 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
     }
     if (command.options.dry_run === command.options.confirm) throw new CliError("cli:dry_run_required", "Use exactly one of --dry-run or --confirm for agent installation changes.");
     const operation = command.name === "agent-install" ? installAgent : uninstallAgent;
-    const data = await Promise.all(clients.map((client) => operation(client, { dry_run: command.options.dry_run, confirm: command.options.confirm, ...(dependencies.home_directory === undefined ? {} : { home: dependencies.home_directory }), ...(command.options.values["workspace"] === undefined ? {} : { workspace: command.options.values["workspace"] }) })));
+    const data = await Promise.all(clients.map((client) => operation(client, { dry_run: command.options.dry_run, confirm: command.options.confirm, ...(dependencies.agent_launcher === undefined ? {} : { launcher: dependencies.agent_launcher }), ...(dependencies.home_directory === undefined ? {} : { home: dependencies.home_directory }), ...(command.options.values["workspace"] === undefined ? {} : { workspace: command.options.values["workspace"] }) })));
     return { exit_code: 0, data: { clients: data }, stdout: output({ clients: data }, command.options.json) };
   }
   if ((MUTATING_COMMANDS as readonly string[]).includes(command.name)) {
@@ -408,7 +408,7 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
       const result = dependencies.execute_admin ? await dependencies.execute_admin(command, preview) : await dependencies.client.call(adminCall[mutationName], { args: command.args, values: command.options.values, ...(command.options.proposal_id === undefined ? {} : { proposal_id: command.options.proposal_id }), ...(command.options.payload === undefined ? {} : { payload: command.options.payload }), selected_technology_ids: selection.selected_technology_ids, selected_plugin_ids: selection.selected_plugin_ids, confirmed: true, preview });
       const resultPayload = "outcome" in (result as object) ? (result as { readonly payload?: unknown; readonly error?: unknown }).payload ?? (result as { readonly error?: unknown }).error ?? result : result;
       const integrationAnswer = mutationName === "workspace-add" ? await dependencies.prompt("Configure Urdira in an agent now? Enter yes/all, or a comma-separated client list (claude-code, codex, opencode, cursor, vscode/copilot, cline, roo, claude-desktop). Enter no to skip. [yes/all/clients/no]") : undefined;
-      const agent_integrations = integrationAnswer === undefined ? undefined : await configureInteractiveAgents(integrationAnswer, dependencies.home_directory, command.args[0]);
+      const agent_integrations = integrationAnswer === undefined ? undefined : await configureInteractiveAgents(integrationAnswer, dependencies.home_directory, command.args[0], dependencies.agent_launcher);
       const data = { dry_run: false, confirmed: true, interactive: true, command: mutationName, preview, result: resultPayload, ...(agent_integrations === undefined ? {} : { agent_integrations }) };
       return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(data, command.options.json, semanticModelNotice(resultPayload)) };
     }
@@ -431,14 +431,21 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
     const rendered = !command.options.json ? formatOrphanCommandResult(mutationName, resultPayload) ?? data : data;
     return { exit_code: "outcome" in (result as object) && (result as { readonly outcome: string }).outcome !== "success" ? 1 : 0, data, stdout: output(rendered, command.options.json, semanticModelNotice(resultPayload)) };
   }
+  const suppliedPayload = command.options.payload ?? { args: command.args, values: command.options.values };
+  const continuationEnvelope = command.name === "query" && isPlainRecord(suppliedPayload) && suppliedPayload["request_type"] === "continuation" && isPlainRecord(suppliedPayload["continuation"])
+    ? suppliedPayload["continuation"]
+    : undefined;
+  const queryEnvelope = command.name === "query" && isPlainRecord(suppliedPayload) && suppliedPayload["request_type"] === "query" && isPlainRecord(suppliedPayload["query"])
+    ? suppliedPayload["query"]
+    : undefined;
   const call = command.name === "status" ? "core:status"
     : command.name === "index" ? "core:index_status"
       : command.name === "workspace-list" ? "core:workspace_admin_list"
         : command.name === "workspace-show" ? "core:workspace_admin_show"
           : command.name === "workspace-orphans" ? "core:workspace_orphans_list"
             : command.name === "codebase-list" ? "core:codebase_list"
-              : "core:query";
-  const data = await dependencies.client.call(call, command.options.payload ?? { args: command.args, values: command.options.values });
+              : continuationEnvelope === undefined ? "core:query" : "core:query_continue";
+  const data = await dependencies.client.call(call, continuationEnvelope ?? queryEnvelope ?? suppliedPayload);
   const resultPayload = data.payload ?? data.error ?? data;
   // `--json` always passes the raw payload through verbatim (per this
   // command's own descriptor and every other read-only command here); the

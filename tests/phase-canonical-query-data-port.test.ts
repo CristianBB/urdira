@@ -797,6 +797,25 @@ function sourceBundles(evaluation: { readonly streams: Readonly<Record<string, r
 }
 
 describe("CanonicalRecordQueryDataPort core:get_source", () => {
+  it("keeps the requested declaration visible when surrounding context exceeds the snippet budget", async () => {
+    const text = `${Array.from({ length: 12 }, (_, index) => `const before${index} = ${index};`).join("\n")}\nfunction target() { return 1; }\n${Array.from({ length: 12 }, (_, index) => `const after${index} = ${index};`).join("\n")}`;
+    const start = text.indexOf("function target");
+    const record = stubRecord("rec-target", "artv-target", { name: "target", path: "src/target.ts", start, end: start + "function target() { return 1; }".length });
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records_by_ids: async () => [record],
+      artifact_text: async () => ({ text }),
+    }));
+
+    const evaluation = await port.execute(getSourceOperation(["rec-target"], {
+      mode: "relevant",
+      max_characters_per_snippet: 80,
+      max_total_characters: 80,
+      context_lines: 10,
+    }));
+
+    expect(sourceBundles(evaluation)[0]!.optional_source_snippets[0]!.text).toContain("function target");
+  });
+
   it("narrows a symbol selector by context_artifact even when no module container record is materialized", async () => {
     const declarationA: CanonicalQueryRecord = {
       ...stubRecord("rec-session-a", "artv-a", { path: "src/server/session.ts", name: "Session" }),
@@ -1024,6 +1043,28 @@ describe("CanonicalRecordQueryDataPort SNIPPET_POLICY inline snippets (plan 2026
       primary_source_span: { artifact_version_id: "artv-1", start_byte: String(BYE_TOKEN_START), end_byte: String(BYE_TOKEN_END), start_line: "6", end_line: "6" },
     };
   }
+
+  it.each([false, true])("preserves the complete reference union for duplicate batch targets (indexed=%s)", async (indexed) => {
+    const records = [
+      stubRecord("a", "artv-1", { name: "a" }),
+      stubRecord("b", "artv-1", { name: "b" }),
+      stubRecord("caller", "artv-1", { name: "caller" }),
+      callRelation("call-a", "caller", "a"),
+      callRelation("call-b", "caller", "b"),
+    ];
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { if (indexed) throw new Error("no corpus fallback"); return records; },
+      ...(indexed ? {
+        records_by_ids: async (_scope: QueryScope, ids: readonly string[]) => records.filter((record) => ids.includes(record.record_id)),
+        graph_edges_by_subject_ids: async () => ["a", "b"].map((target) => ({ edge_id: `edge-${target}`, source_subject_id: "caller", target_subject_id: target, relation_record_id: `call-${target}`, relation_kind: "core:call", role: "source", evidence_class: "confirmed" })),
+      } : {}),
+    }));
+    const evaluation = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: ["a", "b", "a"].map((record_id) => ({ subject_type: "record", record_id })) }, scope });
+    expect(evaluation.streams["references"]).toHaveLength(2);
+    expect(evaluation.streams["owners"]).toHaveLength(1);
+    const empty = await port.execute({ operation_id: "core:find_references", result_streams: ["references", "owners"], arguments: { target: [] }, scope });
+    expect(empty.streams["references"]).toEqual([]);
+  });
 
   function findReferencesPort(): CanonicalRecordQueryDataPort {
     return new CanonicalRecordQueryDataPort(stubPort({
@@ -1776,6 +1817,77 @@ describe("SqliteCanonicalQuerySnapshotPort pushdown methods", () => {
 });
 
 describe("CanonicalRecordQueryDataPort core:build_context", () => {
+  it.each([
+    ["definitions", "core:defines", "outbound"], ["implementations", "core:implements", "inbound"],
+    ["callers", "core:call", "inbound"], ["callees", "core:call", "outbound"],
+    ["dependencies", "core:depends_on", "outbound"], ["contracts", "core:type_of", "outbound"],
+    ["effects", "core:write", "outbound"], ["configuration", "core:binds", "inbound"],
+    ["extension_points", "core:inherits", "outbound"],
+  ])("expands %s with indexed provenance and possible certainty", async (facet, kind, direction) => {
+    const seed = stubRecord("seed", "version-seed", { name: "Feature" });
+    const related = stubRecord("related", "version-related", { name: "Related" });
+    const edge = { edge_id: "edge", relation_record_id: "relation-proof", source_subject_id: direction === "inbound" ? "related" : "seed", target_subject_id: direction === "inbound" ? "seed" : "related", relation_kind: kind!, role: "", evidence_class: "possible" };
+    const port = new CanonicalRecordQueryDataPort(stubPort({ records: async () => { throw new Error("No corpus scan"); }, records_by_name: async () => [seed], records_by_ids: async (_scope, ids) => [seed, related].filter((record) => ids.includes(record.record_id)), graph_edges_by_subject_ids: async () => [edge] }));
+    const result = await port.execute({ operation_id: "core:build_context", result_streams: ["context"], scope, arguments: { task: "Feature", query_class: "identifier", facets: [facet] } });
+    const bundle = (result.streams["context"] as any[]).find((entry) => entry.value.primary_result.record_id === "related").value;
+    expect(bundle.assessment.classification).toBe("possible");
+    expect(bundle.provenance_path).toEqual([{ subject_type: "record", record_id: "relation-proof" }]);
+  });
+
+  it.each(["core:build_context", "core:get_source"] as const)("hydrates every %s page from the frozen manifest after restart", async (operationId) => {
+    const records = Array.from({ length: 5 }, (_, index) => stubRecord(`context-${index}`, `version-${index}`, { name: "Feature", start: 0, end: 100 }));
+    const snapshot = stubPort({ records_by_name: async () => records, records_by_ids: async (_scope, ids) => records.filter((record) => ids.includes(record.record_id)), graph_edges_by_subject_ids: async () => [], artifact_text: async () => ({ text: "x".repeat(100) }) });
+    const lifecycle = new TestManifestLifecycle();
+    const createEngine = () => new QueryEngine({ data_port: new CanonicalRecordQueryDataPort(snapshot), cursor_cache: new CursorCache({ signing_secret: "context-pages" }), manifest_store: new DurableManifestStore(lifecycle as never), now: () => now });
+    const budget = { max_items: 5, max_characters: 100_000 };
+    const streamName = operationId === "core:build_context" ? "context" : "sources";
+    const first = await createEngine().execute({ api_version: 3, scope, expression: { expression_type: "operation", operation: operationId, arguments: operationId === "core:build_context" ? { task: "Feature", query_class: "identifier", facets: ["definitions"] } : { subjects: records.map((record) => ({ subject_type: "record", record_id: record.record_id })), source: { mode: "body", max_characters_per_snippet: 100, max_total_characters: 200, context_lines: 0 } } }, options: { freshness: "current", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "none", diagnostic_detail: false }, snippets: { mode: "body", max_characters_per_snippet: 100, max_total_characters: 200, context_lines: 0 }, registry: { registry: "none", include_payload_schemas: false }, response_budget: budget } });
+    let page = first;
+    const ids: string[] = [];
+    do {
+      const stream = page.streams[streamName]!;
+      for (const entry of stream.items) { const bundle = entry.value as any; ids.push(bundle.primary_result.record_id); expect(bundle.optional_source_snippets[0].text).toHaveLength(100); expect(entry).not.toHaveProperty("source_hydration"); }
+      if (!stream.next_cursor) break;
+      page = await createEngine().continue({ cursor: stream.next_cursor, response_budget: budget });
+    } while (ids.length <= 5);
+    expect(ids).toEqual(records.map((record) => record.record_id));
+  });
+
+  it("does not hide an unresolved explicit seed", async () => {
+    const port = new CanonicalRecordQueryDataPort(stubPort({ records_by_ids: async () => [] }));
+    await expect(port.execute({ operation_id: "core:build_context", result_streams: ["context"], scope, arguments: { task: "Fix feature", facets: ["definitions"], seeds: [{ subject_type: "record", record_id: "missing" }] } })).rejects.toMatchObject({ code: "core:selector_unresolvable" });
+  });
+
+  it("retains every declaration for an unanchored symbol seed in broad context", async () => {
+    const generated = stubRecord("rec-seed-js", "artv-js", { name: "Feature", path: "lib/feature.js", start: 0, end: 8 });
+    const authored = stubRecord("rec-seed-ts", "artv-ts", { name: "Feature", path: "src/feature.ts", start: 0, end: 8 });
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records_by_name: async (_scope, name) => name === "Feature" ? [generated, authored] : [],
+      records_by_ids: async () => [],
+      graph_edges_by_subject_ids: async () => [],
+    }));
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      result_streams: ["context"],
+      scope,
+      arguments: { task: "Feature", facets: ["definitions"], seeds: [{ subject_type: "symbol", name: "Feature" }] },
+    });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([authored.record_id, generated.record_id]);
+  });
+
+  it("defers source hydration until a page and honors the requested body budget", async () => {
+    const record = stubRecord("body-record", "artv-1", { name: "Feature", start: 0, end: 3000 });
+    let reads = 0;
+    const port = new CanonicalRecordQueryDataPort(stubPort({ records_by_name: async () => [record], records_by_ids: async () => [], graph_edges_by_subject_ids: async () => [], artifact_text: async () => { reads++; return { text: "x".repeat(3000) }; } }));
+    const evaluation = await port.execute({ operation_id: "core:build_context", result_streams: ["context"], scope, arguments: { task: "Feature", query_class: "identifier", facets: ["definitions"] }, source_options: { mode: "body", max_characters_per_snippet: 5000, max_total_characters: 5000, context_lines: 0 } });
+    expect(reads).toBe(0);
+    const item = evaluation.streams["context"]![0] as import("../packages/engine/src/query-operators.js").QueryStreamItem;
+    const hydrated = await port.hydrate_item(item, 0);
+    expect((hydrated!.value as any).optional_source_snippets[0].text).toHaveLength(3000);
+    expect(reads).toBe(1);
+  });
+
   it("resolves task identifiers through bounded point lookups without materializing the full corpus", async () => {
     const registry = stubRecord("rec-registry", "artv-1", { path: "src/languageFeatureRegistry.ts", name: "LanguageFeatureRegistry", start: GREET_START, end: GREET_END });
     const event = stubRecord("rec-event", "artv-1", { path: "src/languageFeatureRegistry.ts", name: "onDidChange", start: FAREWELL_START, end: FAREWELL_END });
@@ -1809,7 +1921,7 @@ describe("CanonicalRecordQueryDataPort core:build_context", () => {
     const bundles = contextItems.map((entry) => entry.value as { readonly result_set: string; readonly primary_result: { readonly record_id?: string }; readonly optional_source_snippets: readonly unknown[] });
     expect(bundles.map((bundle) => bundle.primary_result.record_id)).toEqual(["rec-registry", "rec-event"]);
     expect(bundles.every((bundle) => bundle.result_set === "context")).toBe(true);
-    expect(bundles.every((bundle) => bundle.optional_source_snippets.length > 0)).toBe(true);
+    expect(bundles.every((bundle) => bundle.optional_source_snippets.length === 0)).toBe(true);
   });
 
   it("expands the tests facet through indexed covers edges with stable deduplication and ordering", async () => {
@@ -1847,19 +1959,192 @@ describe("CanonicalRecordQueryDataPort core:build_context", () => {
 
     const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
     expect(items.map((item) => item.value.primary_result.record_id)).toEqual(["rec-test-a", "rec-test-b", "rec-subject"]);
-    expect(graphCalls).toBe(2);
-    expect(items.slice(1).every((item) => item.value.provenance_path.length === 0)).toBe(true);
-    expect(items.slice(1).every((item) => item.value.optional_source_snippets.length > 0)).toBe(true);
+    expect(graphCalls).toBe(3);
+    expect(items[0]!.value.provenance_path.length).toBeGreaterThan(0);
+    expect(items.slice(1).every((item) => item.value.optional_source_snippets.length === 0)).toBe(true);
   });
 
-  it("finds tests through an indexed caller when the resolved subject has no direct coverage", async () => {
+  it("adds exact lexical test evidence around a resolved symbol when covers edges do not expose the test", async () => {
+    const subject = stubRecord("rec-subject-lexical", "artv-source", { path: "src/feature.ts", name: "Feature", start: 0, end: 8 });
+    const testArtifact = { ...stubRecord("artifact-record:artv-test", "artv-test", { path: "tests/feature.spec.ts" }), category: "artifact_subject", kind: "core:source_file", universal_kind: "core:artifact" };
+    const testPrefix = "before\n".repeat(30);
+    const testBody = "test(() => {\n  Feature();\n  first();\n  second();\n  third();\n  verifyResult();\n});\n";
+    const testSource = `${testPrefix}${testBody}after\n`;
+    // Production JS/TS records describe executable declarations through the
+    // universal kind even when their plugin kind does not contain the words
+    // "callable" or "declaration". Context hydration must still select this
+    // smallest enclosing function instead of falling back to a few lines
+    // around the lexical match.
+    const testCallable = {
+      ...stubRecord("rec-test-callable", "artv-test", { path: "tests/feature.spec.ts", name: "uses Feature", start: testPrefix.length, end: testPrefix.length + testBody.length }),
+      kind: "jsts:entity_function",
+      universal_kind: "core:function",
+    };
+    const sourceArtifact = { ...stubRecord("artifact-record:artv-source", "artv-source", { path: "src/feature.ts" }), category: "artifact_subject", kind: "core:source_file", universal_kind: "core:artifact" };
+    let lexicalFilters: unknown;
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "Feature" ? [subject] : [],
+      records_by_ids: async () => [],
+      graph_edges_by_subject_ids: async () => [],
+      search_lexical_page: async (_scope, pattern, _mode, options) => {
+        lexicalFilters = options?.filters;
+        return { capability: "indexed", matches: pattern === "Feature" ? [
+          { artifact_id: "art-test", artifact_version_id: "artv-test", offsets: [testSource.indexOf("Feature")], line_spans: [{ start_line: "32", end_line: "32" }] },
+        ] : [] };
+      },
+      records_by_artifact_versions: async (_scope, ids) => [testArtifact, sourceArtifact].filter((record) => ids.includes(record.owner_artifact_version_id)),
+      records_by_owner_artifact_versions: async (_scope, ids) => ids.includes("artv-test") ? [testArtifact, testCallable] : [],
+      artifact_text: async (_scope, version) => version === "artv-test" ? { text: testSource } : { text: "export function Feature() {}" },
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Feature", query_class: "identifier", facets: ["definitions", "tests"] },
+      source_options: { mode: "relevant", max_characters_per_snippet: 120, max_total_characters: 1_000, context_lines: 2 },
+      scope,
+    });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any; readonly source_hydration?: unknown }>;
+
+    expect(items.map((item) => item.value.primary_result.record_id ?? item.value.primary_result.artifact_version_id)).toEqual([subject.record_id, "artv-test"]);
+    expect(lexicalFilters).toMatchObject({ test_artifacts_only: true });
+    expect(items[1]!.value.assessment.classification).toBe("possible");
+    expect(items[1]!.value.primary_result.source_span).toMatchObject({ artifact_version_id: "artv-test", start_byte: String(testSource.indexOf("Feature")), start_line: "32" });
+    expect((items[1] as any).source_hydration.record.record_id).toBe(testCallable.record_id);
+    const hydrated = await port.hydrate_item(items[1] as any, 0);
+    expect((hydrated!.value as any).optional_source_snippets[0].text).toContain("Feature();");
+    expect((hydrated!.value as any).optional_source_snippets[0].text).toContain("verifyResult();");
+  });
+
+  it("keeps lexical test hydration centered on the exact match when anonymous tests have no callable record", async () => {
+    const subject = stubRecord("rec-subject-anonymous-test", "artv-source", { path: "src/feature.ts", name: "Feature", start: 0, end: 8 });
+    const prefix = "before();\n".repeat(30);
+    const testBody = "test('feature', async () => {\n  Feature();\n  await exercise();\n  expect(result).toBe(expected);\n});\n";
+    const testSource = `${prefix}${testBody}after();\n`;
+    const offset = testSource.indexOf("Feature");
+    const testArtifact = { ...stubRecord("artifact-record:artv-test", "artv-test", { path: "tests/feature.spec.ts" }), category: "artifact_subject", kind: "core:source_file", universal_kind: "core:artifact" };
+    const moduleRecord = { ...stubRecord("rec-test-module", "artv-test", { path: "tests/feature.spec.ts", name: "tests/feature.spec.ts", start: 0, end: testSource.length }), kind: "jsts:entity_container", universal_kind: "core:container" };
+    const referenceRecord = { ...stubRecord("rec-test-reference", "artv-test", { path: "tests/feature.spec.ts", start: offset, end: offset + "Feature".length }), category: "relation", kind: "jsts:relation_references", universal_kind: "core:references" };
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "Feature" ? [subject] : [],
+      records_by_ids: async () => [],
+      graph_edges_by_subject_ids: async () => [],
+      search_lexical_page: async () => ({ capability: "indexed", matches: [{ artifact_id: "art-test", artifact_version_id: "artv-test", offsets: [offset], line_spans: [{ start_line: "3", end_line: "3" }] }] }),
+      records_by_artifact_versions: async (_scope, ids) => ids.includes("artv-test") ? [testArtifact] : [],
+      records_by_owner_artifact_versions: async (_scope, ids) => ids.includes("artv-test") ? [referenceRecord, moduleRecord] : [],
+      artifact_text: async (_scope, version) => version === "artv-test" ? { text: testSource } : { text: "export function Feature() {}" },
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context", operation_version: 1, result_streams: ["context"],
+      arguments: { task: "Feature", query_class: "identifier", facets: ["definitions", "tests"] },
+      source_options: { mode: "relevant", max_characters_per_snippet: 1_000, max_total_characters: 2_000, context_lines: 4 }, scope,
+    });
+    const item = (evaluation.streams["context"] ?? [])[1] as any;
+
+    expect(item.source_hydration.record.record_id).not.toBe(moduleRecord.record_id);
+    expect(item.source_hydration.record.primary_source_span).toMatchObject({
+      start_byte: String(offset),
+      end_byte: String(offset + "Feature".length),
+    });
+    const hydrated = await port.hydrate_item(item, 0);
+    expect(hydrated).toBeDefined();
+    const hydratedValue = hydrated!.value as { readonly optional_source_snippets: readonly { readonly text: string }[] };
+    const hydratedText = hydratedValue.optional_source_snippets[0]!.text;
+    expect(hydratedText).toContain("test('feature', async () => {");
+    expect(hydratedText).toContain("expect(result).toBe(expected);");
+    expect(hydratedText.length).toBeLessThan(testSource.length);
+    expect(hydratedText.match(/before\(\);/gu)?.length ?? 0).toBeLessThanOrEqual(4);
+  });
+
+  it("retains distinct lexical test occurrences from the same artifact", async () => {
+    const subject = stubRecord("rec-subject-repeated-test", "artv-source", { path: "src/feature.ts", name: "Feature", start: 0, end: 8 });
+    const firstBody = "test('first case', () => {\n  Feature();\n  firstAssertion();\n});\n";
+    const spacer = "unrelated();\n".repeat(20);
+    const secondBody = "test('second case', () => {\n  Feature();\n  secondAssertion();\n});\n";
+    const testSource = `${firstBody}${spacer}${secondBody}`;
+    const firstOffset = testSource.indexOf("Feature");
+    const secondOffset = testSource.lastIndexOf("Feature");
+    const testArtifact = { ...stubRecord("artifact-record:artv-test", "artv-test", { path: "tests/feature.spec.ts" }), category: "artifact_subject", kind: "core:source_file", universal_kind: "core:artifact" };
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "Feature" ? [subject] : [],
+      records_by_ids: async () => [],
+      graph_edges_by_subject_ids: async () => [],
+      search_lexical_page: async () => ({ capability: "indexed", matches: [{ artifact_id: "art-test", artifact_version_id: "artv-test", offsets: [firstOffset, secondOffset], line_spans: [{ start_line: "2", end_line: "2" }, { start_line: "26", end_line: "26" }] }] }),
+      records_by_artifact_versions: async (_scope, ids) => ids.includes("artv-test") ? [testArtifact] : [],
+      records_by_owner_artifact_versions: async () => [],
+      artifact_text: async (_scope, version) => version === "artv-test" ? { text: testSource } : { text: "export function Feature() {}" },
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context", operation_version: 1, result_streams: ["context"],
+      arguments: { task: "Feature", query_class: "identifier", facets: ["definitions", "tests"] },
+      source_options: { mode: "relevant", max_characters_per_snippet: 1_000, max_total_characters: 4_000, context_lines: 2 }, scope,
+    });
+    const lexicalItems = ((evaluation.streams["context"] ?? []) as readonly any[]).filter((item) => item.value.primary_result.body?.matched_symbol === "Feature");
+
+    expect(lexicalItems).toHaveLength(2);
+    expect(lexicalItems.map((item) => item.value.primary_result.source_span.start_byte)).toEqual([String(firstOffset), String(secondOffset)]);
+    const hydrated = await Promise.all(lexicalItems.map((item) => port.hydrate_item(item, 0)));
+    expect((hydrated[0]!.value as any).optional_source_snippets[0].text).toContain("firstAssertion");
+    expect((hydrated[1]!.value as any).optional_source_snippets[0].text).toContain("secondAssertion");
+  });
+
+  it("uses named declarations from the same indexed artifact to locate executable test examples", async () => {
+    const subject = stubRecord("rec-subject-sibling", "artv-source", { path: "src/feature.ts", name: "affectedFeature", start: 40, end: 80 });
+    const sibling = stubRecord("rec-sibling", "artv-source", { path: "src/feature.ts", name: "featureStateForTest", start: 0, end: 30 });
+    const unrelatedSibling = stubRecord("rec-unrelated-sibling", "artv-source", { path: "src/feature.ts", name: "internalImplementationDetail", start: 90, end: 120 });
+    const testArtifact = { ...stubRecord("artifact-record:artv-test", "artv-test", { path: "tests/feature.spec.ts" }), category: "artifact_subject", kind: "core:source_file", universal_kind: "core:artifact" };
+    const lessRelevantTestArtifact = { ...stubRecord("artifact-record:artv-a-watch", "artv-a-watch", { path: "tests/watch.spec.ts" }), category: "artifact_subject", kind: "core:source_file", universal_kind: "core:artifact" };
+    const searched: string[] = [];
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "affectedFeature" ? [subject] : [],
+      records_by_ids: async () => [],
+      graph_edges_by_subject_ids: async () => [],
+      records_by_owner_artifact_versions: async (_scope, versions) => versions.includes("artv-source") ? [subject, sibling, unrelatedSibling] : [],
+      search_literal: async (_scope, pattern) => {
+        searched.push(pattern);
+        return pattern === "featureStateForTest" ? [
+          { artifact_id: "art-watch", artifact_version_id: "artv-a-watch", offsets: [14], line_spans: [{ start_line: "2", end_line: "2" }] },
+          { artifact_id: "art-test", artifact_version_id: "artv-test", offsets: [14], line_spans: [{ start_line: "2", end_line: "2" }] },
+        ] : [];
+      },
+      records_by_artifact_versions: async (_scope, ids) => [lessRelevantTestArtifact, testArtifact].filter((record) => ids.includes(record.owner_artifact_version_id)),
+      artifact_text: async (_scope, version) => version === "artv-test" || version === "artv-a-watch" ? { text: "test(() => { featureStateForTest(); });\n" } : { text: "export const featureStateForTest = () => {};\nexport function affectedFeature() {}\n" },
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Change affectedFeature", query_class: "identifier", facets: ["definitions", "tests"] },
+      source_options: { mode: "relevant", max_characters_per_snippet: 1_000, max_total_characters: 4_000, context_lines: 2 },
+      scope,
+    });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any; readonly source_hydration?: unknown }>;
+
+    expect(items.map((item) => item.value.primary_result.record_id ?? item.value.primary_result.artifact_version_id)).toEqual([subject.record_id, "artv-test", "artv-a-watch"]);
+    expect(searched).toContain("featureStateForTest");
+    expect(searched).not.toContain("internalImplementationDetail");
+    const hydrated = await port.hydrate_item(items[1] as any, 0);
+    expect((hydrated!.value as any).optional_source_snippets[0].text).toContain("featureStateForTest");
+  });
+
+  it.each([false, true])("finds caller tests even when direct coverage exists (%s)", async (directCoverage) => {
     const subject = stubRecord("rec-subject-indirect", "artv-1", { path: "src/feature.ts", name: "Feature", start: 0, end: 8 });
     const caller = { ...stubRecord("rec-caller-indirect", "artv-1", { path: "src/consumer.ts", name: "consume", start: 0, end: 8 }), kind: "call_expression", universal_kind: "core:call" };
     const test = stubRecord("rec-test-indirect", "artv-1", { path: "test/feature.ts", name: "feature test", start: 0, end: 8 });
-    const records = new Map([subject, caller, test].map((record) => [record.record_id, record]));
+    const directTest = stubRecord("rec-test-direct", "artv-1", { path: "test/direct.ts", name: "direct test", start: 0, end: 8 });
+    const records = new Map([subject, caller, test, directTest].map((record) => [record.record_id, record]));
     const edges = [
       { edge_id: "edge-call", source_subject_id: caller.record_id, target_subject_id: subject.record_id, relation_record_id: "rel-call", relation_kind: "core:call", role: "", evidence_class: "confirmed" },
       { edge_id: "edge-cover", source_subject_id: test.record_id, target_subject_id: caller.record_id, relation_record_id: "rel-cover", relation_kind: "core:covers", role: "", evidence_class: "confirmed" },
+      ...(directCoverage ? [{ edge_id: "edge-direct-cover", source_subject_id: directTest.record_id, target_subject_id: subject.record_id, relation_record_id: "rel-direct-cover", relation_kind: "core:covers", role: "", evidence_class: "confirmed" }] : []),
     ];
     const port = new CanonicalRecordQueryDataPort(stubPort({
       records: async () => { throw new Error("full corpus must not be read"); },
@@ -1916,10 +2201,10 @@ describe("CanonicalRecordQueryDataPort core:build_context", () => {
     const evaluation = await port.execute({ operation_id: "core:build_context", operation_version: 1, result_streams: ["context"], arguments: { task: "Feature0", query_class: "identifier", facets: ["tests"] }, scope });
     const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
     expect(items.map((item) => item.value.primary_result.record_id)).toEqual([test.record_id, ...subjects.map((subject) => subject.record_id)]);
-    expect(graphCalls).toBe(2);
+    expect(graphCalls).toBe(3);
   });
 
-  it("keeps explicit seeds, definitions, and indexed tests ahead of callers", async () => {
+  it("keeps an explicit seed authoritative instead of widening from incidental task identifiers", async () => {
     const seed = stubRecord("rec-seed", "artv-1", { name: "Target", path: "src/target.ts", start: 0, end: 8 });
     const caller = { ...stubRecord("rec-caller", "artv-1", { name: "caller", path: "src/caller.ts", start: 0, end: 8 }), kind: "call_expression", universal_kind: "core:call" };
     const test = stubRecord("rec-test", "artv-1", { name: "target test", path: "test/target.ts", start: 0, end: 8 });
@@ -1927,27 +2212,120 @@ describe("CanonicalRecordQueryDataPort core:build_context", () => {
     const port = new CanonicalRecordQueryDataPort(stubPort({
       records: async () => { throw new Error("full corpus must not be read"); },
       records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
-      records_by_name: async (_scope, name) => name === "Caller" ? [caller] : [],
+      records_by_name: async (_scope, name) => { throw new Error(`task identifier must only rank explicit-seed context: ${name}`); },
       graph_edges_by_subject_ids: async (_scope, ids) => ids.includes(seed.record_id) ? [{ edge_id: "edge-test", source_subject_id: test.record_id, target_subject_id: seed.record_id, relation_record_id: "rel-test", relation_kind: "core:covers", role: "", evidence_class: "confirmed" }] : [],
     }));
     const evaluation = await port.execute({ operation_id: "core:build_context", operation_version: 1, result_streams: ["context"], arguments: { task: "Caller", query_class: "identifier", seeds: [{ subject_type: "record", record_id: seed.record_id }], facets: ["definitions", "tests"] }, scope });
     const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
-    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([seed.record_id, test.record_id, caller.record_id]);
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([seed.record_id, test.record_id]);
   });
 
-  it("returns a bounded empty context when no point-lookup capability is available", async () => {
+  it("puts tests after the primary task declaration and before secondary task declarations", async () => {
+    const primary = stubRecord("rec-primary", "artv-primary", { name: "primaryTarget", path: "src/primary.ts", start: 0, end: 8 });
+    const secondary = stubRecord("rec-secondary", "artv-secondary", { name: "secondaryTarget", path: "src/secondary.ts", start: 0, end: 8 });
+    const test = stubRecord("rec-test", "artv-test", { name: "Primary test", path: "test/primary.spec.ts", start: 0, end: 8 });
+    const records = new Map([primary, secondary, test].map((record) => [record.record_id, record]));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "primaryTarget" ? [primary] : name === "secondaryTarget" ? [secondary] : [],
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      graph_edges_by_subject_ids: async (_scope, ids) => ids.includes(primary.record_id) ? [{ edge_id: "edge-test", source_subject_id: test.record_id, target_subject_id: primary.record_id, relation_record_id: "rel-test", relation_kind: "core:covers", role: "", evidence_class: "confirmed" }] : [],
+    }));
+    const evaluation = await port.execute({ operation_id: "core:build_context", operation_version: 1, result_streams: ["context"], arguments: { task: "Change primaryTarget and secondaryTarget", query_class: "identifier", facets: ["definitions", "tests"] }, scope });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([primary.record_id, test.record_id, secondary.record_id]);
+  });
+
+  it("puts requested tests before unnamed wrappers returned with the primary declaration", async () => {
+    const wrapper = {
+      ...stubRecord("rec-wrapper", "artv-primary", { path: "src/primary.ts", start: 0, end: 80 }),
+      category: "artifact_subject",
+      kind: "core:source_file",
+      universal_kind: "core:artifact",
+    };
+    const primary = stubRecord("rec-primary", "artv-primary", { name: "primaryTarget", path: "src/primary.ts", start: 20, end: 40 });
+    const test = stubRecord("rec-test", "artv-test", { name: "Primary test", path: "test/primary.spec.ts", start: 0, end: 8 });
+    const records = new Map([wrapper, primary, test].map((record) => [record.record_id, record]));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "primaryTarget" ? [wrapper, primary] : [],
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      graph_edges_by_subject_ids: async (_scope, ids) => ids.includes(primary.record_id) || ids.includes(wrapper.record_id)
+        ? [{ edge_id: "edge-test", source_subject_id: test.record_id, target_subject_id: primary.record_id, relation_record_id: "rel-test", relation_kind: "core:covers", role: "", evidence_class: "confirmed" }]
+        : [],
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Change primaryTarget", query_class: "identifier", facets: ["definitions", "tests"] },
+      scope,
+    });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+
+    expect(items.map((item) => item.value.primary_result.record_id ?? item.value.primary_result.artifact_version_id)).toEqual([primary.record_id, test.record_id, wrapper.owner_artifact_version_id]);
+  });
+
+  it("places authored typed declarations before JavaScript duplicates without dropping either result", async () => {
+    const generated = { ...stubRecord("rec-js", "artv-js", { name: "Target", path: "out/target.js", start: 0, end: 8, language: "javascript" }), body: { language: "javascript" } };
+    const authored = { ...stubRecord("rec-ts", "artv-ts", { name: "Target", path: "src/target.ts", start: 0, end: 8, language: "typescript" }), body: { name: "Target", language: "typescript" } };
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "Target" ? [generated, authored] : [],
+      records_by_ids: async () => [],
+      records_by_artifact_versions: async (_scope, versions) => versions.map((version) => stubRecord(`artifact-${version}`, version, { path: version === "artv-ts" ? "src/target.ts" : "out/target.js", start: 0, end: 8 })),
+      graph_edges_by_subject_ids: async () => [],
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Target", query_class: "identifier", facets: ["definitions"] },
+      scope,
+    });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([authored.record_id, generated.record_id]);
+  });
+
+  it("places requested tests before generated duplicates of an unanchored symbol seed", async () => {
+    const generated = stubRecord("rec-js", "artv-js", { name: "Target", path: "lib/target.js", start: 0, end: 8, language: "javascript" });
+    const authored = stubRecord("rec-ts", "artv-ts", { name: "Target", path: "src/target.ts", start: 0, end: 8, language: "typescript" });
+    const test = stubRecord("rec-test", "artv-test", { name: "Target test", path: "test/target.spec.ts", start: 0, end: 8, language: "typescript" });
+    const records = new Map([generated, authored, test].map((record) => [record.record_id, record]));
+    const port = new CanonicalRecordQueryDataPort(stubPort({
+      records: async () => { throw new Error("full corpus must not be read"); },
+      records_by_name: async (_scope, name) => name === "Target" ? [generated, authored] : [],
+      records_by_ids: async (_scope, ids) => ids.flatMap((id) => records.get(id) === undefined ? [] : [records.get(id)!]),
+      graph_edges_by_subject_ids: async (_scope, ids) => ids.some((id) => id === authored.record_id || id === generated.record_id) ? [{ edge_id: "edge-test", source_subject_id: test.record_id, target_subject_id: authored.record_id, relation_record_id: "rel-test", relation_kind: "core:covers", role: "", evidence_class: "confirmed" }] : [],
+    }));
+
+    const evaluation = await port.execute({
+      operation_id: "core:build_context",
+      operation_version: 1,
+      result_streams: ["context"],
+      arguments: { task: "Target", query_class: "identifier", facets: ["definitions", "tests"], seeds: [{ subject_type: "symbol", name: "Target" }] },
+      scope,
+    });
+    const items = (evaluation.streams["context"] ?? []) as ReadonlyArray<{ readonly value: any }>;
+
+    expect(items.map((item) => item.value.primary_result.record_id)).toEqual([authored.record_id, test.record_id, generated.record_id]);
+  });
+
+  it("reports unresolved task discovery without scanning the corpus", async () => {
     const port = new CanonicalRecordQueryDataPort(stubPort({
       records: async () => { throw new Error("full corpus must not be read"); },
       records_for_query: async () => { throw new Error("query corpus must not be read"); },
     }));
-    const evaluation = await port.execute({
+    await expect(port.execute({
       operation_id: "core:build_context",
       operation_version: 1,
       result_streams: ["context"],
       arguments: { task: "Improve registry notifications", facets: ["definitions"] },
       scope,
-    });
-    expect(evaluation.streams["context"]).toEqual([]);
+    })).rejects.toMatchObject({ code: "core:selector_unresolvable" });
   });
 });
 

@@ -1,7 +1,7 @@
 # Urdira Product Foundation
 
 Status: Current product contract
-Last updated: 2026-09-09
+Last updated: 2026-09-14
 
 ## Purpose of this document
 
@@ -56,7 +56,7 @@ Decisions 21, 22 and 25 and the [structural indexing fast path](protocol/structu
 The 2026-09 v4 cutover (Decisions 26-29) replaces the v3 native pipeline's
 scan orchestration, structural storage, and digesting with a Rust-owned
 worker and its own mmap-served structural store for newly added workspaces,
-while retaining the public query API and five-tool MCP surface; the linked
+while retaining the public query API and three-tool MCP surface; the linked
 contracts describe the additive operations and format-specific behavior. An
 already-registered v3 workspace keeps working as v3
 (`URDIRA_V4=0` opts a new workspace out). The accompanying handoff and
@@ -340,9 +340,13 @@ The approved MCP surface is:
 
 - `urdira_query`: execute an individual operation, composed pipeline, or named investigation recipe.
 - `urdira_context`: convenience wrapper over `core:build_context` with a structural wait default.
-- `urdira_analyze_change`: analyze an existing or hypothetical change through a focused schema.
-- `urdira_build_context`: build a bounded context package for a coding task.
 - `urdira_index_status`: report repository, revision, capability, and freshness information.
+
+Impact analysis remains available as `core:analyze_impact` through
+`urdira_query`; explicit context construction remains available through
+`urdira_context` and `core:build_context`. Keeping these capabilities behind
+the two general entry points avoids advertising duplicate schemas on every
+model turn.
 
 The formal schemas and adapter behavior are defined by the query and daemon specifications.
 

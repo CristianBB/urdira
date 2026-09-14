@@ -1,6 +1,6 @@
 # Current implementation and evidence
 
-Reviewed: 2026-09-09. This is an implementation inventory, not a new product
+Reviewed: 2026-09-14. This is an implementation inventory, not a new product
 contract or a release certification. Follow the [product foundation](product-foundation.md)
 for normative decisions and the [architecture map](architecture.md) for code paths.
 
@@ -39,7 +39,8 @@ See [versioning](versioning.md) for format selection and outdated-data recovery.
 | Semantic retrieval | Exact generation/provider-bound vector scans; resident contiguous-buffer native top-K for eligible float32 lanes; exact filtered/chunked fallback; explicit coverage and affected-set pagination | [Decision 06](decisions/06-semantic-search-ranking.md), [semantic registry](semantic/core-semantic-reasons.md) |
 | Daemon lifecycle | Scan failure becomes visible degraded state; last valid snapshot remains available subject to admission; startup detects orphaned data; explicit purge rechecks eligibility | [Administration contract](protocol/workspace-administration-contract.md), [robustness evidence](evidence/2026-09-08-v4-daemon-robustness.md) |
 | Index packs | Explicit v4 export/import is daemon/CLI-wired; binary pack preserves native data, rekeys catalog workspace identity and reconciles destination source; no pack registry or automatic network distribution | [Decisions 23](decisions/23-index-pack.md) / [30](decisions/30-index-pack-distribution.md) |
-| Agent and human interfaces | Five read-only MCP tools, explicit query scope, compact default text, opt-in snippets; CLI administration and foreground loopback web interface | [MCP contract](protocol/mcp-adapter-contract.md), [README](../README.md) |
+| Agent context delivery | Explicit-seed context roots, deterministic definition/caller/test ordering, page-local source sharing, exact source identity, envelope-aware page fitting, and immutable portable continuations | [Decision 19](decisions/19-agent-search-integration.md), [Public query contract](protocol/public-query-contract.md) |
+| Agent and human interfaces | Three read-only MCP tools; prompt and pre-tool hooks for supported agents; explicit query scope, compact default text, client-controlled context budgets; CLI administration and foreground loopback web interface | [MCP contract](protocol/mcp-adapter-contract.md), [README](../README.md) |
 
 `core:index_status` is a top-level status operation. Attempting to evaluate it
 through the subject-producing query engine is rejected with
@@ -68,9 +69,12 @@ set-identity rules, not arbitrary entity selections.
 - **macOS watchers have a file-descriptor budget.** Automatic selection uses
   kqueue for small workspaces and fs-events above 2,000 files; an explicit
   backend override can change that selection.
-- **Snippets default to zero.** The MCP `snippet_lines` rendering option is
-  opt-in (0–3). Larger source retrieval remains controlled by query snippets
-  and source-operation arguments.
+- **Ordinary compact snippets default to zero.** The MCP `snippet_lines`
+  rendering option is opt-in (0–3). `urdira_context` separately defaults to a
+  6,000-character per-snippet projection, 30,000 source characters, 20 context
+  lines, a 40,000-character response page and the public 50-item response
+  default. Every value is a replaceable client option; logical membership is
+  not truncated to satisfy those hydration and page choices.
 
 ## Retained performance evidence
 
@@ -90,10 +94,31 @@ do not combine them into a single SLA or an unqualified v3/v4 speedup.
 | n8n semantic / hybrid queries | p99 **134.99 / 178.33 ms**, from **1,722.2 / 2,192.7 ms** | Warm, fully embedded corpus; 20 requests per operation after warm-up; no path filter/snippets; explicit 3-shard harness; historical baseline reused | [S-I](evidence/2026-09-08-v4-semantic-native-scan-latency.md) |
 | VS Code pack | **25.459 s** import-plus-no-op-reconcile; **1.57 GB** compressed pack | Transfer at 50 MB/s adds ~31.42 s; fails the half-cold-time distribution gate | [Decision 30](decisions/30-index-pack-distribution.md) |
 
+### Current directed agent-context evidence
+
+The latest accepted Urdira-only samples use frozen tasks, `gpt-5.6-luna`,
+structural readiness and fully disabled semantic indexing. A served prompt or
+pre-tool hook counts as Urdira use. Competitor values are retained medians from
+the frozen comparison campaign and were not rerun.
+
+| Repository | Accepted Urdira sample | Correctness | Structural readiness | Comparable tokens | Retained baseline | Reduction |
+|---|---:|---|---:|---:|---:|---:|
+| Playwright | v72 | strict grader; independent focused validation 2/2 | **4.917 s** | **569,904** | 628,159 | **9.3%** |
+| Prisma | v69 | strict grader; 260 independent tests and typecheck | **7.424 s** | **666,427** | 882,221 | **24.5%** |
+| VS Code | v86 | strict grader and independent validation; frozen Luna task, structural-only readiness and semantic off | **29,536 ms (29.536 s)** | **970,632** | 1,193,155 | **18.7%** |
+
+Playwright v72 and Prisma v69 are accepted samples from the same context-density
+campaign. VS Code v86 is the accepted post-repair provider sample after the
+earlier v70 integration failure; it uses the task-matched provider baseline
+median of 1,193,155 comparable tokens. V86 is one directed observation, not a
+statistical ranking across repositories. See the [v69/v70 record](evidence/2026-09-13-current-urdira-context-density-benchmark.md#current-prisma-v69-and-vs-code-v70-samples),
+[v71/v72 record](evidence/2026-09-14-agent-context-density.md), and
+[V86 evidence](evidence/2026-09-14-prompt-hook-context-reuse.md).
+
 The August agent-comparison reports remain useful historical evidence but
-predate v4 and its September query fixes. None is a current v4 comparative
-agent rerun. The September 8 snippet experiment retained the default of no
-inline snippets; see [snippet evidence](evidence/2026-09-08-agent-benchmark-inline-snippets.md).
+predate v4 and its September query fixes. The September 8 snippet experiment
+retained the ordinary compact-renderer default of no inline snippets; see
+[snippet evidence](evidence/2026-09-08-agent-benchmark-inline-snippets.md).
 
 ## Limitations and open work
 
@@ -120,9 +145,14 @@ inline snippets; see [snippet evidence](evidence/2026-09-08-agent-benchmark-inli
   provider identity require separate validation. `metric` has no producer
   and uses the empty-set root. The manifest carries records/dependency roots;
   graph/metric roots also live in tree files and catalog rows.
-- Page budgeting now counts item characters and clamps daemon allowances,
-  but a first oversized item or encoded envelope can still exceed the wire
-  bound; see [query implementation notes](protocol/public-query-contract.md#current-implementation-notes-paging-and-status).
+- Page fitting measures the rendered MCP envelope and may expose a smaller
+  prefix of the same immutable execution. An individually oversized source
+  projection still fails explicitly with its required minimum and a valid
+  recovery path; it is never omitted and reported as complete.
+- The accepted Playwright, Prisma, and VS Code context-density rows are one
+  sample per task. VS Code v86 is the post-repair provider observation; its
+  task-matched token comparison is directional evidence, not a statistical
+  claim about all workspaces.
 - The v4 raw structural-addon loader and unremeasured fork-envelope checks
   remain documented integration/verification limitations. Explicit pack
   import/export is wired; automatic v4 donor-fork selection is a separate path.

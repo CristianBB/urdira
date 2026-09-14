@@ -24,7 +24,7 @@ export {
 export { decodeRow as decodeCanonicalQueryRecordRow, type RecordRow as CanonicalQueryRecordRow } from "./query-record-decode.js";
 export { NativeCanonicalQuerySnapshotPort } from "./native-query-snapshot-port.js";
 export { convertV3WorkspaceToNativeStore, type ConvertV3WorkspaceToNativeStoreOptions, type ConvertV3WorkspaceToNativeStoreResult } from "./native-store-convert.js";
-export { loadNativeStructuralStoreAddon, resetNativeStructuralStoreAddonCacheForTests, type NativeStructuralStoreAddon } from "./native-structural-store-binding.js";
+export { configureNativeStructuralStoreAddonPath, loadNativeStructuralStoreAddon, resetNativeStructuralStoreAddonCacheForTests, type NativeStructuralStoreAddon } from "./native-structural-store-binding.js";
 export {
   onRustWorkspaceUpgradeCompleted,
   runRustWorkspaceScan,

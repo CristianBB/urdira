@@ -49,6 +49,45 @@ describe("Phase 12 closed CLI", () => {
     expect(() => parseCliArgs(["status", "--payload", "{}"])).toThrowError(CliError);
   });
 
+  it("routes a literal MORE envelope through query continuation", async () => {
+    const calls: Array<{ readonly call: string; readonly payload: unknown }> = [];
+    const continuationClient: CliDaemonClient = { call: vi.fn(async (call, payload) => {
+      calls.push({ call, payload });
+      return { outcome: "success", payload: { continued: true } };
+    }) };
+    const continuation = {
+      request_type: "continuation",
+      continuation: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        cursor: "opaque-cursor",
+        response_budget: { max_items: 50, max_characters: 40_000 },
+      },
+    };
+
+    await expect(runCli(["query", "--payload", JSON.stringify(continuation)], { client: continuationClient })).resolves.toMatchObject({ exit_code: 0, data: { continued: true } });
+    expect(calls).toEqual([{ call: "core:query_continue", payload: continuation.continuation }]);
+  });
+
+  it("routes an MCP-shaped query envelope through the ordinary CLI query command", async () => {
+    const calls: Array<{ readonly call: string; readonly payload: unknown }> = [];
+    const queryClient: CliDaemonClient = { call: vi.fn(async (call, payload) => {
+      calls.push({ call, payload });
+      return { outcome: "success", payload: { queried: true } };
+    }) };
+    const query = {
+      request_type: "query",
+      query: {
+        api_version: 3,
+        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+        expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: {} },
+      },
+    };
+
+    await expect(runCli(["query", "--payload", JSON.stringify(query)], { client: queryClient })).resolves.toMatchObject({ exit_code: 0, data: { queried: true } });
+    expect(calls).toEqual([{ call: "core:query", payload: query.query }]);
+  });
+
   // The current provisioning contract
   // (`docs/decisions/18-semantic-model-provisioning.md`) requires a configure
   // RPC that downloads the embedding model to print

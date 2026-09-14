@@ -291,7 +291,14 @@ export async function buildTaskPlannerWorkspace(language: "javascript" | "typesc
   await opened.publishCandidate(publication);
   // This fixture intentionally exercises legacy body-search compatibility;
   // production adapters must keep the explicit capability boundary.
-  const snapshot = Object.assign(new SqliteCanonicalQuerySnapshotPort(opened.database), { test_only_allow_legacy_full_corpus_fallback: true as const });
+  const sourceText = new Map(fixture.files.map((file) => [file.artifact_version_id, file.text]));
+  const snapshot = Object.assign(new SqliteCanonicalQuerySnapshotPort(opened.database), {
+    test_only_allow_legacy_full_corpus_fallback: true as const,
+    artifact_text: async (_scope: import("@urdira/contracts").QueryScope, version: string) => {
+      const text = sourceText.get(version);
+      return text === undefined ? undefined : { text };
+    },
+  });
   const engine = new QueryEngine({ data_port: new CanonicalRecordQueryDataPort(snapshot), cursor_cache: new CursorCache({ signing_secret: `secret:${workspaceId}` }), now: () => now });
   return {
     workspaceId,

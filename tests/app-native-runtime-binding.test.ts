@@ -106,7 +106,7 @@ vi.mock("../packages/plugin-javascript-typescript/dist/index.js", async (importO
 });
 
 import { defaultDaemonOptions } from "../apps/urdira/src/index.js";
-import { configureNativeExactVectorTopKPort, exactVectorScan } from "../packages/engine/dist/index.js";
+import { configureNativeExactVectorTopKPort, configureNativeStructuralStoreAddonPath, loadNativeStructuralStoreAddon, exactVectorScan } from "../packages/engine/dist/index.js";
 import { createCanonicalPluginDigestAuthority } from "../packages/engine/src/plugin-digest-authority.js";
 import { JAVASCRIPT_TYPESCRIPT_PLUGIN_ID } from "../packages/plugin-javascript-typescript/src/index.js";
 import { pluginRuntimeExecutableBindingDigest } from "@urdira/plugin-sdk";
@@ -129,9 +129,28 @@ afterEach(() => {
   transportState.semantic_stream_requests.length = 0;
   transportState.rust_fact_stream_inputs.length = 0;
   configureNativeExactVectorTopKPort(undefined);
+  configureNativeStructuralStoreAddonPath(undefined);
 });
 
 describe("Urdira application native runtime binding", () => {
+  it("pins structural queries to the application's verified addon closure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-app-structural-binding-"));
+    try {
+      const addonPath = join(root, "verified.cjs");
+      const workerPath = join(root, "worker");
+      const addon = new TextEncoder().encode("exports.NativeStoreBuilder=class VerifiedBuilder {}; exports.NativeStructuralStoreHandle=class VerifiedHandle {};");
+      const worker = new TextEncoder().encode("worker");
+      await writeFile(addonPath, addon);
+      await writeFile(workerPath, worker);
+      nativeState.closure = { target_id: "darwin-arm64", runtime_target_id: "aarch64-apple-darwin", runtime_component_build_id: sha256(addon), addon_path: addonPath, addon_digest: sha256(addon), worker_path: workerPath, worker_digest: sha256(worker) };
+      process.env["URDIRA_NATIVE_REQUIRED"] = "1";
+      process.env["URDIRA_ANALYSIS_POOL"] = "0";
+      const options = await defaultDaemonOptions(root);
+      expect(loadNativeStructuralStoreAddon().NativeStoreBuilder.name).toBe("VerifiedBuilder");
+      await options.analysis_worker_pool_close_all?.();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("keeps the Rust composition worker as the only production owner loop", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-app-indexing-core-cutover-"));
     const workerPath = join(root, "urdira-indexing-worker.mjs");

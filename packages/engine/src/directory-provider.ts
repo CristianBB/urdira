@@ -207,7 +207,7 @@ interface Capture {
 // default keeps source-first indexing focused on executable/declarative code;
 // callers can still opt in explicitly with an include rule. This is the
 // single workspace policy reused by scans, forks, and filesystem watchers.
-export const DEFAULT_WORKSPACE_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
+export const DEFAULT_WORKSPACE_INCLUSION: InclusionRules = { include: [], exclude: ["node_modules/**", ".git/**", "dist/**", "coverage/**", "test-results/**", "tests/baselines/**", "tests/cases/**", ".urdira/**"], allow_external_root: false };
 const DEFAULT_INCLUSION: InclusionRules = DEFAULT_WORKSPACE_INCLUSION;
 const DEFAULT_GITIGNORE: GitIgnoreRules = { enabled: false, patterns: [] };
 // The walk is metadata/hash I/O bound. Sixteen lanes keep directory

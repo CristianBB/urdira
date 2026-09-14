@@ -136,9 +136,11 @@ export interface CanonicalQuerySnapshotPort {
   readonly records_by_selector_page?: (scope: QueryScope, selector: RecordColumnSelector, limit: number, after_record_id?: string) => Promise<{ readonly records: readonly CanonicalQueryRecord[]; readonly next_cursor?: string }>;
   /** Stable cursor pages over the lexical index. Unsupported means the exact
    * requested syntax/filter is outside the indexed contract. */
-  readonly search_lexical_page?: (scope: QueryScope, pattern: string, mode: "literal" | "safe_regex", options?: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly filters?: { readonly path_patterns?: readonly string[]; readonly language?: readonly string[]; readonly namespace?: readonly string[]; readonly kind?: readonly string[]; readonly subject_type?: readonly string[] } }, limit?: number, after_cursor?: string) => Promise<{ readonly capability: "indexed" | "unsupported"; readonly route?: "fts" | "artifact_cas_paged"; readonly index_used?: "lexical_fts" | "artifact_versions_keyset"; readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string; readonly unsupported_reason?: "safe_regex" | "structural_filter" }>;
+  readonly search_lexical_page?: (scope: QueryScope, pattern: string, mode: "literal" | "safe_regex", options?: { readonly case_sensitive?: boolean; readonly word_mode?: "substring" | "identifier" | "token"; readonly filters?: { readonly path_patterns?: readonly string[]; readonly language?: readonly string[]; readonly namespace?: readonly string[]; readonly kind?: readonly string[]; readonly subject_type?: readonly string[]; readonly test_artifacts_only?: boolean } }, limit?: number, after_cursor?: string) => Promise<{ readonly capability: "indexed" | "unsupported"; readonly route?: "fts" | "artifact_cas_paged"; readonly index_used?: "lexical_fts" | "artifact_versions_keyset"; readonly matches: readonly LexicalSearchMatch[]; readonly next_cursor?: string; readonly unsupported_reason?: "safe_regex" | "structural_filter" }>;
   /** Resolves container records through indexed artifact identity/path columns. */
   readonly container_records_by_artifact_references?: (scope: QueryScope, references: readonly string[]) => Promise<readonly CanonicalQueryRecord[]>;
+  /** Returns every indexed record owned by the exact artifact versions. */
+  readonly records_by_owner_artifact_versions?: (scope: QueryScope, version_ids: readonly string[]) => Promise<readonly CanonicalQueryRecord[]>;
   /** Reads the exact visible adjacency slice touching `subject_ids`. Returning
    * `undefined` means this snapshot has no authoritative graph projection and
    * requires the canonical-record fallback. */
@@ -1310,6 +1312,21 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
   }
 
+  async records_by_owner_artifact_versions(scope: QueryScope, versionIds: readonly string[]): Promise<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical SQLite queries require one explicit workspace; comparison binds each participant separately.");
+    const unique = [...new Set(versionIds)];
+    if (unique.length === 0) return [];
+    const generation = await this.currentGeneration(scope);
+    if (generation === undefined) return [];
+    const found = new Map<string, CanonicalQueryRecord>();
+    for (const part of chunk(unique, DELTA_ID_CHUNK_SIZE)) {
+      const placeholders = part.map(() => "?").join(", ");
+      const rows = await this.queryRecordRows(scope.workspace_id, generation, `records.owner_artifact_version_id IN (${placeholders})`, part);
+      for (const row of rows) found.set(row.record_id, this.decodeRow(row));
+    }
+    return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
+  }
+
   private async graphProjectionAvailable(workspaceId: string, generation: number): Promise<boolean> {
     const key = `${workspaceId}\u0000${generation}`;
     const cached = this.graphAvailabilityCache.get(key);
@@ -1890,6 +1907,7 @@ function recordValue(record: CanonicalQueryRecord, classification: "confirmed" |
       universal_kind: record.universal_kind,
       kind: record.kind,
       classification,
+      ...(record.primary_source_span === undefined ? {} : { source_span: record.primary_source_span }),
       body: record.body,
     };
   }
@@ -2029,7 +2047,7 @@ function comparisonContentDigest(record: CanonicalQueryRecord): string {
 }
 
 function comparisonLocationKey(record: CanonicalQueryRecord): string {
-  return `${record.owner_artifact_id} ${record.owner_artifact_version_id} ${JSON.stringify(record.primary_source_span ?? null)}`;
+  return `${record.owner_artifact_id}\0${record.owner_artifact_version_id}\0${JSON.stringify(record.primary_source_span ?? null)}`;
 }
 
 function compareCanonicalIdentity(left: string, right: string): number {
@@ -2656,11 +2674,29 @@ async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: Query
   // token) -- regardless of `contextLines` (inline policy snippets always
   // call this with `contextLines: 0`, since "one more line of context"
   // would defeat R13's one-line-per-bundle budget accounting).
-  const { start: sliceStart, end: sliceEnd } = mode === "line"
+  let { start: sliceStart, end: sliceEnd } = mode === "line"
     ? { start: lineStart(text, start), end: lineEnd(text, Math.max(coreEnd - 1, start)) }
     : extendSpanForContext(text, signatureAnchor, coreEnd, contextLines);
+  const effectiveLimit = Math.min(maxCharactersPerSnippet, remainingBudget);
+  const coreLength = coreEnd - signatureAnchor;
+  // Context is useful only if it still contains the requested declaration.
+  // When surrounding lines exceed the caller's projection, center the bounded
+  // window around that declaration instead of returning only the earliest
+  // leading lines. The projection remains exact and explicitly truncated.
+  let contextClipped = false;
+  if (mode !== "line" && sliceEnd - sliceStart > effectiveLimit && coreLength <= effectiveLimit) {
+    contextClipped = true;
+    const surrounding = effectiveLimit - coreLength;
+    const before = Math.floor(surrounding / 2);
+    sliceStart = Math.max(sliceStart, signatureAnchor - before);
+    sliceEnd = Math.min(sliceEnd, sliceStart + effectiveLimit);
+    if (sliceEnd < coreEnd) {
+      sliceEnd = coreEnd;
+      sliceStart = Math.max(0, sliceEnd - effectiveLimit);
+    }
+  }
   let snippetText = text.slice(sliceStart, sliceEnd);
-  let truncated = false;
+  let truncated = contextClipped;
   if (snippetText.length > maxCharactersPerSnippet) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, maxCharactersPerSnippet); truncated = true; }
   if (snippetText.length > remainingBudget) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, remainingBudget); truncated = true; }
   const useStoredLines = contextLines === 0 && canonicalSpan !== undefined;
@@ -2685,7 +2721,7 @@ async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: Query
  * once `subjects` is resolved (by either path's own id-lookup), the rest of
  * the operation (mode/budget handling, `sourceSnippet` calls) is identical.
  */
-async function buildGetSourceStreams(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, subjects: readonly CanonicalQueryRecord[], args: Readonly<Record<string, unknown>>): Promise<Readonly<Record<string, readonly QueryStreamItem[]>>> {
+async function buildGetSourceStreams(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, subjects: readonly CanonicalQueryRecord[], args: Readonly<Record<string, unknown>>, deferSource = false): Promise<Readonly<Record<string, readonly QueryStreamItem[]>>> {
   const sourceOptions = object(args["source"]);
   const mode = sourceOptions["mode"] === "none" || sourceOptions["mode"] === "signature" || sourceOptions["mode"] === "relevant" || sourceOptions["mode"] === "body" ? sourceOptions["mode"] : "body";
   const maxCharactersPerSnippet = typeof sourceOptions["max_characters_per_snippet"] === "number" ? sourceOptions["max_characters_per_snippet"] : 4000;
@@ -2694,10 +2730,11 @@ async function buildGetSourceStreams(snapshots: CanonicalQuerySnapshotPort, scop
   let remainingBudget = maxTotalCharacters;
   const sources: QueryStreamItem[] = [];
   for (const record of subjects) {
-    const snippet = mode === "none" ? undefined : await sourceSnippet(snapshots, scope, record, mode, maxCharactersPerSnippet, contextLines, remainingBudget);
+    const snippet = mode === "none" || deferSource ? undefined : await sourceSnippet(snapshots, scope, record, mode, maxCharactersPerSnippet, contextLines, remainingBudget);
     if (snippet !== undefined) remainingBudget -= snippet.text.length;
     sources.push({
       value: { result_set: "sources", primary_result: recordValue(record), assessment: { classification: "confirmed", completeness: "complete" }, provenance_path: [], essential_related_entities: [], optional_source_snippets: snippet === undefined ? [] : [snippet] },
+      ...(deferSource && mode !== "none" ? { source_hydration: { scope, record, options: { mode, max_characters_per_snippet: maxCharactersPerSnippet, max_total_characters: maxTotalCharacters, context_lines: contextLines } } } : {}),
       stable_sort_key: `confirmed\0${record.identity_key ?? record.record_id}`,
     });
   }
@@ -2937,7 +2974,7 @@ function matchesPathPrefix(path: string | undefined, pathPrefixes: readonly stri
   return path !== undefined && pathPrefixes.some((prefix) => path.startsWith(prefix));
 }
 
-function matchesArtifactGlob(path: string, pattern: string): boolean {
+export function matchesArtifactGlob(path: string, pattern: string): boolean {
   const normalizedPath = path.replaceAll("\\", "/");
   const normalizedPattern = pattern.replaceAll("\\", "/");
   let expression = "^";
@@ -2961,6 +2998,28 @@ function matchesArtifactGlob(path: string, pattern: string): boolean {
   return new RegExp(`${expression}$`).test(normalizedPath);
 }
 
+export function isTestArtifactPath(path: string): boolean {
+  const normalized = path.replaceAll("\\", "/").toLocaleLowerCase("en-US");
+  const segments = normalized.split("/");
+  const file = segments.at(-1) ?? "";
+  return segments.some((segment) => segment === "test" || segment === "tests" || segment === "__tests__")
+    || /(?:^|[._-])(?:test|spec)(?:[._-]|$)/u.test(file);
+}
+
+function isTestFacingSymbolName(name: string): boolean {
+  // Exact structural fallback for APIs that production code deliberately
+  // exposes to tests. These names are useful retrieval vocabulary when the
+  // test does not mention the implementation entry point, while ordinary
+  // declarations beside that entry point would widen one focused query into
+  // hundreds of unrelated lexical searches.
+  return /(?:test|spec|fixture|mock|fake)/iu.test(name);
+}
+
+function identifierNameParts(name: string): readonly string[] {
+  return (name.replaceAll(/([\p{Ll}\p{N}])([\p{Lu}])/gu, "$1 $2").match(/[\p{L}\p{N}]+/gu) ?? [])
+    .map((part) => part.toLocaleLowerCase("en-US"));
+}
+
 function literalGlobPrefix(pattern: string): string {
   const normalized = pattern.replaceAll("\\", "/");
   const wildcard = normalized.search(/[?*]/u);
@@ -2979,7 +3038,7 @@ function codePointAt(value: string, offset: number): string {
   return value.slice(offset, offset + width);
 }
 
-function matchesWordMode(value: string, offset: number, length: number, mode: "substring" | "identifier" | "token"): boolean {
+export function matchesWordMode(value: string, offset: number, length: number, mode: "substring" | "identifier" | "token"): boolean {
   if (mode === "substring") return true;
   const boundaryCharacter = mode === "identifier" ? /[$\p{ID_Continue}]/u : /[_\p{L}\p{M}\p{N}]/u;
   const before = codePointBefore(value, offset);
@@ -3498,7 +3557,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * exactly), so this is documented as an intentional generalization, not a
    * regression risk against real workspaces.
    */
-  private async relationClosure(scope: QueryScope, rootRecords: readonly CanonicalQueryRecord[], relationKind: string, direction: "inbound" | "outbound", maxDepth: number, maxNodes: number): Promise<readonly CanonicalQueryRecord[] | undefined> {
+  private async relationClosure(scope: QueryScope, rootRecords: readonly CanonicalQueryRecord[], relationKind: string, direction: "inbound" | "outbound", maxDepth: number, maxNodes: number, provenance?: Map<string, Set<string>>, certainty?: Map<string, boolean>): Promise<readonly CanonicalQueryRecord[] | undefined> {
     if (this.snapshots.records_by_ids === undefined) return undefined;
     const discovered = new Map<string, CanonicalQueryRecord>();
     const seen = new Set(rootRecords.map((record) => record.record_id));
@@ -3518,6 +3577,20 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const next: CanonicalQueryRecord[] = [];
       for (const record of hydrated) {
         if (seen.has(record.record_id)) continue;
+        if (certainty !== undefined) {
+          const ids = new Set([record.record_id, record.identity_id, record.identity_key]);
+          const proofs = rows.filter((edge) => edge.relation_kind === relationKind && ids.has(direction === "outbound" ? edge.target_subject_id : edge.source_subject_id));
+          certainty.set(record.record_id, proofs.length > 0 && proofs.every((edge) => edge.evidence_class === "possible" || frontier.some((parent) => [parent.record_id, parent.identity_id, parent.identity_key].includes(direction === "outbound" ? edge.source_subject_id : edge.target_subject_id) && certainty.get(parent.record_id) === true)));
+        }
+        if (provenance !== undefined) {
+          const ids = new Set([record.record_id, record.identity_id, record.identity_key]);
+          const proofs = provenance.get(record.record_id) ?? new Set<string>();
+          for (const edge of rows) if (edge.relation_kind === relationKind && ids.has(direction === "outbound" ? edge.target_subject_id : edge.source_subject_id)) {
+            proofs.add(edge.relation_record_id);
+            for (const parent of frontier) for (const proof of provenance.get(parent.record_id) ?? []) proofs.add(proof);
+          }
+          provenance.set(record.record_id, proofs);
+        }
         seen.add(record.record_id);
         discovered.set(record.record_id, record);
         next.push(record);
@@ -3549,19 +3622,19 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * target is in `covered`, deduped by `record_id`) but resolved through
    * `relationClosure` instead of a full-corpus `maps.relations` filter.
    */
-  private async relatedTestsPushdown(scope: QueryScope, subjects: readonly CanonicalQueryRecord[]): Promise<readonly CanonicalQueryRecord[] | undefined> {
+  private async relatedTestsPushdown(scope: QueryScope, subjects: readonly CanonicalQueryRecord[], provenance?: Map<string, Set<string>>, certainty?: Map<string, boolean>): Promise<readonly CanonicalQueryRecord[] | undefined> {
     const covered = new Map<string, CanonicalQueryRecord>();
     for (const subject of subjects) covered.set(subject.record_id, subject);
     // Traverse the containment frontier as one bounded union. Calling the
     // indexed adjacency route once per subject made a context with many
     // resolved seeds pay the same depth walk repeatedly; the shared frontier
     // preserves the relation closure while deduplicating common ancestors.
-    const ancestorRecords = await this.relationClosure(scope, subjects, "core:contains", "inbound", CONTAINMENT_ANCESTOR_MAX_DEPTH, Math.min(CONTAINMENT_BATCH_MAX_NODES, CONTAINMENT_ANCESTOR_MAX_NODES * Math.max(1, subjects.length)));
+    const ancestorRecords = await this.relationClosure(scope, subjects, "core:contains", "inbound", CONTAINMENT_ANCESTOR_MAX_DEPTH, Math.min(CONTAINMENT_BATCH_MAX_NODES, CONTAINMENT_ANCESTOR_MAX_NODES * Math.max(1, subjects.length)), provenance, certainty);
     if (ancestorRecords === undefined) return undefined;
     for (const ancestor of ancestorRecords) covered.set(ancestor.record_id, ancestor);
     const coveredRecords = [...covered.values()];
     if (coveredRecords.length === 0) return [];
-    const tests = await this.relationClosure(scope, coveredRecords, "core:covers", "inbound", 1, RELATED_TESTS_MAX_NODES);
+    const tests = await this.relationClosure(scope, coveredRecords, "core:covers", "inbound", 1, RELATED_TESTS_MAX_NODES, provenance, certainty);
     if (tests === undefined) return undefined;
     return [...new Map(tests.map((record) => [record.record_id, record])).values()];
   }
@@ -3763,8 +3836,12 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       return evaluated({ members: memberItems, pending_sites: pendingSites });
     }
     if (operation.operation_id === "core:find_references") {
-      const target = resolveSelectorsToRecords(args["target"] === undefined ? [] : [args["target"]], maps)[0];
-      const relations = target === undefined ? [] : maps.relations.filter((record) => relationEndpoints(record, maps.by_any_id).target === target);
+      const selectors = args["target"] === undefined ? [] : Array.isArray(args["target"]) ? args["target"] : [args["target"]];
+      const targets = new Set(resolveSelectorsToRecords(selectors, maps));
+      const relations = maps.relations.filter((record) => {
+        const target = relationEndpoints(record, maps.by_any_id).target;
+        return target !== undefined && targets.has(target);
+      });
       const owners = relations.flatMap((record) => {
         const source = relationEndpoints(record, maps.by_any_id).source;
         return source === undefined ? [] : [source];
@@ -3907,7 +3984,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     if (!["core:get_outline", "core:find_references", "core:expand_relations", "core:find_paths"].includes(operation.operation_id)) return undefined;
     const args = object(operation.arguments);
     const sourceSelectors = operation.operation_id === "core:get_outline" ? [args["container"]]
-      : operation.operation_id === "core:find_references" ? [args["target"]]
+      : operation.operation_id === "core:find_references" ? (Array.isArray(args["target"]) ? args["target"] : [args["target"]])
       : operation.operation_id === "core:expand_relations" ? args["subjects"]
       : args["sources"];
     const roots = await this.resolveIndexedGraphSelectors(operation.scope, sourceSelectors);
@@ -4057,6 +4134,20 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
    * scan pretending to be relevance ranking. Agents can then use the normal
    * structural operations to expand any returned seed.
    */
+  readonly hydrate_item = async (entry: QueryStreamItem, usedCharacters: number): Promise<QueryStreamItem | undefined> => {
+    if (entry.source_hydration === undefined) return entry;
+    const hydration = entry.source_hydration as { scope: QueryScope; record: CanonicalQueryRecord; options: import("@urdira/contracts").SourceIncludeOptions };
+    const { options, record, scope } = hydration;
+    const { source_hydration: _request, ...result } = entry;
+    if (options.mode === "none") return result;
+    const remaining = options.max_total_characters - usedCharacters;
+    if (remaining <= 0) return undefined;
+    const snippet = await sourceSnippet(this.snapshots, scope, record, options.mode, options.max_characters_per_snippet, options.context_lines, options.max_total_characters);
+    if (snippet === undefined) throw new EngineError("core:source_unavailable", `Requested source is unavailable for ${record.owner_artifact_version_id}.`);
+    if (snippet.text.length > remaining) return undefined;
+    return { ...result, value: { ...object(entry.value), optional_source_snippets: [snippet] } };
+  };
+
   private async tryBuildContextPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
     if (operation.operation_id !== "core:build_context") return undefined;
     const args = object(operation.arguments);
@@ -4066,43 +4157,63 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     const records: CanonicalQueryRecord[] = [];
 
     const directIds = selectors.map(subjectIdentity).filter((value): value is string => value !== undefined);
-    if (directIds.length > 0 && this.snapshots.records_by_ids !== undefined) {
-      try {
-        records.push(...await this.snapshots.records_by_ids(operation.scope, [...new Set(directIds)]));
-      } catch (error) {
-        // Frente Q-2 (2026-09-08): a `seeds` entry may legitimately carry
-        // only an `entity_id`/`relation_id`/`diagnostic_id`/`identity_key`
-        // form (no `record_id`) -- `subjectIdentity` above now prefers
-        // `record_id` when both are present, but cannot invent one when it
-        // is truly absent. Against the native v4 store this now throws
-        // `core:selector_unresolvable` (item 1(a)) instead of silently
-        // scanning for it. `build_context`'s own contract is "deliberately
-        // conservative... never a widened full-corpus scan", not "hard-fail
-        // the entire context on one unindexed seed" -- degrade to zero
-        // direct-id records and let the name-based resolution below (and
-        // the caller's own follow-up structural calls) carry the rest,
-        // exactly as an unmatched name already does.
-        if (!(error instanceof EngineError) || error.code !== "core:selector_unresolvable") throw error;
+    const resolvedSeeds: CanonicalQueryRecord[] = [];
+    for (const selector of selectors) {
+      const seed = object(selector);
+      // Broad context can legitimately span multiple declarations of the
+      // same symbol (for example authored TypeScript plus emitted JavaScript).
+      // Preserve every exact indexed candidate for an unanchored symbol seed;
+      // point operations still reject ambiguity, while context ordering puts
+      // the most useful declaration first. Anchored selectors retain the
+      // shared resolver's exact narrowing and error semantics.
+      const resolved = seed["subject_type"] === "symbol" && typeof seed["context_artifact"] !== "string"
+        ? this.snapshots.records_by_name === undefined
+          ? undefined
+          : filterByKindSelector(await this.snapshots.records_by_name(operation.scope, String(seed["name"] ?? "")), seed["kind_selector"])
+        : await this.resolveIndexedGraphSelectors(operation.scope, [selector]);
+      if (resolved === undefined || resolved.length === 0) throw new EngineErrorWithDetails("core:selector_unresolvable", "An explicit context seed could not be resolved through the indexed selector path.", { unresolved_ids: [subjectIdentity(selector) ?? String(object(selector)["name"] ?? "unknown")] });
+      resolvedSeeds.push(...resolved);
+    }
+    records.push(...resolvedSeeds);
+    const seedNames: string[] = [];
+    const taskNames = contextIdentifierCandidates(task, args["query_class"]);
+    const taskNameRanks = new Map<string, number>();
+    // Explicit selectors define the context root. The natural-language task
+    // still contributes deterministic relevance ordering below, but its
+    // incidental identifiers must not widen a precise seed into unrelated
+    // same-name declarations (for example a repository-wide `onDidChange`).
+    if (selectors.length === 0 && this.snapshots.records_by_name !== undefined) {
+      for (const [rank, name] of [...new Set([...seedNames, ...taskNames])].entries()) {
+        const named = await this.snapshots.records_by_name(operation.scope, name);
+        records.push(...named);
+        for (const record of named) taskNameRanks.set(record.record_id, Math.min(rank, taskNameRanks.get(record.record_id) ?? rank));
       }
     }
 
-    const seedNames = selectors.flatMap((selector) => {
-      const value = object(selector);
-      return value["subject_type"] === "symbol" && typeof value["name"] === "string" ? [value["name"]] : [];
-    });
-    const taskNames = contextIdentifierCandidates(task, args["query_class"]);
-    if (this.snapshots.records_by_name !== undefined) {
-      for (const name of [...new Set([...seedNames, ...taskNames])]) records.push(...await this.snapshots.records_by_name(operation.scope, name));
-    }
-
     const unique = [...new Map(records.map((record) => [record.record_id, record])).values()];
-    const explicitSeedIds = new Set(directIds);
+    if (unique.length === 0) throw new EngineErrorWithDetails("core:selector_unresolvable", "Structural context discovery could not resolve a task seed. Supply an exact symbol or artifact path in seeds, or use core:search_text with a literal pattern and then reuse its subject identity. This does not establish absence of relevant indexed source.", { unresolved_ids: taskNames.length > 0 ? taskNames : [task] });
+    const explicitSeedIds = new Set([...directIds, ...resolvedSeeds.map((record) => record.record_id)]);
     const explicitSeedNames = new Set(seedNames);
     for (const record of unique) {
       const name = typeof record.body["name"] === "string" ? record.body["name"] : undefined;
       if (name !== undefined && explicitSeedNames.has(name)) explicitSeedIds.add(record.record_id);
     }
     const filter = object(args["filter"]);
+    const namespaces = strings(filter["namespaces"]);
+    const subjectTypes = strings(filter["subject_types"]);
+    const kindFilter = object(filter["kind_selector"]);
+    const eligible = (record: CanonicalQueryRecord): boolean => {
+      if (namespaces.length > 0 && !namespaces.includes(record.kind.split(":")[0]!)) return false;
+      if (subjectTypes.length > 0 && !subjectTypes.includes(record.category === "artifact_subject" ? "artifact" : record.category === "entity" ? "entity" : "record") && !(record.category !== "artifact_subject" && subjectTypes.includes("record"))) return false;
+      if (!selected(record, { kind_selector: kindFilter })) return false;
+      const facets = new Set(record.facets ?? []);
+      if (strings(kindFilter["all_facets"]).some((facet) => !facets.has(facet))) return false;
+      const anyFacets = strings(kindFilter["any_facets"]);
+      if (anyFacets.length > 0 && !anyFacets.some((facet) => facets.has(facet))) return false;
+      return !strings(kindFilter["excluded_facets"]).some((facet) => facets.has(facet));
+    };
+    const filteredArtifacts = this.snapshots.artifacts_by_filter === undefined ? undefined : await this.snapshots.artifacts_by_filter(operation.scope, filter as StructuralFilter);
+    const allowedArtifacts = filteredArtifacts === undefined ? undefined : new Set(filteredArtifacts.map((record) => record.owner_artifact_version_id));
     const paths = strings(filter["paths"]);
     const languages = strings(filter["languages"]);
     let artifactPaths = new Map<string, string>();
@@ -4111,19 +4222,25 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       artifactPaths = new Map(artifacts.map((record) => [record.owner_artifact_version_id, String(record.body["path"] ?? "")]));
     }
     const filtered = unique.filter((record) => {
+      if (!eligible(record) || allowedArtifacts !== undefined && !allowedArtifacts.has(record.owner_artifact_version_id)) return false;
       const path = typeof record.body["path"] === "string" ? record.body["path"] : artifactPaths.get(record.owner_artifact_version_id);
       if (paths.length > 0 && (path === undefined || !paths.some((pattern) => matchesArtifactGlob(path, pattern)))) return false;
       if (languages.length > 0 && !languages.includes(String(record.body["language"] ?? ""))) return false;
       return true;
     });
+    const primaryTaskRank = taskNameRanks.size === 0 ? undefined : Math.min(...taskNameRanks.values());
 
     // `tests` is a relation facet, so expand only the already-resolved
     // subjects through the indexed covers/contains projection. This keeps
     // discovery bounded by the seed fan-out and preserves the snapshot bound
     // carried by `operation.scope`; it never widens into the corpus reader.
+    const provenance = new Map<string, Set<string>>();
+    const certainty = new Map<string, boolean>();
+    const sourceHydrationRecords = new Map<string, CanonicalQueryRecord>();
     let contextRecords = filtered;
     const contextSubjectIds = new Set(filtered.map((record) => record.record_id));
     let testRecordIds = new Set<string>();
+    let testCallerRecords: readonly CanonicalQueryRecord[] = [];
     const workspaceSnapshotBindingIds = operation.scope.scope_type === "single_workspace" ? [operation.scope.workspace_id] : operation.scope.participants.map((participant) => participant.workspace_id);
     if (requestedFacets.includes("tests")) {
       if (this.snapshots.graph_edges_by_subject_ids === undefined) {
@@ -4133,7 +4250,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
           reason_codes: ["indexed_graph_projection_unavailable"],
         });
       }
-      let relatedTests = await this.relatedTestsPushdown(operation.scope, filtered);
+      let relatedTests = await this.relatedTestsPushdown(operation.scope, filtered, provenance, certainty);
       if (relatedTests === undefined) {
         throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed graph projection.", {
           capability: "relatedTestsPushdown",
@@ -4143,10 +4260,10 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       }
       // A test may cover a callable that invokes the resolved subject without
       // covering the subject itself.  Use the existing indexed call adjacency
-      // only for that empty direct result; this keeps the common path bounded
-      // while recovering the contractual indirect caller/test relationship.
-      if (relatedTests.length === 0 && filtered.length > 0) {
-        const callers = await this.relationClosure(operation.scope, filtered, "core:call", "inbound", 1, IMPACT_CALLER_MAX_NODES);
+      // for the resolved subjects and retain both direct and caller coverage.
+      // Existing operation work limits fail explicitly rather than cut results.
+      if (filtered.length > 0) {
+        const callers = await this.relationClosure(operation.scope, filtered, "core:call", "inbound", 1, IMPACT_CALLER_MAX_NODES, provenance, certainty);
         if (callers === undefined) {
           throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed call graph projection.", {
             capability: "relatedTestsPushdown",
@@ -4154,7 +4271,8 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
             reason_codes: ["indexed_graph_projection_unavailable"],
           });
         }
-        const indirectTests = await this.relatedTestsPushdown(operation.scope, callers);
+        testCallerRecords = callers;
+        const indirectTests = await this.relatedTestsPushdown(operation.scope, callers, provenance, certainty);
         if (indirectTests === undefined) {
           throw new EngineErrorWithDetails("core:required_capability_unsupported", "The requested tests facet requires the indexed call graph projection.", {
             capability: "relatedTestsPushdown",
@@ -4162,13 +4280,162 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
             reason_codes: ["indexed_graph_projection_unavailable"],
           });
         }
-        relatedTests = indirectTests;
+        relatedTests = [...new Map([...relatedTests, ...indirectTests].map((record) => [record.record_id, record])).values()];
+      }
+      const structurallyCoveredVersions = new Set(relatedTests.map((record) => record.owner_artifact_version_id));
+      const lexicalMatchesByVersion = new Map<string, Array<{ readonly symbol: string; readonly match: LexicalSearchMatch }>>();
+      // Existing tests often exercise a test-facing helper exported beside the
+      // task symbol instead of naming the implementation entry point itself.
+      // Expand the lexical test vocabulary from declarations in the same
+      // indexed owner artifact. This stays exact and snapshot-bound: it does
+      // not infer semantic similarity or scan unrelated source, and every
+      // matching test artifact remains part of the normal ordered result and
+      // continuation manifest.
+      const primaryTaskName = primaryTaskRank === undefined ? undefined : taskNames[primaryTaskRank];
+      const primaryTaskRecords = filtered.filter((record) => primaryTaskRank === undefined
+        ? explicitSeedIds.has(record.record_id)
+        : taskNameRanks.get(record.record_id) === primaryTaskRank && record.category === "entity" && record.body["name"] === primaryTaskName);
+      const primaryArtifacts = this.snapshots.records_by_artifact_versions === undefined
+        ? []
+        : await this.snapshots.records_by_artifact_versions(operation.scope, [...new Set(primaryTaskRecords.map((record) => record.owner_artifact_version_id))]);
+      const primaryPaths = new Map(primaryArtifacts.map((record) => [record.owner_artifact_version_id, String(record.body["path"] ?? "")]));
+      const authoredRank = (record: CanonicalQueryRecord): number => {
+        const path = (typeof record.body["path"] === "string" ? record.body["path"] : primaryPaths.get(record.owner_artifact_version_id) ?? "").toLocaleLowerCase("en-US");
+        return /\.(?:ts|tsx|mts|cts)$/u.test(path) ? 0 : /\.(?:js|jsx|mjs|cjs)$/u.test(path) ? 1 : 0;
+      };
+      const bestPrimaryRank = primaryTaskRecords.length === 0 ? 0 : Math.min(...primaryTaskRecords.map(authoredRank));
+      const siblingOwnerVersions = [...new Set(primaryTaskRecords
+        .filter((record) => authoredRank(record) === bestPrimaryRank)
+        .map((record) => record.owner_artifact_version_id))];
+      const siblingDeclarations = this.snapshots.records_by_owner_artifact_versions === undefined
+        ? []
+        : await this.snapshots.records_by_owner_artifact_versions(operation.scope, siblingOwnerVersions);
+      const taskIdentifierParts = new Set(taskNames.flatMap(identifierNameParts));
+      const pertinentCallers = testCallerRecords.filter((record) => {
+        const name = record.body["name"];
+        return record.category === "entity" && typeof name === "string" && identifierNameParts(name).some((part) => taskIdentifierParts.has(part));
+      });
+      const lexicalSymbols = [...new Set([...filtered, ...pertinentCallers, ...siblingDeclarations.filter((record) => {
+        const name = record.body["name"];
+        return typeof name === "string" && isTestFacingSymbolName(name);
+      })]
+        .filter((record) => /declaration|definition|type|callable/.test(`${record.kind} ${record.universal_kind}`.toLocaleLowerCase("en-US")))
+        .map((record) => record.body["name"])
+        .filter((name): name is string => typeof name === "string" && name.length > 0))];
+      for (const symbol of lexicalSymbols) {
+        let matches: readonly LexicalSearchMatch[] = [];
+        if (this.snapshots.search_lexical_page !== undefined) {
+          const collected: LexicalSearchMatch[] = [];
+          let cursor: string | undefined;
+          while (true) {
+            const page = await this.snapshots.search_lexical_page(operation.scope, symbol, "literal", {
+              case_sensitive: true,
+              word_mode: "identifier",
+              filters: { path_patterns: paths, language: languages, test_artifacts_only: true },
+            }, ROW_FETCH_BATCH_SIZE, cursor);
+            if (page.capability === "unsupported") break;
+            collected.push(...page.matches);
+            if (page.next_cursor === undefined || page.matches.length === 0) break;
+            cursor = page.next_cursor;
+          }
+          matches = collected;
+        } else if (this.snapshots.search_literal !== undefined) {
+          matches = await this.snapshots.search_literal(operation.scope, symbol, {
+            case_sensitive: true,
+            word_mode: "identifier",
+            path_patterns: paths,
+            include_generated: filter["include_generated"] === true,
+            include_external: filter["include_external"] === true,
+          }) ?? [];
+        }
+        for (const match of matches) {
+          if (match.offsets.length === 0 || structurallyCoveredVersions.has(match.artifact_version_id)) continue;
+          const evidence = lexicalMatchesByVersion.get(match.artifact_version_id) ?? [];
+          if (!evidence.some((entry) => entry.symbol === symbol)) evidence.push({ symbol, match });
+          lexicalMatchesByVersion.set(match.artifact_version_id, evidence);
+        }
+      }
+      if (lexicalMatchesByVersion.size > 0 && this.snapshots.records_by_artifact_versions !== undefined) {
+        const lexicalVersions = [...lexicalMatchesByVersion.keys()];
+        const hydratedArtifacts = await this.snapshots.records_by_artifact_versions(operation.scope, lexicalVersions);
+        const ownerRecords = await this.snapshots.records_by_owner_artifact_versions?.(operation.scope, lexicalVersions) ?? [];
+        const richerArtifacts = new Map(filteredArtifacts?.map((record) => [record.owner_artifact_version_id, record]) ?? []);
+        const lexicalTests: CanonicalQueryRecord[] = [];
+        for (const artifact of hydratedArtifacts) {
+          const base = richerArtifacts.get(artifact.owner_artifact_version_id) ?? artifact;
+          const path = String(base.body["path"] ?? "");
+          if (!isTestArtifactPath(path)) continue;
+          for (const evidence of lexicalMatchesByVersion.get(base.owner_artifact_version_id) ?? []) {
+            for (let offsetIndex = 0; offsetIndex < evidence.match.offsets.length; offsetIndex += 1) {
+              const offset = evidence.match.offsets[offsetIndex]!;
+              const sourceSpan = evidence.match.line_spans?.[offsetIndex];
+              const lexicalRecord: CanonicalQueryRecord = {
+                ...base,
+                record_id: `${base.record_id}:lexical:${offset}:${Buffer.from(evidence.symbol).toString("hex")}`,
+                primary_source_span: {
+                  artifact_version_id: base.owner_artifact_version_id,
+                  start_byte: String(offset),
+                  end_byte: String(offset + evidence.symbol.length),
+                  ...(sourceSpan ?? {}),
+                },
+                body: { ...base.body, matched_symbol: evidence.symbol, match_count: evidence.match.offsets.length },
+              };
+              certainty.set(lexicalRecord.record_id, true);
+              const hydrationUsefulness = (record: CanonicalQueryRecord): number => {
+                const descriptor = `${record.kind} ${record.universal_kind}`.toLocaleLowerCase("en-US");
+                // Plugin kinds are descriptive rather than a closed naming
+                // convention. Production JS/TS executable records can be
+                // `jsts:entity_function`, so use the language-neutral kind as
+                // well as legacy descriptor words when selecting the smallest
+                // declaration that contains a lexical test match.
+                if (/callable|declaration|definition|test/u.test(descriptor)
+                  || record.category === "entity" && /^core:(?:function|method|constructor)$/u.test(record.universal_kind)) return 0;
+                if (/container|module/u.test(descriptor)) return 1;
+                if (record.category === "entity") return 2;
+                return 3;
+              };
+              const containingRecord = ownerRecords
+                .filter((record) => {
+                  if (record.owner_artifact_version_id !== base.owner_artifact_version_id || record.category === "artifact_subject") return false;
+                  const start = typeof record.body["start"] === "number" ? record.body["start"] : Number(record.primary_source_span?.start_byte);
+                  const end = typeof record.body["end"] === "number" ? record.body["end"] : Number(record.primary_source_span?.end_byte);
+                  return Number.isFinite(start) && Number.isFinite(end) && start <= offset && end >= offset + evidence.symbol.length;
+                })
+                .filter((record) => hydrationUsefulness(record) === 0)
+                .sort((left, right) => {
+                  const width = (record: CanonicalQueryRecord): number => {
+                    const start = typeof record.body["start"] === "number" ? record.body["start"] : Number(record.primary_source_span?.start_byte);
+                    const end = typeof record.body["end"] === "number" ? record.body["end"] : Number(record.primary_source_span?.end_byte);
+                    return end - start;
+                  };
+                  return width(left) - width(right) || left.record_id.localeCompare(right.record_id);
+                })[0];
+              if (containingRecord !== undefined) sourceHydrationRecords.set(lexicalRecord.record_id, containingRecord);
+              lexicalTests.push(lexicalRecord);
+            }
+          }
+        }
+        relatedTests = [...relatedTests, ...lexicalTests];
       }
       testRecordIds = new Set(relatedTests.map((record) => record.record_id));
       {
+        const taskTerms = new Set(identifierNameParts(task).filter((term) => term.length > 2));
+        const taskRelevance = (record: CanonicalQueryRecord): number => {
+          const body = record.body;
+          const path = String(body["path"] ?? "").replaceAll("\\", "/");
+          const fileName = path.split("/").at(-1) ?? "";
+          const overlap = (value: unknown): number => typeof value === "string"
+            ? identifierNameParts(value).filter((part) => taskTerms.has(part)).length
+            : 0;
+          // An exact lexical association is stronger than a display name;
+          // the basename only resolves otherwise-equal executable examples.
+          return overlap(body["matched_symbol"]) * 4 + overlap(body["name"]) * 2 + overlap(fileName);
+        };
         let orderedTests = [...relatedTests]
           .filter((record) => !contextSubjectIds.has(record.record_id))
-          .sort((left, right) => (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id) || left.record_id.localeCompare(right.record_id));
+          .sort((left, right) => taskRelevance(right) - taskRelevance(left)
+            || (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id)
+            || left.record_id.localeCompare(right.record_id));
         if (languages.length > 0) orderedTests = orderedTests.filter((record) => languages.includes(String(record.body["language"] ?? "")));
         if (paths.length > 0) {
           const testArtifactPaths = this.snapshots.records_by_artifact_versions === undefined ? new Map<string, string>() : new Map(
@@ -4182,10 +4449,76 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         contextRecords = [...filtered, ...orderedTests];
       }
     }
+    const facetRelations: Readonly<Record<string, readonly [string, "inbound" | "outbound" | "both"][]>> = {
+      definitions: [["core:defines", "outbound"]], implementations: [["core:implements", "inbound"], ["core:overrides", "inbound"]],
+      callers: [["core:call", "inbound"]], callees: [["core:call", "outbound"]],
+      dependencies: [["core:import", "outbound"], ["core:depends_on", "outbound"]],
+      contracts: [["core:implements", "outbound"], ["core:type_of", "outbound"]],
+      effects: [["core:read", "outbound"], ["core:write", "outbound"], ["core:throws", "outbound"]],
+      configuration: [["core:binds", "both"]], extension_points: [["core:inherits", "outbound"], ["core:implements", "outbound"]],
+    };
+    if (requestedFacets.includes("analogues")) throw new EngineError("core:required_capability_unsupported", "The structural context path cannot supply semantic analogues; use semantic retrieval with an available semantic lane.");
+    const possibleIds = new Set([...certainty].filter(([, possible]) => possible).map(([id]) => id));
+    const selectedRelations = requestedFacets.flatMap((facet) => facetRelations[facet] ?? []);
+    if (selectedRelations.length > 0 && filtered.length > 0) {
+      const aliases = new Set(filtered.flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((id): id is string => id !== undefined)));
+      const edges = await this.indexedEdges(operation.scope, [...aliases], "both");
+      if (edges === undefined || this.snapshots.records_by_ids === undefined) throw new EngineError("core:required_capability_unsupported", "Requested context facets require indexed relation adjacency and identity hydration.");
+      const selected = edges.flatMap((edge) => {
+        const matching = selectedRelations.filter(([kind]) => kind === edge.relation_kind);
+        const targets = new Set<string>();
+        for (const [, direction] of matching) {
+          if (direction !== "inbound" && aliases.has(edge.source_subject_id)) targets.add(edge.target_subject_id);
+          if (direction !== "outbound" && aliases.has(edge.target_subject_id)) targets.add(edge.source_subject_id);
+        }
+        return [...targets].map((id) => ({ id, edge }));
+      });
+      const related = await this.snapshots.records_by_ids(operation.scope, [...new Set(selected.map(({ id }) => id))]);
+      for (const record of related) {
+        if (languages.length > 0 && !languages.includes(String(record.body["language"] ?? ""))) continue;
+        let path = record.body["path"];
+        if (paths.length > 0 && typeof path !== "string") {
+          const owners = await this.snapshots.records_by_artifact_versions?.(operation.scope, [record.owner_artifact_version_id]) ?? [];
+          path = owners[0]?.body["path"];
+        }
+        if (paths.length > 0 && (typeof path !== "string" || !paths.some((pattern) => matchesArtifactGlob(path, pattern)))) continue;
+        const ids = new Set([record.record_id, record.identity_id, record.identity_key]);
+        const supporting = selected.filter(({ id }) => ids.has(id));
+        provenance.set(record.record_id, new Set(supporting.map(({ edge }) => edge.relation_record_id)));
+        if (supporting.length > 0 && supporting.every(({ edge }) => edge.evidence_class === "possible")) possibleIds.add(record.record_id);
+        if (!contextRecords.some((candidate) => candidate.record_id === record.record_id)) contextRecords.push(record);
+      }
+    }
+    contextRecords = contextRecords.filter((record) => eligible(record) && (allowedArtifacts === undefined || allowedArtifacts.has(record.owner_artifact_version_id)));
     const definitionsRequested = requestedFacets.includes("definitions");
     const definitionRecord = (record: CanonicalQueryRecord): boolean => {
       const descriptor = `${record.kind} ${record.universal_kind}`.toLocaleLowerCase("en-US");
       return /declaration|definition|type|callable/.test(descriptor);
+    };
+    const orderingArtifactPaths = this.snapshots.records_by_artifact_versions === undefined ? new Map<string, string>() : new Map(
+      (await this.snapshots.records_by_artifact_versions(operation.scope, [...new Set(contextRecords.map((record) => record.owner_artifact_version_id))]))
+        .map((record) => [record.owner_artifact_version_id, String(record.body["path"] ?? "")]),
+    );
+    const recordPath = (record: CanonicalQueryRecord): string => typeof record.body["path"] === "string"
+      ? record.body["path"] as string
+      : orderingArtifactPaths.get(record.owner_artifact_version_id) ?? "";
+    const orderingTaskTerms = new Set(identifierNameParts(task).filter((term) => term.length > 2));
+    const taskRelevance = (record: CanonicalQueryRecord): number => {
+      const overlap = (value: unknown): number => typeof value === "string"
+        ? identifierNameParts(value).filter((part) => orderingTaskTerms.has(part)).length
+        : 0;
+      const fileName = recordPath(record).replaceAll("\\", "/").split("/").at(-1) ?? "";
+      return overlap(record.body["matched_symbol"]) * 4 + overlap(record.body["name"]) * 2 + overlap(fileName);
+    };
+    const sourcePriority = (record: CanonicalQueryRecord): number => {
+      const path = recordPath(record).toLocaleLowerCase("en-US");
+      // In mixed TypeScript/JavaScript publications, emitted bundles often
+      // surface as lexical artifact matches without the declaration name in
+      // their body. Prefer typed authored source by extension even when the
+      // generated record cannot be paired by name. A JavaScript-only
+      // workspace keeps its relative order because every item receives the
+      // same priority.
+      return /\.(?:ts|tsx|mts|cts)$/u.test(path) ? 0 : /\.(?:js|jsx|mjs|cjs)$/u.test(path) ? 1 : 0;
     };
     // Keep the first page useful for orientation without changing membership:
     // explicit seeds lead, then definition-like records, indexed tests, and
@@ -4194,28 +4527,38 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     contextRecords = contextRecords
       .map((record, index) => ({ record, index }))
       .sort((left, right) => {
-        const priority = (record: CanonicalQueryRecord): number => explicitSeedIds.has(record.record_id) ? 0 : definitionsRequested && definitionRecord(record) ? 1 : testRecordIds.has(record.record_id) ? 2 : 3;
-        return priority(left.record) - priority(right.record) || left.index - right.index;
+        const priority = (record: CanonicalQueryRecord): number => {
+          // An emitted JavaScript copy of the same named typed declaration is
+          // still a complete result, but it must not consume the useful part
+          // of the first page ahead of an explicitly requested authored test
+          // or relation. Its stable manifest position keeps it available via
+          // the normal continuation instead of discarding it.
+          if (sourcePriority(record) > 0) return 5;
+          if (explicitSeedIds.has(record.record_id)) return 0;
+          if (definitionsRequested
+            && explicitSeedIds.size === 0
+            && taskNameRanks.get(record.record_id) === primaryTaskRank
+            && typeof record.body["name"] === "string"
+            && definitionRecord(record)) return 1;
+          if (testRecordIds.has(record.record_id)) return 2;
+          if (definitionsRequested && definitionRecord(record)) return 3;
+          return 4;
+        };
+        return priority(left.record) - priority(right.record)
+          || taskRelevance(right.record) - taskRelevance(left.record)
+          || left.index - right.index;
       })
       .map(({ record }) => record);
 
-    let remainingSnippetBudget = 20_000;
-    const context: QueryStreamItem[] = [];
-    for (const record of contextRecords) {
-      const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "relevant", 2_000, 2, remainingSnippetBudget);
-      if (snippet !== undefined) remainingSnippetBudget -= snippet.text.length;
-      context.push({
-        value: {
-          result_set: "context",
-          primary_result: recordValue(record),
-          assessment: { classification: "confirmed", completeness: "complete" },
-          provenance_path: [],
-          essential_related_entities: [],
-          optional_source_snippets: snippet === undefined ? [] : [snippet],
-        },
-        stable_sort_key: `confirmed\0${String(context.length).padStart(6, "0")}\0${record.identity_key ?? record.record_id}`,
-      });
-    }
+    const context: QueryStreamItem[] = contextRecords.map((record, index) => ({
+      value: {
+        result_set: "context", primary_result: { ...recordValue(record, possibleIds.has(record.record_id) ? "possible" : "confirmed"), workspace_id: record.workspace_id, owner_artifact_id: record.owner_artifact_id, owner_artifact_version_id: record.owner_artifact_version_id },
+        assessment: { classification: possibleIds.has(record.record_id) ? "possible" : "confirmed", ...(possibleIds.has(record.record_id) ? { confidence_level: "low" } : {}), completeness: "complete" },
+        provenance_path: [...(provenance.get(record.record_id) ?? [])].sort().map((record_id) => ({ subject_type: "record", record_id })), essential_related_entities: [], optional_source_snippets: [],
+      },
+      ...(operation.source_options === undefined || operation.source_options.mode === "none" ? {} : { source_hydration: { scope: operation.scope, record: sourceHydrationRecords.get(record.record_id) ?? record, options: operation.source_options } }),
+      stable_sort_key: `confirmed\0${String(index).padStart(12, "0")}\0${record.identity_key ?? record.record_id}`,
+    }));
     const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
     return result({ context }, capabilityStates);
   }
@@ -4325,7 +4668,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const hydratedArtifacts = await hydrateArtifactSelectorRecords(this.snapshots, operation.scope, selectors, subjects);
       const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
       const resolved = [...new Map([...subjects, ...hydratedArtifacts].map((record) => [record.record_id, record])).values()];
-      return result(await buildGetSourceStreams(this.snapshots, operation.scope, resolved, args), capabilityStates);
+      return result(await buildGetSourceStreams(this.snapshots, operation.scope, resolved, args, operation.source_options !== undefined), capabilityStates);
     }
     if (operation.operation_id === "core:find_records") {
       const selectorArg = object(args["selector"]);
@@ -5503,7 +5846,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const selectors = Array.isArray(args["subjects"]) ? args["subjects"] : [];
       const subjects = resolveSelectorsToRecords(selectors, maps);
       const hydratedArtifacts = await hydrateArtifactSelectorRecords(this.snapshots, boundOperation.scope, selectors, subjects);
-      return evaluated(await buildGetSourceStreams(this.snapshots, boundOperation.scope, [...subjects, ...hydratedArtifacts], args));
+      return evaluated(await buildGetSourceStreams(this.snapshots, boundOperation.scope, [...subjects, ...hydratedArtifacts], args, boundOperation.source_options !== undefined));
     }
     if (boundOperation.operation_id === "core:search_text") {
       const pattern = String(args["pattern"] ?? "").toLocaleLowerCase("en-US");

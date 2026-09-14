@@ -67,6 +67,24 @@ tool paths, and `--phase warm`. The resulting 15 manifests are the campaign
 audit input. Do not invoke the full two-task-per-repository driver as a
 substitute, and do not count smoke or readiness probes as agent cells.
 
+## Phase 0: blocking implementation prerequisites
+
+Phase 0 must pass before any model invocation or readiness campaign. The
+current runner only records cleanup booleans and does not yet emit the required
+per-cell byte/`df` manifest, enforce `BENCH_MIN_FREE_BYTES`, or block the next
+cell on registered residue. Instrument the runner and its signal/finally paths
+to implement the mandatory cleanup checkpoint below, then add a focused test
+for success, failure, timeout/interruption, ownership checks, byte accounting,
+`df`, and the free-space guard. A documentation statement is not evidence that
+the current runner already satisfies this requirement.
+
+The runner's binding to the extracted, hash-verified release archive is also a
+pending Phase 0 prerequisite. Build and install one archive, verify that the
+CLI, MCP, app, plugin, native addon, worker, hooks, and launcher used by the
+cell resolve to those exact archive bytes, and make the runner fail closed when
+the binding cannot be proven. Do not start the 45-run campaign against a source
+checkout while calling it an installed-release measurement.
+
 ## Required order
 
 1. Read `AGENTS.md`, `docs/README.md`, `docs/product-foundation.md`, Decision
@@ -119,6 +137,11 @@ substitute, and do not count smoke or readiness probes as agent cells.
    artifacts are immutable. Compare efficiency only between rows with equal
    correction and coverage, and publish failures and unavailable fields.
 
+The release archive binding is also a pending Phase 0 prerequisite: the runner
+must bind each invocation to the extracted, hash-verified release archive and
+fail closed when that binding cannot be proven. Until Phase 0 passes, the
+session must not start a model.
+
 For each of the 45 agent cells, the direct runner invocation has this shape;
 the coordinator must materialize the placeholders from the cell manifest and
 must not reuse any root between cells:
@@ -141,6 +164,41 @@ from a full-corpus driver audit. If a temporary orchestrator is used to loop
 over the manifest, it must fail closed on a nonzero cell, retain that cell,
 and continue only according to the campaign's declared failure policy; it may
 not retry or overwrite a run.
+
+## Mandatory cleanup checkpoint
+
+The cleanup checkpoint runs after each complete cell or before transfer to another worker.
+During the three internal turns of a cell, its checkout,
+index/data root, prompt-hook cache, and processes remain active and are not
+cleaned between turns. There may be at most one active checkout/index/data root
+and its associated prompt-hook cache for the current cell. Every path is unique,
+recorded in the cell manifest, and owned by that cell.
+
+Cleanup is unconditional: use `finally` or an equivalent signal-safe trap so it
+runs on success, failure, timeout, and interrupt. First stop the cell's worker,
+daemon, comparator server, child processes, file watchers, and open handles;
+then remove the worktree, index/data root, prompt-hook cache, package/build
+temporaries, and any cargo target generated inside the execution root. Retain
+only explicitly named transcripts, manifests, hashes, reports, patches,
+validation logs, and evidence. A failed run cannot skip this checkpoint.
+
+Before and after cleanup, record byte totals for every registered path and run
+`df` for the filesystem containing the output root. The operational free-space
+guard is configurable per host (`BENCH_MIN_FREE_BYTES` or an equivalent
+manifested parameter); it is a runner safety parameter, not an absolute Urdira
+product threshold. This configurable space-free threshold is an operational
+guard, not a product limit. If any registered disposable path remains, a process still
+owns it, its cleanup manifest is missing, or free space is below that configured
+parameter, **block the next execution** and retain the diagnostic. Do not
+invent a default product limit and do not continue by deleting unregistered
+paths.
+
+Each handoff to another worker must include the cleanup manifest status for the
+previous complete cell. Internal turns keep the active cell resources. The
+manifest records paths, ownership checks, processes stopped, bytes before/after,
+`df` output, retained artifacts, and errors. Auditing is limited to the paths
+registered in the current campaign and its retained artifact directory; never
+perform a destructive disk-wide sweep.
 
 ## Correctness and coverage gate
 

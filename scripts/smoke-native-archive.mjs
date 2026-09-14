@@ -15,7 +15,7 @@ export async function smokeNativeArchive(archivePath) {
     const release = JSON.parse(await readFile(join(root, "release.json"), "utf8"));
     const windows = release.target === "win32-x64";
     const nativeFiles = (await readdir(join(root, "native"))).sort();
-    const expectedNativeFiles = ["manifest.json", windows ? "urdira-jsts-syntax-worker.exe" : "urdira-jsts-syntax-worker", "urdira-native.node"].sort();
+    const expectedNativeFiles = ["manifest.json", windows ? "urdira-indexing-worker.exe" : "urdira-indexing-worker", windows ? "urdira-jsts-syntax-worker.exe" : "urdira-jsts-syntax-worker", "urdira-native.node"].sort();
     if (JSON.stringify(nativeFiles) !== JSON.stringify(expectedNativeFiles)) {
       throw new Error(`Native archive must contain exactly one target closure; found ${nativeFiles.join(", ")}.`);
     }
@@ -32,6 +32,9 @@ export async function smokeNativeArchive(archivePath) {
     if (result.stdout.trim() !== release.engine_version) {
       throw new Error(`Private runtime returned ${JSON.stringify(result.stdout.trim())}; expected ${release.engine_version}.`);
     }
+    const indexingWorker = execFileAsync(join(root, "native", windows ? "urdira-indexing-worker.exe" : "urdira-indexing-worker"), [], { cwd: root, env: environment, timeout: 30_000 });
+    indexingWorker.child.stdin?.end();
+    await indexingWorker;
     return { archive: basename(archive), target: release.target, version: release.engine_version, native_files: nativeFiles };
   } finally {
     await rm(root, { recursive: true, force: true });

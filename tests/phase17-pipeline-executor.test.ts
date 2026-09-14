@@ -90,6 +90,32 @@ function items(page: Awaited<ReturnType<QueryEngine["execute"]>>, stream: string
 }
 
 describe("pipeline executor: stage_output resolution", () => {
+  it.each([0, 1, 2])("binds %i declarations to the registered scalar batchable target", async (count) => {
+    const declarations = Array.from({ length: count }, (_, index) => subj({ subject_type: "record", record_id: `decl-${index}` }, String(index)));
+    let referencesCalls = 0;
+    const engine = engineFor({
+      "core:resolve_symbol": () => ({ streams: { declarations, candidates: [] } }),
+      "core:find_references": (operation) => {
+        referencesCalls += 1;
+        expect(operation.arguments).toEqual({ include_declarations: true, target: declarations.map((item) => item.value) });
+        return { streams: { references: declarations, owners: [] } };
+      },
+    });
+    const page = await engine.execute({
+      api_version: 3, scope: scope("workspace:batch-binding"), options,
+      expression: {
+        expression_type: "pipeline",
+        stages: [
+          { stage_id: "resolve", stage_type: "operation", operation: "core:resolve_symbol", arguments: { reference: "sharedName", resolution_scope: "workspace" } },
+          { stage_id: "refs", stage_type: "operation", operation: "core:find_references", arguments: { include_declarations: true }, bindings: { target: { stage_id: "resolve", output: "declarations" } } },
+        ],
+        outputs: [{ name: "references", stage_id: "refs", output: "references" }],
+      } as unknown as QueryExpression,
+    });
+    expect(referencesCalls).toBe(1);
+    expect(items(page, "references").map((item) => item.value)).toEqual(declarations.map((item) => item.value));
+  });
+
   it("executes a v3 dependent chain and preserves declared output aliases", async () => {
     const calls: string[] = [];
     const engine = engineFor({

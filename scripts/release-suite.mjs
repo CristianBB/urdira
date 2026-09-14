@@ -92,6 +92,7 @@ async function packageInspection(rootDir, outputDir, nativeRequired, targets) {
       "native/manifest.json",
       "native/urdira-native.node",
       windows ? "native/urdira-jsts-syntax-worker.exe" : "native/urdira-jsts-syntax-worker",
+      windows ? "native/urdira-indexing-worker.exe" : "native/urdira-indexing-worker",
     ] : [])];
     checks[archive.target] = {
       forbidden: inspection.forbidden.length,

@@ -1070,6 +1070,73 @@ fn incremental_edit_adding_an_unreferenced_parameter_is_self_consistent() {
 }
 
 #[test]
+fn changed_directory_without_indexable_artifacts_is_a_noop() {
+    let scratch_root = scratch_dir("changed-ignored-directory-noop");
+    let workspace_root = scratch_root.join("workspace");
+    copy_dir_recursive(&fixture_root(), &workspace_root);
+    let database_path = scratch_root.join("workspace.sqlite");
+    let structural_root = scratch_root.join("structural");
+    let cas_root = scratch_root.join("cas");
+    let mut syntax = SyntaxWorkerState::default();
+    let mut worker_state: super::state::WorkerState = std::collections::HashMap::new();
+
+    let cold = run_scan(
+        "request:cold",
+        "workspace:v4-e2e-changed-ignored-directory-noop",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Full,
+        &mut syntax,
+        &mut worker_state,
+    );
+    let roots = roots_of(&cold);
+    std::fs::create_dir_all(workspace_root.join("test-results/.playwright-artifacts-0"))
+        .expect("create ignored runtime output directories");
+    std::fs::write(
+        workspace_root.join("test-results/generated-test.ts"),
+        "export const generatedTest = true;\n",
+    )
+    .expect("write ignored generated test source");
+    std::fs::write(
+        workspace_root.join("test-results/.playwright-artifacts-0/metadata.json"),
+        "{}\n",
+    )
+    .expect("write ignored generated test metadata");
+
+    let changed = run_scan(
+        "request:changed-ignored-directory",
+        "workspace:v4-e2e-changed-ignored-directory-noop",
+        &workspace_root,
+        &database_path,
+        &structural_root,
+        &cas_root,
+        ScanScope::Changed {
+            paths: vec![ChangedPath {
+                path: "test-results".to_string(),
+                kind: ChangeKind::Created,
+            }],
+        },
+        &mut syntax,
+        &mut worker_state,
+    );
+
+    assert_eq!(
+        generation_of(&changed),
+        1,
+        "an ignored directory must not mint a generation"
+    );
+    assert_eq!(
+        roots_of(&changed),
+        roots,
+        "a no-op changed scan must report the current roots"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch_root);
+}
+
+#[test]
 fn cold_scan_is_deterministic_across_two_independent_runs() {
     let scratch_a = scratch_dir("determinism-a");
     let scratch_b = scratch_dir("determinism-b");

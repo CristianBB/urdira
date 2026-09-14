@@ -1,20 +1,31 @@
 /* global Buffer */
+import { resolve } from "node:path";
 const SHELL_SOURCE_READ = /(?:^|[\s;&|('"])(?:rg|grep|find|cat|bat|less|more|nl|strings|xxd|od)(?=\s)|(?:^|[\s;&|('"])ls\s+-|git\s+ls-files|sed\s+-n|(?<![|]\s)(?:head|tail|awk)\s+|(?:python3?\s+-c|node\s+-e).*(?:open\(|readFileSync\(|readFile\()/mu;
 const isShellSourceReadCommand = (command) => {
   const text = String(command);
   // Diff/status review is a permitted post-edit operation. A pager/filter
   // such as `sed -n` in a git diff pipeline must not be mistaken for a source
   // discovery read; standalone sed remains covered by SHELL_SOURCE_READ.
-  if (/\bgit\s+diff\b[\s\S]*\|\s*sed\s+-n\b/u.test(text)) return false;
-  return SHELL_SOURCE_READ.test(text);
+  const withoutDiffReview = text.replace(/\bgit\s+diff\b[^;&\n]*\|\s*sed\s+-n\b[^;&\n]*/gu, "");
+  return SHELL_SOURCE_READ.test(withoutDiffReview);
 };
 // Reads of the isolated Codex skill/configuration tree are host setup work,
 // not repository discovery. Keep them in total command_execution counts while
 // excluding their output from repository context measurements.
 const isHostInstructionReadCommand = (command) => /(?:\/\.codex\/(?:skills|AGENTS\.md)(?:\/|\b))/u.test(String(command));
-const TEST_COMMAND = /(?:^|\s)(?:cargo\s+(?:nextest\s+run|test)|go\s+test|pytest|python3?\s+-m\s+pytest|vitest|jest|mocha|ava|pnpm\s+(?:exec\s+)?(?:vitest|test)|npm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?test|bun\s+test)(?:\s|$)/iu;
+const TEST_COMMAND = /(?:^|[\s'"])(?:cargo\s+(?:nextest\s+run|test)|go\s+test|pytest|python3?\s+-m\s+pytest|vitest|jest|mocha|ava|node\s+(?:--test|[^\s]+\s+test)|pnpm\s+(?:exec\s+)?(?:vitest|test)|npm\s+(?:run\s+)?test|yarn\s+(?:run\s+)?(?:test|test-node)|bun\s+test)(?:[\s;'"&|]|$)/iu;
+const PATH_TEST_COMMAND = /(?:^|[;\n&|]|-lc\s+['"])\s*(?:\.?\/)?(?:[^\s/'"]+\/)+(?:vitest|jest|mocha|ava|pytest)(?:[\s;'"&|]|$)/iu;
 const TYPECHECK_COMMAND = /(?:^|\s)(?:tsc(?:\s|$)|pnpm\s+(?:exec\s+)?(?:tsc|typecheck)(?:\s|$)|npm\s+run\s+typecheck(?:\s|$))/iu;
 const LINT_COMMAND = /(?:^|\s)(?:eslint(?:\s|$)|pnpm\s+(?:exec\s+)?lint(?:\s|$)|npm\s+run\s+lint(?:\s|$))/iu;
+const URDIRA_HOOK_SERVED_MARKER = "[urdira hook served]";
+
+const hookServedText = (item) => {
+  if (item?.type !== "error" || typeof item.message !== "string") return null;
+  const marker = item.message.indexOf(URDIRA_HOOK_SERVED_MARKER);
+  if (marker < 0) return null;
+  const output = item.message.slice(marker + URDIRA_HOOK_SERVED_MARKER.length);
+  return output.startsWith("\n") ? output.slice(1) : output;
+};
 
 const URDIRA_DISCOVERY_OPERATIONS = new Set([
   "core:analyze_impact", "core:discover_definitions", "core:expand_relations",
@@ -126,8 +137,54 @@ const itemText = (item) => {
   if (item?.type === "command_execution") {
     return String(item.aggregated_output ?? item.output ?? item.stdout ?? "");
   }
+  const hooked = hookServedText(item);
+  if (hooked !== null) return hooked;
   return "";
 };
+
+// This is transport text, not the host's full model context. Do not synthesize
+// missing output or count structured MCP aliases alongside their text blocks.
+const completedTextCharacters = (item) => {
+  if (item.type === "mcp_tool_call") {
+    if (typeof item.result === "string") return item.result.length;
+    if (!Array.isArray(item.result?.content)) return null;
+    const blocks = item.result.content.filter((part) => part?.type === "text");
+    if (blocks.some((part) => typeof part.text !== "string")) return null;
+    return blocks.reduce((sum, part) => sum + part.text.length, 0);
+  }
+  for (const key of ["aggregated_output", "output"]) {
+    if (typeof item[key] === "string") return item[key].length;
+  }
+  const streams = [item.stdout, item.stderr].filter((value) => typeof value === "string");
+  return streams.length === 0 ? null : streams.reduce((sum, value) => sum + value.length, 0);
+};
+
+const completedToolOutput = (completed) => {
+  const outputs = completed.flatMap(({ item }) => {
+    const hooked = hookServedText(item);
+    if (item?.type !== "mcp_tool_call" && item?.type !== "command_execution" && hooked === null) return [];
+    return [{
+      transport: item.type === "mcp_tool_call" ? "mcp" : item.type === "command_execution" ? "shell" : "hook",
+      tgrep: item.type === "command_execution" && /(?:^|[\s;&|('"`])tgrep(?:\s|$)/u.test(String(item.command ?? "")),
+      characters: hooked === null ? completedTextCharacters(item) : hooked.length,
+    }];
+  });
+  const summarize = (items) => {
+    const missing = items.filter((item) => item.characters === null).length;
+    const known = items.reduce((sum, item) => sum + (item.characters ?? 0), 0);
+    return { calls: items.length, missing_output_calls: missing, known_characters: known, characters: items.length === 0 || missing > 0 ? null : known };
+  };
+  return {
+    mcp: summarize(outputs.filter((item) => item.transport === "mcp")),
+    hook: summarize(outputs.filter((item) => item.transport === "hook")),
+    shell: summarize(outputs.filter((item) => item.transport === "shell")),
+    tgrep: summarize(outputs.filter((item) => item.tgrep)),
+    total_characters: summarize(outputs).characters,
+    full_model_context_characters: null,
+  };
+};
+
+const unwrapLoginShell = (command) => command.match(/^(?:\S*\/)?(?:sh|bash|zsh|dash|ksh)\s+-lc\s+(['"])([\s\S]*)\1$/u)?.[2] ?? command;
 
 const CODEX_ACTION_TYPES = new Set(["mcp_tool_call", "command_execution", "web_search", "file_change"]);
 const CODEX_KNOWN_COMPLETED_TYPES = new Set([...CODEX_ACTION_TYPES, "agent_message", "error"]);
@@ -143,7 +200,10 @@ export const analyzeCodexActions = (completed) => {
     return typeof type === "string" && !CODEX_KNOWN_COMPLETED_TYPES.has(type);
   });
   const errors = completed.filter((event) => event.item?.type === "error");
-  const hookErrors = errors.filter((event) => /hook|trust|skill|integration/iu.test(String(event.item?.message ?? "")));
+  const hookErrors = errors.filter((event) => {
+    const message = String(event.item?.message ?? "");
+    return hookServedText(event.item) === null && /hook/iu.test(message) && /failed|error|blocked|rejected/iu.test(message) && !/bypass-hook-trust.*enabled/iu.test(message);
+  });
   return {
     action_counts: actionCounts,
     web_search_calls: actionCounts.web_search ?? 0,
@@ -240,21 +300,171 @@ const relevancePatterns = (task) => (task?.required_patterns ?? []).flatMap(({ p
   return patterns;
 });
 
-export function analyzeExpandedTranscript(events, arm, task) {
+/** Observations only: absent evidence of use is never evidence of non-use. */
+export function analyzeContextEfficiency(events, options = {}) {
+  const pathKey = (path) => typeof options.workspace_root === "string" ? resolve(options.workspace_root, path) : path;
+  const outputs = new Map();
+  const artifactPositions = new Map();
+  let sourceOrdinal = 0;
+  const editedPaths = new Set(events.flatMap((event) => event?.type === "item.completed" && event.item?.type === "file_change" && Array.isArray(event.item.changes) ? event.item.changes.map((change) => change.path).filter((path) => typeof path === "string") : []));
+  const offered = new Set();
+  const consumed = new Set();
+  const attempted = new Set();
+  const records = new Set();
+  let recordOccurrences = 0;
+  let repeatedOutputCharacters = 0;
+  let repeatedShellCharacters = 0;
+  const sourceByMcp = new Set();
+  const sourceLines = new Set();
+  let observedSource = false;
+  let sourceLineOverlap = 0;
+  let firstMcpEventIndex;
+  const shellSourceReads = { total_calls: 0, before_first_mcp_calls: 0, after_first_mcp_calls: 0, overlapping_calls: 0, nonoverlapping_calls: 0 };
+  const retainSource = (text) => {
+    if (typeof text !== "string") return;
+    observedSource = true;
+    for (const line of text.split("\n")) if (line.trim().length > 0) sourceLines.add(line);
+  };
+  const observations = [];
+  for (const [eventIndex, event] of events.entries()) {
+    if (event?.type !== "item.completed") continue;
+    const item = event.item;
+    if (item?.type !== "mcp_tool_call" && item?.type !== "command_execution") continue;
+    const text = itemText(item);
+    const shell = item.type === "command_execution";
+    if (shell && isHostInstructionReadCommand(item.command ?? "")) continue;
+    if (shell && !isShellSourceReadCommand(item.command ?? "") && !/\btgrep\b/u.test(item.command ?? "")) continue;
+    if (!shell && firstMcpEventIndex === undefined) firstMcpEventIndex = eventIndex;
+    if (shell) {
+      shellSourceReads.total_calls++;
+      if (firstMcpEventIndex === undefined) shellSourceReads.before_first_mcp_calls++;
+      else shellSourceReads.after_first_mcp_calls++;
+      if (observedSource) {
+        let callOverlap = 0;
+        for (const line of text.split("\n")) if (sourceLines.has(line)) callOverlap += line.length;
+        sourceLineOverlap += callOverlap;
+        if (callOverlap > 0) shellSourceReads.overlapping_calls++;
+        else shellSourceReads.nonoverlapping_calls++;
+      }
+    }
+    const request = JSON.stringify(item.arguments ?? {});
+    for (const token of offered) if (request.includes(token)) {
+      attempted.add(token);
+      if (item.status !== "failed" && item.result?.isError !== true && item.error == null && !/"error"\s*:\s*\{/u.test(text)) consumed.add(token);
+    }
+    for (const match of text.matchAll(/^MORE(?: \([^\n]*\))?: (\{.*\})$/gmu)) {
+      try { const value = JSON.parse(match[1]).continuation; const token = value?.continuation_ref ?? value?.cursor; if (typeof token === "string") offered.add(token); } catch { /* Preserve malformed envelopes as unmeasured. */ }
+    }
+    const repeated = text.length > 0 && outputs.has(text);
+    if (repeated) repeatedOutputCharacters += text.length;
+    if (shell && sourceByMcp.has(text) && text.length > 0) repeatedShellCharacters += text.length;
+    if (text.length > 0) outputs.set(text, eventIndex);
+    if (!shell) sourceByMcp.add(text);
+    const countRecords = (value) => {
+      if (value === null || typeof value !== "object") return;
+      if (Array.isArray(value)) { for (const child of value) countRecords(child); return; }
+      if (Array.isArray(value.optional_source_snippets)) for (const snippet of value.optional_source_snippets) retainSource(snippet?.text);
+      if (value.primary_result && typeof value.primary_result === "object") {
+        const primary = value.primary_result;
+        const id = primary.record_id ?? primary.subject?.record_id;
+        const path = primary.body?.path ?? primary.path;
+        sourceOrdinal++;
+        if (typeof path === "string" && !artifactPositions.has(pathKey(path))) artifactPositions.set(pathKey(path), { event_index: eventIndex, ordinal: sourceOrdinal });
+        if (typeof id === "string") { recordOccurrences++; records.add(JSON.stringify([primary.owner_artifact_version_id ?? null, id])); }
+        return;
+      }
+      for (const child of Object.values(value)) if (typeof child === "object") countRecords(child);
+    };
+    if (!shell) {
+      let inSource = false;
+      const snippetLines = [];
+      for (const line of text.split("\n")) {
+        if (/^source:\d+ \{/u.test(line)) { inSource = true; continue; }
+        if (inSource && line.startsWith("    ")) snippetLines.push(line.slice(4));
+        else inSource = false;
+      }
+      if (snippetLines.length > 0) retainSource(snippetLines.join("\n"));
+      try { countRecords(JSON.parse(text)); } catch {
+        for (const line of text.split("\n")) if (line.startsWith("details: ")) { try { countRecords(JSON.parse(line.slice(9))); } catch { /* Not a typed bundle. */ } }
+      }
+    }
+    observations.push({ event_index: eventIndex, transport: shell ? "shell" : "mcp", characters: text.length, exact_output_repeated: repeated });
+  }
+  return {
+    record_id_occurrences: recordOccurrences || null,
+    unique_record_ids: recordOccurrences === 0 ? null : records.size,
+    unique_record_ratio: recordOccurrences === 0 ? null : records.size / recordOccurrences,
+    exact_repeated_output_characters: repeatedOutputCharacters,
+    exact_shell_output_repeated_after_mcp_characters: repeatedShellCharacters,
+    shell_source_line_overlap_characters: observedSource ? sourceLineOverlap : null,
+    shell_source_reads: shellSourceReads,
+    continuations_offered: offered.size,
+    continuations_attempted: attempted.size,
+    continuations_consumed: consumed.size,
+    continuations_not_observed_consumed: offered.size - consumed.size,
+    unused_hydration_characters: null,
+    used_artifact_positions: editedPaths.size === 0 ? null : [...editedPaths].map((path) => ({ path, basis: "observed_file_change", first_typed_context_position: artifactPositions.get(pathKey(path)) ?? null })),
+    relevant_results_per_thousand_characters: null,
+    contributing_context_ratio: null,
+    completeness_preserved: null,
+    observations,
+  };
+}
+
+export function analyzeExpandedTranscript(events, arm, task, options = {}) {
+  const hookAudit = Array.isArray(options.hook_audit) ? options.hook_audit.filter((entry) => entry !== null && typeof entry === "object") : null;
+  // UserPromptSubmit additionalContext is model-visible repository context but
+  // has no transcript item of its own. Reconstruct only this transport from
+  // the content-free audit sidecar. PreToolUse output remains represented by
+  // the command/error transcript and must not be counted twice here.
+  const auditedPromptReads = hookAudit === null ? [] : hookAudit.flatMap((entry, index) => {
+    if (entry.hook_event_name !== "UserPromptSubmit" || entry.operation !== "context" || entry.decision !== "serve" || !Number.isFinite(entry.output_characters) || entry.output_characters < 0) return [];
+    return [{ event_index: -hookAudit.length + index, method: "hook", urdira: true, invoked_tool: null, request: "[UserPromptSubmit]", response: "", response_characters: entry.output_characters, components: [], mcp_components: null }];
+  });
   const completed = events.filter((event) => event?.type === "item.completed");
+  const servedPreToolAudit = hookAudit === null ? [] : hookAudit.filter((entry) => entry.hook_event_name === "PreToolUse" && entry.decision === "serve");
+  const hookReplacementByEvent = new Map();
+  let servedPreToolIndex = 0;
+  for (const [eventIndex, event] of completed.entries()) {
+    const command = event.item?.type === "command_execution" ? String(event.item.command ?? "") : "";
+    const replacementCount = [...command.matchAll(/urdira-hook-output-[^/'"\s]+\/result\.txt/gu)].length;
+    if (replacementCount === 0) continue;
+    const entries = servedPreToolAudit.slice(servedPreToolIndex, servedPreToolIndex + replacementCount);
+    servedPreToolIndex += entries.length;
+    hookReplacementByEvent.set(eventIndex, {
+      count: entries.length,
+      characters: entries.reduce((sum, entry) => sum + (Number.isFinite(entry.output_characters) && entry.output_characters >= 0 ? entry.output_characters : 0), 0),
+    });
+  }
+  const auditedPreToolReads = [...hookReplacementByEvent].map(([event_index, assignment]) => ({
+    event_index,
+    method: "hook",
+    urdira: true,
+    invoked_tool: null,
+    request: String(completed[event_index]?.item?.command ?? "[PreToolUse]"),
+    response: "",
+    response_characters: assignment.characters,
+    components: [],
+    mcp_components: null,
+  }));
   const codexActions = analyzeCodexActions(completed);
-  const reads = completed.flatMap((event, eventIndex) => {
+  const transcriptReads = completed.flatMap((event, eventIndex) => {
     const item = event.item;
     const command = item?.type === "command_execution" ? String(item.command ?? "") : "";
     const configured = arm === "baseline"
       ? item?.type === "command_execution" && isShellSourceReadCommand(command) && !isHostInstructionReadCommand(command)
       : arm === "tgrep"
         ? configuredTgrepCall(item, arm)
-        : configuredMcpCall(item, arm);
+        : configuredMcpCall(item, arm) || (arm === "urdira-typescript" && hookServedText(item) !== null);
     if (!configured) return [];
     const response = itemText(item);
     return [{ event_index: eventIndex, request: item?.type === "command_execution" ? command : JSON.stringify(item?.arguments ?? {}), response, response_characters: response.length }];
   });
+  const reads = [
+    ...auditedPromptReads.map(({ event_index, request, response, response_characters }) => ({ event_index, request, response, response_characters })),
+    ...auditedPreToolReads.map(({ event_index, request, response, response_characters }) => ({ event_index, request, response, response_characters })),
+    ...transcriptReads,
+  ];
   const patterns = relevancePatterns(task);
   const edits = completed.map((event, index) => /apply_patch|file_change|write_file|git\s+apply|editor_action/iu.test(JSON.stringify(event)) ? index : -1).filter((index) => index >= 0);
   const hostInstructionReads = completed.flatMap((event, eventIndex) => {
@@ -264,18 +474,36 @@ export function analyzeExpandedTranscript(events, arm, task) {
     const response = itemText(item);
     return [{ event_index: eventIndex, response_characters: response.length }];
   });
-  const observedReads = completed.flatMap((event, eventIndex) => {
+  const observedTranscriptReads = completed.flatMap((event, eventIndex) => {
     const item = event.item;
     const command = item?.type === "command_execution" ? String(item.command ?? "") : "";
     const isMcpDiscovery = item?.type === "mcp_tool_call" && String(item.tool ?? "").toLowerCase() !== "urdira_index_status";
     const isHostInstructionRead = item?.type === "command_execution" && isHostInstructionReadCommand(command);
     const isShellDiscovery = item?.type === "command_execution" && isShellSourceReadCommand(command) && !isHostInstructionRead;
     const isTgrepDiscovery = item?.type === "command_execution" && /(?:^|[\s;&|('"`])tgrep(?:\s|$)/u.test(command);
-    if (!isMcpDiscovery && !isShellDiscovery && !isTgrepDiscovery) return [];
+    const isUrdiraHookDiscovery = hookServedText(item) !== null;
+    const hookReplacement = hookReplacementByEvent.get(eventIndex);
+    if (!isMcpDiscovery && !isShellDiscovery && !isTgrepDiscovery && !isUrdiraHookDiscovery && hookReplacement === undefined) return [];
     const response = itemText(item);
+    if (hookReplacement !== undefined) {
+      const markerCharacters = hookReplacement.count * (URDIRA_HOOK_SERVED_MARKER.length + 1);
+      const shellCharacters = Math.max(0, response.length - hookReplacement.characters - markerCharacters);
+      return [
+        {
+          event_index: eventIndex, method: "hook", urdira: true, invoked_tool: null, request: command,
+          response: "", response_characters: hookReplacement.characters, components: [], mcp_components: null,
+        },
+        ...(isShellDiscovery && shellCharacters > 0 ? [{
+          event_index: eventIndex, method: "shell", urdira: false, invoked_tool: isTgrepDiscovery ? "tgrep" : null, request: command,
+          response, response_characters: shellCharacters, components: [], mcp_components: null,
+        }] : []),
+      ];
+    }
     return [{
       event_index: eventIndex,
-      method: isMcpDiscovery ? "mcp" : isTgrepDiscovery ? "tgrep" : "shell",
+      method: isMcpDiscovery ? "mcp" : isUrdiraHookDiscovery ? "hook" : "shell",
+      urdira: isUrdiraHookDiscovery || (isMcpDiscovery && (String(item.server ?? "").toLowerCase() === "urdira" || String(item.tool ?? "").toLowerCase().startsWith("urdira_"))),
+      invoked_tool: isTgrepDiscovery ? "tgrep" : null,
       request: item?.type === "command_execution" ? command : JSON.stringify(item?.arguments ?? {}),
       response,
       response_characters: response.length,
@@ -286,21 +514,33 @@ export function analyzeExpandedTranscript(events, arm, task) {
       mcp_components: item?.type === "mcp_tool_call" ? classifyMcpResponseComponents(item) : null,
     }];
   });
+  const observedReads = [...auditedPromptReads, ...observedTranscriptReads];
   const observedDiscoveryIndices = observedReads.map((read) => read.event_index);
   const observedFirstEdit = edits.at(0);
   const discoveryIndices = reads.map((read) => read.event_index);
   const firstEdit = edits.at(0);
+  const attestedScriptCommands = new Set();
   const verificationAttempts = completed.flatMap((event) => {
     const item = event.item;
     if (item?.type !== "command_execution") return [];
     const command = String(item.command ?? "");
-    const kind = TEST_COMMAND.test(command) ? "test" : TYPECHECK_COMMAND.test(command) ? "typecheck" : LINT_COMMAND.test(command) ? "lint" : null;
+    const innerCommand = unwrapLoginShell(command);
+    // Package scripts can have arbitrary names. Use the command echoed by
+    // the package manager, not repository-specific script-name heuristics.
+    const scriptTest = /(?:^|[\s'"])(?:npm|pnpm|yarn)\s/u.test(command)
+      && itemText(item).split("\n").some((line) => /^>\s/u.test(line) && TEST_COMMAND.test(line.slice(2)));
+    const priorScriptTest = [...attestedScriptCommands].some((known) => innerCommand === known || innerCommand.startsWith(`${known} && `));
+    if (scriptTest && !/[;&|\n]/u.test(innerCommand)) attestedScriptCommands.add(innerCommand);
+    const kind = TEST_COMMAND.test(command) || PATH_TEST_COMMAND.test(command) || scriptTest || priorScriptTest ? "test" : TYPECHECK_COMMAND.test(command) ? "typecheck" : LINT_COMMAND.test(command) ? "lint" : null;
     if (kind === null) return [];
-    const exitCode = commandExitCode(item);
+    // A later command or pipeline can mask the test's exit. Retain uncertainty
+    // instead of attributing the compound shell's success to the test.
+    const shellExit = commandExitCode(item);
+    const exitCode = /;|\||\n/u.test(command) || (shellExit !== 0 && /&&/u.test(innerCommand)) ? null : shellExit;
     return [{ kind, command, exit_code: exitCode, passed: exitCode === null ? null : exitCode === 0, output_characters: itemText(item).length }];
   });
   const testAttempts = verificationAttempts.filter((attempt) => attempt.kind === "test");
-  const methodReads = (method) => observedReads.filter((read) => read.method === method);
+  const methodReads = (method) => observedReads.filter((read) => method === "tgrep" ? read.invoked_tool === "tgrep" : read.method === method);
   const methodCharacters = (method) => {
     const readsForMethod = methodReads(method);
     return readsForMethod.length === 0 ? null : readsForMethod.reduce((sum, read) => sum + read.response_characters, 0);
@@ -331,11 +571,40 @@ export function analyzeExpandedTranscript(events, arm, task) {
   }));
   const outputCharactersByMethod = {
     mcp: methodCharacters("mcp"),
+    hook: methodCharacters("hook"),
     shell: methodCharacters("shell"),
     tgrep: methodCharacters("tgrep"),
   };
+  const firstRepositoryRead = observedReads.at(0);
+  const readsBeforeFirstEdit = observedReads.filter((read) => firstEdit === undefined || read.event_index < firstEdit);
+  const configuredEventIndices = new Set(reads.map((read) => read.event_index));
+  const configuredReadsBeforeFirstEdit = readsBeforeFirstEdit.filter((read) => configuredEventIndices.has(read.event_index)
+    && !(arm === "urdira-typescript" && read.method === "shell" && hookReplacementByEvent.has(read.event_index)));
+  const configuredCharactersBeforeFirstEdit = configuredReadsBeforeFirstEdit.reduce((sum, read) => sum + read.response_characters, 0);
+  const totalCharactersBeforeFirstEdit = readsBeforeFirstEdit.reduce((sum, read) => sum + read.response_characters, 0);
+  const firstConfigured = reads.at(0)?.event_index;
+  const hookIndices = observedReads.filter((read) => read.method === "hook").map((read) => read.event_index);
+  const directUrdiraMcpCalls = observedReads.filter((read) => read.urdira && read.method === "mcp").length;
+  const auditedHookCalls = hookAudit === null ? hookIndices.length : hookAudit.length;
+  const urdiraEffectiveCalls = directUrdiraMcpCalls + auditedHookCalls;
   return {
     ...codexActions,
+    completed_tool_output: completedToolOutput(completed),
+    context_efficiency: analyzeContextEfficiency(events, options),
+    context_lead: {
+      first_repository_discovery_transport: firstRepositoryRead?.method ?? null,
+      first_repository_discovery_source: firstRepositoryRead === undefined ? null : firstRepositoryRead.urdira ? "urdira" : firstRepositoryRead.method === "mcp" ? "other_mcp" : "shell",
+      configured_before_shell: firstConfigured === undefined ? null : firstShell === undefined ? true : firstConfigured < firstShell,
+      configured_calls_before_first_edit: configuredReadsBeforeFirstEdit.length,
+      configured_characters_before_first_edit: configuredCharactersBeforeFirstEdit,
+      mcp_calls_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "mcp").length,
+      hook_calls_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "hook").length,
+      shell_source_calls_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "shell").length,
+      mcp_characters_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "mcp").reduce((sum, read) => sum + read.response_characters, 0),
+      hook_characters_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "hook").reduce((sum, read) => sum + read.response_characters, 0),
+      shell_source_characters_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "shell").reduce((sum, read) => sum + read.response_characters, 0),
+      configured_character_share_before_first_edit: totalCharactersBeforeFirstEdit === 0 ? null : configuredCharactersBeforeFirstEdit / totalCharactersBeforeFirstEdit,
+    },
     repository_read_calls: observedReads.length,
     configured_repository_read_calls: reads.length,
     assigned_tgrep_calls: arm === "tgrep" ? reads.length : 0,
@@ -343,6 +612,7 @@ export function analyzeExpandedTranscript(events, arm, task) {
     host_instruction_read_calls: hostInstructionReads.length,
     host_instruction_context_characters: hostInstructionReads.reduce((sum, read) => sum + read.response_characters, 0),
     tool_output_characters: outputCharactersByMethod.mcp,
+    hook_output_characters: outputCharactersByMethod.hook,
     shell_output_characters: outputCharactersByMethod.shell,
     tgrep_output_characters: outputCharactersByMethod.tgrep,
     output_characters_by_method: outputCharactersByMethod,
@@ -361,14 +631,20 @@ export function analyzeExpandedTranscript(events, arm, task) {
     observed_rediscovery_after_each_edit: edits.every((edit) => observedDiscoveryIndices.some((discovery) => discovery > edit)),
     observed_tool_usage: {
       mcp_calls: observedReads.filter((read) => read.method === "mcp").length,
+      urdira_hook_calls: auditedHookCalls,
+      urdira_hook_served_calls: hookAudit === null ? hookIndices.length : hookAudit.filter((entry) => entry.decision === "serve").length,
+      urdira_hook_fallback_calls: hookAudit === null ? null : hookAudit.filter((entry) => entry.decision === "fallback").length,
+      urdira_hook_fallback_reasons: hookAudit === null ? null : Object.fromEntries([...new Set(hookAudit.map((entry) => entry.fallback_reason).filter((reason) => typeof reason === "string"))].sort().map((reason) => [reason, hookAudit.filter((entry) => entry.fallback_reason === reason).length])),
+      urdira_effective_calls: urdiraEffectiveCalls,
       shell_calls: observedReads.filter((read) => read.method === "shell").length,
-      tgrep_calls: observedReads.filter((read) => read.method === "tgrep").length,
+      tgrep_calls: observedReads.filter((read) => read.invoked_tool === "tgrep").length,
       host_instruction_reads: hostInstructionReads.length,
     },
     discovery_adoption: {
       mcp_before_shell: mcpBeforeShell,
       shell_after_mcp: shellAfterMcp,
       zero_mcp: mcpIndices.length === 0,
+      zero_urdira_effective_use: urdiraEffectiveCalls === 0,
       mcp_calls: mcpIndices.length,
       shell_calls: shellIndices.length,
     },

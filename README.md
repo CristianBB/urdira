@@ -41,6 +41,53 @@ languages require a compatible plugin. Without a structural plugin, source
 catalog, text retrieval, snapshot, freshness, and index-status capabilities
 remain available; unsupported operations fail explicitly.
 
+### Context an agent can use directly
+
+`urdira_context` combines explicitly requested structural neighborhoods with
+source selected by `options.snippets`. Client-selected `response_budget` and
+source projection options govern each page; logical results are not discarded
+to make responses small. Exact or overlapping source ranges from the same
+artifact version are coalesced into one continuous local source and share
+references, while distinct source, record provenance, coverage and
+continuations remain visible. Large queries are legitimately large and pageable. When a complete
+page cannot fit, Urdira returns an explicit budget error instead of silently
+removing results. Semantic analogues require the semantic retrieval surface;
+the structural context route reports that capability boundary explicitly.
+If a request enlarges source hydration but omits `response_budget.max_characters`,
+the MCP adapter derives a larger default ceiling from that explicit projection.
+Supplying `max_characters` keeps the client's value unchanged.
+
+When those options are omitted, `urdira_context` uses a task-oriented source
+window (6,000 characters per snippet, 30,000 source characters, 20 surrounding
+lines, and a 40,000-character response page). These are public replaceable
+defaults. Relevant windows are clipped around the requested declaration so
+leading context cannot push the requested symbol out of the snippet. When the
+same declaration exists in typed source and JavaScript output, typed source is
+ordered first while both results remain pageable.
+
+For the `tests` facet, indexed `covers` relationships remain confirmed
+evidence. Exact identifier occurrences in test-shaped artifacts supplement
+missing graph relationships as possible evidence. Their source windows are
+hydrated from the smallest indexed callable that contains the occurrence when
+one exists, so the initial context can include the complete executable test
+body without weakening the structural classification. The prompt hook uses the
+public 50-item response default within its replaceable 40,000-character page
+budget; clients can override both values.
+
+Agents should start with the returned locations, code and evidence, request
+further Urdira context when needed, and avoid re-reading the same information
+through shell. Editing, tests, builds and Git remain host operations. Index
+coverage, page coverage and source-projection truncation are separate signals.
+An empty search is not missing coverage: agents should try related indexed
+terms, locate artifacts and request source through Urdira before using native
+discovery for a concrete retrieval failure or unsupported capability. The Codex
+installer includes this guidance once in the additive `developer_instructions`
+configuration, preserving existing user instructions and leaving the host base
+instructions intact. It preserves a user-owned `~/.codex/AGENTS.md` and removes
+the older duplicated Urdira block during an upgrade. In Codex code mode the
+guidance names the deferred `tools.mcp__urdira__*` callables explicitly, so the
+agent does not spend a model round discovering them through `ALL_TOOLS`.
+
 ## Install
 
 Urdira 0.3.3 requires Node.js `>=24.18.1`. The dependency-free 0.3.3 bootstrap
@@ -104,6 +151,10 @@ root (see [`docs/README.md`](docs/README.md) and
 pipeline described below instead; this opt-out is intended for one release.
 Neither format is migrated into the other automatically -- a workspace keeps
 whichever format it was created with until it is removed and re-added.
+Hot-file writes are serialized per file so adjacent partitions cannot race on
+shared filesystem blocks. Encoding, hashing and writes to separate files remain
+parallel. Integrity errors remain explicit; published data is never silently
+repaired by changing its checksum.
 
 ## Current state: v4 default, v3 legacy
 
@@ -327,7 +378,7 @@ per-user daemon; workspace scope stays in tool arguments and is never stored as
 connection state. Most MCP clients use this entry:
 
 Discovery reports the exact installed Urdira release in `serverInfo.version`
-and marks the five-tool catalog as static with `tools.listChanged: false`.
+and marks the three-tool catalog as static with `tools.listChanged: false`.
 
 ```json
 {
@@ -403,18 +454,134 @@ the index is not current:
 All integrations are opt-in and idempotent. The same command writes the
 native hook or MCP configuration appropriate for the selected client:
 
-For Codex, installation also writes a managed block to the user-level
-`~/.codex/AGENTS.md`; Codex loads this file as global developer instructions,
-so the discovery rule applies even when the named agent or skill is not
-selected. It also writes the `urdira_explorer` agent and the
-`urdira-discovery` skill. Both direct read-heavy discovery to Urdira first,
+The CLI records its exact executable and entry point in managed integrations,
+so a host PATH pointing to another Urdira cannot change the hook runtime.
+Reinstall after moving or upgrading the installation to refresh managed entries.
+
+For Codex, installation writes the global discovery rule once through the
+additive `developer_instructions` setting. It preserves user-owned
+`~/.codex/AGENTS.md` content and removes the legacy duplicated managed block on
+upgrade. It also writes the optional `urdira_explorer` agent. Prompt and
+pre-tool hooks provide the normal discovery path; upgrades remove the former
+managed `urdira-discovery` skill so Codex does not spend a separate model turn
+loading instructions already supplied by those hooks. The explorer directs
+read-heavy discovery to Urdira first,
 require an explicit `urdira_index_status` call before declaring Urdira
 unavailable, and preserve any exact tool error before falling back,
 continue a paginated response when requested facets are incomplete, and accept
-current complete coverage as sufficient. They leave shell discovery for
-missing or incomplete indexed data; editing, testing, building, and Git remain
-native task actions. The generated guidance does not require a pipeline or
-change Urdira's read-only MCP contract.
+current complete coverage as sufficient. Urdira should supply the main
+repository context. Focused shell reads remain appropriate for verification,
+generated or unindexed state, and identified missing details; the guidance
+discourages rereading unchanged source already returned by Urdira. Editing,
+testing, building, and Git remain native task actions. The generated guidance
+does not require a pipeline or change Urdira's read-only MCP contract.
+
+Claude Code and Codex also receive a managed `UserPromptSubmit` hook. When the
+submitted prompt includes a working directory and the workspace index is
+current, the hook runs one explicitly scoped `core:build_context` query and
+injects its deduplicated source, identities, relations, coverage, and portable
+continuation before the model starts. Source blocks lead the prompt packet and
+the first code-shaped identifier is sent as an explicit symbol seed; the full
+task still orders the result without making every incidental identifier a new
+context root. This keeps common member names from widening a focused request
+across a large repository. Source blocks
+retain their path, artifact version, byte range, and line range; identical text
+from different artifacts remains distinct. This hook call counts as Urdira use, and
+the injected text tells the agent to reuse it instead of repeating bootstrap
+and discovery. A follow-up prompt with no newly resolvable repository seed
+receives an explicit reuse instruction instead of being mislabeled as a stale
+index and triggering another bootstrap. If current context cannot be obtained, the hook injects the
+static primary-context guidance and leaves the normal MCP and `PreToolUse`
+paths available. When `core:build_context` reports
+`core:coverage_incomplete` or `core:selector_unresolvable`, the hook preserves
+the typed diagnostic and, when declared, runs the source-safe
+`core:search_text` fallback with separate index/page coverage and a literal
+`MORE` continuation. A hook probe missing its prompt or working directory also
+stays on that static path; complete Claude Code and Codex prompt payloads
+resolve the indexed context through the daemon. Set
+`URDIRA_AGENT_PROMPT_CONTEXT_MAX_CHARACTERS` to choose the
+client-side prompt-context response budget; the public default is 40,000. The
+public item default is 50, matching the ordinary query default, so a
+focused result set can complete inside the character budget instead of being
+forced onto a continuation by an integration-specific six-item quota. Set
+`URDIRA_AGENT_PROMPT_CONTEXT_MAX_ITEMS` to replace it. Both values remain
+client choices rather than engine quotas.
+The hook cache stores only session identity, explicit workspace scope and
+snapshot metadata, prompt hash and seed for up to 24 hours; it never stores
+source bodies or continuation payloads.
+A clear same-session follow-up may reuse the packet even with an incidental
+identifier, while an explicit missing-detail request always starts a new Urdira
+query.
+The populated prompt packet identifies itself as the completed first Urdira
+action and tells the agent to work from its listed sources before making any
+further MCP or shell discovery request. It does not advertise another tool in
+that packet, because doing so can trigger a redundant lookup of a symbol whose
+source is already present. It carries the exact `query_scope` and treats the
+supplied test sources as the default focused test locations. The agent starts
+the edit before considering `MORE`; when a concrete missing fact requires the
+remaining page, the complete envelope is executable through
+`urdira query --payload '<MORE JSON>' --json` as well as the MCP query tool.
+The CLI accepts both the MCP-shaped initial query envelope and the literal
+continuation envelope and routes them to their corresponding daemon calls.
+The packet's `SOURCE GUIDE` separates production and test snippets so the
+first implementation pass can consider definitions, callers, public wiring,
+and focused test locations without another repository inventory. The result
+index remains authoritative for identity, certainty, source associations, and
+continuation.
+When the packet contains editable source, `ACTION READY` tells the agent to
+start its first edit from that source and to consider supplied caller wiring
+before inventorying the repository. Missing facts can still be recovered with
+the exact continuation or a focused native read.
+For noisy builds, the managed Codex instructions keep complete output in a
+temporary log, show one line on success, and show a bounded tail on failure.
+This keeps validation visible without repeatedly carrying routine progress in
+later model turns. The same guidance uses task-specific exit variables in zsh
+wrappers and reuses a successful validation result when no relevant edit has
+followed it, avoiding failed wrappers and handoff-only reruns.
+Both clients retain their `PreToolUse` translation for supported searches.
+Codex also translates a simple `sed -n '<start>,<end>p' <path>` read into an
+exact `core:get_source` lookup and emits only the requested line projection;
+unsupported or incomplete projections continue through the native command.
+Searches may combine a stderr discard with a terminal numeric `head`
+projection. Oversized individual match lines retain their path and line,
+declare that source text was projected by the host budget, and remain
+recoverable through an Urdira source read.
+Ripgrep exclusion globs such as `--glob '!generated/**'` remain on the native
+path because the public structural path filter is an inclusion-only union. The
+hook never turns an exclusion into a positive filter or reports the resulting
+empty page as a complete search.
+Served Codex output is materialized in a mode-0600 temporary file and the
+replacement command only reads that exact file. Later hook invocations remove
+stale Urdira output directories internally. This keeps the same
+source text from being recorded once in the rewritten command and again in its
+stdout while leaving the model-visible result unchanged.
+OpenCode's injected `grep` and `glob` tools receive the session directory as
+explicit scope and return Urdira results directly to the model.
+
+When a supported native search is served through one of these hooks, its
+model-visible response begins with `[urdira hook served]`. Benchmark and replay
+tooling records every interception in a content-free audit sidecar and counts
+it once as Urdira hook use. Reports and graders load that sidecar explicitly,
+including `UserPromptSubmit` context that has no transcript tool item. They
+report served output, typed fallback,
+direct MCP calls, and shell commands that actually ran separately. Hook errors
+and trust warnings are not counted as interceptions.
+
+The Codex hook supports standalone `rg`/`grep` searches, line-projected
+`sed -n` reads, a terminal numeric `head` projection, and independent
+repository-reading segments separated by semicolons or conditional `&&`. It
+preserves separators and native segments; a segment that cannot be served
+faithfully remains native while independently translatable segments use
+Urdira. A
+paginated indexed search prints the current page plus an executable `MORE:`
+continuation envelope; the page is never presented as complete. An explicit
+`head` projection is complete when the requested number of lines has already
+been produced. Declared truncation remains served when the page includes a
+portable continuation. Truncation without recovery, pagination without a
+portable cursor, or a page that cannot fit the host output limit fails open to
+the original native command. Installed guidance also tells agents to run the
+repository's required compile step after editing when an exact-file test runner
+consumes generated output.
 
 ```bash
 urdira agent install --client claude-code --confirm
@@ -444,8 +611,6 @@ by hand.
 | `urdira_index_status` | Discover registered workspaces and inspect freshness, snapshots, capabilities, plugins, and indexing issues. |
 | `urdira_query` | Run a direct operation, typed pipeline, registered recipe, or cursor continuation. |
 | `urdira_context` | Execute the registered context recipe for a complete coding task in one call. |
-| `urdira_analyze_change` | Analyze a hypothetical delete, rename, move, signature, type, visibility, contract, or behavior change. |
-| `urdira_build_context` | Build one bounded evidence-aware context package for a coding task. |
 
 The query surface includes definition and artifact discovery, symbol
 resolution, outlines, references, graph expansion and paths, literal and safe
@@ -464,21 +629,25 @@ The web MCP profile returns the complete typed page in `structuredContent`.
 Its companion text block keeps labels, completeness, and opaque continuation
 cursors but omits repeated source snippets and hydration/evidence/registry
 payloads, so browser clients do not pay for the same response data twice.
-The compact text also reports freshness, non-complete capability coverage, the
-number of items shown, and whether another page exists. Treat `coverage:
-complete` with `page: shown=N; more=no` as complete for the declared query
-scope; continue the opaque cursor or follow the reported recovery when
-coverage is partial, stale, unknown, or unsupported.
+The compact text also reports freshness, index coverage, page coverage, the
+number of items shown, and whether another page exists. `coverage: complete`
+describes the indexed scope; `page_coverage: complete` together with
+`page: shown=N; more=no` means the selected page has no remaining results.
+When `page_coverage` is incomplete, copy the exact `MORE` continuation if the
+task needs more. Follow the reported recovery when index coverage is partial,
+stale, unknown, or unsupported.
 
 When no `query_scope` is available, agents call `urdira_index_status` once with
 the exact workspace root. They then reuse the returned `query_scope` object
 byte-for-byte on every source-reading request; they do not rediscover status or
 reconstruct the scope between calls. A returned cursor is opaque and must be
 continued with the same scope and the complete `ContinuationRequest` shape.
-The signed cursor is compact so the complete value remains practical to copy;
+The signed v3 cursor uses Brotli and hexadecimal framing so the complete value remains
+practical to copy;
 it remains bound to the persisted execution, stream, position, scope, snapshot,
-ordering, projection, budget, and expiry. Never decode or edit it. Legacy
-self-contained cursors remain accepted during the compatibility window.
+ordering, projection, budget, and expiry. Never decode or edit it. Deflate/hex
+v2 and legacy self-contained cursors remain accepted during the compatibility
+window.
 Compact agent text may render a bounded server-side `continuation_ref` that
 retains the full cursor and binds it to the original scope, budget, and expiry.
 Use exactly one of `cursor` or `continuation_ref`; clients requiring
@@ -542,6 +711,10 @@ the server resolves its original scope and budget.
 }
 ```
 
+V3 pipeline bindings use the operation registry to preserve complete batch inputs,
+including multiple resolved declarations bound to `find_references.target`.
+Direct scalar requests retain their existing cardinality contract.
+
 For a multi-step coding task, prefer `urdira_context` or an API v3 pipeline
 with explicit stage bindings. Dependent stages execute inside one snapshot and
 one MCP request; freshness and the required readiness frontier are requested
@@ -550,16 +723,15 @@ wrapper waits for the structural frontier by default (30 seconds unless an
 explicit freshness policy is supplied); source-safe operations remain usable
 at `source_ready` while later stages continue in the background.
 
-The MCP server teaches this flow during discovery: its quick start first helps
-the agent choose among the five tools, then explains direct operations,
-recipes, continuations, and typed pipelines before the exhaustive catalog.
-Pipeline examples cover `search -> source`, `resolve -> references`, and
-`resolve -> references -> source`. Each downstream `bindings` property names
-the argument it fills and points to an earlier `{stage_id, output}`; sequence
-arguments receive the complete upstream set, while scalar arguments require
-exactly one item. The same essential guidance is repeated in the
-`urdira_query` tool and pipeline schema descriptions for clients that do not
-surface server-level instructions. Ordinary discovery uses `urdira_context`,
+The MCP server teaches this flow with a compact quick start, continuation
+rules, pipeline semantics, and a registry-derived operation/output catalog.
+Each downstream `bindings` property names the argument it fills and points to
+an earlier `{stage_id, output}`; sequence arguments receive the complete
+upstream set, while scalar arguments require exactly one item. The
+`urdira_query` description retains the essential pipeline guidance for clients
+that do not surface server-level instructions. Nested schema prose is omitted
+from the advertised MCP copy while its closed fields, types, enums, and runtime
+validation remain unchanged. Ordinary discovery uses `urdira_context`,
 while `urdira_query` is enough for one precise lookup; broad requests should be
 narrowed with paths, kinds, context artifacts, entity ids, filters, or response
 budgets. Continue paginated results with the exact cursor and original scope.
@@ -634,6 +806,29 @@ are not part of the public contract and may change without notice.
 ## Benchmark evidence
 
 For the next four-arm comparison, use the [expanded agent campaign runbook](docs/benchmarks/expanded-agent-campaign.md). It records the smoke scoped to selected repositories, small/medium/large examples, 32/96-run full-corpus matrix, executable commands, audit requirements, measured fields, and known historical provenance discrepancies. Urdira readiness is structural only; semantic indexing, materialization, and semantic-sidecar creation are excluded.
+
+### Current directed context-density samples
+
+The latest accepted Urdira-only samples are Playwright v72 at **569,904**
+comparable tokens and Prisma v69 at **666,427**. Both pass strict grading and
+independent validation; they improve on the retained equal-task baseline
+medians by **9.3%** and **24.5%**, respectively. Playwright reached structural
+readiness in **4.917 s** and Prisma in **7.424 s**. Urdira supplied all observed
+repository context before the first edit in both samples, while focused shell
+remained available for identified gaps and validation.
+
+VS Code v70 produced an independently valid patch but failed integration
+grading. The repaired integration was then measured in VS Code v86: the frozen Luna
+provider task passed strict grading and independent validation with
+**970,632** comparable tokens and **29.536 s** structural readiness, with
+semantic indexing disabled. This is below the task-matched provider medians for
+the retained baseline (**1,193,155**), tgrep (**1,011,210**), CodeGraph
+(**1,430,741**) and memory (**1,938,561**). These are single directed samples,
+and competitor values are retained campaign medians rather than fresh reruns.
+See the [current-state qualifications](docs/current-state.md#current-directed-agent-context-evidence),
+[Prisma/VS Code evidence](docs/evidence/2026-09-13-current-urdira-context-density-benchmark.md#current-prisma-v69-and-vs-code-v70-samples),
+[VS Code V86 evidence](docs/evidence/2026-09-14-prompt-hook-context-reuse.md),
+and [Playwright v72 evidence](docs/evidence/2026-09-14-agent-context-density.md).
 
 The following August campaigns predate the v4 default and September query
 optimizations. They are historical comparisons, not measurements of current v4.
@@ -717,6 +912,11 @@ the benchmark runner alongside the [benchmark corpus and task
 contract](release/benchmarks/expanded-typescript-agent-benchmark.json). See the
 [current Markdown report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-27.md)
 and [JSON report](release/benchmarks/expanded-typescript-agent-benchmark-results-2026-08-27.json).
+The [current measurement contract](docs/benchmarks/expanded-agent-campaign.md)
+separates legacy discovery characters from all completed MCP/shell text in
+`completed_tool_output`. Tgrep is counted within shell, missing output remains
+unknown, and tool text is not presented as the model's full context. Offline
+replay derives corrected measurements without changing original transcripts.
 The
 previous derived reports were retired because their Urdira rows were
 invalidated; they must not be used as current performance evidence. P95 fields
@@ -870,6 +1070,24 @@ The production package graph is the dependency-free `urdira` bootstrap,
 transcripts, and historical implementation plans are excluded from published
 packages.
 
+## Agent-context recovery
+
+MCP fits rendered pages by rereading prefixes of the immutable execution,
+including envelope and continuation overhead in the client-selected budget.
+No result is dropped or skipped. An individually oversized projection reports
+its minimum required budget and the exact request location to change.
+Context tools accept the same continuation envelope as `urdira_query`; a
+previous-page link is always explicitly labeled. Continuations preserve the
+execution diagnostics and registry selection.
+
+Structural context discovery that cannot resolve a seed returns
+`core:selector_unresolvable` with recovery guidance. Supply an exact symbol or
+artifact seed, or use literal `core:search_text` and reuse the returned identity.
+Direct covering tests and caller-covering tests are combined with their evidence.
+Reuse delivered source and follow Urdira continuations only as the task needs.
+See the [repair evidence](docs/evidence/2026-09-12-agent-context-recovery.md).
+
+
 ## Architecture and documentation
 
 ```mermaid
@@ -896,3 +1114,9 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md), then run
 
 See [SECURITY.md](SECURITY.md) for reporting and support policy. Urdira is
 released under the [MIT License](LICENSE).
+
+Release acceptance executes the indexing worker from the extracted archive as
+well as the launcher, verifying that both retain executable permissions.
+
+Installed structural queries reuse the exact addon selected and verified by the
+application, without depending on a development checkout path.

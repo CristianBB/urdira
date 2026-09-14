@@ -19,6 +19,7 @@
   },
   "sideEffects": false,
   "dependencies": {
+    "@decimalturn/toml-patch": "3.0.3",
     "@urdira/contracts": "workspace:*",
     "@urdira/daemon": "workspace:*"
   }

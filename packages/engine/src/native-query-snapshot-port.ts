@@ -23,6 +23,7 @@
  * first two), and the test matrix comparing this port's answers against
  * `SqliteCanonicalQuerySnapshotPort` for the same seeded fixtures.
  */
+import { isTestArtifactPath, matchesArtifactGlob, matchesWordMode } from "./canonical-query-data-port.js";
 import type { QueryScope, StructuralFilter } from "@urdira/contracts";
 import type { SqliteDatabase } from "@urdira/storage";
 import type {
@@ -57,6 +58,9 @@ export interface NativeLexicalSearchFilters {
   readonly namespace?: readonly string[];
   readonly kind?: readonly string[];
   readonly subject_type?: readonly string[];
+  /** Internal build-context optimization. Membership remains defined by the
+   * same test-artifact predicate used after lexical matching. */
+  readonly test_artifacts_only?: boolean;
 }
 
 export interface NativeLexicalSearchPage {
@@ -108,19 +112,16 @@ function encodeLexicalCursor(artifactId: string, versionId: string): string {
 function lexicalPathMatches(path: string | null, patterns: readonly string[] | undefined): boolean {
   if (patterns === undefined || patterns.length === 0) return true;
   if (path === null) return false;
-  return patterns.some((pattern) => {
-    const escaped = pattern.replace(/[.+^${}()|[\]\\]/gu, "\\$&").replaceAll("**", ".*").replaceAll("*", "[^/]*").replaceAll("?", "[^/]");
-    return new RegExp(`^${escaped}$`, "u").test(path);
-  });
+  return patterns.some((pattern) => matchesArtifactGlob(path, pattern));
 }
 
-function lexicalMatches(text: string, pattern: string, mode: "literal" | "safe_regex", caseSensitive: boolean): readonly number[] {
+function lexicalMatches(text: string, pattern: string, mode: "literal" | "safe_regex", caseSensitive: boolean, wordMode: "substring" | "identifier" | "token"): readonly number[] {
   if (mode === "safe_regex") {
     let expression: RegExp;
     try { expression = new RegExp(pattern, caseSensitive ? "gu" : "giu"); }
     catch { throw new QueryPlanError("core:selector_invalid", "The safe_regex lexical pattern is invalid."); }
     const offsets: number[] = [];
-    for (const match of text.matchAll(expression)) if (match.index !== undefined) offsets.push(match.index);
+    for (const match of text.matchAll(expression)) if (match.index !== undefined && matchesWordMode(text, match.index, match[0].length, wordMode)) offsets.push(match.index);
     return offsets;
   }
   const haystack = caseSensitive ? text : text.toLocaleLowerCase();
@@ -131,7 +132,7 @@ function lexicalMatches(text: string, pattern: string, mode: "literal" | "safe_r
   while (offset < haystack.length) {
     const found = haystack.indexOf(needle, offset);
     if (found < 0) break;
-    offsets.push(found);
+    if (matchesWordMode(text, found, needle.length, wordMode)) offsets.push(found);
     offset = found + Math.max(1, needle.length);
   }
   return offsets;
@@ -568,6 +569,7 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       for (const candidate of candidates) {
         candidateCursor = { artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id };
         if (!lexicalPathMatches(candidate.normalized_path, pathPatterns) || (language.length > 0 && (candidate.language_hint === null || !language.includes(candidate.language_hint)))) continue;
+        if (filters?.test_artifacts_only === true && !isTestArtifactPath(candidate.normalized_path ?? "")) continue;
         if (dictionaries !== undefined) {
           const ownerOrdinal = findArtifactOrdinal(dictionaries, candidate.artifact_id, candidate.artifact_version_id);
           const ownerRows = ownerOrdinal === undefined ? [] : this.handle.recordsByOwnerOrdinal(ownerOrdinal, generation);
@@ -575,7 +577,7 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
         }
         const file = await this.sqlite.artifact_text(scope, candidate.artifact_version_id);
         if (file === undefined) continue;
-        const offsets = lexicalMatches(file.text, pattern, mode, options.case_sensitive === true);
+        const offsets = lexicalMatches(file.text, pattern, mode, options.case_sensitive === true, options.word_mode ?? "substring");
         if (offsets.length === 0) continue;
         matches.push({ artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id, offsets, line_spans: lexicalLineSpans(file.text, offsets, pattern.length) });
         if (matches.length >= limit) { stoppedForLimit = true; break; }
@@ -613,6 +615,24 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
         if (row.universalKind !== "core:container") continue;
         found.set(row.recordId, this.decode(row, scope.workspace_id));
       }
+    }
+    return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
+  }
+
+  async records_by_owner_artifact_versions(scope: QueryScope, versionIds: readonly string[]): Promise<readonly CanonicalQueryRecord[]> {
+    if (scope.scope_type !== "single_workspace") throw new TypeError("Canonical native-store queries require one explicit workspace; comparison binds each participant separately.");
+    const unique = [...new Set(versionIds)];
+    if (unique.length === 0) return [];
+    const generation = await this.ensureGeneration(scope);
+    if (generation === undefined) return [];
+    const dicts = this.handle.dictionaries();
+    const found = new Map<string, CanonicalQueryRecord>();
+    for (const artifactVersionId of unique) {
+      const artifactId = dicts.artifacts.find((entry) => entry.artifactVersionId === artifactVersionId)?.artifactId;
+      if (artifactId === undefined) continue;
+      const ordinal = findArtifactOrdinal(dicts, artifactId, artifactVersionId);
+      if (ordinal === undefined) continue;
+      for (const row of this.handle.recordsByOwnerOrdinal(ordinal, generation)) found.set(row.recordId, this.decode(row, scope.workspace_id));
     }
     return [...found.values()].sort((left, right) => left.record_id.localeCompare(right.record_id));
   }
@@ -655,8 +675,8 @@ export class NativeCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     for (const dir of directions) {
       for (const row of this.handle.adjacency(uniqueLeft, dir, generation)) {
         if (kinds.size > 0 && !kinds.has(row.relationKind)) continue;
-        if (dir === "outbound" && right.has(row.targetSubjectId)) output.add(`${row.sourceSubjectId} ${row.targetSubjectId}`);
-        if (dir === "inbound" && right.has(row.sourceSubjectId)) output.add(`${row.targetSubjectId} ${row.sourceSubjectId}`);
+        if (dir === "outbound" && right.has(row.targetSubjectId)) output.add(`${row.sourceSubjectId}\u0000${row.targetSubjectId}`);
+        if (dir === "inbound" && right.has(row.sourceSubjectId)) output.add(`${row.targetSubjectId}\u0000${row.sourceSubjectId}`);
       }
     }
     return output;

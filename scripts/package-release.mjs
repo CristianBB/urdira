@@ -187,7 +187,9 @@ async function listFiles(root, current = root) {
         || relativePath === "runtime/node"
         || relativePath === "runtime/node.exe"
         || relativePath === "native/urdira-jsts-syntax-worker"
-        || relativePath === "native/urdira-jsts-syntax-worker.exe";
+        || relativePath === "native/urdira-jsts-syntax-worker.exe"
+        || relativePath === "native/urdira-indexing-worker"
+        || relativePath === "native/urdira-indexing-worker.exe";
       output.push({ path, relative_path: relativePath, mode: executable ? 0o755 : 0o644 });
     }
   }

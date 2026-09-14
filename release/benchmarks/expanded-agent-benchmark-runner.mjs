@@ -4,12 +4,14 @@
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { inspectAgentValidationEnvironment, isCurrentStructuralFrontier } from "./agent-validation-environment.mjs";
 import { createTimingCapture, summarizeTimingCaptures } from "./expanded-agent-timing.mjs";
 import { findWorkerStartupAttestation } from "./urdira-worker-attestation.mjs";
 import { writeUrdiraIsolatedShim } from "./urdira-isolated-shim.mjs";
+import { retainCodexHostSessions } from "./codex-host-evidence.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -60,6 +62,7 @@ function validateRuntimePreflight() {
 }
 
 const preflight = validateRuntimePreflight();
+
 if (preflightOnly) {
   process.stdout.write(`${JSON.stringify({ ok: true, repository_id: repositoryId, task_id: taskId, arm, ...preflight })}\n`);
   process.exit(0);
@@ -72,6 +75,7 @@ const runId = `${repositoryId}-${taskId}-${arm}-${sample}`;
 // worktree isolation are part of the benchmark contract.
 const effectiveDataRoot = arm === "urdira-typescript" ? (dataRoot ?? join("/tmp", "urdira-expanded-isolated", `${repositoryId}-${taskId}-${sample}`)) : dataRoot;
 const transcript = join(outputDir, `${runId}.jsonl`);
+const hookAuditPath = join(outputDir, `${runId}.hook-audit.jsonl`);
 const timingSidecar = join(outputDir, `${runId}.timing.json`);
 const manifestPath = join(outputDir, `${runId}.json`);
 const hostLog = join(outputDir, `${runId}.host.log`);
@@ -84,14 +88,18 @@ writeTimingSidecar();
 const setupStartedAt = Date.now();
 let codexIntegrationHome;
 let codexIntegration;
+let hostSessionEvidence;
 const cleanupCodexIntegration = () => {
-  if (codexIntegrationHome !== undefined) rmSync(codexIntegrationHome, { recursive: true, force: true });
+  if (codexIntegrationHome !== undefined && existsSync(codexIntegrationHome)) {
+    hostSessionEvidence = retainCodexHostSessions(codexIntegrationHome, join(outputDir, `${runId}.host-sessions`));
+    rmSync(codexIntegrationHome, { recursive: true, force: true });
+  }
 };
 const recordFailure = (reason) => {
   const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
   try {
     cleanupCodexIntegration();
-    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
+    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
   } catch { /* retain the original failure when the output directory is unavailable */ }
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -140,13 +148,44 @@ const git = async (...args) => {
 if (argv.includes("--host")) await hostMain();
 
 await git("reset", "--hard", commit);
-await git("clean", "-fd");
+// Preserve caller-provided dependency trees while removing generated source
+// output. The validation preflight below runs after this reset so it checks
+// the exact worktree that will be handed to the model.
+await git("clean", "-fd", "-e", "node_modules", "-e", "**/node_modules");
+// The internal host process only owns indexing and never executes repository
+// tests. Dependency readiness belongs to the outer agent cell; applying it to
+// `--host` prevents isolated prompt-hook probes after dependency cleanup.
+if (worktree && !argv.includes("--host")) {
+  const validation = inspectAgentValidationEnvironment(worktree, (task.required_patterns ?? []).map((entry) => entry.path), process.env.SHELL ?? "/bin/sh", nodeBin);
+  preflight.validation_environment = validation;
+  if (!validation.ready) {
+    mkdirSync(outputDir, { recursive: true });
+    const failurePath = join(outputDir, `${repositoryId}-${taskId}-${arm}-${sample}.preflight-failure.json`);
+    writeFileSync(failurePath, `${JSON.stringify({ ok: false, repository_id: repositoryId, task_id: taskId, arm, commit, worktree, model_invoked: false, validation_environment: validation }, null, 2)}\n`, { flag: "wx" });
+    throw new Error(`Agent validation prerequisites failed; model was not invoked. Evidence: ${failurePath}`);
+  }
+}
 const setup = await prepareArm();
 if (arm === "urdira-typescript") {
   codexIntegrationHome = mkdtempSync(join("/tmp", "urdira-expanded-codex-home-"));
+  const urdiraBinDir = join(codexIntegrationHome, "bin");
+  const shellRuntimeProfile = join(codexIntegrationHome, ".zprofile");
+  // Login shells read this after inheriting the benchmark environment. Keep
+  // the isolated shim ahead of the native closure: that directory also owns a
+  // release launcher named `urdira`, but it is not itself an extracted release
+  // root and cannot locate runtime/node when executed directly.
+  writeFileSync(shellRuntimeProfile, `export PATH=${JSON.stringify(urdiraBinDir)}:${JSON.stringify(dirname(nodeBin))}:$PATH\n`, { encoding: "utf8", mode: 0o600 });
+  const isolatedShellRuntime = spawnSync("/bin/zsh", ["-lc", "node --version"], {
+    cwd: worktree,
+    encoding: "utf8",
+    env: { ...process.env, HOME: codexIntegrationHome, ZDOTDIR: codexIntegrationHome, PATH: `${dirname(nodeBin)}:${process.env.PATH ?? ""}` },
+  });
+  const isolatedShellVersion = String(isolatedShellRuntime.stdout ?? "").trim();
+  if (isolatedShellRuntime.status !== 0 || isolatedShellVersion !== preflight.node) {
+    throw new Error(`Urdira benchmark preflight: isolated shell resolved ${isolatedShellVersion || "no Node runtime"}; expected ${preflight.node}. ${String(isolatedShellRuntime.stderr ?? "").trim()}`);
+  }
   const urdiraCliPath = join(root, "apps/urdira/dist/cli.js");
   const urdiraCliVersion = JSON.parse(readFileSync(join(root, "apps/urdira/package.json"), "utf8")).version;
-  const urdiraBinDir = join(codexIntegrationHome, "bin");
   const urdiraShimPath = join(urdiraBinDir, "urdira");
   const urdiraEndpoint = join(effectiveDataRoot, "daemon.sock");
   mkdirSync(urdiraBinDir, { recursive: true });
@@ -155,7 +194,7 @@ if (arm === "urdira-typescript") {
   if (shimVersion.status !== 0) throw new Error(`isolated urdira --version failed: ${shimVersion.stderr}`);
   const cliFingerprint = createHash("sha256").update(readFileSync(urdiraCliPath)).digest("hex");
   const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");
-  const installed = await installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome });
+  const installed = await installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome, launcher: [urdiraShimPath] });
   const userAuthPath = join(homedir(), ".codex", "auth.json");
   const isolatedAuthPath = join(codexIntegrationHome, ".codex", "auth.json");
   let authMode = "external-or-missing";
@@ -171,7 +210,7 @@ if (arm === "urdira-typescript") {
     home: codexIntegrationHome,
     files: installed.files,
     changed: installed.changed,
-    mcp: "runner-configured-per-process",
+    mcp: "hook-first-cli-continuations",
     ignore_user_config: false,
     hook_trust: "dangerously-bypass-hook-trust",
     auth: authMode,
@@ -181,6 +220,8 @@ if (arm === "urdira-typescript") {
     cli_sha256: cliFingerprint,
     path_prepend: urdiraBinDir,
     endpoint: urdiraEndpoint,
+    shell_runtime_profile: shellRuntimeProfile,
+    shell_runtime_version: isolatedShellVersion,
   };
 }
 
@@ -212,10 +253,11 @@ const setupElapsedMs = Date.now() - setupStartedAt;
 
 const codexArgs = ["-m", model, "-s", "danger-full-access", "-a", "never", ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"]), "exec", "--json", "--skip-git-repo-check", "-C", worktree];
 const addMcp = (args) => {
-  if (arm === "urdira-typescript") {
-    const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
-    args.push("-c", `mcp_servers.urdira.command=${JSON.stringify(nodeBin)}`, "-c", `mcp_servers.urdira.args=[${JSON.stringify(join(root, "release/benchmarks/expanded-urdira-mcp-entry.mjs"))}]`, "-c", `mcp_servers.urdira.env.URDIRA_DATA_ROOT=${JSON.stringify(effectiveDataRoot)}`, "-c", `mcp_servers.urdira.env.URDIRA_BENCHMARK_FRESHNESS_TIMEOUT_MS=${JSON.stringify(String(benchmarkTimeoutMs))}`, "-c", "mcp_servers.urdira.startup_timeout_sec=120", "-c", `mcp_servers.urdira.tool_timeout_sec=${mcpToolTimeoutSec}`);
-  } else if (arm === "codebase-memory") {
+  // The production Codex integration injects Urdira through UserPromptSubmit
+  // and PreToolUse hooks. Loading the complete MCP catalog as well would send
+  // the same discovery surface on every model interaction. A needed MORE
+  // envelope remains executable through the installed `urdira query` CLI.
+  if (arm === "codebase-memory") {
     const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
     args.push("-c", `mcp_servers.codebase-memory.command=${JSON.stringify(codebaseMemoryBin)}`, "-c", "mcp_servers.codebase-memory.startup_timeout_sec=120", "-c", `mcp_servers.codebase-memory.tool_timeout_sec=${mcpToolTimeoutSec}`);
   } else if (arm === "codegraph") {
@@ -225,7 +267,7 @@ const addMcp = (args) => {
 };
 addMcp(codexArgs);
 const firstInstructionMs = Date.now();
-const codexEnvironment = codexIntegration === undefined ? undefined : { HOME: codexIntegrationHome, CODEX_HOME: join(codexIntegrationHome, ".codex"), PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: codexIntegration.endpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin };
+const codexEnvironment = codexIntegration === undefined ? undefined : { HOME: codexIntegrationHome, CODEX_HOME: join(codexIntegrationHome, ".codex"), ZDOTDIR: codexIntegrationHome, PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: codexIntegration.endpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_AGENT_HOOK_AUDIT_LOG: hookAuditPath };
 let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, env: codexEnvironment, input: initialInstruction, timing_label: "turn-1" });
 if (first.timing) { codexTimingCaptures.push(first.timing); writeTimingSidecar(); }
 writeFileSync(transcript, first.stdout, "utf8");
@@ -281,7 +323,7 @@ const waitForCurrentStructuralFrontier = async (afterTurn) => {
     if ([entry?.workspace_status, entry?.freshness_status, entry?.startup_phase].includes("failed")) {
       throw new Error(`Urdira inter-turn indexing failed after turn ${afterTurn}: ${JSON.stringify(entry)}`);
     }
-    if (entry?.structural_ready === true && ["current", "equivalent"].includes(entry?.freshness_status)) {
+    if (isCurrentStructuralFrontier(entry)) {
       const elapsed = Date.now() - started;
       appendFileSync(hostLog, `BENCH_INTER_TURN_READY ${JSON.stringify({ after_turn: afterTurn, elapsed_ms: elapsed, workspace_id: entry.workspace_id })}\n`);
       return elapsed;
@@ -319,11 +361,11 @@ if (hostMetrics?.semantic_sidecar_created === true) {
   throw new Error("Semantic index exclusion failed: the Urdira benchmark created a semantic sidecar.");
 }
 
-const grade = await run(nodeBin, [join(root, "release/benchmarks/expanded-agent-benchmark-grader.mjs"), "--worktree", worktree, "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--transcript", transcript], { cwd: root });
+const grade = await run(nodeBin, [join(root, "release/benchmarks/expanded-agent-benchmark-grader.mjs"), "--worktree", worktree, "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--transcript", transcript, "--hook-audit", hookAuditPath], { cwd: root });
 let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
 cleanupCodexIntegration();
-const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), host_session_evidence: hostSessionEvidence, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;
@@ -498,9 +540,9 @@ async function hostMain() {
     // Preserve the campaign's phase contract. A `warm` sample starts only
     // after the complete structural snapshot is current/equivalent; releasing
     // at the first transient source frontier moves indexing work into the
-    // measured agent turn. Do not change this gate -- it is what keeps warm
-    // runs comparable across campaigns.
-    const warmReady = entry?.structural_ready === true && ["current", "equivalent"].includes(entry?.freshness_status);
+    // measured agent turn. Use source/structural freshness rather than the
+    // aggregate state, which can include an unavailable semantic lane.
+    const warmReady = isCurrentStructuralFrontier(entry);
     // Non-warm ("cold") phases used to release at the very first
     // `source_ready` poll and then re-derive their own defensive
     // "durable source frontier" language here, because `source_ready` could

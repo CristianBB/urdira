@@ -1836,6 +1836,7 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   // empty workspace.
   const structuralStoreDir = structuralStoreDirFor(database.database.filename);
   const structuralStoreKind = await readStructuralStore(database.database);
+  if (structuralStoreKind === "native") await restorePersistedV4Readiness(database.database, resolution.workspace_id);
   // v4 (P2-7): `SqliteCanonicalQuerySnapshotPort`'s `search_literal`/
   // `semantic_index_state`/`semantic_vectors` methods run unqualified SQL
   // against `lexical_index_state`/`lexical_fts`/`lexical_documents`/
@@ -2198,6 +2199,19 @@ interface V4WorkspaceReadinessState {
   readonly semantic_maintenance_submitted?: boolean | undefined;
 }
 const v4ReadinessState = new Map<string, V4WorkspaceReadinessState>();
+
+async function restorePersistedV4Readiness(database: WorkspaceDatabase["database"], workspaceId: string): Promise<void> {
+  const current = await database.get<{ current_generation: number }>("SELECT current_generation FROM workspace_current_state WHERE workspace_id = ?", [workspaceId]);
+  if (!Number.isSafeInteger(current?.current_generation) || current!.current_generation < 0) {
+    v4ReadinessState.set(workspaceId, { ...v4ReadinessState.get(workspaceId) });
+    return;
+  }
+  v4ReadinessState.set(workspaceId, {
+    ...v4ReadinessState.get(workspaceId),
+    queryable_generation: current!.current_generation,
+    durable_generation: current!.current_generation,
+  });
+}
 /**
  * P1-D-c: per-workspace-process (decision 29) transport instances are
  * reused across scans, so this tracks which ones this daemon process has
@@ -4124,6 +4138,12 @@ export class DaemonRuntime {
       // to ON, per `DaemonRuntimeOptions.lexical_index`'s doc comment.
       const lexicalMaintenanceInFlight = new Set<string>();
       const lexicalMaintenancePending = new Set<string>();
+      // A daemon restart reconstructs `v4ReadinessState` asynchronously while
+      // query engines warm. Startup lexical maintenance can be admitted before
+      // that warm-up observes the native structural-store marker. Cache only
+      // the negative result locally; a positive result is represented by the
+      // existing v4 readiness map and must route maintenance to the sidecar.
+      const legacyLexicalWorkspaceIds = new Set<string>();
       const submitLexicalMaintenance = (workspaceId: string): void => {
         if (options.lexical_index === false) return;
         if (options.lexical_owned_by_rust === true) return;
@@ -4140,6 +4160,16 @@ export class DaemonRuntime {
             run: async () => {
               let database: WorkspaceDatabase | undefined;
               try {
+                if (!v4ReadinessState.has(workspaceId) && !legacyLexicalWorkspaceIds.has(workspaceId)) {
+                  const probed = await durableStorage.openWorkspace(workspaceId);
+                  if ((await readStructuralStore(probed.database)) === "native") {
+                    database = probed;
+                    await restorePersistedV4Readiness(probed.database, workspaceId);
+                  } else {
+                    legacyLexicalWorkspaceIds.add(workspaceId);
+                    await probed.close();
+                  }
+                }
                 // v4 (plan §9, P2-7): checked FIRST, ahead of the threaded
                 // path below -- `runLexicalReconcileInThread`'s worker
                 // thread (`lexical-worker-thread.ts`) calls
@@ -4154,7 +4184,7 @@ export class DaemonRuntime {
                 // doc) -- v4 lexical maintenance is new work, not a
                 // regression against any existing threaded contract.
                 if (v4ReadinessState.has(workspaceId)) {
-                  database = await durableStorage.openWorkspace(workspaceId);
+                  database ??= await durableStorage.openWorkspace(workspaceId);
                   const sidecarSql = await database.openSidecar("lexical");
                   // See this task's evidence doc, "maintenance on sidecars":
                   // `reconcileLexicalProjection`'s own SQL joins
@@ -4632,7 +4662,9 @@ export class DaemonRuntime {
           }
           try {
             const maxFrameBytes = options.max_frame_bytes ?? IPC_DEFAULT_MAX_FRAME_BYTES;
-            return attachIndexFreshness(await engine.continue({ cursor, response_budget: { max_items: budget["max_items"] as number, max_characters: frameSafeMaxCharacters(maxFrameBytes, budget["max_characters"] as number) } }), registry.get(workspaceId));
+            const pageItemLimit = payload["page_item_limit"];
+            if (pageItemLimit !== undefined && (!Number.isSafeInteger(pageItemLimit) || typeof pageItemLimit !== "number" || pageItemLimit < 0 || pageItemLimit > budget["max_items"])) throw new DaemonError("core:ipc_request_invalid", "page_item_limit must be an integer within the original response budget.");
+            return attachIndexFreshness(await engine.continue({ cursor, ...(pageItemLimit === undefined ? {} : { page_item_limit: pageItemLimit as number }), response_budget: { max_items: budget["max_items"] as number, max_characters: frameSafeMaxCharacters(maxFrameBytes, budget["max_characters"] as number) } }), registry.get(workspaceId));
           } finally {
             enforceWarmRecordsBudget(queryEngines, warmRecordsLru);
           }

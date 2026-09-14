@@ -8,6 +8,39 @@ import { describe, expect, it } from "vitest";
 const execFileAsync = promisify(execFile);
 
 describe("expanded agent report", () => {
+  it("uses the final counter when resumed Codex turns report cumulative thread usage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-cumulative-"));
+    const transcript = join(root, "run.jsonl");
+    const hookAudit = join(root, "run.hook-audit.jsonl");
+    const events = [
+      { type: "thread.started", thread_id: "thread-1" },
+      { type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 80, output_tokens: 10, reasoning_output_tokens: 4 } },
+      { type: "thread.started", thread_id: "thread-1" },
+      { type: "turn.completed", usage: { input_tokens: 170, cached_input_tokens: 130, output_tokens: 18, reasoning_output_tokens: 7 } },
+      { type: "thread.started", thread_id: "thread-1" },
+      { type: "turn.completed", usage: { input_tokens: 220, cached_input_tokens: 160, output_tokens: 25, reasoning_output_tokens: 9 } },
+    ];
+    await writeFile(transcript, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
+    await writeFile(hookAudit, `${JSON.stringify({ hook_event_name: "UserPromptSubmit", operation: "context", decision: "serve", output_characters: 1200 })}\n`, "utf8");
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ campaign_id: "test", model: "test", expected_runs: 1, independent_campaigns: 1, arms: ["urdira-typescript"], repositories: [{ id: "repo", repository: "owner/repo", commit: "abc", tasks: [{ id: "task", complexity: "small" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "urdira-typescript", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript, hook_audit_path: hookAudit, correctness: { evidence: {} } } }] }, null, 2)}\n`, "utf8");
+    const comparisonPath = join(root, "comparison.json");
+    await writeFile(comparisonPath, `${JSON.stringify({ runs: [] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--comparison-report", comparisonPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0].metrics).toMatchObject({
+      input_tokens: 220,
+      cached_input_tokens: 160,
+      output_tokens: 25,
+      reasoning_tokens: 9,
+      token_usage_semantics: "cumulative_thread",
+      hook_output_characters: 1200,
+      observed_tool_usage: { urdira_hook_calls: 1, urdira_hook_served_calls: 1, urdira_effective_calls: 1 },
+      discovery_adoption: { zero_urdira_effective_use: false },
+    });
+  });
+
   it("separates recoverable selector narrowing from unexpected MCP failure", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-expanded-report-"));
     const transcript = join(root, "run.jsonl");
@@ -122,6 +155,7 @@ describe("expanded agent report", () => {
     expect(report).toMatchObject({
       report_version: 2,
       task_comparisons: [{
+        completed_tool_output: { mcp: { calls: 5 }, shell: { calls: 0, characters: null }, full_model_context_characters: null },
         structural_readiness_ms: 123,
         semantic_index_enabled: false,
         semantic_sidecar_created: false,
@@ -131,10 +165,13 @@ describe("expanded agent report", () => {
     });
     expect(report.measurement_contract.readiness).toContain("Semantic indexing");
     const markdown = await readFile(`${output}.md`, "utf8");
-    expect(markdown).toContain("working code-intelligence alternative");
+    expect(markdown).toContain("primary repository-context source");
+    expect(markdown).toContain("Configured share before edit");
+    expect(markdown).not.toContain("with no native source-reading fallback");
     expect(markdown).toContain("Semantic sidecar created");
     expect(markdown).toContain("Process-tree peak RSS KiB");
     expect(markdown).toContain("External Codex call timing");
+    expect(markdown).toContain("Completed transport text");
     expect(markdown).toContain("7.0");
   });
 });

@@ -1,7 +1,7 @@
 # Decision 26: v4 immutable segment structural store
 
 Status: **Accepted**
-Last updated: 2026-09-09
+Last updated: 2026-09-12
 Depends on: [Storage and projection architecture](05-storage-projection-architecture.md), [Content-derived record identity](11-content-derived-record-identity.md), [Transactional projection digests](13-transactional-projection-digests.md), [Native pipeline and relational storage](21-native-pipeline-relational-storage.md), [v3 optimization](22-v3-optimization.md), [Index pack](23-index-pack.md), [Rust native acceleration](25-rust-native-acceleration.md)
 Related: decisions [27](27-v4-merkle-bucket-digests.md), [28](28-v4-rust-semantics-and-residual-checker.md), [29](29-v4-rust-owned-scan-pipeline.md) own the parts of this system they specify (digests, semantics, scan orchestration)
 
@@ -61,6 +61,18 @@ layout; the owner's numeric target is reachable only with the segment store.
 
 ## Decision
 
+### Hot-file write isolation
+
+Partition ranges that do not overlap in bytes can still share a filesystem
+block. Physical allocation does not prove that those blocks are initialized.
+Serialize positional writes to each individual hot file, including full-write
+retries, while retaining parallel encoding, hashing, secondary-index work and
+writes to different files. Do not rely on sparse allocation, allocation success
+or logical range disjointness to authorize concurrent writes to the same file.
+The bytes, partition checksum formula, manifest publication protocol and stored
+execution order remain unchanged. Reader integrity failures stay explicit;
+never repair a published file by replacing its checksum with the observed one.
+
 Urdira v4 (`index_contract` `0x34`) replaces the v3 structural SQLite tables
 with an immutable, per-generation segment store: `crates/urdira-structural-store`
 (design, evidence: `docs/evidence/2026-09-02-v4-p2-3-structural-store.md`),
@@ -68,6 +80,16 @@ written and read exclusively from Rust, exposed to the daemon through a napi
 read path and a query port. SQLite remains the catalog, snapshot,
 control-plane, and lifecycle authority, plus independently enabled sidecar
 files for lexical FTS and semantic vectors.
+
+A changed-scope observation that contains no added, changed, or deleted
+indexable artifact is an indexing no-op. The worker refreshes metadata and
+returns the current generation and roots without invoking incremental syntax
+analysis or publication. Directory watcher events for ignored runtime output
+therefore cannot widen an empty changed-artifact set into a corpus rebuild.
+The shared default inclusion policy classifies `test-results/**` as runtime
+output alongside dependency, distribution, and coverage trees. Enumeration,
+watchers, the TypeScript security boundary, and the Rust source frontier apply
+the same rule. A caller may still opt in with an explicit include rule.
 
 ### Directory layout
 
@@ -115,8 +137,9 @@ single hash over the whole re-mmap'd region: it combines the 16
 per-nibble-partition xxh3 hashes the partitioned writer already computed
 while writing (`write_base_partitioned`), concatenating their
 little-endian bytes in nibble order and hashing that concatenation — a
-nibble with no rows is skipped (needed for a store with fewer than 16
-populated nibbles). This avoids a second full re-mmap-and-hash pass after
+nibble with no rows contributes the hash of an empty byte range and is never
+skipped. All 16 slots participate, including stores with fewer than 16 populated
+nibbles. This avoids a second full re-mmap-and-hash pass after
 the partitioned write (`crates/urdira-structural-store/src/segment_io.rs`).
 
 | File | Content | Stride |

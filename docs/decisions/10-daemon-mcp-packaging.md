@@ -1,7 +1,7 @@
 # Daemon, MCP Integration, and Packaging
 
 Status: Accepted  
-Last updated: 2026-09-09
+Last updated: 2026-09-14
 Depends on: Query API, workspace model, storage architecture, and lifecycle configuration
 
 ## Decision objective
@@ -82,11 +82,12 @@ operations do not need to be wrapped in a pipeline.
 The adapter presents Urdira as the first tool for repository discovery and
 source reading. Because the surface is read-only, shell tools remain the
 boundary for editing, tests, builds, and Git inspection. Query pages continue
-with the complete continuation envelope emitted by `MORE`: `api_version`, the
-original scope, and the opaque cursor are required. `response_budget` is
-optional; clients preserve it when emitted or add it only to override the
-default. Clients never decode, reconstruct, or substitute an MCP catalog
-cursor.
+with the complete continuation envelope emitted by `MORE`. A portable cursor
+form carries `api_version`, original scope, opaque cursor and any emitted
+`response_budget`. A server-local `continuation_ref` form carries only
+`api_version` and the reference; the adapter resolves its original scope and
+budget. Clients copy either form literally and never decode, reconstruct, or
+substitute an MCP catalog cursor.
 
 The copyable examples exposed by the adapter are part of its agent-facing
 contract. `urdira_context` is top-level, with `api_version`, `scope`, `task`,
@@ -115,13 +116,13 @@ The daemon interface is intentionally not a public Urdira protocol. Its framing,
 
 Every implementation must nevertheless preserve these invariants: the channel is local and owner-restricted; peer, engine build, data root, and compatibility are verified before domain payloads; requests and responses are typed, bounded, correlated, cancellable, and explicitly workspace-scoped; unknown versions and fields fail closed; progress and operation errors remain distinct; the MCP boundary never opens storage or runs plugins; and daemon restart recovery preserves committed snapshots and ready cursor executions. Cross-user and remote daemon access are unsupported.
 
-The channel's fixed-size IPC frame (256 KiB by default) bounds every response independently of any caller-declared budget: a `core:query`/`core:query_continue` response's effective `response_budget.max_characters` is clamped to at most half the frame size before the engine builds a page, and the page builder additionally truncates by cumulative serialized size, always keeping at least one item so a page never regresses to zero progress. A generous or oversized declared budget therefore degrades to a smaller bounded page and a continuation cursor for the remainder instead of failing the whole request against the transport ceiling.
+The channel's fixed-size IPC frame (256 KiB by default) bounds every response independently of any caller-declared budget: a `core:query`/`core:query_continue` response's effective `response_budget.max_characters` is clamped to at most half the frame size before the engine builds a page, and the page builder additionally limits cumulative serialized item size. At the MCP boundary, final-envelope fitting rereads a smaller prefix of that same immutable execution when framing requires it and preserves continuations for untouched items. An indivisible projected unit that cannot fit returns its typed minimum-budget error; no layer drops it and reports a complete page.
 
 ## MCP server
 
-The coding agent launches `urdira mcp` as one stdio MCP server. The MCP module is packaged in the Urdira executable and has no independently configured endpoint, daemon version, or workspace session. Its advertised `serverInfo.version` is the exact Urdira runtime release version. It targets the stable MCP `2026-07-28` modern protocol era through the stable v2 line of the official TypeScript SDK, explicitly serves compatible 2025-era clients through the v2 `serveStdio` factory, and exposes five approved tools: `urdira_query`, `urdira_context`, `urdira_analyze_change`, `urdira_build_context`, and `urdira_index_status`. The catalog is static for one adapter release and explicitly advertises `tools.listChanged: false`. `urdira_context` is the task-oriented wrapper over the registered `core:build_context` operation and defaults to a bounded structural-readiness wait; it does not introduce another query semantic. MCP connection state selects wire-era behavior only; every source-reading call validates explicit scope. The exact binding is authoritative in the [MCP server contract](../protocol/mcp-adapter-contract.md).
+The coding agent launches `urdira mcp` as one stdio MCP server. The MCP module is packaged in the Urdira executable and has no independently configured endpoint, daemon version, or workspace session. Its advertised `serverInfo.version` is the exact Urdira runtime release version. It targets the stable MCP `2026-07-28` modern protocol era through the stable v2 line of the official TypeScript SDK, explicitly serves compatible 2025-era clients through the v2 `serveStdio` factory, and exposes three approved tools: `urdira_query`, `urdira_context`, and `urdira_index_status`. The catalog is static for one adapter release and explicitly advertises `tools.listChanged: false`. `urdira_context` is the task-oriented wrapper over the registered `core:build_context` operation and defaults to a bounded structural-readiness wait; every other operation, including impact analysis, remains available through `urdira_query`. MCP connection state selects wire-era behavior only; every source-reading call validates explicit scope. The exact binding is authoritative in the [MCP server contract](../protocol/mcp-adapter-contract.md).
 
-Tool input schemas are generated from the authoritative public API schema registry as JSON Schema 2020-12. Every object sets `additionalProperties: false`; every union has a discriminator; every agent-visible field has a concise description covering meaning, presence, default, limits, units, ordering, interaction, and cursor behavior. Shared definitions are generated once and schema snapshots are conformance-tested against the logical models. The agent profile intentionally does not advertise `outputSchema` and emits no `structuredContent`; completed calls keep the existing compact `content[0].text`. The web profile advertises the reserved structured result schema and returns validated `structuredContent` while retaining equivalent text. Both profiles invoke the same five domain tools. The official SDK emits the negotiated legacy wire shape on legacy agent connections. Urdira operation failures use typed `isError: true` tool results, while malformed MCP envelopes remain JSON-RPC protocol errors.
+Tool input schemas are generated from the authoritative public API schema registry as JSON Schema 2020-12. Every object sets `additionalProperties: false`; every union has a discriminator; every agent-visible field has a concise description covering meaning, presence, default, limits, units, ordering, interaction, and cursor behavior. Shared definitions are generated once and schema snapshots are conformance-tested against the logical models. The agent profile intentionally does not advertise `outputSchema` and emits no `structuredContent`; completed calls keep the existing compact `content[0].text`. The web profile advertises the reserved structured result schema and returns validated `structuredContent` while retaining equivalent text. Both profiles expose the same three tools and route the same registered operations through them. The official SDK emits the negotiated legacy wire shape on legacy agent connections. Urdira operation failures use typed `isError: true` tool results, while malformed MCP envelopes remain JSON-RPC protocol errors.
 
 The server instructions begin with a progressive quick start and tool-choice guide before exposing the exhaustive catalogs. The `urdira_query` description remains independently usable when a client omits server instructions: it distinguishes operation, recipe, pipeline, and continuation requests and explains static `arguments`, dependency `bindings`, complete-set propagation, final `outputs`, and scalar cardinality. The manual includes executable `search -> source`, `resolve -> references`, and three-stage `resolve -> references -> source` examples. Exact signatures and output stream names are generated from the authoritative registries; every registered operation must have exactly one categorized usage guide. Continuation uses the same tool with `ContinuationRequest`; the agent never reconstructs or decodes cursor claims.
 
@@ -273,3 +274,15 @@ launcher, and startup fails closed on a missing or mismatched worker digest.
 ## Change history
 
 - **2026-09-09** (`7a29869`): documented the IPC frame's fixed size and the `response_budget.max_characters` clamp (half the frame) plus size-based page truncation in "Private daemon boundary" above -- a declared budget can no longer overflow the transport into `core:ipc_frame_too_large`.
+
+Release archives preserve executable modes for both native workers. Acceptance
+executes the indexing worker from the extracted archive with closed stdin, in
+addition to checking the launcher version. A failed worker spawn must never
+signal a process without a valid child identity; its asynchronous spawn error
+must be consumed and reported without terminating the daemon.
+
+Application composition pins the structural query loader to the addon path from
+the already checksum-verified native closure. The engine receives that path
+through its injected configuration port; it does not depend on the native
+packaging adapter. The configured production path takes precedence over
+development environment and repository-relative fallbacks.

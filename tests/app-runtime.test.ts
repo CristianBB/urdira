@@ -115,6 +115,36 @@ describe("Urdira application runner", () => {
     expect(urdiraHelp()).toContain("urdira mcp");
     expect(urdiraHelp()).toContain("explicit workspace scope");
   });
+  it("injects static prompt guidance for an incomplete hook payload without starting a daemon", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-prompt-hook-"));
+    let startupPhases = 0;
+    try {
+      const result = await runUrdira(["agent", "hook", "--client", "claude-code", "--payload", JSON.stringify({ hook_event_name: "UserPromptSubmit" })], {
+        daemon: {
+          data_root: join(root, "daemon"),
+          engine_build_id: "must-not-start",
+          scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 1, client_quotas: {} },
+        },
+        on_startup_progress: () => { startupPhases++; },
+      });
+      expect(startupPhases).toBe(0);
+      expect(result.data).toMatchObject({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: expect.stringContaining("main repository context") } });
+      await expect(readdir(join(root, "daemon"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("does not bypass daemon resolution for Codex prompt context", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-codex-prompt-hook-"));
+    try {
+      await expect(runUrdira([
+        "agent", "hook", "--client", "codex", "--payload",
+        JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "Fix Target", cwd: root }),
+      ], { endpoint: join(root, "missing-daemon.sock") })).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("runs a read-only CLI command through an existing daemon endpoint", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-app-runtime-"));
     const runtime = await DaemonRuntime.start({

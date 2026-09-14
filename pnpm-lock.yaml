@@ -104,6 +104,9 @@ importers:
 
   packages/cli:
     dependencies:
+      '@decimalturn/toml-patch':
+        specifier: 3.0.3
+        version: 3.0.3
       '@urdira/contracts':
         specifier: workspace:*
         version: link:../contracts
@@ -373,6 +376,10 @@ packages:
 
   '@bufbuild/protobuf@2.11.0':
     resolution: {integrity: sha512-sBXGT13cpmPR5BMgHE6UEEfEaShh5Ror6rfN3yEK5si7QVrtZg8LEPQb0VVhiLRUslD2yLnXtnRzG035J/mZXQ==}
+
+  '@decimalturn/toml-patch@3.0.3':
+    resolution: {integrity: sha512-z8w09LRalZT41nOp5y0hwpyJnLZ2bcBAJ4tIbznxLfEzfWIgVLIP9vWjCPJ2IhBBuo0/P+Rr5ibCZtbroyuHHQ==}
+    engines: {node: '>=16'}
 
   '@emnapi/runtime@1.11.3':
     resolution: {integrity: sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==}
@@ -2149,6 +2156,8 @@ snapshots:
   '@bcoe/v8-coverage@1.0.2': {}
 
   '@bufbuild/protobuf@2.11.0': {}
+
+  '@decimalturn/toml-patch@3.0.3': {}
 
   '@emnapi/runtime@1.11.3':
     dependencies:

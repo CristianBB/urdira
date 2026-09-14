@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { smokeNativeArchive } from "../scripts/smoke-native-archive.mjs";
 import { buildReleaseMetadata, sha256 } from "../scripts/release-contract.mjs";
 import { inspectProductionTree, inspectReleaseArchive, writeDeterministicArchive } from "../scripts/package-release.mjs";
 
@@ -50,4 +51,20 @@ describe("Phase 14 deterministic package builder", () => {
     expect(inspection.forbidden).toEqual([]);
     expect(inspection.symlinks).toEqual([]);
   });
+});
+
+it.runIf(process.platform !== "win32")("smokes the complete native closure including the indexing worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "urdira-native-closure-test-"));
+  const tree = join(root, "tree");
+  await mkdir(join(tree, "native"), { recursive: true });
+  await mkdir(join(tree, "bin"), { recursive: true });
+  for (const name of ["manifest.json", "urdira-native.node", "urdira-jsts-syntax-worker", "urdira-indexing-worker"]) await writeFile(join(tree, "native", name), "fixture");
+  await writeFile(join(tree, "native", "urdira-indexing-worker"), "#!/bin/sh\nexit 0\n");
+  await writeFile(join(tree, "release.json"), JSON.stringify({ target: "darwin-arm64", engine_version: "0.3.3" }));
+  const launcher = join(tree, "bin", "urdira");
+  await writeFile(launcher, "#!/bin/sh\nprintf '0.3.3\\n'\n");
+  await chmod(launcher, 0o755);
+  const archive = join(root, "closure.tar.gz");
+  await writeDeterministicArchive(tree, archive);
+  await expect(smokeNativeArchive(archive)).resolves.toMatchObject({ native_files: expect.arrayContaining(["urdira-indexing-worker"]), version: "0.3.3" });
 });

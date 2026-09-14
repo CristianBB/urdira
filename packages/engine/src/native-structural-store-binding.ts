@@ -1,20 +1,8 @@
 /**
- * Raw loader for the `NativeStoreBuilder`/`NativeStructuralStoreHandle`
- * napi classes (`crates/urdira-native-node/src/structural_store_napi.rs`,
- * v4 plan P2-5). Deliberately separate from `@urdira/native`'s
- * `loadNativeBinding`/`getNativeBinding` (`packages/native/src/loader.ts`):
- * that loader validates a FROZEN, versioned `NativeBinding` function
- * surface against a signed release manifest (build id, per-file sha256,
- * exact target platform package) -- appropriate for the shipped addon,
- * not for this task's "test the port against real fixtures TODAY" scope,
- * where the addon is a fresh local `cargo build` a developer or CI job
- * just produced. This loader does a plain `require()` of the built
- * addon file, with no manifest/checksum ceremony.
- *
- * Resolution order for the addon path:
- * 1. `URDIRA_NATIVE_ADDON_PATH` env var, if set (test/CI override).
- * 2. `<repoRoot>/release/native/<hostTarget>/urdira-native.node`, the same
- *    path `scripts/build-native.mjs` populates.
+ * Native structural store classes are loaded from the exact addon path pinned
+ * by application composition after native-closure verification. Development
+ * without that composition retains the explicit environment and checkout
+ * fallbacks. The engine does not resolve production packages itself.
  */
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
@@ -281,6 +269,14 @@ function defaultAddonPath(): string {
 }
 
 let cached: NativeStructuralStoreAddon | undefined;
+let configuredAddonPath: string | undefined;
+
+/** Application composition supplies its verified native closure path. */
+export function configureNativeStructuralStoreAddonPath(path: string | undefined): void {
+  if (configuredAddonPath === path) return;
+  configuredAddonPath = path;
+  cached = undefined;
+}
 
 /** Loads (and caches) the raw addon. Throws with a clear message if the
  * addon has not been built yet -- run `node scripts/build-native.mjs` (or,
@@ -288,7 +284,7 @@ let cached: NativeStructuralStoreAddon | undefined;
  * --release` and copy the produced dylib to the expected path) first. */
 export function loadNativeStructuralStoreAddon(): NativeStructuralStoreAddon {
   if (cached !== undefined) return cached;
-  const path = process.env["URDIRA_NATIVE_ADDON_PATH"] ?? defaultAddonPath();
+  const path = configuredAddonPath ?? process.env["URDIRA_NATIVE_ADDON_PATH"] ?? defaultAddonPath();
   if (!existsSync(path)) throw new Error(`Native structural store addon not found at ${path}. Build it first (node scripts/build-native.mjs, or cargo build -p urdira-native-node --release).`);
   const loaded = require(path) as Partial<NativeStructuralStoreAddon>;
   if (typeof loaded.NativeStoreBuilder !== "function" || typeof loaded.NativeStructuralStoreHandle !== "function") throw new Error(`Native addon at ${path} does not export NativeStoreBuilder/NativeStructuralStoreHandle.`);

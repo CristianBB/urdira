@@ -275,6 +275,8 @@ export class QueryOperationTelemetry {
 }
 
 export interface QueryContinuationRequest {
+  /** Private presentation limit; cannot change the signed budget ceiling. */
+  readonly page_item_limit?: number;
   readonly cursor: string;
   readonly response_budget: { readonly max_items: number; readonly max_characters: number };
 }
@@ -289,6 +291,8 @@ export interface QueryManifestStore {
 }
 
 export interface QueryStreamPage {
+  readonly page_start_cursor?: string;
+  readonly total?: number;
   readonly items: ReadonlyArray<QueryStreamItem>;
   readonly next_cursor?: string;
   readonly previous_cursor?: string;
@@ -352,7 +356,7 @@ class MemoryManifestStore implements QueryManifestStore {
         items.push(...segment.slice(segmentOffset, segmentOffset + take));
         nextOrdinal += take;
       }
-      return { items, has_more: nextOrdinal < manifest.entry_count };
+      return { items, has_more: nextOrdinal < manifest.entry_count, total: manifest.entry_count };
     },
   };
 }
@@ -516,7 +520,7 @@ export class DurableManifestStore implements QueryManifestStore {
           segmentIndex += 1;
         }
       }
-      return { items: page, has_more: nextOrdinal + page.length < descriptor.entry_count };
+      return { items: page, has_more: nextOrdinal + page.length < descriptor.entry_count, total: descriptor.entry_count };
     },
   };
 }
@@ -584,6 +588,7 @@ function beginResourceMeasurement(probe: QueryOperationMetricProbe, operationId:
 function measuredPort(port: QueryDataPort, sink: (metric: QueryOperationMetric) => void, clock: () => number, probe: QueryOperationMetricProbe): QueryDataPort {
   const report = (metric: QueryOperationMetric): void => { try { sink(metric); } catch { /* Telemetry cannot affect query correctness. */ } };
   return {
+    ...(port.hydrate_item === undefined ? {} : { hydrate_item: port.hydrate_item.bind(port) }),
     ...(port.consumes_stage_handles === undefined ? {} : { consumes_stage_handles: port.consumes_stage_handles }),
     execute: async (operation) => {
       const started = clock();
@@ -643,7 +648,12 @@ function scopeDigest(scope: QueryScope): string {
 }
 
 function streamItems(evaluation: OperationEvaluation): Readonly<Record<string, readonly QueryStreamItem[]>> {
-  return Object.fromEntries(Object.entries(evaluation.streams).map(([stream, values]) => [stream, values.map(item)]));
+  return Object.fromEntries(Object.entries(evaluation.streams).flatMap(([stream, values]) => {
+    const rows = values.map(item);
+    if (stream !== "context") return [[stream, rows]];
+    const possible = rows.filter((row) => (row.value as { assessment?: { classification?: string } })?.assessment?.classification === "possible");
+    return possible.length === 0 ? [[stream, rows]] : [[stream, rows.filter((row) => !possible.includes(row))], [`${stream}\0possible`, possible]];
+  }));
 }
 
 async function appendEvaluationStream(store: QueryManifestStore, executionId: string, stream: string, direction: CursorDirection, values: AsyncIterable<QueryStreamItem> | undefined, fallback: readonly QueryStreamItem[]): Promise<void> {
@@ -746,7 +756,7 @@ export class QueryEngine {
         const pageStarted = this.metricClock();
         let page: ReadPageResult<QueryStreamItem>;
         try {
-          page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, max_characters: Math.max(1, remainingCharacters), reader: this.manifestStore.reader });
+          page = await this.cursorCache.readPage({ execution_id: executionId, result_stream: stream, direction: "forward", projection_digest: plan.plan_digest, ordering_digest: plan.plan_digest, scope_digest: scopeDigest(request.scope), response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.options.response_budget), frozen_snapshot_digest: scopeDigest(request.scope), frozen_status_digest: evaluation.semantic_state ?? "ready", completeness: evaluation.completeness as QueryExecutionPage["completeness"] | undefined, expires_at: expiresAt, now, limit: request.options.response_budget.max_items, max_characters: Math.max(1, remainingCharacters), reader: this.manifestStore.reader, ...(this.dataPort.hydrate_item === undefined ? {} : { hydrate_item: this.dataPort.hydrate_item.bind(this.dataPort) }) });
           let serializedBytes = 0;
           try { serializedBytes = canonicalBytes(page.items).byteLength; } catch { /* Internal telemetry remains best-effort. */ }
           this.reportPage({ page_kind: "initial", stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: page.items.length, rows_hydrated: page.items.length, serialized_bytes: serializedBytes, success: true });
@@ -757,7 +767,9 @@ export class QueryEngine {
         remainingCharacters = Math.max(0, remainingCharacters - page.items.reduce((sum, item) => sum + JSON.stringify(item).length, 0));
         pages[stream] = page;
       }
-      return { query_execution_id: executionId, plan_digest: plan.plan_digest, streams: pages, completeness: (evaluation.completeness as QueryExecutionPage["completeness"]) ?? { overall_status: "unknown", dimensions: [] }, diagnostics: request.options.diagnostics.diagnostics === "none" ? [] : evaluation.diagnostics ?? [], registry: { mode: request.options.registry.registry, operation_ids: request.options.registry.registry === "none" ? [] : [...plan.operation_versions].map((binding) => binding.operation_id), recipe_ids: request.options.registry.registry === "none" ? [] : [...plan.recipe_versions].map((binding) => binding.recipe_id) }, ...(evaluation.semantic_state === undefined ? {} : { semantic_state: evaluation.semantic_state }), expires_at: expiresAt };
+      const result: QueryExecutionPage = { query_execution_id: executionId, plan_digest: plan.plan_digest, streams: pages, completeness: (evaluation.completeness as QueryExecutionPage["completeness"]) ?? { overall_status: "unknown", dimensions: [] }, diagnostics: request.options.diagnostics.diagnostics === "none" ? [] : evaluation.diagnostics ?? [], registry: { mode: request.options.registry.registry, operation_ids: request.options.registry.registry === "none" ? [] : [...plan.operation_versions].map((binding) => binding.operation_id), recipe_ids: request.options.registry.registry === "none" ? [] : [...plan.recipe_versions].map((binding) => binding.recipe_id) }, ...(evaluation.semantic_state === undefined ? {} : { semantic_state: evaluation.semantic_state }), expires_at: expiresAt };
+      await this.manifestStore.append(executionId, "\0execution_streams", "forward", [{ stable_sort_key: "metadata", value: { streams: Object.entries(pages).map(([name, page]) => ({ name, total: page.total ?? streams[name]?.length ?? 0 })), diagnostics: result.diagnostics, registry: result.registry, ...(result.semantic_state === undefined ? {} : { semantic_state: result.semantic_state }) } }]);
+      return result;
     } finally {
       if (spool) {
         await spool.cleanup(executionId);
@@ -768,10 +780,13 @@ export class QueryEngine {
 
   async continue(request: QueryContinuationRequest): Promise<QueryExecutionPage> {
     const claims = this.cursorCache.decode(request.cursor);
+    const pageLimit = request.page_item_limit ?? request.response_budget.max_items;
+    if (!Number.isSafeInteger(pageLimit) || pageLimit < 0 || pageLimit > request.response_budget.max_items) throw new EngineError("core:budget_invalid", "Private page limit must be within the original response budget.");
     const pageStarted = this.metricClock();
     let read: ReadPageResult<QueryStreamItem>;
     try {
-      read = await this.cursorCache.readPage({ cursor: request.cursor, expected_response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.response_budget), limit: request.response_budget.max_items, max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, now: this.now() });
+      read = await this.cursorCache.readPage({ cursor: request.cursor, expected_response_budget_ceiling_digest: computeDigest("core:query_budget", "core:query_budget_digest", 1, "core:ResponseBudget", 1, request.response_budget), limit: Math.max(1, pageLimit), max_characters: request.response_budget.max_characters, reader: this.manifestStore.reader, ...(pageLimit === 0 || this.dataPort.hydrate_item === undefined ? {} : { hydrate_item: this.dataPort.hydrate_item.bind(this.dataPort) }), now: this.now() });
+      if (pageLimit === 0) read = { items: [], ...(read.total === undefined ? {} : { total: read.total }), has_next: read.items.length > 0 || read.has_next, has_previous: false, page_start_cursor: request.cursor, ...(read.items.length > 0 || read.has_next ? { next_cursor: request.cursor } : {}) };
       let serializedBytes = 0;
       try { serializedBytes = canonicalBytes(read.items).byteLength; } catch { /* Internal telemetry remains best-effort. */ }
       this.reportPage({ page_kind: "continuation", stream: claims.result_stream, cost_ms: finiteNonNegative(this.metricClock() - pageStarted), candidates: read.items.length, rows_hydrated: read.items.length, serialized_bytes: serializedBytes, success: true });
@@ -782,14 +797,27 @@ export class QueryEngine {
     // Backward storage is traversed in reverse, but every public page is
     // rendered in canonical forward order. CursorCache's traversal-relative
     // next/previous fields therefore swap when projected back to page order.
-    const page: ReadPageResult<QueryStreamItem> = claims.direction === "forward" ? read : {
+    const page: ReadPageResult<QueryStreamItem> = claims.direction === "forward" || pageLimit === 0 ? read : {
+      ...(read.page_start_cursor === undefined ? {} : { page_start_cursor: read.page_start_cursor }),
+      ...(read.total === undefined ? {} : { total: read.total }),
       items: [...read.items].reverse(),
       has_next: read.has_previous,
       has_previous: read.has_next,
       ...(read.previous_cursor === undefined ? {} : { next_cursor: read.previous_cursor }),
       ...(read.next_cursor === undefined ? {} : { previous_cursor: read.next_cursor }),
     };
-    return { query_execution_id: claims.execution_id, plan_digest: claims.projection_digest, streams: { [claims.result_stream]: page }, completeness: claims.completeness ?? { overall_status: "unknown", dimensions: [] }, diagnostics: [], registry: { mode: "none", operation_ids: [], recipe_ids: [] }, expires_at: claims.expires_at };
+    const streams: Record<string, QueryStreamPage> = { [claims.result_stream]: page };
+    const metadata = await this.manifestStore.reader.read({ execution_id: claims.execution_id, result_stream: "\0execution_streams", direction: "forward", limit: 1 });
+    const stored = metadata.items[0]?.value;
+    const executionMetadata = stored !== null && typeof stored === "object" && !Array.isArray(stored) ? stored as { streams?: unknown; diagnostics?: ReadonlyArray<unknown>; registry?: QueryExecutionPage["registry"]; semantic_state?: QueryExecutionPage["semantic_state"] } : undefined;
+    // Previously materialized executions stored only the stream description array.
+    const descriptions = executionMetadata?.streams ?? stored;
+    if (Array.isArray(descriptions)) for (const description of descriptions as { name: string; total: number }[]) {
+      if (description.name === claims.result_stream) continue;
+      streams[description.name] = { items: [], total: description.total, has_next: description.total > 0, has_previous: false,
+        ...(description.total > 0 ? { next_cursor: this.cursorCache.encode({ ...claims, result_stream: description.name, direction: "forward", stable_position: "" }) } : {}) };
+    }
+    return { query_execution_id: claims.execution_id, plan_digest: claims.projection_digest, streams, completeness: claims.completeness ?? { overall_status: "unknown", dimensions: [] }, diagnostics: executionMetadata?.diagnostics ?? [], registry: executionMetadata?.registry ?? { mode: "none", operation_ids: [], recipe_ids: [] }, ...(executionMetadata?.semantic_state === undefined ? {} : { semantic_state: executionMetadata.semantic_state }), expires_at: claims.expires_at };
   }
 
   private reportPage(metric: QueryPageMetric): void {
@@ -799,13 +827,14 @@ export class QueryEngine {
   }
 
   private async evaluate(plan: NormalizedQueryPlan, scope: QueryScope, executionId: string, spool?: StageSpool, abortSignal?: AbortSignal): Promise<OperationEvaluation> {
+    const port: QueryDataPort = { ...this.dataPort, execute: (operation) => this.dataPort.execute({ ...operation, source_options: plan.projection.snippets }) };
     const expression = plan.normalized_expression as unknown as QueryRequest["expression"];
-    if (expression.expression_type === "operation") return evaluateOperation({ operation_id: expression.operation, arguments: expression.arguments, scope, port: this.dataPort });
+    if (expression.expression_type === "operation") return evaluateOperation({ operation_id: expression.operation, arguments: expression.arguments, scope, port });
     if (expression.expression_type === "recipe") {
       const recipe = recipeRegistry.find((candidate) => candidate.recipe_id === expression.recipe_id)!;
-      return executeRecipe({ recipe, recipeArguments: expression.arguments as unknown as Readonly<Record<string, unknown>>, scope, port: this.dataPort });
+      return executeRecipe({ recipe, recipeArguments: expression.arguments as unknown as Readonly<Record<string, unknown>>, scope, port });
     }
-      return executePipeline({ execution_id: executionId, stages: expression.stages as ReadonlyArray<import("@urdira/contracts").QueryStage>, outputs: expression.outputs as ReadonlyArray<import("@urdira/contracts").StageOutputReference>, scope, port: this.dataPort, stream_final: true, ...(spool === undefined ? {} : { spool }), ...(abortSignal === undefined ? {} : { abort_signal: abortSignal }) });
+      return executePipeline({ execution_id: executionId, stages: expression.stages as ReadonlyArray<import("@urdira/contracts").QueryStage>, outputs: expression.outputs as ReadonlyArray<import("@urdira/contracts").StageOutputReference>, scope, port, stream_final: true, ...(spool === undefined ? {} : { spool }), ...(abortSignal === undefined ? {} : { abort_signal: abortSignal }) });
   }
 }
 

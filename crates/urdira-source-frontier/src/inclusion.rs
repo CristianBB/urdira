@@ -34,6 +34,7 @@ pub fn default_workspace_inclusion() -> InclusionRules {
             ".git/**".to_string(),
             "dist/**".to_string(),
             "coverage/**".to_string(),
+            "test-results/**".to_string(),
             "tests/baselines/**".to_string(),
             "tests/cases/**".to_string(),
             ".urdira/**".to_string(),
@@ -243,11 +244,11 @@ fn gitignore_match(patterns: &[String], path: &str) -> Option<(bool, String)> {
     decision
 }
 
-const BINARY_LIKE_PATH: &[&str] = &["node_modules", "dist", "coverage", ".git"];
+const BINARY_LIKE_PATH: &[&str] = &["node_modules", "dist", "coverage", "test-results", ".git"];
 
-/// True for a path with a `node_modules`, `dist`, `coverage`, or `.git`
+/// True for a path with a `node_modules`, `dist`, `coverage`, `test-results`, or `.git`
 /// DIRECTORY segment somewhere above the final component (port of the TS
-/// inline regex `/(?:^|\/)(?:node_modules|dist|coverage|\.git)\//`, which
+/// inline regex `/(?:^|\/)(?:node_modules|dist|coverage|test-results|\.git)\//`, which
 /// requires a trailing `/` after the matched name and so can never match
 /// the path's own final segment).
 fn has_generated_or_vcs_segment(path: &str) -> bool {
@@ -443,6 +444,16 @@ mod tests {
                 &gitignore
             )
             .included
+        );
+        let generated_test = evaluate_inclusion(
+            &observe("test-results/run/generated-test.ts", 10, "text/plain"),
+            &rules,
+            &gitignore,
+        );
+        assert!(!generated_test.included);
+        assert_eq!(
+            generated_test.reason_code,
+            "security:generated_or_binary_default"
         );
         assert!(
             !evaluate_inclusion(&observe(".git/HEAD", 10, "text/plain"), &rules, &gitignore)

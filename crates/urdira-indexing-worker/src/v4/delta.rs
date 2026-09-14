@@ -711,6 +711,39 @@ fn run_one(
         Some(&cas),
     );
     let source_delta = SourceDelta::compute_partial(&workspace_state.frontier, &observations);
+    if source_delta.added.is_empty()
+        && source_delta.changed.is_empty()
+        && source_delta.deleted.is_empty()
+    {
+        // Filesystem watchers report directory-level create/modify events for
+        // ignored runtime output such as `test-results/`. `observe_paths`
+        // correctly turns those events into an empty authoritative source
+        // delta. Stop here: running incremental analysis with an empty
+        // changed-artifact set makes the syntax worker conservatively widen
+        // to the retained corpus, rebuilding hundreds of thousands of rows
+        // for a directory Urdira does not index.
+        Catalog::refresh_metadata(
+            conn,
+            &request.workspace_id,
+            &mut workspace_state.frontier,
+            &source_delta.metadata_refreshed,
+        )?;
+        let roots = super::scan::read_generation_roots(conn, current_generation)?;
+        let generation = u64::try_from(current_generation)
+            .map_err(|_| ScanError("generation must be non-negative".into()))?;
+        return Ok((
+            IndexingEvent::ScanCompleted {
+                request_id: request.request_id.clone(),
+                operation_id: request.request_id.clone(),
+                generation,
+                snapshot_id: format!("snapshot:{}:{current_generation}", request.workspace_id),
+                roots,
+                timings: clock.completed_timings(),
+                reconcile: None,
+            },
+            Vec::new(),
+        ));
+    }
     let now = super::now_iso8601();
     let batch_meta = BatchMeta {
         source_provider_binding_id: format!("urdira:v4-directory-walker:{}", request.workspace_id),

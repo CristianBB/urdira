@@ -19,11 +19,19 @@ For a new session executing the current selected three-repository definitive
 measurement, use the [self-contained benchmark handoff](definitive-agent-benchmark-handoff.md).
 It adds the exact 45-run independent-campaign protocol and does not replace
 the general contracts or historical evidence below.
+Its mandatory cleanup checkpoint applies after each complete cell or before
+transfer to another worker; during the three internal turns of a cell its
+checkout, index, and data root remain active. A failed cell cannot bypass
+cleanup or unblock the next execution while registered residues remain.
 
 ## Current optimization and verification decision
 
-The current objective is to reduce discovery fallback and duplicated reading
-while preserving every legitimate piece of information requested by the task.
+The current objective is for Urdira to provide the main repository context and
+reduce duplicated or premature reading while preserving every legitimate piece
+of information requested by the task. Shell reading is not a failure by
+itself: it may verify changed/generated state or supply a concrete missing
+detail. The failure signal is avoidable repetition, unjustified broad native
+discovery, or an Urdira response that does not let the agent begin the task.
 The agent chooses `response_budget` from the task's needs. A budget is a
 response-shaping control, not a campaign success criterion: this procedure
 does not impose an absolute character, token, or quota threshold. A smaller
@@ -49,14 +57,33 @@ cursor outcomes, hydration/evidence/registry components, and host readiness
 and process measurements. These metrics explain behavior; none is an
 absolute pass threshold by itself.
 
-Tool attribution must keep three quantities separate: direct tool output,
-shell output, and total context delivered to the agent. For `tgrep`, report
+For each run, record which transport supplied the first repository context,
+configured-tool and shell calls/characters before the first edit, and the
+configured tool's relative share of that observed pre-edit context. Classify
+later shell source reads as before/after the first MCP result and as having or
+not having exact nonblank line overlap with source already returned through
+MCP. These are observational proxies: character share is not semantic
+usefulness, overlap is not proof of waste, and a non-overlapping read is not
+automatically justified. Manual transcript evidence remains authoritative for
+why a read contributed to the task.
+
+Tool attribution must keep direct MCP output, Urdira hook-served output, hook
+fallback, shell output, and total context delivered to the agent separate. A
+native command recorded by the Urdira hook audit counts once as effective
+Urdira use whether the bridge serves it or correctly falls back. The stable
+`[urdira hook served]` marker identifies model-visible hook output; the
+content-free audit sidecar identifies all interceptions and their typed
+decisions. Hook failures and trust notices do not count, and a denied native
+command does not become an executed shell read. For `tgrep`, report
 the direct tgrep call/output separately from shell commands that invoke or
 inspect tgrep, and report their sum only as a derived total. The same rule
 applies to Urdira and other MCP tools. A command classified as shell must not
 be counted as a direct tool call merely because it ran a tool binary. This
 prevents tgrep-vs-Urdira comparisons from confusing tool output with command
-or transcript context. The grader remains a task-contract and integration
+or transcript context. Historical transcripts without an audit sidecar or
+unambiguous served marker remain unknown rather than being inferred from a
+generic hook message.
+The grader remains a task-contract and integration
 check; it does not measure semantic quality, prove tool causality, or replace
 manual attribution review.
 
@@ -132,7 +159,7 @@ cold/warm matrix or an OS page-cache eviction experiment.
    `packages/cli/dist/agent-integration.js`, and native artifacts match the
    recorded checkout. The global Urdira install is not used. The Urdira arm
    invokes the production `installAgent("codex", { dry_run: false, confirm: true,
-   home: <isolated-root> })` path, so its Codex hooks, explorer, and skill are
+   home: <isolated-root> })` path, so its Codex hooks and optional explorer are
    the same artifacts as `urdira agent install --client codex`. The runner sets
    `HOME` and `CODEX_HOME` to that disposable root, removes
    `--ignore-user-config` for this arm so those installed artifacts are loaded,
@@ -142,7 +169,7 @@ cold/warm matrix or an OS page-cache eviction experiment.
    auth file exists; no credential bytes are copied or recorded. The runner
    deletes the root after the cell (including failure cleanup). The MCP
    server remains an explicit per-process Codex configuration because the
-   production Codex installer currently owns hooks, explorer, and skill files;
+   production Codex installer currently owns hooks and the explorer file;
    this is recorded as `installed-integration` with
    `mcp: runner-configured-per-process`, rather than being reported as MCP-only.
    The runner also places a disposable `bin/urdira` shim first on the Codex
@@ -153,6 +180,14 @@ cold/warm matrix or an OS page-cache eviction experiment.
    measured CLI artifact. The hook command remains the literal installed
    `urdira agent hook`; if the measured CLI is unavailable the shim exits
    safely instead of falling through to an unrelated host executable.
+   The installed Codex `UserPromptSubmit` hook performs one scoped
+   `core:build_context` request before each model turn when the structural
+   snapshot is current. Count each interception as Urdira use, retain served
+   and fallback outcomes in the hook audit, and include the injected
+   characters in model context. A served prompt hook should let the agent
+   begin from the injected source without repeating workspace bootstrap or
+   broad context discovery; later Urdira calls remain valid for an identified
+   gap, a continuation, or post-edit freshness.
 3. Prepare four repository clones under one dedicated root, named `typescript`,
    `playwright`, `prisma`, and `vscode`; ensure each corpus SHA exists locally.
    Record test dependencies available in the actual fresh worktrees. The agent
@@ -167,7 +202,7 @@ cold/warm matrix or an OS page-cache eviction experiment.
    inherited. Record v4/residual/lexical settings and overrides explicitly.
    August v3 results do not measure the current v4 default.
    The expanded Urdira MCP entrypoint passes only the isolated `data_root`.
-   It inherits the production five-tool set, descriptions, and
+   It inherits the production three-tool set, descriptions, and
    `MCP_SERVER_INSTRUCTIONS`; it passes no `tool_names`, `compact`, or custom
    `instructions`. The runner may add only ephemeral paths and timeout
    settings needed for isolation and measurement.
@@ -347,8 +382,11 @@ review v4 catalog, lexical, structural, Rust sidecar, CAS, and semantic sizes
 separately. Semantic size must remain zero and semantic-sidecar creation false.
 Compare matched tasks and show every failure.
 
-Transcript context is split into `tool_output_characters`,
-`shell_output_characters`, and `tgrep_output_characters` per run. The report
+Legacy discovery output is split into `tool_output_characters`,
+`shell_output_characters`, and `tgrep_output_characters` per run. These fields
+and `repository_context_characters` exclude status, tests, builds, Git review,
+and host instruction reads unless classified as discovery; they are not the
+total context observed by the model. The report
 also retains lexical `target_attributed_characters` and
 `target_unattributed_characters` proxies, plus protocol-identifiable snippets,
 hydration, evidence, and registry component counts/characters. Component
@@ -357,6 +395,21 @@ method values are never reported as zero. `discovery_adoption` records whether
 MCP preceded shell discovery, whether shell followed MCP, and whether the run
 had zero observed MCP discovery calls. These are observational metrics and do
 not classify arbitrary shell text as a typed protocol component.
+
+`completed_tool_output` separately counts text from all completed MCP and shell
+items, including status, tests, builds, Git review and host instruction reads.
+Each transport reports calls, missing-output calls, characters and the known
+subtotal. Tgrep remains a shell subset and is never added to the combined total.
+Count string UTF-16 code units, without JSON envelopes or synthetic separators
+between MCP text blocks. Prefer aggregated shell output over aliases; otherwise
+use the recorded output or stdout/stderr. Explicit empty output counts as zero;
+missing or malformed output makes that transport's total and the combined total
+`null`. A transport with no calls is unavailable (`null`), while known subtotals
+are lower bounds. No completed tool items means no observed total. Structured-only
+MCP output does not establish model-visible text. System instructions, schemas,
+prompts, images and host context management are outside this accounting:
+`full_model_context_characters` remains `null`. Retain any separately reported
+host token usage in its own unit; never infer tokens from these character counts.
 
 The cell runner writes a separate `<run-id>.timing.json` sidecar while each of
 the three Codex turns is running. It timestamps complete JSONL lines using a
@@ -407,6 +460,13 @@ process; investigate false cleanup flags. Preserve transcripts/reports before
 removing temporary artifacts. The current driver deletes worktrees immediately,
 so preserving diffs or additional untracked tests requires a verified capture
 step before cleanup. No unrelated project or daemon should be removed.
+
+Before a fresh sample using native test dependencies, prepare the declared
+dependency build and execute an unchanged focused baseline test. Merely finding
+the package directory does not prove its native addon can load. Select the test
+file at the harness level, not only a test-name filter that loads every module.
+Retain preparation commands, outputs and generated-file hashes; no dependency
+installation belongs to the measured agent phase.
 
 ## Historical provenance and next-campaign readiness
 
@@ -521,3 +581,407 @@ counts. These actions do not contribute to MCP, shell, repository-read, or
 context-character measurements; those historical fields continue to count only
 their existing protocol-defined sources. Started and completed events are
 deduplicated by counting completed items only.
+
+## Offline context replay and focused validation
+
+`node release/benchmarks/replay-agent-context.mjs --output NEW.json RAW_DIRECTORY...`
+replays raw JSONL files without starting a host, agent, or competitor. The
+output is created exclusively and records transcript and manifest hashes,
+retained outcomes, transport attribution and efficiency observations. Missing
+manifest outcomes and subjective use/relevance metrics remain null. Tgrep
+invocations are a subset of shell transport, not a third additive transport.
+Exact repeated-output metrics are literal observations, not proof of wasted
+source or proof that an agent did not use a result.
+
+Validate focused context separately from broad, paginated context. Accept
+correctness, distinct information, stable ordering, exact provenance and
+complete pagination before comparing relative efficiency. No absolute token,
+character or call-count threshold is an acceptance criterion. For the next
+fresh validation use exactly one frozen task in each of Playwright, Prisma
+and VS Code, run sequentially with Luna and structural semantic-off settings.
+Do not invoke the full two-task-per-repository campaign as a substitute; retain
+each attempt without retries or competitor execution.
+
+The 2026-09-12 implementation follow-through and the three retained failed
+integration samples are recorded in
+[`../evidence/2026-09-12-agent-context-information-preservation.md`](../evidence/2026-09-12-agent-context-information-preservation.md).
+Functional/release gates passed; the agent-integration acceptance did not.
+
+## Repair verification after the retained September 12 samples
+
+The three single-sample failures remain immutable evidence; repair verification
+uses deterministic regressions and offline replay, with no model retries. See
+[context recovery](../evidence/2026-09-12-agent-context-recovery.md).
+
+Before a real cell starts, the runner now inspects the exact Node executable
+that it will prepend to the isolated agent shell and the availability of
+declared dependencies in the root and target package
+ancestors. A failure writes an exclusive `.preflight-failure.json` artifact with
+`model_invoked: false` and stops before model execution. This is separate from
+structural index readiness. It installs nothing and does not claim that available
+dependencies prove the repository's tests will pass. Runtime-only preflight with
+no worktree remains a runtime check, not a validation-environment acceptance.
+
+Offline metrics use the manifest's explicit worktree to reconcile absolute edited
+paths with indexed relative paths. Continuation attempt and consumption counts are counts of unique references,
+not raw call counts. A failed-only reference counts as attempted but not consumed;
+a subsequently successful request marks it consumed. Per-call failures remain
+in the transcript and ordinary MCP failure metrics. Exact nonblank source-line overlap in later shell source
+reads counts characters excluding line separators; it is observational overlap,
+not proof of wasted reading or unused hydration. Per-call counts distinguish
+overlapping and non-overlapping reads after MCP context, while reads made before
+the first MCP result remain separate. It is `null` without observed source.
+Diff-only review is excluded. Original output-equality metrics remain separately
+named. Relevance, unused hydration and contribution remain `null` without
+transcript evidence supporting an annotation.
+
+## Explicitly authorized fresh live verification
+
+After the repair gates, the user authorized one new Luna sample each in
+Playwright, Prisma and VS Code, sequentially, without retries or competitors.
+See [live verification](../evidence/2026-09-12-agent-live-verification.md).
+All three fail integration acceptance. Prepared repository prerequisites and a
+direct shim-version probe did not prevent the actual agent hook from resolving
+an older unprepared runtime. Independently executed tests pass for Playwright,
+fail in Prisma, and fail to load in VS Code. Preserve these outcomes separately
+from the original samples and the successful deterministic release gates.
+Completed-shell telemetry omits commands rejected before launch: do not treat
+missing shell output as evidence of successful fallback elimination.
+Hook-trust notices are integration warnings, not hook execution errors. The
+runner retains raw host-session evidence before cleaning its isolated home so
+pre-launch rejections remain auditable separately from completed shell output.
+The user subsequently authorized iterative repair; new attempts after concrete
+repairs are retained separately and do not replace these failed samples.
+
+The next repaired current-arm samples and their retained comparator comparison
+are recorded in
+[`../evidence/2026-09-13-current-urdira-context-density-benchmark.md`](../evidence/2026-09-13-current-urdira-context-density-benchmark.md).
+All three current samples pass the strict grader and independent focused
+validation. They do not establish an efficiency improvement: every current
+token total remains above every retained comparator median. Hook sidecars prove
+that all 61 Codex PreToolUse interceptions fell back as unsupported input, and
+the VS Code sample exposes the practical failure of line-only shell bounds when
+a matching generated record occupies a megabyte-long line.
+
+The subsequent hook repair uses Codex `PreToolUse` `updatedInput` to replace a
+faithfully translatable simple `rg` command with output from Urdira. Quoted regex
+operators are parsed as pattern content and multiple explicit paths remain one
+indexed filter. Compound shell commands and unsupported options continue to fail
+open. This repair postdates those samples and is not attributed to them.
+
+The fresh v3 samples after that repair are recorded in
+[`../evidence/2026-09-13-current-urdira-arm-v3.md`](../evidence/2026-09-13-current-urdira-arm-v3.md).
+The repair served none of 57 live interceptions because every observed search
+was composed with another shell operation. Prisma alone passed both the strict
+grader and independent validation. Playwright failed its independent ordering
+test, and VS Code failed both the strict grader and its disposable-leak test.
+The retained comparison therefore treats two efficiency rows as diagnostic and
+does not claim equal correctness.
+
+Custom package-script test names are recognized when their recorded
+package-manager output identifies a known test command. That evidence can be
+reused by later identical commands, including the same command followed by an
+`&&` chain, even when npm does not echo the inner command again. Different
+arguments or script names do not inherit that evidence. A nonzero compound
+exit does not identify which command failed and remains unknown. Original transcripts
+and manifests remain unchanged; corrected counts belong in derived replay
+reports. Compound command exits remain unknown when the inner test result
+cannot be attributed safely.
+
+Executable test paths are recognized without treating a source-file read of the
+executable as a test invocation. Newline-separated commands, like semicolon or
+pipe compositions, retain unknown inner-test exits unless independently attested.
+
+For production-native verification, pin `URDIRA_NATIVE_REQUIRED=1` and
+`URDIRA_NATIVE_ROOT` to the exact accepted extracted closure, retain its archive
+and worker digests, and attest that the composed app/engine/MCP/CLI modules used
+by the driver match the installed archive. Keep the semantic switches disabled.
+A launcher-version probe alone cannot establish installed query readiness:
+also verify worker execution and an actual structural MCP query after readiness.
+
+Retries intended as clean integration evidence use new detached worktrees at the
+frozen revision and fresh preparation. `git reset --hard` plus `git clean -fd`
+does not remove ignored test reports and can expose previous attempted solutions
+to discovery. Retain reused-tree results, but exclude a contaminated attempt from
+comparison and record why. Do not copy prior worktree output directories into a
+new sample; only reproduce declared dependency and baseline build preparation.
+
+## Earlier paginated-hook samples
+
+The earlier post-repair Playwright, Prisma and VS Code samples are recorded in
+[`../evidence/2026-09-13-current-urdira-arm-v10.md`](../evidence/2026-09-13-current-urdira-arm-v10.md).
+All three passed the strict grader and independent focused validation at that
+time. This section is historical: the later VS Code v70 sample failed its
+integration grader, and the accepted post-repair measurement is VS Code v75,
+recorded in [`../evidence/2026-09-14-agent-context-density.md`](../evidence/2026-09-14-agent-context-density.md).
+A runner
+preflight attempt that checked the host login shell instead of the explicitly
+injected Node executable stopped before model invocation; its artifact is
+retained, and a focused regression guards the repair. In the accepted samples,
+Urdira is the first discovery source and supplies all observed pre-edit source
+characters in Playwright and Prisma, and 65.6 percent in VS Code. The repaired
+hook prevents the previous megabyte-long generated line from entering VS Code's
+context: repository context falls from 1,156,423 characters in v9 to 208,525 in
+the current sample. Retained competitor medians still use fewer total tokens on
+all three tasks, so the result supports correctness and better context control,
+not a general efficiency or statistical winner claim.
+
+## Current prompt-hook samples
+
+The next single samples after dynamic Codex `UserPromptSubmit` context are
+recorded in
+[`../evidence/2026-09-13-prompt-hook-agent-arm-v20.md`](../evidence/2026-09-13-prompt-hook-agent-arm-v20.md).
+All three strict graders pass. Playwright and Prisma receive model-visible
+prompt context before their first action; VS Code falls back because the index
+is stale at both prompt boundaries. Audited prompt context is Urdira use and its
+characters belong to hook transport even though Codex emits no transcript tool
+item for it. `PreToolUse` output is still counted from the transcript to avoid
+double attribution. The current samples remain above every retained comparator
+median in total tokens, so they reject an efficiency-win claim and identify
+turn-boundary freshness plus redundant follow-up actions as the next blockers.
+
+Three subsequent Playwright-only gates are recorded in
+[`../evidence/2026-09-13-playwright-context-gates-v21-v23.md`](../evidence/2026-09-13-playwright-context-gates-v21-v23.md).
+V23 removes repeated follow-up bootstrap and reduces direct MCP use to one
+call. Correct cumulative-thread accounting gives it 1,470,687 total tokens,
+6.7 percent above the closest retained comparator, codebase-memory. The former
+3,411,724 value summed cumulative resumed-thread counters and is retired.
+The Prisma and VS Code samples therefore were not repeated: the focused gate
+did not satisfy the runbook's efficiency condition for expanding the campaign.
+
+Five later Playwright gates are recorded in
+[`../evidence/2026-09-13-playwright-context-gates-v24-v28.md`](../evidence/2026-09-13-playwright-context-gates-v24-v28.md).
+V27 is the latest accepted strict-correctness sample at 1,527,823 tokens. V28
+demonstrates that authored-TypeScript ordering alone does not remove redundant
+agent discovery: Urdira supplied 97.3 percent of observed pre-edit repository
+context after hook-audit replay, but one invalid direct query and higher token
+use failed the gate. Prisma and VS Code were again not repeated.
+
+## Final context-density checks and cleanup
+
+The final sequential checks are recorded in
+[`../evidence/2026-09-13-current-urdira-context-density-benchmark.md`](../evidence/2026-09-13-current-urdira-context-density-benchmark.md).
+Playwright v48 and Prisma v49 pass the strict grader and every focused test run
+by the agent. Prisma uses fewer total tokens than every retained comparator
+median; Playwright ranks between tgrep and codebase-memory. VS Code v50 is
+rejected despite its path-level grader result because its focused test consumed
+an uncompiled `out/` artifact and failed. V51 reached durable structural
+readiness in 49 seconds and served its first three searches through the hook,
+but the Luna worker then stopped producing events before any edit; the retained
+attempt was terminated and not retried.
+
+An explicitly paginated hook response is now served with its continuation even
+when the response declares page truncation. It falls back only when truncation
+has no valid continuation or the rendered page cannot fit the host limit. The
+installed guidance also tells agents to run a repository's required compile
+step after editing when the exact-file test runner consumes generated output.
+The corrected VS Code patch was verified locally with the core-only
+`gulp compile-client` task and the exact test selector, which passed 3/3.
+
+Delete each sample's dependencies, generated build output and Urdira data root
+immediately after retaining its report, transcript, hook audit, timing and host
+log. Native residual tests use an owned scratch guard that removes their store
+on scope exit. The cleanup manifest for this campaign is
+`/Users/Cristian/BenchmarkResults/urdira-context-cleanup-20260913.json`; the
+final frozen worktrees are clean and dependency-free.
+
+## Hook-first follow-up protocol
+
+For Codex and other hosts with prompt or pre-tool interception, a successfully
+served hook is an Urdira discovery action. Attribute the bytes to hook
+transport and subtract the replacement-file bytes and marker from native shell
+output. A compound command may contain both transports; retain the native
+segments as shell without double-counting the replaced segment. Missing or
+ambiguous attribution remains `null`.
+
+The current Urdira arm uses the production prompt and pre-tool hooks as its
+primary integration and does not also advertise the Urdira MCP catalog to the
+same model session. The packet contains explicit workspace scope, treats its
+supplied test sources as the default test location, and tells the agent to
+start the task before consuming a continuation or searching for alternatives.
+If a concrete missing fact blocks the task, execute the literal `MORE` envelope
+with `urdira query --payload <json> --json`; the CLI routes both initial-query
+and continuation envelopes while preserving direct core payload compatibility.
+
+Run one fresh Playwright sample after this change. Accept correctness and exact
+focused validation before comparing tokens. If the sample does not improve on
+the retained equal-correctness boundary, inspect its transcript and formulate
+a new product or integration hypothesis before another run. Clean its checkout,
+data root, package-manager cache, and generated output immediately after
+retaining the transcript, report, hook audit, patch, hashes, validation, and
+cleanup manifest.
+
+The first hook-first sample showed that login-shell PATH order is part of this
+gate. The generated `.zprofile` must place the isolated Urdira shim before the
+directory containing the host-native Node closure, since that directory also
+contains a launcher that is valid only inside an extracted release root. Verify
+`command -v urdira` and `urdira --version` through the isolated login shell
+before accepting CLI continuation coverage.
+
+Prompt packets should include a compact source guide separating production and
+test snippets. Treat listed production snippets as candidate definitions,
+callers, and public wiring during the first implementation pass. This guide is
+an ordering aid; it does not remove results, change certainty, or replace the
+result index and exact continuation.
+
+When a populated packet has complete index coverage and editable source, mark
+it action-ready. The agent should make its first edit from those snippets and
+consider listed caller wiring before repository inventory. This is guidance,
+not a restriction: a named missing fact, incomplete coverage, generated output,
+or focused validation may still require Urdira continuation or native shell.
+
+The v66 transcript exposed a line-only projection gap: `rg ... 2>/dev/null |
+head -40` remained native and one generated declaration line contributed
+22,874 characters. The bridge accepts that exact projection composition and
+uses the hook's character budget as well as its requested line count. An
+oversized match retains its identity and an explicit Urdira source-recovery
+instruction instead of silently dropping the result.
+
+V67 did not repeat that exact search, so the parser repair is accepted from its
+deterministic regression rather than attributed to the sample. It did expose
+two new general integration costs: a zsh wrapper used the reserved `status`
+parameter and successful build/test evidence was repeated in later handoff
+turns without an intervening edit. Installed guidance now uses task-specific
+exit variables and reuses still-current successful validation. A further sample
+requires this distinct hypothesis; do not treat model action variance as proof
+of the parser behavior.
+
+V68 confirms both guidance effects in the live integration: its validation
+wrappers use task-specific exit variables, and later handoff turns do not repeat
+the successful build or test without a new edit. Its strict grader passes and
+its cumulative comparable usage falls to 659,789, but the independent watcher
+check retains a timeout after 2/3 selected cases pass. The sample is therefore
+excluded from equal-correctness comparison and is not retried.
+
+The subsequent directed Prisma v69 sample passes strict grading and independent
+validation at 666,427 comparable tokens, with Urdira supplying all context
+observed before the first edit. VS Code v70 independently produces a correct
+and validated patch but fails the integration grader: its initial prompt
+context expands both `LanguageFeatureRegistry` and the common `onDidChange`
+member as roots, exceeds the hook window and leaves native discovery dominant.
+The sample is retained without retry. Prompt hooks now provide their first
+code-shaped identifier as an explicit symbol seed, and `core:build_context`
+treats explicit seeds as authoritative roots while using the full task only
+for ordering. Validate this exact repair with deterministic regressions; do not
+attribute it retroactively to v70 or retry the retained sample.
+
+Do not leave generated validation output in the source frontier during sample
+preparation. V70 compiled VS Code before indexing and included its generated
+`out/` tree: the initial catalog held 27,589 rows, while a later `clean-out`
+cycle reconciled 11,864 rows. Its 86,416 ms readiness value is therefore not a
+like-for-like regression against v50. Future readiness samples must prepare
+dependencies, remove generated validation output, and only then start the
+structural scan; compilation remains part of post-edit validation.
+
+V71 exposed another adapter fidelity error. A native `rg` command with a
+negative `--glob` was converted into the public inclusion-only `filter.paths`
+field, so Urdira served an empty result and the agent consumed a large
+continuation to recover the missing test wiring. The bridge now leaves negative
+globs on the native path. V72 applies that regression fix and indexes the
+checkout only after generated `lib/` output from preparation has been removed.
+It passes the strict grader and independent focused validation at 569,904
+comparable tokens. This is 9.3 percent below the retained equal-task baseline
+median of 628,159. Structural readiness was 4,917 ms. The complete evidence and
+single-sample limitation are recorded in
+[`../evidence/2026-09-14-agent-context-density.md`](../evidence/2026-09-14-agent-context-density.md).
+
+V73 is retained as a dependency-preparation failure before model invocation.
+V74 is the two-task VS Code smoke gate and passes 2/2 with strict grader 0.
+V75 is the accepted one-sample VS Code measurement: both frozen Luna tasks pass
+the strict grader and independent validation with semantic indexing disabled.
+Its task-specific readiness values are 29,537 ms for
+`language-registry-change-notification` and 43,880 ms for
+`language-provider-registration-idempotence`. Their comparable usages are
+1,248,648 and 1,462,541 tokens respectively. These are separate task values;
+the campaign has no task-matched baseline medians for this pair, so it does not
+claim an efficiency improvement from their sum. Native shell reads remain valid
+when the hook does not contain the needed fact; a served hook is counted as
+Urdira use. The v73 failure, v74 smoke, v75 raw hashes, replay and independent
+checks are retained with the dated evidence.
+
+The later v76 and v77 dependency-preparation failures remain retained and do
+not replace v75. V78 passed the strict grader only for the registry task; its
+provider task stopped at preflight. V79 reached provider readiness in 29,525
+ms but failed the strict grader because the model runtime could not resolve
+`@typescript/native/lib/tsc.js`. V79 is not an accepted sample or an
+efficiency comparison. Its independent post-run validation passed the
+resulting patch's TypeScript typecheck, targeted ESLint, diff check and the
+focused once-only registration test. See
+[`2026-09-14-prompt-hook-context-reuse.md`](../evidence/2026-09-14-prompt-hook-context-reuse.md)
+for the exact retained outcomes, hook fallback counts and cleanup record.
+
+V82 is the accepted provider follow-up after rebuilding the production CLI,
+application, native addon and indexing worker. It preserves the exact
+`core:coverage_incomplete` diagnostic when `core:build_context` needs stage 3
+but the sample is ready at structural stage 1, then serves an explicitly
+scoped `core:search_text` source-safe fallback with separate coverage and
+continuation fields. Readiness was 27,555 ms. The strict grader and independent
+validation passed; the audit recorded 3 served prompt packets and 5 served
+pre-tool packets, with all other fallbacks retained by reason. V82 is a single
+task-matched integration observation and does not establish a general token
+efficiency result. Its final cumulative-thread usage was 1,655,594 tokens,
+13.2 percent above the prior V75 provider observation at 1,462,541 tokens. The
+first prompt packet contained only the 441-character
+`core:selector_unresolvable` diagnostic; the useful context packet arrived
+after native shell discovery. Its preflight hash stamp and raw artifacts are
+retained in the benchmark results directory.
+
+V83 is retained as a failed single-sample hypothesis check. Selector recovery
+reduced pre-edit shell source output to 59,812 characters while preserving
+14 effective hook interceptions, but the agent changed an opaque continuation
+cursor before replaying it and the strict validation gate rejected the sample.
+This does not invalidate the generic source-safe fallback; it records that the
+agent must copy continuation references literally. No competitor or retry is
+added.
+
+V84 was interrupted after model execution and before manifest/grader emission,
+so its raw artifacts are retained as an infrastructure failure. The transcript
+showed that the benchmark task's `TypeScript` language name was selected as the
+structural seed before `LanguageProvider`, yielding unrelated low-confidence
+matches. The prompt adapter now removes path metadata and ranks repeated,
+specific code-shaped candidates generically; the regression includes a
+`BenchmarkResults` path and the exact task prompt.
+
+V85 is the one fresh provider sample for that seed-ranking hypothesis. It used
+the frozen VS Code commit, Luna, structural-only readiness and semantic off. It
+passed the strict grader and independent validation with two target paths,
+required patterns, focused TypeScript compilation and clean diff. Readiness was
+29,520 ms. Raw turn usage summed to 2,804,588 tokens; under the campaign's
+task-matched convention, the comparable last cumulative-thread value was
+1,296,289 (1,286,069 input plus 10,220 output). It was above provider medians
+for baseline (1,193,155) and tgrep (1,011,210), and below CodeGraph (1,430,741)
+and memory (1,938,561); the sample is a correctness/integration pass and not
+an efficiency improvement. The first
+edit followed 43,656 hook characters and no shell source output; total hook
+and shell output was 57,188 and 73,410 characters. The audit retained 29
+effective hook interceptions (9 served and 20 fallbacks by their typed reasons)
+and no cursor mutation. V84/V85 raw reports, transcripts, independent replay,
+cleanup measurements and exact artifact hashes remain under their external
+benchmark result directories. V85 cleanup removed 2,650,438,997 checkout bytes,
+5,564,632,313 data-root bytes and 223 prompt-cache bytes after process checks.
+No competitor or retry was added.
+
+After V85, the prompt cache was refined for same-session continuations. A
+follow-up that contains an incidental resolvable identifier but no explicit
+missing-detail request reuses the packet for the same workspace snapshot; an
+explicit request for a missing caller or detail triggers a fresh Urdira query.
+The session identity remains bound to the existing hook key and workspace id.
+Regressions cover both branches. The exact focused command
+`CI=true pnpm exec vitest run tests/agent-integration.test.ts` passed 44/44
+tests in the audited checkout. No retained artifact supports a 53-test count.
+This change has not received a new benchmark sample, so its efficiency effect
+is not claimed.
+
+V86 is the single fresh provider sample for same-session prompt-context reuse.
+It passed the strict grader and independent checks using frozen VS Code, Luna,
+structural-only readiness and semantic off. Readiness was 29,536 ms and the
+comparable last cumulative-thread value was 970,632 tokens (961,131 input plus
+9,501 output), a 25.1 percent reduction from V85's 1,296,289. It is below the
+provider task-matched medians for baseline (1,193,155), tgrep (1,011,210),
+CodeGraph (1,430,741) and memory (1,938,561). The first edit followed 54,019
+hook characters and no shell source output; totals were 56,124 hook and 60,946
+shell characters. The audit recorded 22 effective hook interceptions (6 served,
+16 fallbacks: stale 5, overflow 2, unsupported 9). The explicit missing-detail
+regression forces a new query, so reuse does not suppress named recovery. The
+V86 result, replay, stamp, hashes and cleanup measurements are retained under
+its external result directory; no competitor or retry was added.

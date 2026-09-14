@@ -486,7 +486,11 @@ describe("local Urdira web composition", () => {
     expect(client.getDiscoverResult()?._meta?.["io.modelcontextprotocol/serverInfo"]).toEqual({ name: "urdira", version: "0.3.3" });
     expect(client.getDiscoverResult()?.capabilities.tools).toEqual({ listChanged: false });
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(5);
+    expect(tools.tools.map((tool) => tool.name)).toEqual([
+      "urdira_index_status",
+      "urdira_context",
+      "urdira_query",
+    ]);
     expect(tools.tools.every((tool) => tool.outputSchema !== undefined)).toBe(true);
     const result = await client.callTool({ name: "urdira_index_status", arguments: { workspace_ids: [] } });
     expect(result.structuredContent).toEqual({ page: { workspaces: [] } });

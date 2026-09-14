@@ -826,10 +826,12 @@ describe("Phase 7 five-call source providers", () => {
     await mkdir(join(root, "node_modules", "large-dependency"), { recursive: true });
     await mkdir(join(root, "dist", "generated"), { recursive: true });
     await mkdir(join(root, "coverage", "html"), { recursive: true });
+    await mkdir(join(root, "test-results", "run-1"), { recursive: true });
     await writeFile(join(root, "src", "index.ts"), "export const index = true;\n");
     await writeFile(join(root, "node_modules", "large-dependency", "index.ts"), "export const dependency = true;\n");
     await writeFile(join(root, "dist", "generated", "index.js"), "export const generated = true;\n");
     await writeFile(join(root, "coverage", "html", "index.html"), "<!doctype html>\n");
+    await writeFile(join(root, "test-results", "run-1", "generated-test.ts"), "export const generatedTest = true;\n");
 
     const listed: string[] = [];
     const provider = new DirectorySourceProvider({
@@ -849,7 +851,7 @@ describe("Phase 7 five-call source providers", () => {
     const observations = decoded<{ readonly observations: readonly ProviderObservation[] }>(payload.observation_batch).observations;
 
     expect(observations.map((observation) => observation.normalized_uri)).toEqual(["src/index.ts"]);
-    expect(listed.some((path) => path.includes("node_modules") || path.includes("/dist") || path.includes("/coverage"))).toBe(false);
+    expect(listed.some((path) => path.includes("node_modules") || path.includes("/dist") || path.includes("/coverage") || path.includes("/test-results"))).toBe(false);
   });
 });
 

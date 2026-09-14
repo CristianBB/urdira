@@ -297,7 +297,13 @@ export function createIndexingCoreProcessTransport(descriptor: IndexingCoreProce
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   }) as ChildProcessWithoutNullStreams;
-  if (child.pid === undefined) { child.kill(); throw new Error("Indexing-core worker did not expose a process identity."); }
+  if (child.pid === undefined) {
+    // A failed spawn has no child to terminate. Killing its uninitialized
+    // handle can signal the caller's process group on POSIX. Node reports the
+    // spawn error asynchronously even though this factory fails synchronously.
+    child.once("error", () => undefined);
+    throw new Error("Indexing-core worker did not expose a process identity.");
+  }
   const decoder = new RustWorkerFrameDecoder(maxBytes);
   const pending = new Map<string, Pending>();
   // v4 `workspace_scan` side-channel (task P2-2b): the only command whose

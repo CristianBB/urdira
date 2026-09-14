@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { deflateRawSync, inflateRawSync } from "node:zlib";
+import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants, inflateRawSync } from "node:zlib";
 import { EngineError } from "./errors.js";
 
 export type CursorDirection = "forward" | "backward";
@@ -13,6 +13,7 @@ export interface ManifestStreamReadRequest {
 }
 
 export interface ManifestStreamReadResult<T> {
+  readonly total?: number;
   readonly items: ReadonlyArray<T>;
   readonly has_more: boolean;
 }
@@ -85,9 +86,13 @@ export interface ReadPageRequest<T> {
   readonly max_characters: number;
   readonly reader: ManifestStreamReader<T>;
   readonly position_of?: (item: T) => string;
+  readonly hydrate_item?: (item: T, source_characters: number) => Promise<T | undefined>;
 }
 
 export interface ReadPageResult<T> {
+  /** Private position used to fit presentation without reexecuting a query. */
+  readonly page_start_cursor?: string;
+  readonly total?: number;
   readonly items: ReadonlyArray<T>;
   readonly next_cursor?: string;
   readonly previous_cursor?: string;
@@ -130,15 +135,33 @@ export class CursorCache {
   }
 
   encode(claims: QueryCursorClaims): string {
-    return this.encodeV2(claims);
+    return this.encodeV3(claims);
   }
 
-  private encodeV2(claims: QueryCursorClaims): string {
+  private encodeV3(claims: QueryCursorClaims): string {
     // Keep every immutable claim in the token so it remains valid after a
-    // daemon restart, but compress the JSON before framing. The old hex JSON
-    // representation routinely exceeded 2 KB for source positions and digests.
-    const payload = Buffer.from(deflateRawSync(Buffer.from(stableJson(claims), "utf8"))).toString("hex");
-    const signed = `v2.${payload}`;
+    // daemon restart. Short field aliases plus Brotli keep long structural
+    // positions copyable by agent clients without replacing the portable
+    // cursor with server-local pending state. V2 and legacy tokens remain
+    // accepted by decode() for compatibility.
+    const compact = {
+      b: claims.response_budget_ceiling_digest,
+      ...(claims.completeness === undefined ? {} : { c: claims.completeness }),
+      d: claims.direction === "forward" ? "f" : "b",
+      e: claims.execution_id,
+      f: claims.frozen_status_digest,
+      i: claims.frozen_snapshot_digest,
+      o: claims.ordering_digest,
+      p: claims.stable_position,
+      q: claims.projection_digest,
+      r: claims.result_stream,
+      s: claims.scope_digest,
+      x: claims.expires_at,
+    };
+    const payload = brotliCompressSync(Buffer.from(stableJson(compact), "utf8"), {
+      params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 },
+    }).toString("hex");
+    const signed = `v3.${payload}`;
     const signature = createHmac("sha256", this.secret).update(signed).digest("hex");
     return `${signed}.${signature}`;
   }
@@ -147,16 +170,36 @@ export class CursorCache {
     if (typeof token !== "string") throw new CursorCacheError("core:cursor_invalid", "Cursor must be a string.");
     const parts = token.split(".");
     const legacy = parts.length === 2;
-    const compact = parts.length === 3 && parts[0] === "v2";
-    if ((!legacy && !compact) || parts.some((part) => part.length === 0)) throw new CursorCacheError("core:cursor_invalid", "Cursor encoding is invalid.");
-    const signed = compact ? `${parts[0]}.${parts[1]}` : parts[0]!;
-    const expected = Buffer.from(createHmac("sha256", this.secret).update(signed).digest("hex"), "utf8");
-    const provided = Buffer.from(parts.at(-1)!, "utf8");
+    const v2 = parts.length === 3 && parts[0] === "v2";
+    const v3 = parts.length === 3 && parts[0] === "v3";
+    if ((!legacy && !v2 && !v3) || parts.some((part) => part.length === 0)) throw new CursorCacheError("core:cursor_invalid", "Cursor encoding is invalid.");
+    const encodedParts = legacy ? parts : parts.slice(1);
+    if (encodedParts.some((part) => part.length % 2 !== 0 || !/^[0-9a-f]+$/u.test(part))) throw new CursorCacheError("core:cursor_invalid", "Cursor encoding is invalid.");
+    const signed = v2 || v3 ? `${parts[0]}.${parts[1]}` : parts[0]!;
+    const expected = createHmac("sha256", this.secret).update(signed).digest();
+    let provided: Buffer;
+    try {
+      provided = Buffer.from(parts.at(-1)!, "hex");
+    } catch {
+      throw new CursorCacheError("core:cursor_invalid", "Cursor signature is invalid.");
+    }
     if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) throw new CursorCacheError("core:cursor_invalid", "Cursor authentication failed.");
     let value: unknown;
     try {
-      const encoded = compact ? inflateRawSync(Buffer.from(parts[1]!, "hex")).toString("utf8") : Buffer.from(parts[0]!, "hex").toString("utf8");
-      value = JSON.parse(encoded);
+      if (v3) {
+        const compact = JSON.parse(brotliDecompressSync(Buffer.from(parts[1]!, "hex")).toString("utf8")) as Record<string, unknown>;
+        value = {
+          cursor_kind: "query",
+          execution_id: compact["e"], scope_digest: compact["s"], result_stream: compact["r"], stable_position: compact["p"],
+          direction: compact["d"] === "f" ? "forward" : compact["d"] === "b" ? "backward" : undefined,
+          projection_digest: compact["q"], ordering_digest: compact["o"], response_budget_ceiling_digest: compact["b"],
+          frozen_snapshot_digest: compact["i"], frozen_status_digest: compact["f"], expires_at: compact["x"],
+          ...(compact["c"] === undefined ? {} : { completeness: compact["c"] }),
+        };
+      } else {
+        const encoded = v2 ? inflateRawSync(Buffer.from(parts[1]!, "hex")).toString("utf8") : Buffer.from(parts[0]!, "hex").toString("utf8");
+        value = JSON.parse(encoded);
+      }
     } catch { throw new CursorCacheError("core:cursor_invalid", "Cursor payload is not valid JSON."); }
     if (!isRecord(value) || value["cursor_kind"] !== "query" || typeof value["execution_id"] !== "string" || typeof value["scope_digest"] !== "string" || typeof value["result_stream"] !== "string" || typeof value["stable_position"] !== "string" || !["forward", "backward"].includes(String(value["direction"])) || typeof value["projection_digest"] !== "string" || typeof value["ordering_digest"] !== "string" || typeof value["response_budget_ceiling_digest"] !== "string" || typeof value["frozen_snapshot_digest"] !== "string" || typeof value["frozen_status_digest"] !== "string" || typeof value["expires_at"] !== "string") throw new CursorCacheError("core:cursor_invalid", "Cursor claims are incomplete.");
     return value as unknown as QueryCursorClaims;
@@ -194,19 +237,25 @@ export class CursorCache {
     // after the first stops as soon as adding it would exceed the budget,
     // not after: the running total never includes a truncated item's size.
     let consumedCharacters = 0;
-    let characterCutIndex = itemLimited.length;
-    for (let index = 0; index < itemLimited.length; index += 1) {
-      const itemCharacters = JSON.stringify(itemLimited[index]).length;
-      if (index > 0 && consumedCharacters + itemCharacters > request.max_characters) { characterCutIndex = index; break; }
+    let sourceCharacters = 0;
+    const items: T[] = [];
+    for (const raw of itemLimited) {
+      const hydrated = request.hydrate_item === undefined ? raw : await request.hydrate_item(raw, sourceCharacters);
+      if (hydrated === undefined) break;
+      const itemCharacters = JSON.stringify(hydrated).length;
+      if (items.length > 0 && consumedCharacters + itemCharacters > request.max_characters) break;
       consumedCharacters += itemCharacters;
+      items.push(hydrated);
+      const value = isRecord(hydrated) && isRecord(hydrated["value"]) ? hydrated["value"] : {};
+      const snippets = Array.isArray(value["optional_source_snippets"]) ? value["optional_source_snippets"] : [];
+      sourceCharacters += snippets.reduce((sum: number, snippet: unknown) => sum + (isRecord(snippet) && typeof snippet["text"] === "string" ? snippet["text"].length : 0), 0);
     }
-    const characterTruncated = characterCutIndex < itemLimited.length;
-    const items = characterTruncated ? itemLimited.slice(0, characterCutIndex) : itemLimited;
+    const characterTruncated = items.length < itemLimited.length;
     const hasMore = result.has_more || result.items.length > request.limit || characterTruncated;
     const firstPosition = items.length === 0 ? undefined : safePosition(items[0]!, 0, request.position_of);
     const lastPosition = items.length === 0 ? undefined : safePosition(items[items.length - 1]!, items.length - 1, request.position_of);
-    const make = (direction: CursorDirection, position: string): string => this.encodeV2({ ...claims, direction, stable_position: position });
-    const page: ReadPageResult<T> = { items, has_next: hasMore, has_previous: claims.stable_position.length > 0 };
+    const make = (direction: CursorDirection, position: string): string => this.encodeV3({ ...claims, direction, stable_position: position });
+    const page: ReadPageResult<T> = { page_start_cursor: this.encodeV3(claims), ...(result.total === undefined ? {} : { total: result.total }), items, has_next: hasMore, has_previous: claims.stable_position.length > 0 };
     if (hasMore && lastPosition) (page as { next_cursor?: string }).next_cursor = make(claims.direction, lastPosition);
     if (claims.stable_position.length > 0 && firstPosition) (page as { previous_cursor?: string }).previous_cursor = make(claims.direction === "forward" ? "backward" : "forward", firstPosition);
     return page;

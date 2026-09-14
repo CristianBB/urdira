@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { decodeCanonical } from "../packages/canonical/src/index.js";
-import { WorkspaceRegistry, sidecarDatabasePathFor, sidecarScanDirFor, structuralStoreDirFor, type RustWorkspaceScanTransport, type WorkspaceScanRequest } from "../packages/engine/src/index.js";
+import { WorkspaceRegistry, ensureV4Workspace, sidecarDatabasePathFor, sidecarScanDirFor, structuralStoreDirFor, type RustWorkspaceScanTransport, type WorkspaceScanRequest } from "../packages/engine/src/index.js";
 import { DaemonClient, DaemonRuntime, type DaemonRuntimeOptions } from "../packages/daemon/src/index.js";
 import { createDurableStorage, openSqliteDatabase, readStructuralStore } from "../packages/storage/src/index.js";
 
@@ -34,6 +34,14 @@ async function sleep(ms: number): Promise<void> {
 async function pollUntil(predicate: () => boolean, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Condition did not become true within ${timeoutMs} ms.`);
+    await sleep(25);
+  }
+}
+
+async function pollUntilAsync(predicate: () => Promise<boolean>, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error(`Condition did not become true within ${timeoutMs} ms.`);
     await sleep(25);
   }
@@ -390,6 +398,56 @@ describe("Daemon v4 workspace-scan wiring (URDIRA_V4 default + explicit opt-out/
       await pollUntil(() => existsSync(lexicalSidecarPath), 20_000);
     } finally {
       await stopV4Daemon(daemon);
+    }
+  }, 30_000);
+
+  it("routes startup lexical maintenance for a pre-existing ready v4 workspace to its sidecar", async () => {
+    process.env["URDIRA_V4"] = "1";
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-v4-startup-lexical-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-v4-startup-lexical-workspace-"));
+    const registry = new WorkspaceRegistry({ create_id: (kind) => `${kind}:v4-startup-lexical` });
+    const workspace = registry.register({
+      display_root: workspaceRoot,
+      provider: { source_provider_binding_id: "binding:v4-startup-lexical", source_provider: "core:directory_source_provider", source_provider_version: "1", provider_role: "primary", binding_identity: "identity:v4-startup-lexical", configuration_digest: "digest:v4-startup-lexical" },
+      description: { provider_kind: "core:directory_source_provider", immutable_binding_identity: "identity:v4-startup-lexical", features: "{}", source_state_fingerprint: "fingerprint:v4-startup-lexical" },
+    });
+    registry.beginReconciliation(workspace.workspace_id);
+    registry.markReady(workspace.workspace_id, "snapshot:v4-startup-lexical");
+    const storage = await createDurableStorage({ rootDir: dataRoot });
+    await ensureV4Workspace({ storage: storage as unknown as Parameters<typeof ensureV4Workspace>[0]["storage"], workspace_id: workspace.workspace_id, create_semantic_sidecar: false });
+    await storage.catalog.registerWorkspace({ workspace_id: workspace.workspace_id, canonical_root: workspace.canonical_root, display_root: workspace.display_root, source_provider_bindings: [workspace.provider], status: "registered", registered_at: workspace.registered_at });
+    const seeded = await storage.openWorkspace(workspace.workspace_id);
+    await seeded.database.exec("PRAGMA foreign_keys = OFF");
+    await seeded.database.run("INSERT INTO workspace_current_state (workspace_id, current_snapshot_id, current_generation, current_registry_snapshot_id, current_resolution_lock_id, current_configuration_revision_id, current_freshness_checkpoint_id, state_revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [workspace.workspace_id, "snapshot:v4-startup-lexical", 1, "registry:v4-startup-lexical", "lock:v4-startup-lexical", "configuration:v4-startup-lexical", "freshness:v4-startup-lexical", 1, "2026-09-12T00:00:00.000Z"]);
+    await seeded.close();
+    await storage.close();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let runtime: DaemonRuntime | undefined;
+    try {
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-v4-startup-lexical",
+        workspace_registry: asDaemonWorkspaceRegistry(registry),
+        resolve_plugin_provider: async () => undefined,
+        lexical_thread: true,
+        semantic_index: false,
+        reconciliation_sweep_interval_ms: 0,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint, { request_timeout_ms: 120_000 });
+      await sleep(500);
+      await pollUntilAsync(async () => {
+        const status = await client.call("core:status", {});
+        return status.outcome === "success" && (status.payload as { readonly active_jobs?: number }).active_jobs === 0;
+      }, 5_000);
+      expect(errorSpy.mock.calls.map((call) => call.map(String).join(" ")).join("\n")).not.toContain("no such table: lexical_index_state");
+      const readiness = await fetchIndexStatus(client, workspace.workspace_id);
+      expect(readiness).toMatchObject({ source_ready: true, structural_ready: true, structural_queryable_generation: 1, structural_durable_generation: 1 });
+    } finally {
+      errorSpy.mockRestore();
+      await runtime?.stop().catch(() => undefined);
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 30_000);
 

@@ -923,7 +923,7 @@ fn with_reconcile_summary(event: IndexingEvent, summary: ReconcileSummary) -> In
 /// a freshly computed set) -- the same four `set_kind`s
 /// `publish.rs::write_snapshot_transaction` always writes
 /// (`records`/`dependency`/`graph`/`metric`).
-fn read_generation_roots(
+pub(super) fn read_generation_roots(
     conn: &rusqlite::Connection,
     generation: i64,
 ) -> Result<ScanRoots, ScanError> {

@@ -50,6 +50,12 @@ const metricsFor = (manifest, arm, task) => {
   if (!manifest?.transcript) return undefined;
   let events;
   try { events = readFileSync(manifest.transcript, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch { return undefined; }
+  let hookAudit;
+  try {
+    hookAudit = typeof manifest.hook_audit_path === "string" && existsSync(manifest.hook_audit_path)
+      ? readFileSync(manifest.hook_audit_path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      : [];
+  } catch { hookAudit = []; }
   const completed = events.filter((event) => event.type === "item.completed");
   const mcpCalls = completed.filter((event) => event.item?.type === "mcp_tool_call");
   const mcpFailureDetails = mcpCalls.filter((event) => event.item?.status === "failed").map((event) => {
@@ -89,16 +95,23 @@ const metricsFor = (manifest, arm, task) => {
     ? Math.max(0, Date.parse(firstDiscoveryTimestamp) - Date.parse(firstTimestamp))
     : null;
   const usage = events.filter((event) => event.type === "turn.completed").map((event) => event.usage ?? {});
-  const input = usage.reduce((sum, item) => sum + Number(item.input_tokens ?? 0), 0);
-  const cached = usage.reduce((sum, item) => sum + Number(item.cached_input_tokens ?? 0), 0);
-  const output = usage.reduce((sum, item) => sum + Number(item.output_tokens ?? 0), 0);
-  const reasoning = usage.reduce((sum, item) => sum + Number(item.reasoning_output_tokens ?? 0), 0);
-  const transcriptMetrics = analyzeExpandedTranscript(events, arm, task);
+  const threadIds = events.filter((event) => event.type === "thread.started" && typeof event.thread_id === "string").map((event) => event.thread_id);
+  const counters = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"];
+  const oneResumedThread = usage.length > 1 && threadIds.length === usage.length && new Set(threadIds).size === 1;
+  const monotonicCounters = counters.every((field) => usage.every((item, index) => index === 0 || Number(item[field] ?? 0) >= Number(usage[index - 1]?.[field] ?? 0)));
+  const cumulativeUsage = oneResumedThread && monotonicCounters;
+  const total = (field) => cumulativeUsage ? Number(usage.at(-1)?.[field] ?? 0) : usage.reduce((sum, item) => sum + Number(item[field] ?? 0), 0);
+  const input = total("input_tokens");
+  const cached = total("cached_input_tokens");
+  const output = total("output_tokens");
+  const reasoning = total("reasoning_output_tokens");
+  const transcriptMetrics = analyzeExpandedTranscript(events, arm, task, { hook_audit: hookAudit });
   const compositionMetrics = arm === "urdira-typescript" ? analyzeUrdiraPipelineContract(events) : null;
   const uncached = Math.max(0, input - cached);
   return {
     ...transcriptMetrics,
     composition_metrics: compositionMetrics,
+    token_usage_semantics: cumulativeUsage ? "cumulative_thread" : "per_turn",
     outer_turns: usage.length,
     observable_agent_iterations: completed.filter((event) => event.item?.type === "agent_message").length,
     command_actions: completed.filter((event) => event.item?.type === "command_execution").length,
@@ -308,6 +321,7 @@ const summaries = Object.fromEntries(Object.entries(groups).map(([key, rows]) =>
     repository_read_calls: { median: percentile(numeric("repository_read_calls"), 0.5), mean: mean(numeric("repository_read_calls")) },
     repository_context_characters: { median: percentile(numeric("repository_context_characters"), 0.5), mean: mean(numeric("repository_context_characters")) },
     tool_output_characters: { median: percentile(numeric("tool_output_characters"), 0.5), mean: mean(numeric("tool_output_characters")) },
+    hook_output_characters: { median: percentile(numeric("hook_output_characters"), 0.5), mean: mean(numeric("hook_output_characters")) },
     shell_output_characters: { median: percentile(numeric("shell_output_characters"), 0.5), mean: mean(numeric("shell_output_characters")) },
     tgrep_output_characters: { median: percentile(numeric("tgrep_output_characters"), 0.5), mean: mean(numeric("tgrep_output_characters")) },
     target_attributed_characters: { median: percentile(numeric("target_attributed_characters"), 0.5), mean: mean(numeric("target_attributed_characters")) },
@@ -315,8 +329,12 @@ const summaries = Object.fromEntries(Object.entries(groups).map(([key, rows]) =>
     context_component_characters: Object.fromEntries(["snippets", "hydration", "evidence", "registry"].map((component) => [component, { median: percentile(rows.map((row) => Number(row.metrics?.context_component_characters?.[component] ?? NaN)), 0.5), mean: mean(rows.map((row) => Number(row.metrics?.context_component_characters?.[component] ?? NaN))) }])),
     discovery_adoption: {
       zero_mcp_runs: rows.filter((row) => row.metrics?.discovery_adoption?.zero_mcp === true).length,
+      zero_urdira_effective_use_runs: rows.filter((row) => row.metrics?.discovery_adoption?.zero_urdira_effective_use === true).length,
       mcp_before_shell_runs: rows.filter((row) => row.metrics?.discovery_adoption?.mcp_before_shell === true).length,
       shell_after_mcp_runs: rows.filter((row) => row.metrics?.discovery_adoption?.shell_after_mcp === true).length,
+      mcp_led_runs: rows.filter((row) => row.metrics?.context_lead?.first_repository_discovery_transport === "mcp").length,
+      hook_led_runs: rows.filter((row) => row.metrics?.context_lead?.first_repository_discovery_transport === "hook").length,
+      configured_majority_before_edit_runs: rows.filter((row) => Number(row.metrics?.context_lead?.configured_character_share_before_first_edit) >= 0.5).length,
     },
     context_calls_unattributed_to_declared_targets: { median: percentile(numeric("context_calls_unattributed_to_declared_targets"), 0.5), mean: mean(numeric("context_calls_unattributed_to_declared_targets")) },
     test_attempts: { median: percentile(numeric("test_attempts"), 0.5), mean: mean(numeric("test_attempts")) },
@@ -349,10 +367,13 @@ const report = {
     composition_metrics: "For Urdira, the report records pipeline, recipe, direct-operation, dependency, and malformed-composition usage observationally. Each is valid when appropriate, and no choice is required.",
     repository_context_characters: "Characters returned by observed repository-discovery calls. This is tool-response context, not source-only bytes.",
     action_telemetry: "Completed Codex action counts include MCP calls, shell commands, web searches, file changes, agent messages, and errors. Web searches and file changes are reported separately and never contribute to repository reads or repository context characters; unknown completed item types are counted as unclassified actions.",
-    transcript_output_breakdown: "tool_output_characters, shell_output_characters, and tgrep_output_characters split observed discovery response characters by method. Missing methods remain null. context_component_* counts only protocol-identifiable snippets, hydration, evidence, or registry payloads; unidentifiable components remain null.",
+    transcript_output_breakdown: "tool_output_characters, hook_output_characters, shell_output_characters, and tgrep_output_characters split observed discovery response characters by method. A hook-served search counts as effective Urdira use while remaining distinct from direct MCP and executed shell transport. Missing methods remain null. context_component_* counts only protocol-identifiable snippets, hydration, evidence, or registry payloads; unidentifiable components remain null.",
+    completed_tool_output: "All completed MCP, Urdira hook-served, and shell text, including status, tests, builds and host instruction reads. Missing output makes totals unknown; tgrep is a shell subset. These UTF-16 character counts are not full model context or token usage.",
     mcp_component_bytes: "For real Urdira MCP text-content responses, tool_envelope is the UTF-8 JSON request/status envelope, model_visible_serialized is the UTF-8 response content visible to the model, source_text is identifiable indented source text, records is identifiable result/header metadata, and hydration/evidence/registry remain null unless the response carries an explicit typed byte field. These are lower-bound protocol classifications and never use structuredContent.bytes as a required shape.",
     target_attributed_characters: "Characters from observed discovery responses whose request or response contains a declared task path/file/required-pattern marker. This is a lexical attribution proxy, not a semantic relevance judgment; it is null when the task declares no patterns.",
-    discovery_adoption: "mcp_before_shell records ordering only when both methods occur; shell_after_mcp records a shell discovery after an MCP discovery. zero_mcp is true when no observed MCP discovery occurred. Non-applicable ordering values are null.",
+    discovery_adoption: "mcp_before_shell records ordering only when both methods occur; shell_after_mcp records a shell discovery after an MCP discovery. zero_mcp describes direct MCP transport only; zero_urdira_effective_use is false when either direct Urdira MCP or an attested Urdira hook interception supplied repository context. Non-applicable ordering values are null.",
+    context_lead: "Records the first repository-discovery transport and source, whether the configured tool preceded shell discovery, and configured-tool versus shell calls and characters before the first edit. Hook-served Urdira output is configured-tool context, with its calls and characters retained separately from direct MCP. configured_character_share_before_first_edit is a relative character-volume observation, not a semantic usefulness score or an absolute success threshold.",
+    shell_source_reads: "Classifies source-reading shell calls before or after the first MCP result and, when MCP source is identifiable, by exact nonblank line overlap. Shell use is not a failure by itself; overlap and non-overlap require transcript evidence to interpret.",
     unattributed_context: "A proxy: observed discovery calls or returned characters containing none of the task's declared path/file/required-pattern markers. It is not a semantic irrelevance judgment.",
     tests: "Test attempts are parsed from command events. A pass or failure requires a numeric process exit code; missing exit codes remain unknown.",
     resources: "process_tree_peak_rss_kib covers the benchmark cell runner and all descendants, including the agent and any configured MCP. Urdira host-only RSS is retained separately for readiness diagnostics.",
@@ -393,6 +414,7 @@ const report = {
     command_timing: run.timing_metrics?.aggregates?.commands_by_command ?? null,
     repository_read_calls: run.metrics?.repository_read_calls ?? null,
     repository_context_characters: run.metrics?.repository_context_characters ?? null,
+    completed_tool_output: run.metrics?.completed_tool_output ?? null,
     tool_output_characters: run.metrics?.tool_output_characters ?? null,
     shell_output_characters: run.metrics?.shell_output_characters ?? null,
     tgrep_output_characters: run.metrics?.tgrep_output_characters ?? null,
@@ -404,6 +426,8 @@ const report = {
     context_component_characters: run.metrics?.context_component_characters ?? null,
     context_component_calls: run.metrics?.context_component_calls ?? null,
     discovery_adoption: run.metrics?.discovery_adoption ?? null,
+    context_lead: run.metrics?.context_lead ?? null,
+    context_efficiency: run.metrics?.context_efficiency ?? null,
     context_calls_unattributed_to_declared_targets: run.metrics?.context_calls_unattributed_to_declared_targets ?? null,
     context_characters_unattributed_to_declared_targets: run.metrics?.context_characters_unattributed_to_declared_targets ?? null,
     declared_unsafe_omissions: run.correctness?.declared_unsafe_omissions ?? null,
@@ -447,10 +471,16 @@ const evidenceRows = runs.map((run) => {
   const omissions = run.correctness?.declared_unsafe_omissions;
   const omissionText = Array.isArray(omissions) ? (omissions.length === 0 ? "none" : omissions.join(", ")) : "—";
   const adoption = run.metrics?.discovery_adoption;
-  const adoptionText = adoption ? (adoption.zero_mcp ? "zero-mcp" : adoption.mcp_before_shell === true ? "mcp-before-shell" : adoption.shell_after_mcp === true ? "shell-after-mcp" : "mixed") : "—";
-  return `| ${run.repository} | ${run.task} | ${run.arm} | ${run.correctness?.evidence_grounded_plan === true ? "yes" : run.correctness?.evidence_grounded_plan === false ? "no" : "—"} | ${omissionText.replaceAll("|", "/")} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.tool_output_characters)} | ${number(run.metrics?.shell_output_characters)} | ${number(run.metrics?.tgrep_output_characters)} | ${number(run.metrics?.target_attributed_characters)} | ${number(run.metrics?.target_unattributed_characters)} | ${adoptionText} | ${number(run.metrics?.mcp_calls)} | ${number(run.metrics?.mcp_failed_calls)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} |`;
+  const lead = run.metrics?.context_lead;
+  const adoptionText = adoption ? (adoption.zero_urdira_effective_use ? "zero-urdira" : lead?.configured_before_shell === true ? "configured-led" : lead?.first_repository_discovery_transport === "hook" ? "urdira-hook-led" : lead?.first_repository_discovery_transport === "mcp" ? "other-mcp-led" : "shell-led") : "—";
+  const shellReads = run.metrics?.context_efficiency?.shell_source_reads;
+  return `| ${run.repository} | ${run.task} | ${run.arm} | ${run.correctness?.evidence_grounded_plan === true ? "yes" : run.correctness?.evidence_grounded_plan === false ? "no" : "—"} | ${omissionText.replaceAll("|", "/")} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.tool_output_characters)} | ${number(run.metrics?.hook_output_characters)} | ${number(run.metrics?.shell_output_characters)} | ${number(run.metrics?.tgrep_output_characters)} | ${number(run.metrics?.target_attributed_characters)} | ${number(run.metrics?.target_unattributed_characters)} | ${adoptionText} | ${number(lead?.configured_character_share_before_first_edit, 3)} | ${number(shellReads?.overlapping_calls)}/${number(shellReads?.nonoverlapping_calls)} | ${number(run.metrics?.observed_tool_usage?.urdira_effective_calls)} | ${number(run.metrics?.mcp_calls)} | ${number(run.metrics?.mcp_failed_calls)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} |`;
 });
 const actionRows = runs.map((run) => `| ${run.repository} | ${run.task} | ${run.arm} | ${number(run.metrics?.web_search_calls)} | ${number(run.metrics?.file_change_actions)} | ${run.metrics?.first_action_type ?? "—"} | ${number(run.metrics?.integration_warning_count)} | ${number(run.metrics?.hook_error_count)} | ${number(run.metrics?.unclassified_action_count)} |`);
+const transportTextRows = runs.map((run) => {
+  const text = run.metrics?.completed_tool_output;
+  return `| ${run.repository} | ${run.task} | ${run.arm} | ${number(text?.mcp?.characters)} | ${number(text?.hook?.characters)} | ${number(text?.shell?.characters)} | ${number(text?.total_characters)} |`;
+});
 const urdiraRuns = runs.filter((run) => run.arm === "urdira-typescript");
 const urdiraDiscoveryCalls = urdiraRuns.reduce((sum, run) => sum + Number(run.metrics?.mcp_discovery_calls ?? 0), 0);
 const urdiraDiscoverySuccesses = urdiraRuns.reduce((sum, run) => sum + Number(run.metrics?.mcp_discovery_successful_calls ?? 0), 0);
@@ -467,11 +497,15 @@ const urdiraUsedCorrectly = urdiraDiscoveryCalls === 0
   || (urdiraUnexpectedFailures === 0
     && urdiraApiV3Calls === urdiraDiscoveryCalls
     && urdiraExplicitWorkspaceCalls === urdiraDiscoveryCalls);
+const urdiraPrimaryContextRuns = urdiraRuns.filter((run) =>
+  run.metrics?.context_lead?.configured_before_shell === true
+  && run.metrics?.context_lead?.first_repository_discovery_source === "urdira"
+  && Number(run.metrics?.context_lead?.configured_character_share_before_first_edit) >= 0.5).length;
 const viabilityAssessment = comparisonReport
   ? urdiraDiscoveryCalls === 0
     ? `Urdira was not selected by the agent in these cells. That natural tool choice is recorded as an observation and does not fail the task grader; timing, token, and cost fields therefore describe the configured arm without claiming successful Urdira retrieval.`
     : urdiraUsedCorrectly
-    ? `Urdira passed ${urdiraRuns.filter((run) => run.completed_successfully).length}/${urdiraRuns.length} graders. Of ${urdiraDiscoveryCalls} discovery operations, ${urdiraDiscoverySuccesses} completed directly and ${urdiraSelectorAmbiguities} returned the typed core:selector_ambiguous recovery signal; there were ${urdiraUnexpectedFailures} unexpected MCP failures. The completed calls included ${urdiraUsefulDiscoveries} useful results and ${urdiraEmptyDiscoveries} legitimate empty searches. Every discovery used API v3, an explicit single-workspace scope, Urdira before editing, and Urdira rediscovery after editing, with no native source-reading fallback. This campaign supports evaluating its timing, token, and cost trade-offs as a working code-intelligence alternative.`
+    ? `Urdira passed ${urdiraRuns.filter((run) => run.completed_successfully).length}/${urdiraRuns.length} graders. Of ${urdiraDiscoveryCalls} discovery operations, ${urdiraDiscoverySuccesses} completed directly and ${urdiraSelectorAmbiguities} returned the typed core:selector_ambiguous recovery signal; there were ${urdiraUnexpectedFailures} unexpected MCP failures. The completed calls included ${urdiraUsefulDiscoveries} useful results and ${urdiraEmptyDiscoveries} legitimate empty searches. Every discovery used API v3 and an explicit single-workspace scope. In ${urdiraPrimaryContextRuns}/${urdiraRuns.length} runs, Urdira was the first repository discovery transport and supplied at least half of observed pre-edit repository-context characters. Shell reads remain classified by timing and source overlap rather than treated as failures. This campaign supports evaluating Urdira as the primary repository-context source together with its timing, token, cost, density and fallback trade-offs.`
     : `Urdira passed ${urdiraRuns.filter((run) => run.completed_successfully).length}/${urdiraRuns.length} graders, but only ${urdiraDiscoverySuccesses}/${urdiraDiscoveryCalls} discovery calls succeeded (${urdiraTimeouts} IPC timeouts, ${urdiraCoverageFailures} incomplete-coverage responses, and ${urdiraValidationFailures} request-validation failures). Agents completed the graded diffs through narrow source inspection after MCP failures. Under this protocol the result does not yet support claiming Urdira as a viable code-intelligence replacement, and its token/cost measurements cannot be attributed to successful Urdira retrieval.`
   : null;
 const firstFrontierMs = (metrics, predicate) => metrics?.readiness_events?.find(predicate)?.elapsed_ms ?? null;
@@ -527,9 +561,19 @@ ${viabilityAssessment ? `## Viability assessment\n\n${viabilityAssessment}\n` : 
 
 ## Discovery, omissions, and verification
 
-| Repository | Task | Arm | Evidence grounded | Declared omissions | Repository reads | Context chars | Tool chars | Shell chars | tgrep chars | Target chars | Unattributed chars | Adoption | MCP calls | Failed MCP | Tests A/P/F/? |
-|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| Repository | Task | Arm | Evidence grounded | Declared omissions | Repository reads | Context chars | Direct MCP chars | Hook chars | Shell chars | tgrep chars | Target chars | Unattributed chars | Adoption | Configured share before edit | Shell overlap/non-overlap calls | Effective Urdira calls | MCP calls | Failed MCP | Tests A/P/F/? |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
 ${evidenceRows.join("\n")}
+
+## Completed transport text
+
+All completed MCP, attested Urdira hook-served, and shell text is included here,
+including tests, builds, status and host instruction reads. Tgrep stays within shell. Missing output
+remains unknown. These character counts are not the model's full context.
+
+| Repository | Task | Arm | MCP text chars | Hook text chars | Shell text chars | Combined tool text chars |
+|---|---|---|---:|---:|---:|---:|
+${transportTextRows.join("\n")}
 
 ## Codex action telemetry
 

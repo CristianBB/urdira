@@ -374,6 +374,44 @@ maybeDescribe("NativeStoreBuilder / NativeStructuralStoreHandle round trip", () 
 });
 
 maybeDescribe("NativeCanonicalQuerySnapshotPort vs SqliteCanonicalQuerySnapshotPort", () => {
+  it("searches nested and root files with alternative recursive globs across pages", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await opened.database.run("UPDATE source_artifacts SET normalized_path = 'src/deep/nested/index.ts' WHERE artifact_id = 'art-1'");
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const source = vi.spyOn(sqlite, "artifact_text").mockResolvedValue({ text: "needle" });
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      try {
+        const options = { filters: { path_patterns: ["tests/**", "src/**/*.ts"] } };
+        const first = await native.search_lexical_page(scope, "needle", "literal", options, 1);
+        expect(first.matches.map((match) => match.artifact_id)).toEqual(["art-1"]);
+        expect(first.next_cursor).toBeDefined();
+        const second = await native.search_lexical_page(scope, "needle", "literal", options, 1, first.next_cursor);
+        expect(second.matches.map((match) => match.artifact_id)).toEqual(["art-2"]);
+        const last = await native.search_lexical_page(scope, "needle", "literal", options, 1, second.next_cursor);
+        expect(last.matches).toEqual([]);
+        const shallow = await native.search_lexical_page(scope, "needle", "literal", { filters: { path_patterns: ["src/*.ts"] } });
+        expect(shallow.matches.map((match) => match.artifact_id)).toEqual(["art-2"]);
+      } finally { source.mockRestore(); }
+    });
+  });
+
+  it("honors lexical identifier boundaries instead of returning substring matches", async () => {
+    await withWorkspace(async (opened, storeDir) => {
+      await seedFixture(opened);
+      await convertV3WorkspaceToNativeStore(opened.database, workspace.workspace_id, 1, storeDir);
+      const sqlite = new SqliteCanonicalQuerySnapshotPort(opened.database);
+      const source = vi.spyOn(sqlite, "artifact_text").mockResolvedValue({ text: "needle needles $needle needle" });
+      const native = NativeCanonicalQuerySnapshotPort.open(opened.database, storeDir, sqlite);
+      try {
+        const page = await native.search_lexical_page(scope, "needle", "literal", { word_mode: "identifier" });
+        expect(page.matches).toHaveLength(2);
+        expect(page.matches[0]?.offsets).toEqual([0, 23]);
+      } finally { source.mockRestore(); }
+    });
+  });
+
   it("exposes identity-key keyset batches with stable record-id ties and duplicate keys", async () => {
     await withWorkspace(async (opened, storeDir) => {
       await seedFixture(opened);

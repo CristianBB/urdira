@@ -59,7 +59,7 @@ export function evaluateInclusion(observation: InclusionObservation, rules: Incl
   if (path === ".git" || path.startsWith(".git/") || path === ".urdira" || path.startsWith(".urdira/")) return { included: false, reason_code: "security:mandatory_exclusion" };
   if (observation.is_directory) return { included: false, reason_code: "security:directory_not_artifact" };
   if (observation.byte_length > 10 * 1024 * 1024) return { included: false, reason_code: "security:size_exclusion" };
-  if (observation.media_type.startsWith("application/octet-stream") || /(?:^|\/)(?:node_modules|dist|coverage|\.git)\//.test(path)) {
+  if (observation.media_type.startsWith("application/octet-stream") || /(?:^|\/)(?:node_modules|dist|coverage|test-results|\.git)\//.test(path)) {
     const explicit = matches(rules.include, path);
     if (!explicit) return { included: false, reason_code: "security:generated_or_binary_default" };
   }

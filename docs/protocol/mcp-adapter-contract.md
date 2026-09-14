@@ -28,7 +28,7 @@ MCP `2026-07-28` is the primary modern, stateless protocol era. Urdira implement
 - The adapter rejects an unsupported modern revision with MCP `UnsupportedProtocolVersionError`, including the exact supported revisions.
 - MCP request metadata selects protocol behavior only. It never selects a Urdira workspace, snapshot, query execution, cursor, plugin, or configuration.
 
-The initial stdio adapter is dual-era for coding-agent interoperability. It calls `serveStdio` with the legacy posture explicitly set to `serve`, rather than relying on an SDK default. A modern opening selects the `2026-07-28` per-request-metadata behavior; a legacy opening selects the SDK's supported 2025-era `initialize` lifecycle for that stdio connection. Both paths build the same five-tool server from the same factory and preserve identical Urdira domain semantics. Legacy connection state may select only MCP wire behavior and must never select a workspace, snapshot, query execution, cursor, plugin, or configuration.
+The initial stdio adapter is dual-era for coding-agent interoperability. It calls `serveStdio` with the legacy posture explicitly set to `serve`, rather than relying on an SDK default. A modern opening selects the `2026-07-28` per-request-metadata behavior; a legacy opening selects the SDK's supported 2025-era `initialize` lifecycle for that stdio connection. Both paths build the same three-tool server from the same factory and preserve identical Urdira domain semantics. Legacy connection state may select only MCP wire behavior and must never select a workspace, snapshot, query execution, cursor, plugin, or configuration.
 
 Removing legacy support or changing the selected legacy revisions is a release compatibility decision with explicit conformance evidence. It does not change the Urdira public query API, but it must be announced because it can prevent an older host from connecting.
 
@@ -36,7 +36,7 @@ Removing legacy support or changing the selected legacy revisions is a release c
 
 The initial adapter advertises only the MCP `tools` server capability. It does not advertise resources, resource subscriptions, prompts, completion, sampling, roots, elicitation, logging, Tasks, MCP Apps, or any other extension.
 
-The adapter also sets the top-level `instructions` field of the initialize/discover result. It is a deterministic, progressively disclosed agent manual in this order: a four-step quick start, a five-tool decision guide, expression selection, a minimal direct query, the pipeline mental model and executable examples, readiness and result guidance, then the exact operation and recipe catalogs. The pipeline section defines `arguments` as static inputs, `bindings` as typed edges from an earlier `{stage_id, output}` to a downstream argument, `outputs` as the final exposed streams, complete-set propagation, topological ordering, and scalar-cardinality failure. It includes tested `search -> source`, `resolve -> references`, and `resolve -> references -> source` examples plus recovery guidance for invalid output names, selector shapes, readiness, and cursors.
+The adapter also sets the top-level `instructions` field of the initialize/discover result. It is the single detailed deterministic guide: bootstrap and tool choice, validated copy-ready examples, continuation rules, the pipeline data-flow model, and registry-derived operation and recipe identifiers. Tool descriptions state only the role and boundary of each tool, so clients that resend descriptions and server instructions do not duplicate request examples. The pipeline section preserves complete-set propagation, exact output binding, final-output selection, and scalar-cardinality failure, including the `resolve -> references -> source` pattern.
 
 The decision guide uses the following public workflow. When a client has no
 `query_scope`, it calls `urdira_index_status` once with the exact workspace
@@ -81,17 +81,21 @@ duplicates every operation. Direct, context, recipe, and pipeline examples
 copied from that authority are therefore contract guidance, not illustrative
 implementation prose.
 
-The exact operation signatures and recipe catalog in `instructions` are generated directly from the same registries used to validate requests. Every registered operation must appear once in the categorized usage guide; missing guidance or duplicate coverage fails server construction. `instructions` is plain descriptive text, not a capability, and advertising it does not imply resources, prompts, or any other extension.
+The compact operation/output and recipe catalog in `instructions` is generated directly from the same registries used to validate requests. Every registered operation must appear once in the categorized usage guide; missing guidance or duplicate coverage fails server construction. Detailed argument shapes remain in the closed tool schema and runtime registry instead of being repeated in the instruction string. `instructions` is plain descriptive text, not a capability, and advertising it does not imply resources, prompts, or any other extension.
 
 The tool set is static for the lifetime of an adapter release and is returned in deterministic discovery order. The SDK preserves registration order, so the catalog starts with `urdira_index_status`, then `urdira_context`, then `urdira_query`; this makes the bootstrap and discovery flow visible before specialized tools. The adapter explicitly advertises `tools.listChanged: false`; it does not rely on the SDK default, because registering the first tool otherwise enables list-change support. Tool additions, removals, or incompatible schema changes require a new adapter release and process restart. On modern connections, `tools/list` uses the MCP `2026-07-28` list-response shape, including `resultType`, cache metadata supported by the SDK, and MCP's opaque `nextCursor` when the catalog ever exceeds one page. The SDK emits the negotiated legacy list shape on legacy connections. Any MCP list cursor is a transport catalog cursor and has no relationship to Urdira query cursors.
 
-The five tool names, in discovery order, are:
+The three tool names, in discovery order, are:
 
 - `urdira_index_status`
 - `urdira_context`
 - `urdira_query`
-- `urdira_build_context`
-- `urdira_analyze_change`
+
+`urdira_query` exposes every registered direct operation, recipe, and pipeline,
+including `core:analyze_impact` and `core:build_context`. `urdira_context`
+provides the readiness-aware task-context entry point. The adapter does not
+advertise duplicate per-operation wrappers whose schemas would be resent on
+every model turn.
 
 Names are unique, case-sensitive, stable within the API major, and restricted to MCP's portable tool-name character set.
 
@@ -100,7 +104,7 @@ Names are unique, case-sensitive, stable within the API major, and restricted to
 Every tool definition contains:
 
 - a stable `name` and concise human-readable `title`;
-- a concise `description` explaining when to use it, how it differs from the other four tools, explicit workspace scope, continuation behavior, and Urdira's read-only guarantee; `urdira_query` also carries a self-contained pipeline primer so clients that omit server instructions still receive the essential binding rules;
+- a concise `description` explaining when to use it and how it differs from the other two tools; detailed grammar and each copy-ready request appear once in the server instructions and remain enforced by the closed input schema;
 - an `inputSchema` generated from the authoritative Urdira public schema;
 - annotations `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`.
 
@@ -119,9 +123,11 @@ The compact rendering includes a copy-ready `query_scope` object for every
 workspace. Clients reuse that object byte-for-byte; `workspace_id` is opaque
 and must not be retyped, abbreviated, normalized, or synthesized.
 
-The `inputSchema` uses JSON Schema 2020-12. Every object is closed with `additionalProperties: false`, every union has an explicit discriminator, and every agent-visible field has the description required by the public query contract. Pipeline schema descriptions explicitly distinguish static stage `arguments`, dependency `bindings`, topological stage order, operation-specific stream names, and final declared `outputs`. The generated schema is validated using the SDK's supported schema integration and retained as a release fixture so that SDK upgrades cannot alter it silently.
+The `inputSchema` uses JSON Schema 2020-12. Every object is closed with `additionalProperties: false` and every union has an explicit discriminator. Field names, types, enums, required sets, and closure rules are preserved, while nested descriptive prose is removed from the advertised MCP copy because the server instructions carry the workflow guidance and MCP clients resend schemas to the model. Runtime validation still uses the same complete generated schema. The compact advertised schema is validated using the SDK's supported schema integration and retained as a release fixture so SDK upgrades cannot alter it silently.
 
-MCP annotations are descriptive hints, not the security boundary. The daemon protocol and Urdira authorization rules independently enforce that all five operations are read-only.
+MCP annotations are descriptive hints, not the security boundary. The daemon
+protocol and Urdira authorization rules independently enforce that all three
+advertised tools and every operation reachable through them are read-only.
 
 ## Tool calls and results
 
@@ -131,11 +137,12 @@ On a modern connection, `tools/call` follows the MCP `2026-07-28` result model:
 - In the agent profile no result carries `structuredContent`, so a client is guaranteed to find the full result in `content`. In the web profile `structuredContent` is the complete wrapper. The companion `content` text is a bounded summary that keeps result labels, counts, completeness, and full opaque continuation cursors while omitting source snippets and repeated hydration/evidence/registry payloads; typed clients must use `structuredContent` for those details.
 - `content` contains exactly one text block. By default it is Urdira's compact, grep-like plain-text rendering of the public wrapper value; an undocumented `render: "json"` debug argument (accepted at runtime but never advertised in any schema, description, or the server instructions) instead puts the complete JSON-serialized wrapper in that same text block.
 - The compact text rendering always states index coverage and page coverage separately and, when present, freshness and non-complete capability dimensions. It also states how many items are shown and whether any stream has more pages. `coverage: complete` with `page_coverage: incomplete; action=continue` means the index covers the scope but the requested result page is not complete; clients must follow the exact cursor with the original scope before using another discovery method. `page_coverage: complete` together with `more=no` means that page is complete. `partial`, `stale`, `unknown`, or `unsupported` requires following the reported operation availability or recovery guidance.
-- The compact text rendering can include a short inline source snippet for each result through an equally hidden `snippet_lines` argument (an integer `0`-`3`, accepted at runtime but never advertised in any schema, description, or the server instructions). It defaults to `0` (no inline snippet): a 2026-09-08 benchmark measured a cheaper but less reliable agent run with snippets enabled, so the default keeps them off. Setting `snippet_lines` only changes the rendered response size; it never changes which results are returned or their evidence, and it composes with `render: "json"`.
+- Agent text preserves every source snippet admitted by the engine's explicit projection. Exact duplicate owned ranges share page-local `source:N` labels, and each bundle lists its `source_refs`; distinct ranges and artifact versions remain separate. Bundle meaning is projected once into reusable `identity`, `relation`, `assessment`, `evidence`, `attributes`, and `related` lines instead of repeating the complete primary-result JSON after the locator and source. Artifact and artifact-version fields already emitted by `identity` or source coordinates are omitted from `attributes`; their exact values remain present once. Exact record/entity/relation identifiers, artifact version and range, relation endpoints, non-default assessment, provenance, and non-locator attributes remain visible. Stream summaries use explicit shown, total, mode, continuation, and previous-page fields. The legacy hidden `snippet_lines` argument is accepted for compatibility but cannot suppress requested source. Oversized query envelopes return `core:snippet_budget_impossible` with recovery guidance instead of dropping snippets or bundles after cursor generation.
+- When a query explicitly requests a larger source `max_total_characters` but omits `response_budget.max_characters`, the adapter derives the character ceiling from the requested source total plus the documented default envelope allowance. This prevents the default transport ceiling from silently weakening an explicit source projection. An explicitly supplied `response_budget.max_characters` is never changed; if it cannot carry one projected unit, the typed `core:snippet_budget_impossible` result remains authoritative.
 - A successful Urdira operation sets `isError: false` or omits it when the SDK's exact type permits omission.
 - A recoverable Urdira `OperationError` returns the typed error wrapper as compact JSON in `content[0].text` and sets `isError: true`. The agent therefore receives the registered diagnostic code, retryability, recovery actions, and closed details needed to correct the call.
 
-Arguments that fail the advertised tool `inputSchema` are rejected by the official SDK before the handler runs and return a bounded, safe `isError: true` tool result so the agent can correct the arguments. Because no valid Urdira request exists at that point, this SDK-owned validation result is not an Urdira `OperationError` wrapper; for closed enums, however, the adapter includes the registered allowed values in the validation diagnostic. In particular, invalid `urdira_context`/`urdira_build_context` facets name all valid context facets and the schema advertises the same enum.
+Arguments that fail the advertised tool `inputSchema` are rejected by the official SDK before the handler runs and return a bounded, safe `isError: true` tool result so the agent can correct the arguments. Because no valid Urdira request exists at that point, this SDK-owned validation result is not an Urdira `OperationError` wrapper; for closed enums, however, the adapter includes the registered allowed values in the validation diagnostic. In particular, invalid `urdira_context` facets name all valid context facets and the schema advertises the same enum.
 
 MCP protocol errors are reserved for MCP-level failures: invalid JSON or JSON-RPC structure, an unknown method or tool, a malformed `tools/call` envelope rather than invalid tool arguments, an unsupported protocol revision, or an unrecoverable adapter failure before a valid Urdira operation result exists. Domain failures such as an unknown workspace, stale cursor, incomplete required coverage, unavailable index, or invalid operation interaction are Urdira `OperationError` tool results rather than JSON-RPC errors.
 
@@ -156,12 +163,13 @@ Urdira result pagination is application-level state carried through explicit too
 - Registry mode `used` gives each hydrated parent slice one immutable `registry_usage_set_id`; its cursor continues that exact definition set even when all parent result streams are summary-only. Mode `none` disables only registry hydration, while every other selected stream remains pageable.
 - The agent must not decode, edit, compare semantically, or confuse these tokens with MCP `tools/list` cursors.
 
-Query cursors are emitted in a compact signed wire form to keep the complete
+Query cursors are emitted in a v3 Brotli-compressed, hexadecimal-framed signed
+wire form to keep the complete
 opaque value copyable in an agent response. The token still carries all
 execution, stream, position, scope, snapshot, ordering, projection, budget,
 status, completeness, and expiry bindings and remains valid across daemon
-restart while the persisted execution is retained. Legacy self-contained hex
-cursors remain accepted during the compatibility window. A malformed or
+restart while the persisted execution is retained. Deflate/hex v2 and legacy
+self-contained hex cursors remain accepted during the compatibility window. A malformed or
 partially copied value fails closed with `core:cursor_invalid`.
 
 The continuation envelope emitted by `MORE` is a complete executable
@@ -248,3 +256,32 @@ Any mismatch is a release blocker. MCP compatibility is an adapter property; it 
 - [Official TypeScript SDK v2 tool errors](https://ts.sdk.modelcontextprotocol.io/v2/servers/errors.html)
 - [Official TypeScript SDK v2 stdio serving](https://ts.sdk.modelcontextprotocol.io/v2/serving/stdio.html)
 - [Official TypeScript SDK v2 legacy-client support](https://ts.sdk.modelcontextprotocol.io/v2/serving/legacy-clients.html)
+
+## Agent context information preservation
+
+Context optimization removes duplicate or premature hydration, not logical
+results. Client-normalized response and source budgets remain authoritative.
+Every selected stream, including a summary-only stream, retains its totals
+and continuation. Index coverage and page coverage are independent; empty
+pages retain diagnostics. Agent text must preserve requested source and its
+provenance without a renderer-only truncation. Exact duplicate source ranges
+within one page may share a local reference keyed by snapshot, artifact,
+version, span, and text. Different source ranges and owners remain distinct;
+each page is independently readable. An agent consumes further pages when
+the task requires them, rather than exhausting unrelated results.
+
+The adapter fits query pages using their final text/JSON representation before
+returning them. The private `core:query_continue` payload may include
+`page_item_limit` (integer from zero through the original `max_items`), and
+internal stream pages carry a signed `page_start_cursor`. These fields are
+never public query fields. The adapter reads smaller pages from the same
+manifest, preserving all untouched stream summaries, and measures the actual
+result. It never discards bundles with a cursor pointing past them. Public
+continuations retain the original response budget and use `urdira_query`.
+
+Continuation pages retain the selected execution diagnostics, registry, and
+semantic state from the immutable manifest. Older manifests without that metadata
+retain their original compatibility behavior. A backward-only continuation must
+carry its `.previous` label; it cannot be presented as an unqualified `MORE`.
+Context discovery failures remain typed errors with actionable indexed recovery,
+not successful empty context pages.

@@ -123,7 +123,7 @@ describe("Phase 11 cursor cache", () => {
       frozen_snapshot_digest: "snapshots-1", frozen_status_digest: "status-1", limit: 2,
       max_characters: 1_000_000, reader: manifest,
     });
-    expect(first.next_cursor).toMatch(/^v2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
+    expect(first.next_cursor).toMatch(/^v3\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
     const restarted = new CursorCache({ signing_secret: secret });
     await expect(restarted.readPage({ cursor: first.next_cursor!, limit: 2, max_characters: 1_000_000, reader: manifest })).resolves.toMatchObject({ items: [{ id: "c" }] });
 
@@ -136,5 +136,27 @@ describe("Phase 11 cursor cache", () => {
     const legacyPayload = Buffer.from(stableJson(claims), "utf8").toString("hex");
     const legacy = `${legacyPayload}.${createHmac("sha256", secret).update(legacyPayload).digest("hex")}`;
     expect(restarted.decode(legacy)).toMatchObject({ execution_id: "legacy", stable_position: "a" });
+  });
+
+  it("keeps realistic portable cursors denser than the previous compressed envelope", async () => {
+    const secret = "phase-11-realistic-cursor";
+    const stablePosition = "confirmed\u0000000000000017\u0000jsts:call:packages/playwright/src/runner/vcs.ts:2277:2346:jsts:function:packages/playwright/src/runner/vcs.ts:747:detectChangedTestFiles:jsts:function:packages/playwright/src/transform/compilationCache.ts:9277:affectedTestFiles";
+    const digest = (character: string) => `sha256:${character.repeat(64)}`;
+    const first = await new CursorCache({ signing_secret: secret }).readPage({
+      execution_id: "query-9ba29950188ea3bc-0", result_stream: "context", direction: "forward",
+      projection_digest: digest("a"), ordering_digest: digest("b"), response_budget_ceiling_digest: digest("c"),
+      frozen_snapshot_digest: digest("d"), frozen_status_digest: "ready", scope_digest: digest("e"),
+      completeness: { overall_status: "complete", dimensions: [] }, expires_at: "2026-09-13T21:15:03.280Z",
+      limit: 1, max_characters: 1_000_000,
+      reader: reader([{ id: "first", stable_sort_key: stablePosition }, { id: "second", stable_sort_key: `${stablePosition}:next` }]),
+    });
+    const current = first.next_cursor!;
+    const claims = new CursorCache({ signing_secret: secret }).decode(current);
+    const previousPayload = Buffer.from((await import("node:zlib")).deflateRawSync(Buffer.from(stableJson(claims), "utf8"))).toString("hex");
+    const previous = `v2.${previousPayload}.${createHmac("sha256", secret).update(`v2.${previousPayload}`).digest("hex")}`;
+
+    expect(current.length).toBeLessThan(previous.length);
+    expect(new CursorCache({ signing_secret: secret }).decode(current)).toEqual(claims);
+    expect(new CursorCache({ signing_secret: secret }).decode(previous)).toEqual(claims);
   });
 });

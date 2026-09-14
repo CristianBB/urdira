@@ -51,6 +51,11 @@ For coding-agent discovery, a pipeline should normally bind an upstream `subject
 | `include_external` | boolean, default `false` | Whether virtual standard-library and dependency-declaration artifacts may be primary results. Relations may still cite them when false. |
 | `include_generated` | boolean, default `false` | Whether policy-classified generated artifacts may be primary results when they were indexed. |
 
+Entries within `paths` are alternatives. `*` matches within one path component;
+`**` crosses directory boundaries, and `**/` also matches zero directories.
+The same path semantics apply to native paged lexical search and artifact
+discovery.
+
 Filters are hard eligibility constraints applied before ordering. They cannot relax workspace inclusion or security policy.
 
 `StructuralFilter` is a closed object. Clients must use the fields listed above;
@@ -154,7 +159,7 @@ Output `pending_sites` (additive, `unclassified`; 2026-09-04) lists every visibl
 
 Outputs are `references` and `owners`. The operation reports symbol-resolution completeness separately from pagination.
 
-For `expand.operation` and immutable recipes, `target` is a declared batchable field: a non-empty confirmed subject set is evaluated as one globally planned union, with target-to-reference provenance retained and deduplication by exact record identity. The direct operation expression still accepts exactly one `SubjectSelector`. An empty upstream set returns exact empty outputs without widening scope.
+For `expand.operation`, v3 pipeline bindings, and immutable recipes, `target` is a declared batchable field: a non-empty confirmed subject set is evaluated as one globally planned union, with target-to-reference provenance retained and deduplication by exact record identity. The direct operation expression still accepts exactly one `SubjectSelector`. An empty upstream set returns exact empty outputs without widening scope.
 
 ### `core:expand_relations`
 
@@ -299,11 +304,40 @@ Outputs preserve both participant-bound subjects. Correlations never become cano
 | `facets` | required non-empty subset of `definitions`, `implementations`, `callers`, `callees`, `dependencies`, `contracts`, `effects`, `tests`, `configuration`, `analogues`, `extension_points` | Context categories requested. |
 | `filter` | optional `StructuralFilter` | Hard context scope. |
 
-Output `context` is a deduplicated ordered set of result bundles. When `tests` is requested, the indexed `core:contains`/`core:covers` projection expands the resolved seeds and subjects. If a resolved subject has no direct covering test, the same indexed graph is used for a bounded inbound `core:call` step and the callers' covering tests are considered. The expansion honors the supplied structural filters and the operation's advertised work limits. If that projection is unavailable, the operation returns the typed `core:required_capability_unsupported` error rather than silently omitting the facet. Response and source budgets control hydration only; operation work limits are server-advertised and exact failure replaces truncation of logical membership.
+Output `context` is a deduplicated ordered set of result bundles. When `tests` is requested, the indexed `core:contains`/`core:covers` projection expands the resolved seeds and subjects. The same indexed graph is also used for a bounded inbound `core:call` step; callers' covering tests are unioned with direct covering tests, preserving their evidence even when direct coverage exists. Exact identifier matches in test-shaped source artifacts supplement absent graph relationships as possible evidence. Each supplement retains its artifact version and exact match span, and hydration centers on that span; confirmed structural tests keep their classification and membership. The expansion honors the supplied structural filters and the operation's advertised work limits. If the graph projection is unavailable, the operation returns the typed `core:required_capability_unsupported` error rather than silently omitting the facet. Response and source budgets control hydration only; operation work limits are server-advertised and exact failure replaces truncation of logical membership.
+
+When an exact lexical test match lies inside an indexed executable entity,
+hydration uses the smallest containing function, method, constructor, callable,
+declaration, definition, or test record. Executable recognition uses the
+language-neutral universal kind as well as plugin descriptions. If no such
+record exists, hydration remains centered on the exact match with the requested
+context lines. This supplies a usable test body without widening membership to
+the entire test artifact.
+
+Structural context facets use the shared indexed selector and adjacency ports.
+Definitions follow outbound `core:defines`; implementations follow inbound
+`core:implements` and `core:overrides`; callers/callees follow inbound/outbound
+`core:call`; dependencies follow outbound `core:import` and `core:depends_on`;
+contracts follow outbound `core:implements` and `core:type_of`; effects follow
+outbound `core:read`, `core:write`, and `core:throws`; configuration follows
+`core:binds` in both directions; extension points follow outbound `core:inherits`
+and `core:implements`. These are direct structural neighborhoods, not a claim
+that all conceptual relevance has been discovered. Every selected endpoint
+retains its relation-record provenance and possible classifications. Missing
+indexed capabilities fail explicitly. Analogues require semantic retrieval;
+the structural-only context path rejects that facet explicitly.
+
+Context source projection is persisted as an internal manifest hydration
+request over the original artifact versions. It is hydrated for each page
+using normalized `options.snippets`, never a separate operation-wide source
+allowance. Exhausting a page's source allowance advances through a cursor;
+source unavailable errors are not converted to successful missing snippets.
 
 For deterministic first-page usefulness, context ordering prioritizes explicit seeds, then declaration/definition/type/callable records when `definitions` is requested, then records obtained through the indexed `tests` facet, followed by other resolved subjects. Ties retain the indexed resolution order; this changes presentation only and does not change membership or completeness.
 
-Without a configured semantic lane, task discovery is conservative and bounded: explicit `seeds` and identifier-shaped task terms are resolved through exact indexed subject lookups. A prose-only task with no resolvable seed returns an empty context instead of widening into a complete-corpus scan. Returned subjects can be expanded with the ordinary structural operations. This keeps absence of relevance ranking explicit and prevents context construction from materializing an entire large workspace merely to produce no useful result.
+Without a configured semantic lane, task discovery is conservative and bounded. When explicit `seeds` are present, they alone define the context roots; identifier-shaped terms in `task` contribute deterministic ordering but do not add roots. Without explicit seeds, identifier-shaped task terms are resolved through exact indexed subject lookups. A task with no resolvable seed fails with `core:selector_unresolvable`; it must explain that structural task discovery could not identify a seed and recommend an exact symbol/path seed or `core:search_text`. It must not imply that the index contains no relevant source or widen into a complete-corpus scan. Returned subjects can be expanded with the ordinary structural operations. This keeps absence of relevance ranking explicit and prevents a precise request from expanding through common incidental member names across a large workspace.
+
+An unanchored symbol seed in `core:build_context` retains every exact indexed declaration because broad context may need authored and generated forms together. Deterministic context ordering selects the useful lead without discarding the other declarations. Point operations that require one subject continue to report `core:selector_ambiguous`; `context_artifact` remains available when the caller explicitly needs one declaration.
 
 ### `core:index_status`
 
@@ -388,9 +422,19 @@ portable cursor. References do not survive a server restart. The full cursor
 remains available in structured output for clients that require portability or
 restart.
 
-`urdira_analyze_change` requires `api_version`, `scope`, `target`, `change`, and `options`; it optionally accepts `include_transitive`, `include_tests`, and `filter`. It normalizes byte-for-byte to `core:analyze_impact` and returns the ordinary query page/error union.
-
-`urdira_build_context` requires `api_version`, `scope`, `task`, `facets`, and `options`; it optionally accepts `query_class`, `seeds`, and `filter`. It normalizes to `core:build_context` and returns the ordinary query page/error union. When `options.freshness` is omitted, this complete-context wrapper requests `mode: "wait"`, `required_frontier: "structural"`, and a bounded 30-second timeout; an explicit freshness policy remains authoritative.
+Impact analysis uses the ordinary `urdira_query` operation envelope with
+`operation: "core:analyze_impact"`; its required and optional arguments remain
+those of the registered operation. Task context uses `urdira_context` or the
+ordinary `urdira_query` operation envelope with
+`operation: "core:build_context"`. When `urdira_context` omits
+`options.freshness`, it requests `mode: "wait"`,
+`required_frontier: "structural"`, and a bounded 30-second timeout; an explicit
+freshness policy remains authoritative. Its public source defaults are
+`mode: "relevant"`, 6,000 characters per snippet, 30,000 source characters,
+and 20 surrounding lines, with a 40,000-character response page. These are
+replaceable client defaults, not completeness limits: an explicit source
+projection or `response_budget` remains authoritative, and remaining results
+stay available through continuation.
 
 `urdira_index_status` defaults to API v3. The MCP initial form accepts an exact
 `workspace_root`; it returns layered
@@ -449,7 +493,7 @@ operation or algebra operator, static `arguments`, and explicit `bindings` to
 earlier stage outputs. Bindings are typed references to complete upstream
 streams; they are not expanded into a JSON array before execution. The server
 validates and topologically orders the dependency DAG before starting an
-expensive stage, rejects ambiguous scalar cardinality, and preserves one
+expensive stage, rejects ambiguous non-batchable scalar cardinality, and preserves one
 immutable snapshot across the chain. Independent branches may run in
 parallel. The response contains results, provenance, completeness, freshness
 and a continuation; a continuation only pages the already-produced manifest.
@@ -468,12 +512,14 @@ allowances to at most half its configured IPC frame size; callers continue the
 returned cursors for remaining items instead of requesting a larger transport
 frame.
 
-The manifest paginator admits the first item of each page to make progress,
-even if that item alone exceeds the character allowance. It measures item JSON,
-not the final transport envelope. The MCP projection may further reduce source
-content; an indivisible oversized item/envelope can still fail transport
-framing. This is an implementation limitation relative to the strict response
-budget requirement, not permission to silently omit structured results.
+The manifest paginator admits the first item of each page internally so that a
+continuation can attempt progress. Before an MCP page is returned, the adapter
+measures its complete rendered envelope and rereads a smaller prefix of the
+same immutable execution when necessary. This presentation fitting never
+changes scope, snapshot, ordering, source projection, logical membership or the
+client-selected budget. If one indivisible projected unit cannot fit, the call
+returns `core:snippet_budget_impossible` with the measured minimum and recovery
+guidance. No structured result or source content is silently omitted.
 
 `core:index_status` is served by the top-level status RPC / `urdira_index_status`
 MCP tool. The subject-producing query evaluator rejects it with

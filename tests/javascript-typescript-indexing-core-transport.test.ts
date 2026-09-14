@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { chunkSourceIndexCommits } from "../packages/plugin-javascript-typescript/src/indexing-core-process-transport.js";
+import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { describe, expect, it, vi } from "vitest";
+import { chunkSourceIndexCommits, createIndexingCoreProcessTransport } from "../packages/plugin-javascript-typescript/src/indexing-core-process-transport.js";
 
 describe("chunkSourceIndexCommits", () => {
   it("returns the whole array as a single chunk when it already fits the budget", () => {
@@ -36,4 +38,14 @@ describe("chunkSourceIndexCommits", () => {
     expect(chunks.flat()).toEqual(commits);
     expect(chunks.some((chunk) => chunk.length === 1 && chunk[0] === huge)).toBe(true);
   });
+});
+
+vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
+
+it("does not signal an unspawned worker and consumes its asynchronous error", () => {
+  const child = Object.assign(new EventEmitter(), { pid: undefined, kill: vi.fn() });
+  vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+  expect(() => createIndexingCoreProcessTransport({ command: "/missing-worker" })).toThrow("did not expose a process identity");
+  expect(child.kill).not.toHaveBeenCalled();
+  expect(() => child.emit("error", new Error("spawn EACCES"))).not.toThrow();
 });

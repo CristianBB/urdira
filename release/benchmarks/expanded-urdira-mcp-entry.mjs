@@ -3,6 +3,7 @@ import { runUrdiraMcp } from "../../apps/urdira/dist/index.js";
 
 const handle = await runUrdiraMcp({
   data_root: process.env.URDIRA_DATA_ROOT,
+  endpoint: process.env.URDIRA_ENDPOINT,
 });
 
 const shutdown = () => {

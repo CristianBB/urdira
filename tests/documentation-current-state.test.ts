@@ -47,8 +47,8 @@ describe("current-state documentation", () => {
     expect(guide).toContain("urdira_index_status");
     expect(guide).toContain("urdira_query");
     expect(guide).toContain("urdira_context");
-    expect(guide).toContain("urdira_analyze_change");
-    expect(guide).toContain("urdira_build_context");
+    expect(guide).not.toContain("urdira_analyze_change");
+    expect(guide).not.toContain("urdira_build_context");
     expect(await read("docs/README.md")).toContain("[current architecture](architecture.md)");
   });
 
@@ -59,6 +59,48 @@ describe("current-state documentation", () => {
     expect(foundation).toContain("[Index pack](decisions/23-index-pack.md)");
     expect(readme).toContain("expanded-typescript-agent-benchmark-results-2026-08-27.md");
     expect(release).toContain("expanded-typescript-agent-benchmark-results-2026-08-27.md");
+  });
+
+  it("keeps the current agent-context surface and evidence qualifications visible", async () => {
+    const currentState = await read("docs/current-state.md");
+    const architecture = await read("docs/architecture.md");
+    const daemonMcp = await read("docs/decisions/10-daemon-mcp-packaging.md");
+    const agentIntegration = await read("docs/decisions/19-agent-search-integration.md");
+    const publicQuery = await read("docs/protocol/public-query-contract.md");
+    const mcpContract = await read("docs/protocol/mcp-adapter-contract.md");
+    const readme = await read("README.md");
+
+    expect(currentState).toContain("Three read-only MCP tools");
+    expect(currentState).toContain("Playwright | v72");
+    expect(currentState).toContain("Prisma | v69");
+    expect(currentState).toContain("VS Code | v86");
+    expect(currentState).toContain("970,632");
+    expect(currentState).toContain("29,536 ms");
+    expect(currentState).toContain("semantic off");
+    expect(currentState).not.toContain("VS Code | none after repair");
+    expect(currentState).not.toContain("no post-repair VS Code agent sample exists");
+    expect(currentState).not.toContain("VS Code still needs one post-repair agent sample");
+    expect(architecture).toContain("exposes three read-only tools");
+    expect(architecture).toContain("a populated Urdira context block is already the");
+    expect(daemonMcp).toContain("Both profiles expose the same three tools");
+    expect(daemonMcp).toContain("A server-local `continuation_ref` form carries only");
+    expect(agentIntegration).toContain("`definitions`, `tests`, `implementations`, `callers`");
+    expect(agentIntegration).toContain("core:search_text");
+    expect(agentIntegration).toContain("same-session");
+    expect(agentIntegration).toContain("24 hours");
+    expect(agentIntegration).toContain("missing-detail");
+    expect(agentIntegration).toContain("Ripgrep exclusion globs remain native");
+    expect(publicQuery).toContain("measures its complete rendered envelope");
+    expect(mcpContract).toContain("all three\nadvertised tools");
+    expect(readme).toContain("Current directed context-density samples");
+    expect(readme).toContain("VS Code v86");
+    expect(readme).toContain("same-session");
+    expect(readme).toContain("source-safe");
+    expect(readme).toContain("`page_coverage: complete`");
+    expect(readme).toContain("public 50-item response default");
+    expect(readme).not.toContain("six items per stream by default");
+    expect(architecture).toContain("packages/cli/src/agent-integration.ts");
+    expect(architecture).toContain("decisions/19-agent-search-integration.md");
   });
 
   it("publishes only current architecture decisions, without rejected drafts or implementation diaries", async () => {

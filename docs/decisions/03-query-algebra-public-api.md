@@ -1,7 +1,7 @@
 # Query Algebra and Public API
 
 Status: Accepted  
-Last updated: 2026-09-09  
+Last updated: 2026-09-12
 Depends on: Universal data model and capability contract
 
 ## Decision objective
@@ -62,6 +62,12 @@ Define stable agent-oriented operations, composed-query semantics, uniform respo
 - Ranking and reranking execute exactly once during query materialization. Cursor continuation hydrates immutable ordered manifests and never repeats discovery, traversal, scoring, fusion, or reranking.
 - `ResultBundle` explains why a result belongs through evidence, provenance, classification, confidence when applicable, and completeness. It does not explain why the result received one ordinal rather than another; final result order is the only agent-facing ranking projection.
 - The approved semantic operation-error subset is documented in [Core operation error codes](../protocol/core-operation-error-codes.md).
+
+V3 operation bindings honor the operation registry: a bound scalar field declared
+batchable lowers to the existing whole-set `expand.operation` algebra. Sequence
+fields retain sequence binding; unregistered scalar fields still require one
+subject. This changes neither direct-operation cardinality nor already persisted
+execution manifests.
 
 ## Public request contract
 
@@ -228,13 +234,17 @@ Every exact code, trigger, non-meaning, retryability, recovery action, and close
 
 ## MCP surface
 
-The adapter exposes exactly five read-only tools:
+The adapter exposes exactly three non-overlapping read-only tools:
 
 - `urdira_query`: accepts `QueryRequest` or `ContinuationRequest` and covers operations, pipelines, recipes, and every cursor stream.
 - `urdira_context`: a task-oriented entry point that lowers to `core:build_context` with a bounded structural-readiness wait by default (see [Agent search integration](19-agent-search-integration.md)); it adds no second context semantic beyond `core:build_context`.
-- `urdira_analyze_change`: a concise wrapper over `core:analyze_impact`; it requires explicit scope, target, change descriptor, options, and budget.
-- `urdira_build_context`: a concise wrapper over `core:build_context`; it requires explicit scope, task, optional seeds, desired context facets, options, and budget.
 - `urdira_index_status`: lists discoverable workspaces when unscoped or returns pinned freshness, capability, plugin, activation, and repair-status views for explicit workspace IDs.
+
+`core:analyze_impact` remains an ordinary direct operation of `urdira_query`.
+`core:build_context` remains available through `urdira_context`, through a
+direct `urdira_query` operation, and inside pipelines. Separate wrappers for
+those operations are not advertised because their duplicate schemas add
+context to every model turn without adding engine capability.
 
 `urdira_index_status` is backed by `IndexStatusExecution`, not a live row-by-row scan. Its initial request freezes workspace summaries, activation issues, and candidate issues at one `observed_at` into independent ordered streams. Continuations repeat the exact ordered `workspace_ids`, may change only their page-local budget within the original ceiling, and cannot accept a query cursor.
 
@@ -255,3 +265,28 @@ Representative discovery, impact, testing, architecture, semantic, and paginatio
 ## Change history
 
 - **2026-09-09**: added the `core:selector_unresolvable` and `core:non_subject_operation` planning errors and the `core:affected_set_stale` freshness/coverage error (with its `core:semantic_affected_page` trigger) to the operation-error families above, verified against `packages/contracts/src/registries.ts` (Frente Q-2, 2026-09-08, and Frente S-A, 2026-09-06); `core:compare` and `core:execution_resource_limit` were already accurate and needed no change, confirmed against `packages/contracts/src/registries.ts` and the `core:compare` implementation in `packages/daemon/src/runtime.ts` (Frente Q-4, 2026-09-08).
+
+## Agent context information preservation
+
+Context optimization removes duplicate or premature hydration, not logical
+results. Client-normalized response and source budgets remain authoritative.
+Every selected stream, including a summary-only stream, retains its totals
+and continuation. Index coverage and page coverage are independent; empty
+pages retain diagnostics. Agent text must preserve requested source and its
+provenance without a renderer-only truncation. Exact duplicate source ranges
+within one page may share a local reference keyed by snapshot, artifact,
+version, span, and text. Different source ranges and owners remain distinct;
+each page is independently readable. An agent consumes further pages when
+the task requires them, rather than exhausting unrelated results.
+
+### Presentation-aware page fitting
+
+Before publishing an agent page, the adapter measures its complete rendered
+representation and selects a fitting prefix through the engine's immutable
+manifest page reader. Private stream start cursors and a private page item
+limit support this selection; they do not change the original response budget,
+projection, scope, ordering, snapshot, or execution. The limit cannot exceed
+the signed budget ceiling. A zero-item stream is an explicit summary with a
+continuation at its unchanged position. No logical query is reexecuted.
+A single requested projection that cannot fit produces its exact measured
+minimum and recovery guidance. Source is never shortened by page fitting.

@@ -59,9 +59,9 @@ describe("Phase 13 Urdira MCP adapter", () => {
   it("exposes the deterministic public tools, including the one-call context wrapper", () => {
     const definitions = createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } });
     expect(definitions.map((definition) => definition.name)).toEqual([...MCP_TOOL_NAMES]);
-    expect(definitions.map((definition) => definition.input_schema.type)).toEqual(["object", "object", "object", "object", "object"]);
-    expect(definitions.map((definition) => definition.input_schema.properties?.["scope"]).filter((value) => value !== undefined)).toHaveLength(3);
-    expect(definitions.map((definition) => definition.input_schema.additionalProperties)).toEqual([false, false, false, false, false]);
+    expect(definitions.map((definition) => definition.input_schema.type)).toEqual(["object", "object", "object"]);
+    expect(definitions.map((definition) => definition.input_schema.properties?.["scope"]).filter((value) => value !== undefined)).toHaveLength(1);
+    expect(definitions.map((definition) => definition.input_schema.additionalProperties)).toEqual([false, false, false]);
     const queryDefinition = definitions.find((definition) => definition.name === "urdira_query");
     const contextDefinition = definitions.find((definition) => definition.name === "urdira_context");
     expect(queryDefinition?.input_schema.properties?.["request_type"]).toBeDefined();
@@ -70,10 +70,11 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(contextSeeds.items?.oneOf).toHaveLength(6);
     expect(contextSeeds.items?.oneOf?.some((variant) => variant.oneOf !== undefined)).toBe(false);
     expect(contextSeeds.items?.oneOf?.some((variant) => variant.properties?.["path"] !== undefined)).toBe(true);
-    expect(queryDefinition?.description).toContain("scope is inside query");
-    expect(queryDefinition?.description).toContain("exactly one of cursor or continuation_ref");
-    expect(queryDefinition?.description).toContain('"continuation_ref":"<continuation_ref>"');
-    expect(queryDefinition?.description).toContain("continuation_ref MORE request is self-contained");
+    expect(queryDefinition?.description).toContain("scope inside query");
+    expect(queryDefinition?.description).toContain("Copy MORE unchanged");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("exactly one of cursor or continuation_ref");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('"continuation_ref":"<continuation_ref>"');
+    expect(queryDefinition?.description).not.toContain('"continuation_ref":"<continuation_ref>"');
   });
 
   it("rejects malformed v3 expressions before opening the IPC client", async () => {
@@ -214,28 +215,28 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(instructions).toContain("core:get_source=>subjects!:Sequence<SubjectSelector>|source!:SourceIncludeOptions");
     expect(instructions).toContain("discover_definitions.matcher={text:<non-empty string>,mode:exact|prefix|contains|semantic|hybrid}");
     expect(instructions).toContain("get_outline.container accepts only an artifact or entity selector");
-    expect(queryTool?.description).toContain("get_outline.container accepts only an artifact or entity selector");
-    expect(queryTool?.description).toContain("get_source requires source.mode, max_characters_per_snippet, max_total_characters, and context_lines");
-    expect(queryTool?.description).toContain("search_text pipeline outputs are only matches and subjects, never artifacts");
-    expect(contextTool?.description).toContain("definitions | implementations | callers | callees | dependencies | contracts | effects | tests | configuration | analogues | extension_points");
-    expect(contextTool?.description).toContain("api_version: 3 is a required top-level field");
-    expect(contextTool?.description).toContain("public_surfaces is an architecture view, not a context facet");
+    expect(queryTool?.description).toContain("server instructions contain the operation catalog");
+    expect(queryTool?.description).not.toContain("get_outline.container accepts only an artifact or entity selector");
+    expect(contextTool?.description).toContain("definitions, callers, dependencies, tests, contracts, or extension points");
+    expect(contextTool?.description).toContain("Provide api_version, scope, task, and facets at the top level");
+    expect(contextTool?.description).toContain("server instructions contain the closed facet contract");
     expect(instructions).toContain("public_surfaces is an architecture view, not a core:build_context facet");
     expect(instructions).toContain("core:get_source source.mode is only signature, relevant, or body; never none");
-    expect(instructions).toContain("A pipeline binding to a scalar argument requires exactly one upstream result");
+    expect(instructions).toContain("find_references.target accepts all bound declarations");
+    expect(instructions).toContain("find_references.target accepts only entity, record, or symbol selectors");
+    expect(instructions).toContain("An artifact selector is invalid for find_references");
+    expect(instructions).toContain("A pipeline binding to a non-batchable scalar argument requires exactly one upstream result");
     expect(instructions).toContain("Do not read source with grep, rg, find, ls, sed, cat, head, tail, or awk");
     expect(instructions).toContain("urdira_benchmark_discover");
   });
 
   it("teaches the public agent workflow without requiring pipelines", () => {
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_query for a known subject or operation");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_context for broad task discovery");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("it is not required before urdira_query");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("call once when query_scope is missing");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Narrow broad queries with an exact path, kind, context artifact, or returned entity id");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_context for broad discovery and urdira_query for a known subject or direct operation");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("first call urdira_index_status when query_scope is missing");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("narrow with an exact path, kind, context_artifact, entity id, filter, or response budget");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("MORE is a complete ContinuationRequest");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use Urdira before shell for scoped repository discovery and source reading");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("Pipelines are optional");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use shell for a concrete datum left by incomplete or unsupported coverage");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("use direct operations for one lookup and parallel calls for independent lookups");
   });
 
   it("registers the benchmark-only discovery projection without changing public tools", () => {
@@ -324,14 +325,12 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(MCP_SERVER_INSTRUCTIONS).not.toContain('"render"');
   });
 
-  it("lowers analyze-change and context tools to explicit scoped query requests", async () => {
+  it("keeps impact analysis and context construction available through the non-overlapping tools", async () => {
     const call = vi.fn(async (_name: string, payload: unknown) => success(payload));
     const definitions = createUrdiraToolDefinitions({ client: { call } });
-    const target = { subjectType: "symbol", name: "PaymentService.capture" };
-    const change = { changeType: "rename", newName: "authorize" };
 
-    await tool(definitions, "urdira_analyze_change").invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, target: { subject_type: "symbol", name: "PaymentService.capture" }, change: { change_type: "rename", new_name: "authorize" }, options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
-    await tool(definitions, "urdira_build_context").invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, task: "find the call path", facets: ["callers"], options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
+    await tool(definitions, "urdira_query").invoke({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:analyze_impact", arguments: { target: { subject_type: "symbol", name: "PaymentService.capture" }, change: { change_type: "rename", new_name: "authorize" } } }, options: { response_budget: { max_items: 10, max_characters: 10_000 } } } });
+    await tool(definitions, "urdira_context").invoke({ api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, task: "find the call path", facets: ["callers"], options: { freshness: "snapshot", wait_timeout_ms: 0, coverage_requirement: "accept_reported", evidence: { evidence: "summary", evidence_chain_depth: 1 }, diagnostics: { diagnostics: "relevant", diagnostic_detail: false }, snippets: { mode: "none", max_characters_per_snippet: 0, max_total_characters: 0, context_lines: 0 }, registry: { registry: "none" }, response_budget: { max_items: 10, max_characters: 10_000 } } });
 
     expect(call.mock.calls.map(([name]) => name)).toEqual(["core:query", "core:query"]);
     expect(call.mock.calls[0]?.[1]).toMatchObject({
@@ -440,8 +439,8 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(textBlock!.text).toContain("# 1 result");
     expect(textBlock!.text).toContain("src/a.ts");
     expect(textBlock!.text).toContain("Foo class_declaration");
-    expect(textBlock!.text).not.toContain("record_id");
-    expect(textBlock!.text).not.toContain("record:1");
+    expect(textBlock!.text).toContain("record_id");
+    expect(textBlock!.text).toContain("record:1");
     // No duplicated JSON page, and no structuredContent at all: since no
     // tool declares an outputSchema (see the dedicated test above),
     // structuredContent is never required and is never emitted -- an MCP
@@ -746,6 +745,22 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(() => normalizeQueryRequest(payload)).not.toThrow();
   });
 
+  it("defaults urdira_context to a source window large enough to start focused work", async () => {
+    const call = vi.fn(async (_name: string, payload: unknown) => success(payload));
+    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_context");
+    await definition.invoke({
+      api_version: 3,
+      scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
+      task: "Target",
+      facets: ["definitions", "tests"],
+    });
+
+    const payload = call.mock.calls[0]?.[1] as QueryRequest;
+    expect(payload.options.snippets).toEqual({ mode: "relevant", max_characters_per_snippet: 6000, max_total_characters: 30_000, context_lines: 20 });
+    expect(payload.options.response_budget).toEqual({ max_items: 50, max_characters: 40_000 });
+    expect(() => normalizeQueryRequest(payload)).not.toThrow();
+  });
+
   it("deep-merges partial options over agent-friendly defaults", async () => {
     const call = vi.fn(async (_name: string, payload: unknown) => success(payload));
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
@@ -801,11 +816,12 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(MCP_SERVER_INSTRUCTIONS.length).toBeGreaterThan(0);
     for (const operation of operationRegistry) expect(MCP_SERVER_INSTRUCTIONS).toContain(operation.operation_id);
     for (const recipe of recipeRegistry) expect(MCP_SERVER_INSTRUCTIONS).toContain(recipe.recipe_id);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("core:search_text(pattern!");
   });
 
   it("teaches a new agent tool choice and dependent pipelines before the exhaustive catalog", () => {
     expect(MCP_SERVER_INSTRUCTIONS).toMatch(/^URDIRA AGENT QUICK START/u);
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("WHICH MCP TOOL SHOULD I CALL?");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use urdira_context for broad discovery and urdira_query for a known subject or direct operation");
     for (const toolName of MCP_TOOL_NAMES) expect(MCP_SERVER_INSTRUCTIONS).toContain(toolName);
     expect(MCP_SERVER_INSTRUCTIONS).toContain("PIPELINE MENTAL MODEL");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("bindings maps a downstream argument name to {stage_id, output}");
@@ -813,26 +829,36 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(MCP_SERVER_INSTRUCTIONS).toContain("Do not copy opaque ids out and send them back in a later MCP call");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("THREE-STAGE PIPELINE");
     expect(MCP_SERVER_INSTRUCTIONS).toContain("resolve -> references -> source");
-    expect(MCP_SERVER_INSTRUCTIONS).toContain("If a scalar binding receives zero or multiple items");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("If a non-batchable scalar binding receives zero or multiple items");
     expect(MCP_SERVER_INSTRUCTIONS.indexOf("PIPELINE MENTAL MODEL")).toBeLessThan(MCP_SERVER_INSTRUCTIONS.indexOf("EXACT OPERATION CATALOG"));
   });
 
-  it("puts essential pipeline semantics in the query tool and its advertised schema", () => {
+  it("keeps pipeline guidance in the tool description without repeating it throughout the schema", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } }), "urdira_query");
-    expect(definition.description).toContain("For dependent work, use one pipeline");
-    expect(definition.description).toContain("bindings");
-    expect(definition.description).toContain("complete upstream set");
-    expect(definition.description).toContain("search -> source");
+    expect(definition.description).toContain("dependent pipeline");
+    expect(definition.description).toContain("complete typed upstream sets");
+    expect(definition.description).toContain("server instructions contain the operation catalog and validated request examples");
+    expect(definition.description).not.toContain("search -> source");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("THREE-STAGE PIPELINE: resolve -> references -> source");
+    expect(buildBenchmarkInstructions()).toContain("urdira_query accepts exactly one top-level request_type plus query object");
+    expect(buildBenchmarkInstructions()).toContain("scope is inside query alongside api_version and expression");
+    expect(buildBenchmarkInstructions()).toContain("paths belong at arguments.filter.paths");
+    expect(buildBenchmarkInstructions()).toContain("source.mode is only signature, relevant, or body");
 
     const query = definition.input_schema.properties?.["query"] as { properties?: Record<string, unknown> };
     const expression = query.properties?.["expression"] as { oneOf?: Array<{ properties?: Record<string, unknown> }> };
     const pipeline = expression.oneOf?.find((variant) => (variant.properties?.["expression_type"] as { const?: unknown })?.const === "pipeline");
-    const stages = pipeline?.properties?.["stages"] as { description?: string; items?: { oneOf?: Array<{ properties?: Record<string, unknown> }> } };
+    const stages = pipeline?.properties?.["stages"] as { items?: { oneOf?: Array<{ properties?: Record<string, unknown> }> } };
     const operationStage = stages.items?.oneOf?.find((variant) => variant.properties?.["operation"] !== undefined);
-    expect(stages.description).toContain("topological order");
-    expect((operationStage?.properties?.["arguments"] as { description?: string }).description).toContain("Static arguments only");
-    expect((operationStage?.properties?.["bindings"] as { description?: string }).description).toContain("downstream argument name");
-    expect((pipeline?.properties?.["outputs"] as { description?: string }).description).toContain("final streams");
+    expect(operationStage?.properties?.["arguments"]).toBeDefined();
+    expect(operationStage?.properties?.["bindings"]).toBeDefined();
+    expect(pipeline?.properties?.["outputs"]).toBeDefined();
+    const contextDefinition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({})) } }), "urdira_context");
+    expect(contextDefinition.description).toContain("optional seeds anchor known subjects");
+    expect(contextDefinition.description).toContain("server instructions contain the closed facet contract");
+    expect(buildBenchmarkInstructions()).toContain('symbol by known name={subject_type:"symbol",name:"QualifiedOrShortName"}');
+    expect(buildBenchmarkInstructions()).toContain("response_budget is an object, never a number");
+    expect(JSON.stringify(definition.input_schema)).not.toContain('"description"');
   });
 
   it("renders a search_text-style match as one grep -n style line, path: matched text", async () => {
@@ -862,8 +888,9 @@ describe("Phase 13 Urdira MCP adapter", () => {
       query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "price + tax" } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
-    expect(text).toContain("src/billing.ts: const total = price + tax;");
-    expect(text).not.toContain("record_id");
+    expect(text).toContain("src/billing.ts");
+    expect(text).toContain("const total = price + tax;");
+    expect(text).toContain("record_id");
     expect(text).not.toContain("optional_source_snippets");
   });
 
@@ -933,7 +960,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
       },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
-    expect(text).toMatch(/^TRUNCATED: dropped \d+ items? \(response_budget\)$/m);
+    expect(JSON.parse(text).error.code).toBe("core:snippet_budget_impossible");
     expect(text.length).toBeLessThan(2000);
   });
 
@@ -953,7 +980,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     expect(text.split("\n").length).toBeGreaterThan(1);
   });
 
-  it("renders a 600-artifact partial-completeness state as one coverage line, with no raw artifact ids", async () => {
+  it("preserves all 600 affected artifact ids when the caller provides sufficient budget", async () => {
     const ids = Array.from({ length: 600 }, (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`);
     const call = vi.fn(async () => success({
       query_execution_id: "execution-1",
@@ -963,11 +990,11 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
     const result = await definition.invoke({
       request_type: "query",
-      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, options: { response_budget: { max_characters: 100_000, max_items: 100 } }, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("coverage: partial (600 files affected)");
-    expect(text).not.toContain("sha256:");
+    for (const id of ids) expect(text).toContain(id);
   });
 
   // Plan 2026-09-06 (Frente S-A, §4.3): `semantic_coverage`'s raw
@@ -1086,7 +1113,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     for (const definition of definitions) expect(definition.description.length).toBeGreaterThanOrEqual(300);
   });
 
-  it("bounds completeness dimensions to a deterministic prefix with an exact count and set id", async () => {
+  it("preserves complete dimension identities with a sufficient explicit budget", async () => {
     const ids = Array.from({ length: 600 }, (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`);
     const call = vi.fn(async () => success({
       query_execution_id: "execution-1",
@@ -1097,42 +1124,29 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const result = await definition.invoke({
       request_type: "query",
       render: "json",
-      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
+      query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, options: { response_budget: { max_characters: 100000 } }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } } },
     });
     const jsonBlock = result.content.find((block): block is { type: "text"; text: string } => block.type === "text")!;
     const page = (JSON.parse(jsonBlock.text) as { page: { completeness_report: { dimensions: Array<{ affected_artifact_count: number; affected_artifact_ids: string[]; affected_artifact_set_id?: string }> } } }).page;
     const dimension = page.completeness_report.dimensions[0]!;
-    expect(dimension.affected_artifact_count).toBe(600);
-    expect(dimension.affected_artifact_ids.length).toBeLessThanOrEqual(8);
-    expect(dimension.affected_artifact_set_id).toBeDefined();
+    expect(dimension.affected_artifact_ids).toEqual(ids);
+    expect(dimension.affected_artifact_ids.length).toBe(600);
+    expect(dimension.affected_artifact_set_id).toBeUndefined();
   });
 
-  it("sheds an over-budget envelope deterministically and reflects the whole envelope in returned_characters", async () => {
-    const bigText = "x".repeat(500);
-    const streams = { subjects: { items: Array.from({ length: 30 }, (_unused, index) => ({ stable_sort_key: String(index), value: { entity_id: `entity-${index}`, text: bigText } })), has_next: false, has_previous: false } };
-    const call = vi.fn(async () => success({ query_execution_id: "execution-1", streams, completeness: { overall_status: "complete", dimensions: [] } }));
-    const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
-    const invokeOnce = () => definition.invoke({
-      request_type: "query",
-      render: "json",
-      query: {
-        api_version: 3,
-        scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
-        expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } },
-        options: { response_budget: { max_characters: 2000 } },
-      },
-    });
-    const first = await invokeOnce();
-    const second = await invokeOnce();
-    const firstText = first.content.find((block): block is { type: "text"; text: string } => block.type === "text")!.text;
-    const page = (JSON.parse(firstText) as { page: Record<string, unknown> }).page;
-    expect(page["truncation"]).toMatchObject({ truncated: true, reason: "response_budget" });
-    expect((page["truncation"] as { dropped_items: number }).dropped_items).toBeGreaterThan(0);
-    expect(typeof page["returned_characters"]).toBe("number");
-    expect(second).toEqual(first);
+  it("rejects an oversized complete page deterministically without discarding bundles", async () => {
+    const streams = { subjects: { items: Array.from({ length: 50 }, (_, index) => ({ stable_sort_key: String(index), value: { record_id: `record:${index}`, body: { path: `src/${index}.ts`, text: "x".repeat(500) } } })), has_next: false, has_previous: false } };
+    const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({ query_execution_id: "oversized", streams, completeness: { overall_status: "complete", dimensions: [] } })) } }), "urdira_query");
+    const invoke = () => definition.invoke({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } }, options: { response_budget: { max_characters: 6000 } } } });
+    const first = await invoke(); const second = await invoke();
+    expect(first.isError).toBe(true);
+    expect(first.content).toEqual(second.content);
+    const text = first.content[0]!.type === "text" ? first.content[0]!.text : "";
+    expect(JSON.parse(text).error.code).toBe("core:snippet_budget_impossible");
+    expect(text).not.toContain("TRUNCATED");
   });
 
-  it("never emits previous_cursor in the public envelope", async () => {
+  it("preserves previous_cursor in the public envelope", async () => {
     const preShaped = {
       query_execution_id: "execution-1",
       scope_kind: "single_workspace",
@@ -1158,7 +1172,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const jsonBlock = result.content.find((block): block is { type: "text"; text: string } => block.type === "text")!;
     const page = (JSON.parse(jsonBlock.text) as { page: { result_sets: Array<{ confirmed: Record<string, unknown> }> } }).page;
-    expect(page.result_sets[0]?.confirmed["previous_cursor"]).toBeUndefined();
+    expect(page.result_sets[0]?.confirmed["previous_cursor"]).toBe("prev.sig");
     expect(page.result_sets[0]?.confirmed["next_cursor"]).toBe("next.sig");
   });
 
@@ -1208,7 +1222,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("src/service.ts:42");
-    expect(text).toContain("    | doStuff(x);");
+    expect(text).toContain("    doStuff(x);");
     // Compact style, unlike the search_text match style above: the locator
     // and the snippet are on separate lines, never joined with ": ".
     expect(text).not.toContain("src/service.ts:42: doStuff(x);");
@@ -1225,7 +1239,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
   // `urdira_query` call that never sets `snippet_lines` must render no
   // compact snippet line at all, even though the engine still attaches
   // `optional_source_snippets` per SNIPPET_POLICY.
-  it("omits the inline compact snippet line by default (snippet_lines defaults to 0, R14)", async () => {
+  it("preserves supplied source with the default renderer", async () => {
     const call = vi.fn(async () => success({
       query_execution_id: "execution-snippet-default-off",
       streams: {
@@ -1258,7 +1272,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("src/service.ts:42");
     expect(text).not.toContain("    | ");
-    expect(text).not.toContain("doStuff(x);");
+    expect(text).toContain("doStuff(x);");
   });
 
   it("renders a get_outline root member's inline snippet as its opening (signature) line", async () => {
@@ -1293,10 +1307,10 @@ describe("Phase 13 Urdira MCP adapter", () => {
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("createTask");
-    expect(text).toContain("    | createTask(input: TaskInput): Task {");
+    expect(text).toContain("    createTask(input: TaskInput): Task {");
   });
 
-  it("snippet_lines: 0 (hidden response_budget-adjacent option) disables the inline compact snippet line", async () => {
+  it("legacy snippet_lines zero cannot suppress supplied source", async () => {
     const call = vi.fn(async () => success({
       query_execution_id: "execution-snippet-disabled",
       streams: {
@@ -1328,7 +1342,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(text).toContain("src/service.ts:42");
     expect(text).not.toContain("    | ");
-    expect(text).not.toContain("doStuff(x);");
+    expect(text).toContain("doStuff(x);");
   });
 
   it("sheds inline compact snippets before dropping whole find_references bundles under a tight response budget", async () => {
@@ -1366,7 +1380,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
       },
     });
     const text = (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
-    expect(text).toMatch(/^TRUNCATED: dropped \d+ items? \(response_budget\)$/m);
+    expect(JSON.parse(text).error.code).toBe("core:snippet_budget_impossible");
     // `shedToBudget` trims every bundle's `optional_source_snippets` in one
     // unconditional pass BEFORE it ever drops a whole bundle from the tail
     // -- so reaching whole-bundle dropping (asserted below) proves every
@@ -1412,7 +1426,7 @@ describe("Phase 13 Urdira MCP adapter", () => {
     const firstText = (first.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     const secondText = (second.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
     expect(firstText).toBe(secondText);
-    expect(firstText).toContain("    | doStuff(x);");
+    expect(firstText).toContain("    doStuff(x);");
   });
 
   // Adversarial review 2026-09-06 (task item 1): the exact case named in the
@@ -1425,107 +1439,15 @@ describe("Phase 13 Urdira MCP adapter", () => {
   // recomputes deterministically, and (c) two identical calls produce byte-
   // identical text (no ordering/Map-iteration nondeterminism creeping in
   // once both shedding stages are exercised together).
-  it("50 bundles x 200-char snippets under max_characters:6000 sheds snippets then whole bundles, and stays deterministic", async () => {
-    // A real 200-character source line is not mostly whitespace, so the
-    // fixture snippet below fills its full 200 characters with visible
-    // content -- `formatDescriptorLine`'s compact-snippet branch trims each
-    // line, and trailing spaces (an earlier draft of this test used
-    // `" ".repeat(...)` padding) would silently trim away almost the whole
-    // fixture, defeating the "50 x 200 = 10k" case entirely. The path is
-    // realistically long (a deep monorepo path, not `src/file-N.ts`) so that
-    // even after every snippet is shed (stage 1), the 50 bare descriptor
-    // lines alone still exceed `max_characters: 6000` -- forcing stage 2
-    // (whole-bundle dropping) to also fire in the same request, which is
-    // the actual point of this test (verified empirically below, not just
-    // asserted by construction).
-    const pathFor = (index: number): string => `src/apps/web/src/components/workspace/panels/dashboard/deeply/nested/sibling/module/group/file-${index}.ts`;
-    const snippetFor = (index: number): string => `callSiteNumber${index}_${"x".repeat(200)}`.slice(0, 200);
-    const buildStreams = () => ({
-      references: {
-        items: Array.from({ length: 50 }, (_unused, index) => ({
-          stable_sort_key: String(index).padStart(3, "0"),
-          value: {
-            subject_type: "relation",
-            record_id: `rel-${index}`,
-            universal_kind: "core:call",
-            kind: "jsts:relation_call",
-            classification: "confirmed",
-            body: { path: pathFor(index) },
-            source_span: { artifact_version_id: `artv-${index}`, start_byte: "0", end_byte: "10", start_line: "1", end_line: "1" },
-            optional_source_snippets: [{ text: snippetFor(index), span: { artifact_version_id: `artv-${index}`, start_byte: "0", end_byte: "10", start_line: "1", end_line: "1" }, truncated: false, redacted: false, redactions: [] }],
-          },
-        })),
-        has_next: false, has_previous: false,
-      },
-    });
-    // Every fixture snippet is exactly 200 characters, all visible (no
-    // trailing whitespace to be trimmed away) -- the literal "50 x 200 =
-    // 10k" case R13/the review brief describe.
-    expect(buildStreams().references.items.every((item) => item.value.optional_source_snippets[0]!.text.length === 200)).toBe(true);
-
-    const invokeOnce = async (options?: { readonly maxCharacters?: number; readonly snippetLines?: number }): Promise<string> => {
-      const call = vi.fn(async () => success({ query_execution_id: "execution-50x200", streams: buildStreams(), completeness: { overall_status: "complete", dimensions: [] } }));
-      const definition = tool(createUrdiraToolDefinitions({ client: { call } }), "urdira_query");
-      const result = await definition.invoke({
-        request_type: "query",
-        ...(options?.snippetLines === undefined ? {} : { snippet_lines: options.snippetLines }),
-        query: {
-          api_version: 3,
-          scope: { scope_type: "single_workspace", workspace_id: "workspace-1" },
-          expression: { expression_type: "operation", operation: "core:find_references", arguments: { target: { subject_type: "symbol", name: "doStuff" } } },
-          ...(options?.maxCharacters === undefined ? {} : { options: { response_budget: { max_characters: options.maxCharacters } } }),
-        },
-      });
-      return (result.content.find((block): block is { type: "text"; text: string } => block.type === "text"))!.text;
-    };
-
-    // Empirical preconditions (not assumed): (1) fully unbudgeted, all 50
-    // snippets rendered, must exceed 6000 -- otherwise this isn't a
-    // shedding case at all; (2) even with every snippet line suppressed
-    // (`snippet_lines: 0` -- the same final byte shape as `shedToBudget`'s
-    // stage-1 snippet strip, since the renderer treats both identically:
-    // `formatDescriptorLine` never emits a "    | " line when there is
-    // nothing to show), the 50 bare descriptor lines alone must ALSO
-    // exceed 6000 -- otherwise stage 1 alone would already satisfy the
-    // budget and stage 2 (whole-bundle dropping) would never fire.
-    // R14: opt in explicitly on every call that needs snippets rendered --
-    // `snippet_lines` now defaults to 0, so omitting it here would make
-    // `unbudgeted` and `bareDescriptorsOnly` identical by construction
-    // rather than by the shedding logic this test exists to exercise.
-    const unbudgeted = await invokeOnce({ snippetLines: 1 });
-    const bareDescriptorsOnly = await invokeOnce({ snippetLines: 0 });
-    expect(unbudgeted.length).toBeGreaterThan(6000);
-    expect(bareDescriptorsOnly.length).toBeGreaterThan(6000);
-
-    const first = await invokeOnce({ snippetLines: 1, maxCharacters: 6000 });
-    const second = await invokeOnce({ snippetLines: 1, maxCharacters: 6000 });
-
-    // (a) Fits the budget.
-    expect(first.length).toBeLessThanOrEqual(6000);
-    // (c) Deterministic: identical input, byte-identical output, both calls.
-    expect(first).toBe(second);
-    // (b) Both shedding stages fired: EVERY snippet is gone (stage 1) AND
-    // at least one whole bundle was dropped from the tail (stage 2) -- the
-    // empirical preconditions above prove stage 1 alone could not have
-    // been enough.
-    expect(first).not.toContain("    | ");
-    expect(first).not.toContain("callSiteNumber");
-    const truncationMatch = /^TRUNCATED: dropped (\d+) items? \(response_budget\)$/m.exec(first);
-    expect(truncationMatch).not.toBeNull();
-    const droppedCount = Number(truncationMatch![1]);
-    expect(droppedCount).toBeGreaterThan(0);
-    expect(droppedCount).toBeLessThan(50);
-    // The surviving reference count (50 - dropped) matches how many
-    // locator lines actually remain in the text -- `TRUNCATED`'s count and
-    // the real rendered content agree exactly, and this is recomputed
-    // fresh each call (not a stale count carried over), which is exactly
-    // why (c)'s determinism check above matters.
-    const locatorPattern = /file-(\d+)\.ts/g;
-    const survivingIndices = [...first.matchAll(locatorPattern)].map((match) => Number(match[1]));
-    expect(survivingIndices.length).toBe(50 - droppedCount);
-    // Whole bundles are dropped from the TAIL (highest index first): the
-    // surviving set is exactly the first (50 - droppedCount) items, in
-    // order -- never a scattered subset.
-    expect(survivingIndices).toEqual(Array.from({ length: survivingIndices.length }, (_unused, index) => index));
+  it("rejects an oversized complete page deterministically without discarding bundles", async () => {
+    const streams = { subjects: { items: Array.from({ length: 50 }, (_, index) => ({ stable_sort_key: String(index), value: { record_id: `record:${index}`, body: { path: `src/${index}.ts`, text: "x".repeat(500) } } })), has_next: false, has_previous: false } };
+    const definition = tool(createUrdiraToolDefinitions({ client: { call: vi.fn(async () => success({ query_execution_id: "oversized", streams, completeness: { overall_status: "complete", dimensions: [] } })) } }), "urdira_query");
+    const invoke = () => definition.invoke({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "workspace-1" }, expression: { expression_type: "operation", operation: "core:find_records", arguments: { selector: { record_categories: ["entity"] } } }, options: { response_budget: { max_characters: 6000 } } } });
+    const first = await invoke(); const second = await invoke();
+    expect(first.isError).toBe(true);
+    expect(first.content).toEqual(second.content);
+    const text = first.content[0]!.type === "text" ? first.content[0]!.text : "";
+    expect(JSON.parse(text).error.code).toBe("core:snippet_budget_impossible");
+    expect(text).not.toContain("TRUNCATED");
   });
 });

@@ -23,8 +23,6 @@ export const MCP_TOOL_NAMES = [
   "urdira_index_status",
   "urdira_context",
   "urdira_query",
-  "urdira_build_context",
-  "urdira_analyze_change",
 ] as const;
 
 export type UrdiraMcpToolName = (typeof MCP_TOOL_NAMES)[number];
@@ -180,6 +178,7 @@ function objectSchema(properties: Record<string, JsonSchema>, required: readonly
 // this adapter still always emits the complete engine-valid shape.
 const DEFAULT_RESPONSE_BUDGET: JsonRecord = { max_items: 50, max_characters: 20_000 };
 const MAX_MCP_PAGE_ITEMS = 50;
+const MAX_QUERY_RESPONSE_CHARACTERS = 10_000_000;
 const DEFAULT_QUERY_OPTIONS: JsonRecord = {
   freshness: "current",
   wait_timeout_ms: 0,
@@ -189,6 +188,11 @@ const DEFAULT_QUERY_OPTIONS: JsonRecord = {
   snippets: { mode: "relevant", max_characters_per_snippet: 2000, max_total_characters: 20_000, context_lines: 2 },
   registry: { registry: "none", include_payload_schemas: false },
   response_budget: DEFAULT_RESPONSE_BUDGET,
+};
+const DEFAULT_CONTEXT_QUERY_OPTIONS: JsonRecord = {
+  ...DEFAULT_QUERY_OPTIONS,
+  snippets: { mode: "relevant", max_characters_per_snippet: 6000, max_total_characters: 30_000, context_lines: 20 },
+  response_budget: { max_items: 50, max_characters: 40_000 },
 };
 
 function deepMergeDefaults(defaults: JsonRecord, supplied: unknown): JsonRecord {
@@ -228,10 +232,42 @@ function mergeQueryOptions(supplied: unknown): JsonRecord {
   return merged;
 }
 
+function mergeContextQueryOptions(supplied: unknown): JsonRecord {
+  const merged = mergeQueryOptions(deepMergeDefaults(DEFAULT_CONTEXT_QUERY_OPTIONS, supplied));
+  return merged;
+}
+
 function mergeResponseBudget(supplied: unknown): JsonRecord {
   const merged = deepMergeDefaults(DEFAULT_RESPONSE_BUDGET, supplied);
   if (typeof merged["max_items"] === "number") merged["max_items"] = Math.min(MAX_MCP_PAGE_ITEMS, merged["max_items"]);
   return merged;
+}
+
+/**
+ * A source projection and its transport ceiling are separate controls. When
+ * the caller explicitly enlarges source hydration but leaves max_characters
+ * at its public default, preserve that request by deriving a larger default
+ * ceiling. An explicitly supplied max_characters always wins and may still
+ * produce the typed projection-limit diagnostic.
+ */
+function preserveExplicitSourceProjection(options: JsonRecord, suppliedOptions: unknown, expression: unknown): void {
+  const supplied = isRecord(suppliedOptions) ? suppliedOptions : {};
+  const suppliedBudget = isRecord(supplied["response_budget"]) ? supplied["response_budget"] : {};
+  if (typeof suppliedBudget["max_characters"] === "number") return;
+  const totals: number[] = [];
+  const collect = (value: unknown): void => {
+    if (Array.isArray(value)) { for (const entry of value) collect(entry); return; }
+    if (!isRecord(value)) return;
+    const source = isRecord(value["source"]) ? value["source"] : undefined;
+    if (source !== undefined && Number.isSafeInteger(source["max_total_characters"]) && Number(source["max_total_characters"]) > 0) totals.push(Number(source["max_total_characters"]));
+    for (const [key, child] of Object.entries(value)) if (key !== "source") collect(child);
+  };
+  collect(expression);
+  const suppliedSnippets = isRecord(supplied["snippets"]) ? supplied["snippets"] : {};
+  if (Number.isSafeInteger(suppliedSnippets["max_total_characters"]) && Number(suppliedSnippets["max_total_characters"]) > 0) totals.push(Number(suppliedSnippets["max_total_characters"]));
+  if (totals.length === 0) return;
+  const budget = isRecord(options["response_budget"]) ? options["response_budget"] : {};
+  budget["max_characters"] = Math.min(MAX_QUERY_RESPONSE_CHARACTERS, Number(DEFAULT_RESPONSE_BUDGET["max_characters"]) + totals.reduce((sum, value) => sum + value, 0));
 }
 
 const scopeSchema: JsonSchema = objectSchema({
@@ -364,7 +400,7 @@ const structuralFilterFields: readonly string[] = (() => {
   return fields;
 })();
 
-const structuralFilterGuidance = `StructuralFilter is closed. Valid fields are ${structuralFilterFields.map((field) => `filter.${field}`).join(", ")}. Do not use filter.include_globs; use filter.paths for workspace-relative globs.`;
+const structuralFilterGuidance = `StructuralFilter is closed. Valid fields are ${structuralFilterFields.map((field) => `filter.${field}`).join(", ")}. Do not use filter.include_globs; use filter.paths for workspace-relative globs. A directory-name match needs a descendant suffix (for example **/*feature*/**); **/*feature* matches the final path component.`;
 
 function operationArgumentSchema(operationId: string): JsonSchema {
   const operation = operationDefinition(operationId);
@@ -544,11 +580,19 @@ const querySchema: JsonSchema = {
   ],
 };
 
+/** Reuse the existing closed continuation contract on context entry points. */
+function continuableIntentSchema(operation: string, apiVersions?: readonly number[]): JsonSchema {
+  const initial = intentSchema(operation, apiVersions);
+  const properties = initial.properties ?? {};
+  return { ...initial, required: [], properties: { ...properties, request_type: { type: "string", const: "continuation" }, continuation: continuationSchema }, oneOf: [
+    ({ required: initial.required, not: { anyOf: [{ required: ["request_type"] }, { required: ["continuation"] }] } } as unknown as JsonSchema),
+    ({ required: ["request_type", "continuation"], not: { anyOf: Object.keys(properties).map((key) => ({ required: [key] })) } } as unknown as JsonSchema),
+  ] } as JsonSchema;
+}
+
 const toolSchemas: Readonly<Record<UrdiraMcpToolName, JsonSchema>> = {
   urdira_query: querySchema,
-  urdira_context: intentSchema("core:build_context", [3]),
-  urdira_analyze_change: intentSchema("core:analyze_impact"),
-  urdira_build_context: intentSchema("core:build_context"),
+  urdira_context: continuableIntentSchema("core:build_context", [3]),
   urdira_index_status: indexStatusSchema,
 };
 
@@ -596,8 +640,6 @@ const diagnosticMcpJsonSchemaValidator = {
 const toolTitles: Readonly<Record<UrdiraMcpToolName, string>> = {
   urdira_query: "Run Urdira Query",
   urdira_context: "Discover Repository Context",
-  urdira_analyze_change: "Analyze Change Impact",
-  urdira_build_context: "Build Task Context",
   urdira_index_status: "Bootstrap Workspace Index",
 };
 
@@ -629,6 +671,19 @@ export const URDIRA_QUERY_GET_SOURCE_EXAMPLE = {
   },
 } as const;
 
+export const URDIRA_QUERY_SEARCH_TEXT_EXAMPLE = {
+  request_type: "query",
+  query: {
+    api_version: 3,
+    scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" },
+    expression: {
+      expression_type: "operation",
+      operation: "core:search_text",
+      arguments: { pattern: "TargetSymbol", syntax: "literal", word_mode: "identifier", result_projection: "match" },
+    },
+  },
+} as const;
+
 /** Complete continuation envelope shown in MORE; copy it literally. */
 export const URDIRA_QUERY_CONTINUATION_EXAMPLE = {
   request_type: "continuation",
@@ -639,11 +694,9 @@ export const URDIRA_QUERY_CONTINUATION_EXAMPLE = {
 } as const;
 
 const toolDescriptions: Readonly<Record<UrdiraMcpToolName, string>> = {
-  urdira_query: `Run an exact Urdira query when the intent matches a registered operation or when a recipe/pipeline is useful. ${structuralFilterGuidance} Use a direct operation for one known subject, symbol, artifact, path, selector, or lookup; use a recipe for a registered standard workflow; use a pipeline only when a later stage depends on an earlier result. Direct get_source example (copy as-is after replacing the opaque workspace_id; scope is inside query): ${stableJson(URDIRA_QUERY_GET_SOURCE_EXAMPLE)}. Bootstrap query_scope with urdira_index_status only when it is missing, then reuse it byte-for-byte. MORE is a complete, executable ContinuationRequest; copy it literally without rebuilding or editing it. It contains exactly one of cursor or continuation_ref. A continuation_ref MORE request is self-contained and contains only api_version and continuation_ref; do not add scope or response_budget. A portable cursor MORE request contains the original scope and response_budget. The compact continuation_ref form is ${stableJson(URDIRA_QUERY_CONTINUATION_EXAMPLE)}. For dependent work, use one pipeline instead of copying ids between MCP calls. A pipeline stage keeps static values in arguments; bindings maps a downstream argument name to an earlier {stage_id, output} and passes the complete upstream set. Minimal data flow: search -> source means search outputs subjects, then the source stage declares bindings.subjects={stage_id:\"search\",output:\"subjects\"}. List only the final streams to return in pipeline outputs. Output names are operation-specific and are not result_projection values. Scalar bindings require exactly one upstream item; sequence arguments consume the whole set. Source-safe operations (find_artifacts, search_text, get_source) can run at source_ready; structural and semantic operations wait for their registered frontier. Guardrails: get_outline.container accepts only an artifact or entity selector. get_source requires source.mode, max_characters_per_snippet, max_total_characters, and context_lines; mode must be signature, relevant, or body. search_text pipeline outputs are only matches and subjects, never artifacts. Results render as compact plain text by default.`,
-  urdira_context: `Use this for broad, multi-facet repository discovery when definitions, callers, dependencies, tests, contracts, or extension points should arrive together. Send the fields directly at the tool top level; do not wrap this example in request_type or a nested context object: ${stableJson(URDIRA_CONTEXT_EXAMPLE)}. It is the readiness-aware agent wrapper around core:build_context: it waits for the structural frontier by default and, if that wait expires, returns a compact notice naming source/syntax operations usable immediately. api_version: 3 is a required top-level field; scope, task, and facets are also required. Optional seeds anchor known subjects. All overrides stay inside options. Facets use exactly: ${buildContextFacetContract}. public_surfaces is an architecture view, not a context facet. It is a convenience wrapper, not a prerequisite for urdira_query; use a direct operation when the lookup or subject is already known.`,
-  urdira_analyze_change: "Use this for one explicit hypothetical rename, signature change, deletion, move, type, visibility, contract, or behavior change. It is strictly read-only. Supply the exact target returned by prior discovery plus the change descriptor; receive will_break, must_update, may_be_affected, tests_to_run, and uncertain_dynamic_usage with evidence. Prefer this dedicated tool over constructing core:analyze_impact manually. Resolve and copy query_scope from urdira_index_status first.",
-  urdira_build_context: "Use this explicit core:build_context wrapper when you already know the desired task, facets, and optional seed subjects and want the ordinary query-operation behavior. Required fields are api_version:3, scope, task, and facets; options is optional. For a general agent task prefer urdira_context because it adds readiness-aware degradation guidance. For custom dependent stages use urdira_query with a pipeline.",
-  urdira_index_status: "When query_scope is missing, make this the first call for repository discovery or source reading; call it once to bootstrap a new workspace. The primary bootstrap form is exactly {\"workspace_root\":\"/absolute/repository/root\"}; omit response_budget unless you need to override the defaults. If supplied, response_budget is an object, never a number: the only permitted fields are max_items and max_characters, for example {\"workspace_root\":\"/absolute/repository/root\",\"response_budget\":{\"max_items\":50,\"max_characters\":20000}}. The bootstrap form accepts no api_version, scope, options, or other query fields; those belong to query/context tools. Its separate status-list and cursor forms may use only the documented workspace_ids, cursor, include_* flags, and response_budget fields. It resolves or registers the workspace and returns a copy-ready query_scope; reuse that object byte-for-byte in every later tool and never synthesize its opaque workspace_id. Call it again only to check readiness/freshness or after the workspace changes. It also reports source, syntax, structural, and semantic readiness plus operation_availability, retryability, scan failures, and retry timing. For a v4 workspace it additionally reports per-lane generations (structural queryable/durable, lexical/semantic completed) and the last scan's kind, changed paths, and timings, so search_text/search_semantic can be seen as partial until their lane catches up.",
+  urdira_query: "Run an exact Urdira query: one operation, recipe, dependent pipeline, or literal MORE continuation. Reuse source in [Urdira prompt context already loaded] and call this only for a named missing detail, a needed continuation, or post-edit freshness. Bootstrap scope once with urdira_index_status; initial requests use request_type plus query, with scope inside query. Pipelines pass complete typed upstream sets. Filters and selectors are closed by the advertised schema. Copy MORE unchanged. The server instructions contain the operation catalog and validated request examples.",
+  urdira_context: `Use this for broad, multi-facet repository discovery when definitions, callers, dependencies, tests, contracts, or extension points should arrive together. Provide api_version, scope, task, and facets at the top level; optional seeds anchor known subjects and all overrides stay in options. It waits for structural readiness by default, preserves exact declarations and source, and returns explicit coverage and MORE. Continue through urdira_query only when remaining results are needed. The server instructions contain the closed facet contract and a validated request example.`,
+  urdira_index_status: "Make this the first call for repository discovery or source reading when query_scope is missing. Bootstrap or resolve an explicit workspace_root, then reuse the returned opaque query_scope. Optional response_budget is an object. Call again only for readiness, freshness, or workspace changes. The response reports frontier readiness, operation availability, failures, and recovery guidance.",
 };
 
 const operationErrorSchema: JsonSchema = objectSchema({ code: { type: "string" }, message: { type: "string" }, retryable: { type: "boolean" }, recovery_action: { type: "string" }, workspace_id: { type: "string" }, query_execution_id: { type: "string" }, details: { type: "object" } }, ["code", "message", "retryable"]);
@@ -673,7 +726,7 @@ function requireApiVersion(value: unknown): number {
 function queryRequestFromIntent(operationId: string, input: JsonRecord): JsonRecord {
   const apiVersion = requireApiVersion(input["api_version"]);
   const scope = requireScope(input["scope"]);
-  const options = mergeQueryOptions(input["options"]);
+  const options = operationId === "core:build_context" ? mergeContextQueryOptions(input["options"]) : mergeQueryOptions(input["options"]);
   // Context is a complete-facets contract, not a best-effort structural
   // projection.  Its intent wrapper therefore waits for the structural
   // frontier by default; callers can still provide an explicit freshness
@@ -684,6 +737,7 @@ function queryRequestFromIntent(operationId: string, input: JsonRecord): JsonRec
     options["wait_timeout_ms"] = 30_000;
   }
   const operationArguments = isRecord(input["arguments"]) ? input["arguments"] : Object.fromEntries(Object.entries(input).filter(([key]) => !["api_version", "scope", "options", "render"].includes(key)));
+  preserveExplicitSourceProjection(options, input["options"], { expression_type: "operation", operation: operationId, arguments: operationArguments });
   return { api_version: apiVersion, scope, expression: { expression_type: "operation", operation: operationId, arguments: operationArguments }, options };
 }
 
@@ -752,6 +806,7 @@ function queryPayload(input: unknown, continuationStore: ContinuationRefStore = 
   }
   if (!isRecord(canonical["expression"])) throw new McpProtocolError("urdira_query requires expression, or cursor.");
   const options = mergeQueryOptions(canonical["options"]);
+  preserveExplicitSourceProjection(options, canonical["options"], canonical["expression"]);
   const payload = { api_version: apiVersion, scope, expression: canonical["expression"], options };
   validateQueryBeforeIpc(payload);
   return { call: "core:query", payload };
@@ -865,64 +920,7 @@ function operationError(code: string, message: string, details: Readonly<Record<
   };
 }
 
-// --- Public envelope diet --------------------------------------------------
-//
-// `SnapshotCapabilityStateEntry` rows (packages/contracts/src/models.ts) are
-// the engine's internal completeness bookkeeping and can carry hundreds of
-// full `sha256:<64hex>` artifact ids per dimension. `dietDimension` maps
-// each one to the public `CompletenessDimension` shape from
-// docs/decisions/01-universal-data-model.md: an exact count, a small
-// deterministic id prefix, and a set id only when the prefix is not the
-// complete set.
-const DIMENSION_ID_PREFIX_CAP = 8;
-
-function dietDimension(raw: unknown): JsonRecord {
-  const entry = isRecord(raw) ? raw : {};
-  const ids = Array.isArray(entry["affected_artifact_ids"]) ? (entry["affected_artifact_ids"] as unknown[]).filter((id): id is string => typeof id === "string").slice().sort() : [];
-  const exactCount = typeof entry["affected_artifact_count"] === "number" ? entry["affected_artifact_count"] : ids.length;
-  const truncatedSet = ids.length > DIMENSION_ID_PREFIX_CAP;
-  const prefix = ids.slice(0, DIMENSION_ID_PREFIX_CAP);
-  const existingSetId = typeof entry["affected_artifact_set_id"] === "string" ? entry["affected_artifact_set_id"] : undefined;
-  const setId = truncatedSet ? existingSetId ?? `sha256:${createHash("sha256").update(ids.join(",")).digest("hex")}` : undefined;
-  return {
-    workspace_snapshot_binding_ids: Array.isArray(entry["workspace_snapshot_binding_ids"]) ? entry["workspace_snapshot_binding_ids"] : [],
-    capability: typeof entry["capability"] === "string" ? entry["capability"] : "",
-    status: typeof entry["status"] === "string" ? entry["status"] : "unknown",
-    reason_codes: Array.isArray(entry["reason_codes"]) ? entry["reason_codes"] : [],
-    affected_artifact_count: exactCount,
-    affected_artifact_ids: prefix,
-    ...(setId === undefined ? {} : { affected_artifact_set_id: setId }),
-    diagnostic_record_ids: Array.isArray(entry["diagnostic_record_ids"]) ? entry["diagnostic_record_ids"] : [],
-  };
-}
-
-function dietEnvelopeDimensions(envelope: JsonRecord): JsonRecord {
-  const report = isRecord(envelope["completeness_report"]) ? envelope["completeness_report"] as JsonRecord : undefined;
-  if (report === undefined || !Array.isArray(report["dimensions"])) return envelope;
-  return { ...envelope, completeness_report: { ...report, dimensions: report["dimensions"].map(dietDimension) } };
-}
-
-// Agents essentially never paginate backwards, and a `previous_cursor` costs
-// roughly 1KB per continuable stream. It is never generated by the builder
-// below and is stripped here as a defensive backstop for any envelope that
-// already arrives pre-shaped (see the early-return branch in
-// `publicQueryPage`). `has_previous` is left untouched -- only the cursor
-// token itself is omitted.
-function stripPreviousCursor(stream: unknown): unknown {
-  if (!isRecord(stream) || !("previous_cursor" in stream)) return stream;
-  return Object.fromEntries(Object.entries(stream).filter(([key]) => key !== "previous_cursor"));
-}
-
-function stripPreviousCursors(envelope: JsonRecord): JsonRecord {
-  if (!Array.isArray(envelope["result_sets"])) return envelope;
-  const resultSets = (envelope["result_sets"] as JsonRecord[]).map((entry) => ({
-    ...entry,
-    confirmed: stripPreviousCursor(entry["confirmed"]),
-    possible: stripPreviousCursor(entry["possible"]),
-  }));
-  return { ...envelope, result_sets: resultSets };
-}
-
+// Public envelope rendering and explicit response budgets.
 function bundlesOf(stream: unknown): unknown[] {
   return isRecord(stream) && Array.isArray(stream["result_bundles"]) ? stream["result_bundles"] as unknown[] : [];
 }
@@ -1027,15 +1025,21 @@ function shedToBudget(envelope: JsonRecord, maxCharacters: number, measure: (val
 export interface RenderContext { readonly render: "text" | "json"; readonly page_kind: "query" | "index_status"; readonly snippet_lines: number; readonly continuation_scope?: JsonRecord; readonly continuation_response_budget?: JsonRecord; readonly continuation_ref_store?: ContinuationRefStore; }
 
 function measureForRender(renderContext: RenderContext): (value: JsonRecord) => number {
-  if (renderContext.render === "json") return (value) => stableJson(value).length;
-  return renderContext.page_kind === "index_status" ? (value) => renderIndexStatusText(value).length : (value) => renderQueryPageText(value, renderContext.snippet_lines, renderContext.continuation_scope, renderContext.continuation_response_budget, renderContext.continuation_ref_store).length;
+  return (value) => {
+    const result = formatUrdiraResult(value, renderContext);
+    return result.content.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0)
+      + (result.structuredContent === undefined ? 0 : stableJson(result.structuredContent).length);
+  };
 }
 
 function finalizeEnvelope(envelope: JsonRecord, responseBudget: { readonly max_characters?: unknown } | undefined, renderContext: RenderContext): JsonRecord {
   const maxCharacters = typeof responseBudget?.max_characters === "number" && Number.isFinite(responseBudget.max_characters) ? responseBudget.max_characters : undefined;
   const measure = measureForRender(renderContext);
   let current = envelope;
-  if (maxCharacters !== undefined) {
+  if (maxCharacters !== undefined && renderContext.page_kind === "query" && measure(current) > maxCharacters) {
+    return { error: operationError("core:snippet_budget_impossible", "The complete query page cannot fit the requested response budget. For an initial urdira_query request, set query.options.response_budget.max_characters to at least required_minimum_characters, or explicitly change query.expression.arguments.source for get_source. Context overrides belong in options. Keep continuation arguments unchanged; start a new explicitly scoped query if you need a different budget. No result was discarded.", { required_minimum_characters: measure(current), provided_max_characters: maxCharacters }) };
+  }
+  if (maxCharacters !== undefined && renderContext.page_kind !== "query") {
     const shed = shedToBudget(current, maxCharacters, measure);
     current = shed.envelope;
     if (shed.truncated) {
@@ -1059,7 +1063,7 @@ function finalizeEnvelope(envelope: JsonRecord, responseBudget: { readonly max_c
 }
 
 function buildStreamResultSets(streams: JsonRecord): JsonRecord[] {
-  return Object.entries(streams).sort(([left], [right]) => left.localeCompare(right)).map(([resultSet, rawPage]) => {
+  const sets = Object.entries(streams).map(([resultSet, rawPage]) => {
     const page = isRecord(rawPage) ? rawPage : {};
     const items = Array.isArray(page["items"]) ? page["items"] : [];
     const bundles = items.map((item) => {
@@ -1093,9 +1097,17 @@ function buildStreamResultSets(streams: JsonRecord): JsonRecord[] {
         optional_source_snippets: Array.isArray(snippetsField) ? snippetsField : [],
       };
     });
-    const stream = { classification: "confirmed", page_mode: "summary", result_bundles: bundles, total: bundles.length, ...(typeof page["next_cursor"] === "string" ? { next_cursor: page["next_cursor"] } : {}), has_next: page["has_next"] === true, has_previous: page["has_previous"] === true };
+    const stream = { classification: "confirmed", page_mode: bundles.length > 0 ? "hydrated" : "summary", result_bundles: bundles, total: typeof page["total"] === "number" ? page["total"] : bundles.length, ...(typeof page["next_cursor"] === "string" ? { next_cursor: page["next_cursor"] } : {}), ...(typeof page["previous_cursor"] === "string" ? { previous_cursor: page["previous_cursor"] } : {}), has_next: page["has_next"] === true, has_previous: page["has_previous"] === true };
     return { result_set: resultSet, confirmed: stream, possible: { classification: "possible", page_mode: "summary", result_bundles: [], total: 0, has_next: false, has_previous: false } };
   });
+  const merged = new Map<string, JsonRecord>();
+  for (const entry of sets) {
+    const possible = entry.result_set.endsWith("\0possible");
+    const name = possible ? entry.result_set.slice(0, -9) : entry.result_set;
+    const existing = merged.get(name) ?? { ...entry, result_set: name, confirmed: { ...entry.possible, classification: "confirmed" } };
+    merged.set(name, possible ? { ...existing, possible: { ...entry.confirmed, classification: "possible" } } : { ...entry, ...(merged.has(name) ? { possible: existing["possible"] } : {}) });
+  }
+  return [...merged.values()];
 }
 
 function publicQueryPage(value: unknown, scopeKind: "single_workspace" | "comparison" = "single_workspace", responseBudget: { readonly max_characters?: unknown } | undefined, renderContext: RenderContext): unknown {
@@ -1128,8 +1140,6 @@ function publicQueryPage(value: unknown, scopeKind: "single_workspace" | "compar
       ...(isRecord(value["index_freshness"]) ? { index_freshness: value["index_freshness"] } : {}),
     };
   }
-  envelope = dietEnvelopeDimensions(envelope);
-  envelope = stripPreviousCursors(envelope);
   return finalizeEnvelope(envelope, responseBudget, renderContext);
 }
 
@@ -1156,8 +1166,8 @@ function publicIndexStatusPage(value: unknown): unknown {
 // overhead alone was found to be roughly a 10x context tax per query. The
 // functions below render the SAME envelope as compact, information-dense
 // plain text -- one line per result, grouped by path like `grep -n`/`ctags`
-// output -- which is what `urdira_query`/`urdira_analyze_change`/
-// `urdira_build_context`/`urdira_index_status` now emit by default; the
+// output -- which is what `urdira_query`/`urdira_context`/
+// `urdira_index_status` now emit by default; the
 // full JSON page is still available verbatim via `render: "json"` (see
 // `renderFieldSchema`) for debugging or programmatic use.
 //
@@ -1427,13 +1437,130 @@ function appendGroupedDescriptors(descriptors: readonly BundleDescriptor[], poss
   }
 }
 
-function appendStreamLines(resultSetLabel: string, streamPage: unknown, possible: boolean, lines: string[], cursors: { readonly label: string; readonly cursor: string }[], snippetLines: number): void {
+/** Page-local sharing never assumes a client has retained a previous page. */
+function compactSourceCoordinates(snippet: JsonRecord, primary: JsonRecord): string | undefined {
+  const span = isRecord(snippet["span"]) ? snippet["span"] as JsonRecord : undefined;
+  const artifact = firstNonEmptyString(snippet["artifact_id"], primary["owner_artifact_id"], primary["artifact_id"]);
+  const version = firstNonEmptyString(span?.["artifact_version_id"], snippet["artifact_version_id"], primary["owner_artifact_version_id"], primary["artifact_version_id"]);
+  const startByte = firstNonEmptyString(span?.["start_byte"]);
+  const endByte = firstNonEmptyString(span?.["end_byte"]);
+  const startLine = firstNonEmptyString(span?.["start_line"]);
+  const endLine = firstNonEmptyString(span?.["end_line"]);
+  const parts = [
+    ...(artifact === undefined ? [] : [`artifact=${artifact}`]),
+    ...(version === undefined ? [] : [`version=${version}`]),
+    ...(startByte === undefined || endByte === undefined ? [] : [`bytes=${startByte}..${endByte}`]),
+    ...(startLine === undefined || endLine === undefined ? [] : [`lines=${startLine}..${endLine}`]),
+    ...(snippet["truncated"] === true ? ["truncated=yes"] : []),
+    ...(snippet["redacted"] === true ? ["redacted=yes"] : []),
+  ];
+  const redactions = Array.isArray(snippet["redactions"]) ? snippet["redactions"] : [];
+  if (redactions.length > 0) parts.push(`redactions=${stableJson(redactions)}`);
+  return parts.length === 0 ? undefined : parts.join(" ");
+}
+
+function reusableIdentityLine(primary: JsonRecord, sourceAlreadyIdentifiesOwner: boolean): string | undefined {
+  const fields: readonly [string, string][] = [
+    ["record_id", "record_id"], ["entity_id", "entity_id"], ["relation_id", "relation_id"],
+    ["diagnostic_id", "diagnostic_id"], ["identity_key", "identity_key"],
+  ];
+  const parts = fields.flatMap(([label, field]) => typeof primary[field] === "string" ? [`${label}=${primary[field] as string}`] : []);
+  if (!sourceAlreadyIdentifiesOwner) {
+    const artifact = firstNonEmptyString(primary["owner_artifact_id"], primary["artifact_id"]);
+    const version = firstNonEmptyString(primary["owner_artifact_version_id"], primary["artifact_version_id"]);
+    if (artifact !== undefined) parts.push(`artifact=${artifact}`);
+    if (version !== undefined) parts.push(`version=${version}`);
+  }
+  return parts.length === 0 ? undefined : `identity: ${parts.join(" ")}`;
+}
+
+function reusableRelationLine(primary: JsonRecord): string | undefined {
+  const body = isRecord(primary["body"]) ? primary["body"] as JsonRecord : {};
+  const source = firstNonEmptyString(body["source_id"], primary["source_id"]);
+  const target = firstNonEmptyString(body["target_id"], primary["target_id"]);
+  if (source === undefined && target === undefined) return undefined;
+  return `relation: ${source ?? "?"} -> ${target ?? "?"}`;
+}
+
+function reusableEvidenceLine(bundle: JsonRecord): string | undefined {
+  const path = Array.isArray(bundle["provenance_path"]) ? bundle["provenance_path"] : [];
+  if (path.length === 0) return undefined;
+  const entries = path.map((entry) => {
+    if (!isRecord(entry)) return stableJson(entry);
+    return firstNonEmptyString(entry["record_id"], entry["relation_id"], entry["entity_id"], entry["diagnostic_id"], entry["identity_key"]) ?? stableJson(entry);
+  });
+  return `evidence: ${entries.join(" -> ")}`;
+}
+
+function reusableAssessmentLine(bundle: JsonRecord): string | undefined {
+  const assessment = isRecord(bundle["assessment"]) ? bundle["assessment"] as JsonRecord : {};
+  const parts: string[] = [];
+  if (typeof assessment["completeness"] === "string" && assessment["completeness"] !== "complete") parts.push(`completeness=${assessment["completeness"] as string}`);
+  if (typeof assessment["confidence"] === "string") parts.push(`confidence=${assessment["confidence"] as string}`);
+  return parts.length === 0 ? undefined : `assessment: ${parts.join(" ")}`;
+}
+
+function reusableAttributesLine(primary: JsonRecord): string | undefined {
+  const body = isRecord(primary["body"]) ? primary["body"] as JsonRecord : {};
+  const omittedBody = new Set(["path", "name", "qualified_name", "kind", "language", "classification", "source_id", "target_id", "artifact_id", "artifact_version_id", "owner_artifact_id", "owner_artifact_version_id", "start", "end", "name_start", "name_end", "name_start_line"]);
+  const bodyAttributes = Object.fromEntries(Object.entries(body).filter(([key]) => !omittedBody.has(key)));
+  const omittedPrimary = new Set([
+    "body", "record", "subject_type", "result_type", "record_id", "entity_id", "relation_id", "diagnostic_id", "identity_key",
+    "owner_artifact_id", "owner_artifact_version_id", "artifact_id", "artifact_version_id", "kind", "universal_kind", "classification", "source_span",
+    "path", "source_id", "target_id",
+  ]);
+  const primaryAttributes = Object.fromEntries(Object.entries(primary).filter(([key]) => !omittedPrimary.has(key)));
+  const attributes = { ...bodyAttributes, ...primaryAttributes };
+  return Object.keys(attributes).length === 0 ? undefined : `attributes: ${stableJson(attributes)}`;
+}
+
+function appendBundleDetails(bundle: JsonRecord, lines: string[], sources: Map<string, string>): void {
+  const snippets = Array.isArray(bundle["optional_source_snippets"]) ? bundle["optional_source_snippets"].filter(isRecord) : [];
+  const primary = isRecord(bundle["primary_result"]) ? bundle["primary_result"] : {};
+  const refs: string[] = [];
+  for (const snippet of snippets) {
+    const version = (isRecord(snippet["span"]) ? snippet["span"]["artifact_version_id"] : undefined) ?? snippet["artifact_version_id"] ?? primary["owner_artifact_version_id"] ?? primary["artifact_version_id"];
+    const artifact = snippet["artifact_id"] ?? primary["owner_artifact_id"] ?? primary["artifact_id"];
+    const span = snippet["span"];
+    // Without exact ownership and span, equal text is not proof of identity.
+    const key = version !== undefined && span !== undefined ? JSON.stringify([primary["workspace_id"] ?? primary["participant"] ?? null, artifact, version, span]) : undefined;
+    let ref = key === undefined ? undefined : sources.get(key);
+    if (ref === undefined) {
+      ref = `source:${sources.size + 1}`;
+      sources.set(key ?? `unshared:${sources.size}`, ref);
+      const coordinates = compactSourceCoordinates(snippet, primary);
+      lines.push(coordinates === undefined ? ref : `${ref} ${coordinates}`);
+      const text = snippet["text"];
+      if (typeof text === "string") lines.push(...text.split("\n").map((line) => `    ${line}`));
+    }
+    refs.push(ref);
+  }
+  const semanticLines = [
+    reusableIdentityLine(primary, snippets.length > 0),
+    reusableRelationLine(primary),
+    reusableAssessmentLine(bundle),
+    reusableEvidenceLine(bundle),
+    reusableAttributesLine(primary),
+  ].filter((line): line is string => line !== undefined);
+  lines.push(...semanticLines);
+  const related = Array.isArray(bundle["essential_related_entities"]) ? bundle["essential_related_entities"] : [];
+  if (related.length > 0) lines.push(`related: ${stableJson(related)}`);
+  if (refs.length > 0) lines.push(`source_refs: ${refs.join(", ")}`);
+}
+
+function appendStreamLines(resultSetLabel: string, streamPage: unknown, possible: boolean, lines: string[], cursors: { readonly label: string; readonly cursor: string }[], snippetLines: number, sources: Map<string, string>): void {
   if (!isRecord(streamPage)) return;
   const bundles = Array.isArray(streamPage["result_bundles"]) ? streamPage["result_bundles"] as JsonRecord[] : [];
-  if (bundles.length > 0) appendGroupedDescriptors(bundles.map((bundle) => describeBundle(bundle, resultSetLabel)), possible, lines, snippetLines);
-  if (streamPage["has_next"] === true && typeof streamPage["next_cursor"] === "string" && streamPage["next_cursor"].length > 0) {
-    cursors.push({ label: `${resultSetLabel}.${possible ? "possible" : "confirmed"}`, cursor: streamPage["next_cursor"] });
+  const label = `${resultSetLabel}.${possible ? "possible" : "confirmed"}`;
+  const total = typeof streamPage["total"] === "number" ? streamPage["total"] : bundles.length;
+  const mode = firstNonEmptyString(streamPage["page_mode"]) ?? (bundles.length > 0 ? "hydrated" : "summary");
+  lines.push(`${label}: shown=${bundles.length} total=${total} mode=${mode} more=${streamPage["has_next"] === true ? "yes" : "no"} previous=${streamPage["has_previous"] === true ? "yes" : "no"}`);
+  for (const bundle of bundles) {
+    appendGroupedDescriptors([{ ...describeBundle(bundle, resultSetLabel), snippetText: undefined }], possible, lines, snippetLines);
+    appendBundleDetails(bundle, lines, sources);
   }
+  if (streamPage["has_next"] === true && typeof streamPage["next_cursor"] === "string" && streamPage["next_cursor"].length > 0) cursors.push({ label, cursor: streamPage["next_cursor"] });
+  if (streamPage["has_previous"] === true && typeof streamPage["previous_cursor"] === "string" && streamPage["previous_cursor"].length > 0) cursors.push({ label: `${label}.previous`, cursor: streamPage["previous_cursor"] });
 }
 
 function appendContinuationLines(lines: string[], cursors: readonly { readonly label: string; readonly cursor: string }[], continuationScope?: JsonRecord, continuationResponseBudget?: JsonRecord, continuationStore: ContinuationRefStore = continuationRefs): void {
@@ -1442,8 +1569,9 @@ function appendContinuationLines(lines: string[], cursors: readonly { readonly l
     lines.push("MORE: continuation unavailable because the original query scope is not available in this rendering path; use the structured page or rerun through urdira_query.");
     return;
   }
+  lines.push("Continuation tool: urdira_query. Copy the MORE arguments exactly; the originating context tool also accepts them.");
   const continuation = (cursor: string): string => stableJson({ request_type: "continuation", continuation: { api_version: 3, continuation_ref: continuationStore.issue(cursor, continuationScope, continuationResponseBudget ?? DEFAULT_RESPONSE_BUDGET) } });
-  if (cursors.length === 1) lines.push(`MORE: ${continuation(cursors[0]!.cursor)}`);
+  if (cursors.length === 1 && !cursors[0]!.label.endsWith(".previous")) lines.push(`MORE: ${continuation(cursors[0]!.cursor)}`);
   else for (const entry of cursors) lines.push(`MORE (${entry.label}): ${continuation(entry.cursor)}`);
 }
 
@@ -1456,24 +1584,28 @@ function appendFreshnessAndCoverage(page: JsonRecord, lines: string[], pageHasMo
   const completeness = page["completeness_report"];
   if (isRecord(completeness) && typeof completeness["overall_status"] === "string") {
     const dimensions = Array.isArray(completeness["dimensions"]) ? completeness["dimensions"] as JsonRecord[] : [];
-    const affected = dimensions.reduce((sum, dimension) => sum + (typeof dimension["affected_artifact_count"] === "number" ? dimension["affected_artifact_count"] : 0), 0);
+    const affected = dimensions.reduce((sum, dimension) => sum + (typeof dimension["affected_artifact_count"] === "number" ? dimension["affected_artifact_count"] : Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"].length : 0), 0);
     lines.push(`coverage: ${completeness["overall_status"]}${affected > 0 ? ` (${affected} files affected)` : ""}`);
     for (const dimension of dimensions) {
       const capability = firstNonEmptyString(dimension["capability"]);
       const status = firstNonEmptyString(dimension["status"]);
       if (capability !== undefined && status !== undefined && status !== "complete") lines.push(`capability: ${capability}=${status}`);
+      const affectedIds = Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"].filter((entry): entry is string => typeof entry === "string") : [];
+      if (affectedIds.length > 0) lines.push(`affected_artifacts${capability === undefined ? "" : `(${capability})`}: ${affectedIds.join(" ")}`);
+      const reasonCodes = Array.isArray(dimension["reason_codes"]) ? dimension["reason_codes"].filter((entry): entry is string => typeof entry === "string") : [];
+      if (reasonCodes.length > 0) lines.push(`coverage_reasons${capability === undefined ? "" : `(${capability})`}: ${reasonCodes.join(" ")}`);
+      const diagnosticIds = Array.isArray(dimension["diagnostic_record_ids"]) ? dimension["diagnostic_record_ids"].filter((entry): entry is string => typeof entry === "string") : [];
+      if (diagnosticIds.length > 0) lines.push(`coverage_diagnostics${capability === undefined ? "" : `(${capability})`}: ${diagnosticIds.join(" ")}`);
     }
   }
   lines.push(`page_coverage: ${pageHasMore ? "incomplete" : "complete"}${pageHasMore ? "; action=continue" : ""}`);
 }
 
-const DIAGNOSTIC_LINE_CAP = 20;
-
 function renderDiagnosticsText(report: JsonRecord): string[] {
   const diagnostics = Array.isArray(report["diagnostics"]) ? report["diagnostics"] as JsonRecord[] : [];
   if (diagnostics.length === 0) return [];
   const lines = [`DIAGNOSTICS: ${diagnostics.length}`];
-  for (const diagnostic of diagnostics.slice(0, DIAGNOSTIC_LINE_CAP)) {
+  for (const diagnostic of diagnostics) {
     const severity = firstNonEmptyString(diagnostic["severity"]) ?? "info";
     const title = firstNonEmptyString(diagnostic["title"], diagnostic["summary"], diagnostic["message"], diagnostic["code"], diagnostic["diagnostic_code"]) ?? "diagnostic";
     const summary = firstNonEmptyString(diagnostic["summary"]);
@@ -1481,16 +1613,39 @@ function renderDiagnosticsText(report: JsonRecord): string[] {
     const source = isRecord(diagnostic["source"]) ? diagnostic["source"] as JsonRecord : undefined;
     const path = firstNonEmptyString(source?.["path"], diagnostic["path"]);
     lines.push(`  [${severity}] ${title}${summarySuffix}${path !== undefined ? ` (${path})` : ""}`);
+    const details = isRecord(diagnostic["details"]) ? diagnostic["details"] as JsonRecord : undefined;
+    if (details !== undefined && Object.keys(details).length > 0) lines.push(`    recovery: ${stableJson(details)}`);
   }
-  if (diagnostics.length > DIAGNOSTIC_LINE_CAP) lines.push(`  ... and ${diagnostics.length - DIAGNOSTIC_LINE_CAP} more`);
   return lines;
+}
+
+function appendExecutionMetadata(page: JsonRecord, lines: string[]): void {
+  const execution = firstNonEmptyString(page["query_execution_id"]);
+  const scope = firstNonEmptyString(page["scope_kind"]);
+  const expires = firstNonEmptyString(page["expires_at"]);
+  const executionParts = [
+    ...(execution === undefined ? [] : [`id=${execution}`]),
+    ...(scope === undefined ? [] : [`scope=${scope}`]),
+    ...(expires === undefined ? [] : [`expires=${expires}`]),
+  ];
+  if (executionParts.length > 0) lines.push(`execution: ${executionParts.join(" ")}`);
+  const bindings = Array.isArray(page["workspace_snapshot_bindings"]) ? page["workspace_snapshot_bindings"] : [];
+  if (bindings.length > 0) lines.push(`snapshots: ${stableJson(bindings)}`);
+  const semanticCoverage = Array.isArray(page["semantic_coverage_views"]) ? page["semantic_coverage_views"] : [];
+  if (semanticCoverage.length > 0) lines.push(`semantic_coverage: ${stableJson(semanticCoverage)}`);
+  const known = new Set([
+    "query_execution_id", "scope_kind", "expires_at", "workspace_snapshot_bindings", "semantic_coverage_views",
+    "result_sets", "returned_items", "returned_characters", "completeness_report", "diagnostic_report", "index_freshness", "truncation",
+  ]);
+  const extra = Object.fromEntries(Object.entries(page).filter(([key]) => !known.has(key)));
+  if (Object.keys(extra).length > 0) lines.push(`metadata: ${stableJson(extra)}`);
 }
 
 function bundleCountOf(resultSet: JsonRecord): number {
   return bundlesOf(resultSet["confirmed"]).length + bundlesOf(resultSet["possible"]).length;
 }
 
-/** Renders a `QueryResultPage`-shaped envelope (see `publicQueryPage`) as compact, grep/ctags-density plain text. This is the default `content[0].text` for `urdira_query`/`urdira_analyze_change`/`urdira_build_context`; the full JSON page is still reachable via `render: "json"`. `snippetLines` (plan 2026-09-06, Frente N) caps how many lines of a SNIPPET_POLICY-hydrated bundle's inline snippet get printed; optional, default 0 -- opt-in, R14 2026-09-08 (see `DEFAULT_SNIPPET_LINES`). */
+/** Render every selected stream and requested source; identical owned ranges share page-local references. */
 function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SNIPPET_LINES, continuationScope?: JsonRecord, continuationResponseBudget?: JsonRecord, continuationStore: ContinuationRefStore = continuationRefs): string {
   const resultSets = Array.isArray(page["result_sets"]) ? page["result_sets"] as JsonRecord[] : [];
   const totalItems = typeof page["returned_items"] === "number" ? page["returned_items"] : resultSets.reduce((sum, resultSet) => sum + bundleCountOf(resultSet), 0);
@@ -1499,23 +1654,10 @@ function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SN
     return [resultSet["confirmed"], resultSet["possible"]].some((stream) => isRecord(stream) && stream["has_next"] === true && typeof stream["next_cursor"] === "string" && stream["next_cursor"].length > 0);
   });
 
-  if (totalItems === 0) {
-    const lines = ["no results", "hint: broaden the search_text pattern (literal substring or safe_regex), try search_semantic for a behavioral description, or confirm scope.workspace_id is correct via urdira_index_status."];
-    appendFreshnessAndCoverage(page, lines, hasMore);
-    lines.push(`page: shown=0; more=${hasMore ? "yes" : "no"}`);
-    for (const resultSet of resultSets) {
-      const label = firstNonEmptyString(resultSet["result_set"]) ?? "results";
-      for (const [stream, possible] of [[resultSet["confirmed"], false], [resultSet["possible"], true]] as const) {
-        if (isRecord(stream) && stream["has_next"] === true && typeof stream["next_cursor"] === "string" && stream["next_cursor"].length > 0) cursors.push({ label: `${label}.${possible ? "possible" : "confirmed"}`, cursor: stream["next_cursor"] });
-      }
-    }
-    appendContinuationLines(lines, cursors, continuationScope, continuationResponseBudget, continuationStore);
-    return lines.join("\n");
-  }
 
   const nonEmptySets = resultSets.filter((resultSet) => bundleCountOf(resultSet) > 0);
   const breakdown = nonEmptySets.length > 1 ? ` (${nonEmptySets.map((resultSet) => `${resultSet["result_set"]}: ${bundleCountOf(resultSet)}`).join(", ")})` : "";
-  const lines: string[] = [`# ${totalItems} result${totalItems === 1 ? "" : "s"}${breakdown}`];
+  const lines: string[] = [totalItems === 0 ? "no results" : `# ${totalItems} result${totalItems === 1 ? "" : "s"}${breakdown}`];
 
   const truncation = page["truncation"];
   if (isRecord(truncation) && truncation["truncated"] === true) {
@@ -1525,14 +1667,16 @@ function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SN
   }
   appendFreshnessAndCoverage(page, lines, hasMore);
   lines.push(`page: shown=${totalItems}; more=${hasMore ? "yes" : "no"}`);
+  appendExecutionMetadata(page, lines);
   lines.push("");
 
-  const showStreamHeaders = nonEmptySets.length > 1;
-  for (const resultSet of nonEmptySets) {
+  const sources = new Map<string, string>();
+  const showStreamHeaders = resultSets.length > 1;
+  for (const resultSet of resultSets) {
     const label = firstNonEmptyString(resultSet["result_set"]) ?? "results";
     if (showStreamHeaders) lines.push(`## ${label}`);
-    appendStreamLines(label, resultSet["confirmed"], false, lines, cursors, snippetLines);
-    appendStreamLines(label, resultSet["possible"], true, lines, cursors, snippetLines);
+    appendStreamLines(label, resultSet["confirmed"], false, lines, cursors, snippetLines, sources);
+    appendStreamLines(label, resultSet["possible"], true, lines, cursors, snippetLines, sources);
     if (showStreamHeaders) lines.push("");
   }
 
@@ -1540,6 +1684,9 @@ function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SN
   if (isRecord(diagnosticReport)) {
     const diagnosticLines = renderDiagnosticsText(diagnosticReport);
     if (diagnosticLines.length > 0) { lines.push(...diagnosticLines); lines.push(""); }
+    const total = typeof diagnosticReport["total"] === "number" ? diagnosticReport["total"] : diagnosticLines.length;
+    const returned = typeof diagnosticReport["returned"] === "number" ? diagnosticReport["returned"] : diagnosticLines.length;
+    if (total > 0) lines.push(`diagnostics: shown=${returned} total=${total} more=${diagnosticReport["has_more"] === true ? "yes" : "no"}`);
   }
 
   appendContinuationLines(lines, cursors, continuationScope, continuationResponseBudget, continuationStore);
@@ -1780,7 +1927,7 @@ function deadlineForPayload(call: string, payload: JsonRecord): string {
 
 // --- core:build_context graceful degradation --------------------------------
 //
-// urdira_context/urdira_build_context default to waiting for the structural
+// urdira_context defaults to waiting for the structural
 // frontier (see `queryRequestFromIntent` above) so a caller gets the complete
 // facets contract in one call. On a from-zero index that wait can still hit
 // its boundary while the workspace is honestly still indexing --
@@ -1799,7 +1946,7 @@ const SOURCE_SYNTAX_OPERATION_CATALOG: ReadonlyArray<{ readonly operation: strin
   { operation: "core:find_artifacts", frontier: "source", description: "List artifacts by path, language, or kind filter." },
   { operation: "core:search_text", frontier: "source", description: "Literal or regex text search across the workspace." },
   { operation: "core:get_source", frontier: "source", description: "Fetch source snippets for a known artifact, symbol, or entity." },
-  { operation: "core:discover_definitions", frontier: "syntax", description: "List definitions matching a name or kind." },
+  { operation: "core:discover_definitions", frontier: "syntax", description: "Discover registered definitions, not source symbols." },
   { operation: "core:find_records", frontier: "syntax", description: "List structural records by kind or facet." },
   { operation: "core:get_outline", frontier: "syntax", description: "Outline the declarations inside one artifact or entity." },
 ];
@@ -1856,6 +2003,57 @@ async function buildContextDegradationResult(client: UrdiraMcpClient, payload: J
   return presentationProfile === "web" ? { ...result, structuredContent: { page: { degradation: { code: error.code, message: error.message, details: error.details ?? {}, workspace } } } } : result;
 }
 
+/** Fit the actual presentation using only reads of the existing signed manifest. */
+async function fitQueryPage(raw: unknown, scopeKind: "single_workspace" | "comparison", budget: JsonRecord | undefined, renderContext: RenderContext, client: UrdiraMcpClient, requestOptions: LocalIpcRequestOptions): Promise<unknown> {
+  const envelope = (value: unknown) => publicQueryPage(value, scopeKind, undefined, renderContext) as JsonRecord;
+  const max = budget?.["max_characters"];
+  if (typeof max !== "number" || measureForRender(renderContext)(envelope(raw)) <= max) return envelope(raw);
+  if (!isRecord(raw) || !isRecord(raw["streams"])) return publicQueryPage(raw, scopeKind, budget, renderContext);
+  const streams = Object.entries(raw["streams"]).map(([name, page]) => ({ name, page: isRecord(page) ? page : {}, count: isRecord(page) && Array.isArray(page["items"]) ? page["items"].length : 0 }));
+  const total = streams.reduce((sum, stream) => sum + stream.count, 0);
+  if (total === 0 || streams.some((stream) => stream.count > 0 && typeof stream.page["page_start_cursor"] !== "string")) return publicQueryPage(raw, scopeKind, budget, renderContext);
+  const cached = new Map<string, JsonRecord>();
+  const prefix = async (count: number): Promise<JsonRecord> => {
+    const selected: JsonRecord = {};
+    for (const stream of streams) {
+      const take = Math.min(count, stream.count);
+      count -= take;
+      if (take === stream.count) { selected[stream.name] = stream.page; continue; }
+      const key = `${stream.name}:${take}`;
+      let page = cached.get(key);
+      if (page === undefined) {
+        const response = await client.call("core:query_continue", { api_version: 3, scope: renderContext.continuation_scope, cursor: stream.page["page_start_cursor"], response_budget: budget, page_item_limit: take }, requestOptions);
+        if (response.outcome !== "success") throw { error: responseError(response) };
+        const value = requireRecord(response.payload, "manifest page");
+        if (value["query_execution_id"] !== raw["query_execution_id"]) throw new TypeError("Page fitting cannot change query execution.");
+        page = requireRecord(requireRecord(value["streams"], "manifest streams")[stream.name], "manifest stream");
+        cached.set(key, page);
+      }
+      selected[stream.name] = page;
+    }
+    return { ...raw, streams: selected };
+  };
+  // A one-result page establishes a stable minimum. Increasing the caller's
+  // budget cannot move this minimum by admitting unrelated additional rows.
+  try {
+    const minimum = await prefix(1);
+    if (measureForRender(renderContext)(envelope(minimum)) > max) return publicQueryPage(minimum, scopeKind, budget, renderContext);
+    let best = minimum;
+    let low = 2;
+    let high = total - 1;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = await prefix(middle);
+      if (measureForRender(renderContext)(envelope(candidate)) <= max) { best = candidate; low = middle + 1; }
+      else high = middle - 1;
+    }
+    return publicQueryPage(best, scopeKind, budget, renderContext);
+  } catch (error) {
+    if (isRecord(error) && isRecord(error["error"])) return error;
+    throw error;
+  }
+}
+
 async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { client: UrdiraMcpClient }, context: UrdiraMcpToolContext = {}, presentationProfile: McpPresentationProfile = "agent"): Promise<CallToolResult> {
   const raw = requireRecord(input, "tool arguments");
   const canonical = canonicalKeys(raw);
@@ -1867,8 +2065,8 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
   const snippetLines = typeof rawSnippetLines === "number" && Number.isSafeInteger(rawSnippetLines) ? Math.max(0, Math.min(3, rawSnippetLines)) : DEFAULT_SNIPPET_LINES;
   const indexStatus = name === "urdira_index_status";
   const continuationStore = continuationStoreFor(dependencies.client);
-  const query = name === "urdira_query" ? queryPayload(input, continuationStore) : undefined;
-  const payload = query?.payload ?? (indexStatus ? indexStatusPayload(input) : queryRequestFromIntent(name === "urdira_analyze_change" ? "core:analyze_impact" : "core:build_context", requireRecord(canonical, "tool arguments")));
+  const query = name === "urdira_query" || (name === "urdira_context" && isRecord(canonical) && canonical["request_type"] === "continuation") ? queryPayload(input, continuationStore) : undefined;
+  const payload = query?.payload ?? (indexStatus ? indexStatusPayload(input) : queryRequestFromIntent("core:build_context", requireRecord(canonical, "tool arguments")));
   const call = query?.call ?? (indexStatus ? "core:index_status" : "core:query");
   if (call === "core:query") validateQueryBeforeIpc(payload);
   const progress = context.onProgress;
@@ -1887,17 +2085,23 @@ async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { c
   const pageKind: "query" | "index_status" = call === "core:index_status" ? "index_status" : "query";
   const renderContext: RenderContext & { readonly presentation_profile: McpPresentationProfile } = { render, page_kind: pageKind, presentation_profile: presentationProfile, snippet_lines: snippetLines, continuation_ref_store: continuationStore, ...(isRecord(payload["scope"]) ? { continuation_scope: payload["scope"] as JsonRecord } : {}), ...(isRecord(responseBudget) ? { continuation_response_budget: responseBudget } : {}) };
   const page = response.outcome === "success"
-    ? (call === "core:index_status" ? publicIndexStatusPage(response.payload) : publicQueryPage(response.payload, scopeKind, responseBudget, renderContext))
+    ? (call === "core:index_status" ? publicIndexStatusPage(response.payload) : await fitQueryPage(response.payload, scopeKind, responseBudget, renderContext, dependencies.client, requestOptions))
     : { error: responseError(response) };
   return formatUrdiraResult(page, renderContext);
 }
 
-/** Builds the five read-only public MCP tools from their shared closed schemas and IPC dispatcher. */
+function compactAdvertisedSchema(value: JsonSchema): JsonSchema {
+  if (Array.isArray(value)) return value.map((entry) => compactAdvertisedSchema(entry as JsonSchema)) as unknown as JsonSchema;
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).flatMap(([key, entry]) => key === "description" ? [] : [[key, compactAdvertisedSchema(entry as JsonSchema)]])) as JsonSchema;
+}
+
+/** Builds the three non-overlapping read-only MCP tools. */
 export function createUrdiraToolDefinitions(dependencies: { readonly client: UrdiraMcpClient }, options: { readonly presentation_profile?: McpPresentationProfile } = {}): readonly UrdiraMcpToolDefinition[] {
   return MCP_TOOL_NAMES.map((name) => ({
     name,
     description: options.presentation_profile === "web" && name === "urdira_index_status" ? toolDescriptions[name].replace("no MCP outputSchema is advertised for client compatibility", "the web profile also returns schema-validated structuredContent") : toolDescriptions[name],
-    input_schema: toolSchemas[name],
+    input_schema: compactAdvertisedSchema(toolSchemas[name]),
     output_schema: MCP_OUTPUT_SCHEMA,
     invoke: (args: unknown, context?: UrdiraMcpToolContext) => invoke(name, args, dependencies, context, options.presentation_profile ?? "agent"),
   }));
@@ -1913,7 +2117,7 @@ const operationAgentUses: Readonly<Record<string, string>> = {
   "core:find_records": "Enumerate indexed structural records using an exact record/category/kind/facet selector.",
   "core:resolve_symbol": "Resolve a known symbol name, optionally anchored by file and byte offset, into exact declarations or explicit candidates.",
   "core:get_outline": "List declarations inside one known artifact or entity container.",
-  "core:find_references": "Find indexed references and their owning artifacts for one exact resolved target.",
+  "core:find_references": "Find indexed references and their owning artifacts for one exact entity, record, or symbol target; artifact selectors are not reference targets.",
   "core:expand_relations": "Traverse callers, callees, imports, dependencies, containment, control flow, data flow, or other registered relations from known subjects.",
   "core:find_paths": "Find bounded structural paths between explicit source and target subject sets.",
   "core:find_artifacts": "List indexed files using path, language, kind, external, or generated-code filters.",
@@ -1921,7 +2125,7 @@ const operationAgentUses: Readonly<Record<string, string>> = {
   "core:search_semantic": "Find conceptually relevant code from natural language when semantic retrieval alone is desired and available.",
   "core:search_hybrid": "Combine lexical and semantic evidence for natural-language discovery; prefer this when wording and identifiers may both help.",
   "core:get_source": "Hydrate signatures, relevant snippets, or complete bodies for exact artifact/entity/symbol subjects returned by discovery.",
-  "core:analyze_impact": "Classify what breaks or must change for one hypothetical edit; prefer the dedicated urdira_analyze_change tool for this intent.",
+  "core:analyze_impact": "Classify what breaks or must change for one hypothetical edit.",
   "core:find_related_tests": "Find tests, fixtures, mocks, and helpers related to known code subjects.",
   "core:inspect_architecture": "Inspect entry points, boundaries, public surfaces, cycles, extension points, or layers for a workspace or selected scope.",
   "core:compare": "Compare two explicitly role-bound workspace snapshots; it requires comparison scope.",
@@ -1947,81 +2151,31 @@ function buildInstructions(): string {
     `${group.title}:`,
     ...group.ids.map((id) => {
       const operation = operationById.get(id)!;
-      const argumentsSummary = operation.argument_fields.map((field) => `${field.name}${field.presence === "required" ? "!" : "?"}:${field.logical_type}`).join(", ") || "none";
-      return `- ${id} — ${operationAgentUses[id]}\n  frontier=${operation.required_frontier}; arguments=${argumentsSummary}; outputs=${operation.result_streams.join(" | ")}`;
+      const fields = operation.argument_fields.map((field) => `${field.name}${field.presence === "required" ? "!" : "?"}`).join(",");
+      return `- ${id}(${fields}) -> ${operation.result_streams.join("|")} @${operation.required_frontier}`;
     }),
   ].join("\n")).join("\n\n");
-  const recipeLines = recipeRegistry.map((recipe) => `- ${recipe.recipe_id} — ${recipe.description}`).join("\n");
-  const directExample = { request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, expression: { expression_type: "operation", operation: "core:search_text", arguments: { pattern: "PaymentService", syntax: "literal", word_mode: "identifier", result_projection: "artifact" } } } };
-  const pipelineRequest = (expression: unknown): unknown => ({ request_type: "query", query: { api_version: 3, scope: { scope_type: "single_workspace", workspace_id: "<workspace_id>" }, expression } });
+  const recipeLines = recipeRegistry.map((recipe) => `- ${recipe.recipe_id}`).join("\n");
   return [
     "URDIRA AGENT QUICK START",
-    "For any repository discovery or source reading, if query_scope is missing first call urdira_index_status, then use urdira_context for broad discovery or urdira_query for a known subject or direct operation. If page: ... more=yes, treat page_coverage as incomplete and continue every requested facet with the exact cursor and original scope before using shell. For direct queries, narrow with the known path, kind, or context_artifact when available. Use shell for source discovery only when Urdira reports incomplete or unsupported coverage, has no operation for the request, or lacks a concrete datum; shell remains the right tool for edits, tests, builds, and Git.",
-    "Urdira is a read-only, snapshot-aware code-intelligence service. It never edits source, runs commands, or infers workspace scope from the current directory or MCP connection.",
-    "1. Call urdira_index_status with exactly {\"workspace_root\":\"/absolute/repository/root\"}; this primary bootstrap example omits response_budget. If you provide it, use an object, never a number, with only max_items and max_characters: {\"workspace_root\":\"/absolute/repository/root\",\"response_budget\":{\"max_items\":50,\"max_characters\":20000}}. Do not send api_version, scope, options, or query fields; those belong to query/context tools. The separate status-list and cursor forms use only the documented workspace_ids, cursor, include_* flags, and response_budget fields.",
+    "For any repository discovery or source reading, [Urdira prompt context already loaded] is the first Urdira call: start from its source and do not query listed symbols or paths again. Without it, first call urdira_index_status when query_scope is missing. Use urdira_context for broad discovery and urdira_query for a known subject or direct operation. When page_coverage is incomplete, preserve MORE and start working once the supplied context is sufficient. Use shell for a concrete datum left by incomplete or unsupported coverage, and for edits, tests, builds, and Git.",
+    "Urdira is read-only and snapshot-aware. Index coverage, page coverage, and source truncation are separate. A large complete result is valid and remains available through MORE.",
+    "1. Call urdira_index_status with exactly {\"workspace_root\":\"/absolute/repository/root\"}; this primary bootstrap example omits response_budget. If response_budget is needed, use an object, never a number, with max_items and max_characters. Do not send api_version, scope, options, or query fields.",
     "2. Copy the returned query_scope object byte-for-byte into every later call. workspace_id is opaque: never retype, shorten, normalize, or invent it.",
     `2a. For broad context, call urdira_context with these fields directly at top level; do not add request_type or a nested context wrapper: ${stableJson(URDIRA_CONTEXT_EXAMPLE)}`,
     `2b. For source of a known artifact, call urdira_query with this direct operation; scope is inside query and get_source requires all four source fields: ${stableJson(URDIRA_QUERY_GET_SOURCE_EXAMPLE)}`,
-    structuralFilterGuidance,
-    "3. Choose the smallest tool below. If the subject, symbol, artifact, path, selector, or lookup is known, use urdira_query with one direct operation. Use urdira_context for broad multi-facet discovery; use a recipe for a registered workflow; use one pipeline only when a later stage depends on an earlier result.",
-    "4. Let Urdira pass typed results between dependent stages. Do not copy opaque ids out and send them back in a later MCP call unless no single pipeline or recipe can express the task.",
-    "",
-    "WHICH MCP TOOL SHOULD I CALL?",
-    "- urdira_index_status — call once when query_scope is missing; reuse that scope. Call again only for readiness/freshness or after the workspace changes.",
-    "- urdira_query — normal choice for a known subject or exact operation; also supports registered recipes, dependent pipelines, and signed-cursor continuation.",
-    "- urdira_context — broad multi-facet discovery when definitions, callers, dependencies, tests, contracts, or extension points should arrive together.",
-    "- urdira_analyze_change — one read-only hypothetical change-impact question with an exact target.",
-    "- urdira_build_context — explicit core:build_context wrapper when task, facets, and seeds are already known; otherwise prefer urdira_context.",
-    "USING URDIRA WITHOUT OVERREACHING",
-    "Use urdira_query for a known subject or operation such as resolve_symbol, get_outline, find_references, find_records, or get_source; a direct operation is enough for one lookup.",
-    "Use urdira_context for broad task discovery when several facets are needed together; it is not required before urdira_query.",
-    "Narrow broad queries with an exact path, kind, context artifact, or returned entity id; use filters and response budgets instead of requesting a whole workspace.",
-    `MORE is a complete ContinuationRequest. Copy it literally without rebuilding it; it contains exactly one of cursor or continuation_ref. Example: ${stableJson(URDIRA_QUERY_CONTINUATION_EXAMPLE)}`,
-    "Use Urdira before shell for scoped repository discovery and source reading, and reuse paths or snippets it returns. Index coverage and page coverage are separate: coverage: complete with page_coverage: incomplete; action=continue means the index is complete but the requested page is not complete. Continue every requested facet with the exact cursor and original scope before using shell; copy a continuation_ref request literally and do not add scope or response_budget. When page_coverage: complete and more=no, reuse those results for the declared scope; follow recovery guidance when coverage is partial, stale, unknown, or unsupported. For direct operations, prefer exact path, kind, or context_artifact filters. Use shell for edits, tests, builds, and git status or diff; use shell to inspect source when Urdira cannot provide the needed file or operation.",
-    "Pipelines are optional: prefer them when they remove repeated calls or express data dependency; use direct operations or parallel independent queries otherwise.",
-    "",
-    "CHOOSING AN urdira_query EXPRESSION",
-    "- operation: exactly one lookup. Put operation-specific fields in expression.arguments. Do not add operation_version to a direct operation expression.",
-    "- recipe: a registered, immutable multi-step workflow. Put its fields in expression.arguments and use the exact recipe_id.",
-    "- pipeline: a custom typed DAG for dependent or parallel stages. Operation stages do include operation_version:3.",
-    `- continuation: copy the complete MORE object literally. It uses exactly one of cursor or continuation_ref; the server-local form is ${stableJson(URDIRA_QUERY_CONTINUATION_EXAMPLE)}. Portable cursor requests keep the original scope and response_budget byte-for-byte; continuation_ref requests are self-contained and omit both fields. Never decode or edit the cursor.`,
-    "Minimal direct query (options is optional and defaults to agent-friendly values):",
-    JSON.stringify(directExample),
+    "Source projection and response pagination are separate. An explicit projection is never silently reduced; raise only the reported limiting budget after core:snippet_budget_impossible.",
+    "3. Choose the smallest tool and narrow with an exact path, kind, context_artifact, entity id, filter, or response budget. StructuralFilter is closed: use only paths, languages, namespaces, kind_selector, subject_types, include_generated, and include_external; do not send include_globs or language_selector. Request enough source to edit, including imports and the enclosing test suite.",
+    `When continuing, copy the complete MORE object literally. MORE is a complete ContinuationRequest. Copy it literally without rebuilding it; it contains exactly one of cursor or continuation_ref. Index coverage and page coverage are separate. Example: ${stableJson(URDIRA_QUERY_CONTINUATION_EXAMPLE)}`,
+    "4. Reuse delivered source; follow MORE only when remaining results are needed. Empty results are not missing coverage. Preserve partial, stale, unknown, unsupported, and truncated states. Let pipelines pass typed results between dependent stages; use direct operations for one lookup and parallel calls for independent lookups.",
     "",
     "PIPELINE MENTAL MODEL",
-    "A pipeline executes several operations inside one immutable scope and snapshot. Think data flow, not a sequence of client-side requests:",
-    "- stages gives every operation or algebra operator a unique stage_id.",
-    "- arguments contains static values only. Omit an argument when a binding supplies it.",
     "- bindings maps a downstream argument name to {stage_id, output} from an earlier stage.",
     "- The binding passes the complete typed upstream set; it does not interpolate JSON or expose an array of ids to the client.",
-    "- outputs names only the final stage streams the agent needs. Intermediate streams stay internal unless listed.",
-    "Example data flow: search.subjects -> source.arguments.subjects is encoded on the source stage as bindings.subjects={stage_id:\"search\",output:\"subjects\"}.",
-    "Rules that prevent most pipeline errors:",
-    "1. Bind only from an earlier stage and use the exact output name listed for that operation in the catalog below.",
-    "2. The binding property name must be the exact downstream argument name, and that argument must be batchable or accept the referenced scalar type.",
-    "3. Output streams are independent of result_projection. core:search_text always exposes matches and subjects; it never exposes artifacts.",
-    "4. Sequence arguments consume the complete set. Scalar arguments require exactly one upstream item; Urdira fails on zero or many rather than guessing.",
-    "5. Independent stages may run concurrently. A binding creates dependency order automatically; do not add a separate ordering field.",
-    "6. Use options.freshness={mode:\"wait\",required_frontier:\"source\"|\"syntax\"|\"structural\"|\"semantic\",timeout_ms:N} when the newest required frontier matters; do not poll between stages.",
-    "Pipeline troubleshooting:",
-    "- Unknown output: replace it with an exact stream from the operation catalog. For example find_artifacts -> artifacts, search_text -> matches|subjects, resolve_symbol -> declarations|candidates.",
-    "- If a scalar binding receives zero or multiple items, narrow the upstream stage with exact context or use a sequence-valued downstream argument. Never select the first result by accident.",
-    "- Invalid selector: bind a compatible typed subject stream; get_outline.container accepts one artifact or entity, while get_source.subjects accepts a subject sequence.",
-    "- Unavailable frontier: use operation_availability or a bounded freshness wait. Never weaken completeness silently.",
-    "",
-    "TWO-STAGE PIPELINE — search -> source. Search once and fetch relevant source for every matched artifact:",
-    JSON.stringify(pipelineRequest(PIPELINE_EXAMPLE_SEARCH_TO_SOURCE)),
-    "",
-    "TWO-STAGE PIPELINE — resolve -> references. Resolve once and pass exact declarations into reference discovery:",
-    JSON.stringify(pipelineRequest(PIPELINE_EXAMPLE_RESOLVE_TO_REFERENCES)),
-    "",
-    "THREE-STAGE PIPELINE — resolve -> references -> source. Reuse exact declarations, find references, then hydrate source for every owning artifact:",
-    JSON.stringify(pipelineRequest(PIPELINE_EXAMPLE_RESOLVE_REFERENCES_TO_SOURCE)),
-    "",
-    "READINESS, RESULTS, AND PARALLELISM",
-    "source_ready permits core:find_artifacts, source-projection core:search_text, and artifact-selector core:get_source. syntax, structural, and semantic operations require their registered frontiers. partial is queryable and labeled; unknown is not queryable. Follow operation_availability and retry_after_ms.",
-    "Results are compact grep-like text by default. When several queries are independent, issue them as parallel tool calls in one agent message. Use a pipeline only when data must flow between them.",
-    "Edits auto-reindex. A bounded freshness wait belongs in the query that needs the new frontier, not in a client polling loop.",
+    "- outputs names only final streams. Bind exact output names from earlier stages. search_text exposes matches|subjects; find_artifacts exposes artifacts.",
+    "- find_references.target accepts all bound declarations and only entity, record, or symbol selectors. An artifact selector is invalid for find_references.",
+    "- If a non-batchable scalar binding receives zero or multiple items, narrow upstream. Urdira fails rather than selecting one result.",
+    "THREE-STAGE PIPELINE: resolve -> references -> source. Do not copy opaque ids out and send them back in a later MCP call.",
     "",
     "EXACT OPERATION CATALOG",
     "Legend: ! means required, ? means optional. outputs are the only names legal in bindings and final pipeline outputs.",
@@ -2114,7 +2268,7 @@ export function buildBenchmarkInstructions(discoveryPath?: string): string {
     `Registered operation output streams (pipeline bindings must use these exact output names regardless of result_projection): ${operationOutputs}.`,
     `Registered operation arguments (! required, ? optional; use these exact field names and logical types): ${operationArguments}.`,
     "Nested closed contracts used often: discover_definitions.matcher={text:<non-empty string>,mode:exact|prefix|contains|semantic|hybrid}; get_outline.container accepts only an artifact or entity selector (resolve a symbol first); StructuralFilter fields are only paths, languages, namespaces, kind_selector, subject_types, include_external, include_generated. Every paths entry is an exact workspace-relative glob: use src/file.ts for one exact file, src/directory/** for a directory subtree, and never use a bare directory when descendants are intended.",
-    "A pipeline binding to a scalar argument requires exactly one upstream result. Do not bind resolve_symbol declarations directly to get_outline.container when resolution may return multiple declarations; consume an exact returned entity id instead.",
+    "find_references.target accepts all bound declarations when their selectors are compatible. find_references.target accepts only entity, record, or symbol selectors. An artifact selector is invalid for find_references: resolve a symbol first, or use search_text/get_source when the artifact itself is the subject. A pipeline binding to a non-batchable scalar argument requires exactly one upstream result. Do not bind resolve_symbol declarations directly to get_outline.container when resolution may return multiple declarations; consume an exact returned entity id instead.",
     "If core:selector_ambiguous is returned, do not repeat the same selector: use one exact entity_id from details.confirmed_candidate_ids or rerun with context_artifact or kind_selector as requested by recovery_action.",
     `core:build_context and urdira_context facets use exactly ${buildContextFacetContract}; public_surfaces is an architecture view, not a core:build_context facet; use it with core:inspect_architecture.views. If a tool rejects an enum and prints valid values, treat that list as authoritative and immediately retry the corrected call before continuing.`,
     `Copy-paste direct-query example (scope is inside query): ${JSON.stringify(directQueryExample)}.`,
