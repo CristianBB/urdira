@@ -38,7 +38,12 @@ implementation or release.
    Decisions 21/22/25 and the structural fast-path protocol retain that v3
    contract, while Decisions 26–29 govern v4.
 6. Use the [release process](release.md) for qualification and publication.
-   For comparative agent benchmarks, follow the [expanded campaign runbook](benchmarks/expanded-agent-campaign.md).
+   For comparative agent benchmarks, follow the [expanded campaign runbook](benchmarks/expanded-agent-campaign.md)
+   and, for the current selected definitive measurement, its [self-contained
+   benchmark handoff](benchmarks/definitive-agent-benchmark-handoff.md).
+   The [current-state inventory](current-state.md#current-directed-agent-context-evidence)
+   distinguishes the accepted Playwright, Prisma, and post-repair VS Code
+   observations; dated campaign files retain their original outcomes.
 
 Contributors and coding agents must also read [AGENTS.md](../AGENTS.md),
 [CONTRIBUTING.md](../CONTRIBUTING.md), and

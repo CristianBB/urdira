@@ -220,6 +220,31 @@ describe("expanded campaign smoke scope", () => {
     expect(runbook).toMatch(/each selected arm's smoke/u);
   });
 
+  it("links the definitive selected benchmark handoff and preserves its execution contract", () => {
+    const runbook = readFileSync(resolve("docs/benchmarks/expanded-agent-campaign.md"), "utf8");
+    const handoff = readFileSync(resolve("docs/benchmarks/definitive-agent-benchmark-handoff.md"), "utf8");
+    expect(runbook).toContain("definitive-agent-benchmark-handoff.md");
+    expect(handoff).toContain("45 sequential runs");
+    expect(handoff).toContain("three independent campaigns");
+    expect(handoff).toContain("gpt-5.6-luna");
+    expect(handoff).toContain("URDIRA_SEMANTIC_INDEX=0");
+    expect(handoff).toContain("counts as Urdira");
+    expect(handoff).toContain("Do not retry");
+    expect(handoff).toContain("null");
+    expect(handoff).toContain("Cold structural readiness");
+    expect(handoff).toContain("Warm readiness");
+    expect(handoff).toContain("release:acceptance");
+    expect(handoff).toContain("Node `24.18.1` exactly");
+    expect(handoff).toContain("18 readiness-only probes");
+    expect(handoff).toContain("input USD 2/M");
+    expect(handoff).toContain("cached input USD 2/M");
+    expect(handoff).toContain("The top-level campaign driver cannot select one task");
+    expect(handoff).toContain("expanded-agent-benchmark-runner.mjs");
+    expect(handoff).toContain("affected-tests-deterministic");
+    expect(handoff).toContain("wire-name-validation");
+    expect(handoff).toContain("language-provider-registration-idempotence");
+  });
+
   it.each(["playwright", "prisma", "vscode"])("accepts the two-task smoke for %s", (id) => {
     expect(probe([id], rowsFor([id]))).toContain("Repository checkout is unavailable");
   });

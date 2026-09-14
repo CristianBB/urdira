@@ -15,6 +15,11 @@ comes from the [driver](../../release/benchmarks/run-expanded-agent-benchmark.mj
 [grader](../../release/benchmarks/expanded-agent-benchmark-grader.mjs).
 This document introduces no public API or architecture changes.
 
+For a new session executing the current selected three-repository definitive
+measurement, use the [self-contained benchmark handoff](definitive-agent-benchmark-handoff.md).
+It adds the exact 45-run independent-campaign protocol and does not replace
+the general contracts or historical evidence below.
+
 ## Current optimization and verification decision
 
 The current objective is to reduce discovery fallback and duplicated reading
