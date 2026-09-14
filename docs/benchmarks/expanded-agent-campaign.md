@@ -3,6 +3,12 @@
 Status: operational procedure, checked against the runner on 2026-09-10.
 No benchmark was executed during this documentation preparation.
 
+The current definitive reporting status is recorded in the [dated derived
+report](definitive-agent-benchmark-results-2026-09-15.md). It is a pending
+campaign until the final analyzer/render/publication phase in the [self-contained
+handoff](definitive-agent-benchmark-handoff.md) has produced and shown the
+complete table.
+
 ## Authority and scope
 
 [Decision 08](../decisions/08-performance-reliability-evaluation.md) governs
@@ -354,6 +360,15 @@ rerun until green and silently replace failures. A fix changes the measured
 build and requires a new identified campaign/smoke, preserving prior evidence.
 
 ## Reports and retention
+
+The final reporting phase is mandatory: analyze the original retained
+artifacts, render the derived report, update the dated evidence and current
+state, and show the table to the user before declaring the campaign complete.
+Use `analyze-agent-matched.mjs` and `render-expanded-agent-report.mjs` as
+described in the [definitive handoff](definitive-agent-benchmark-handoff.md).
+The report covers each `repo/task/arm`, uses `null, never 0` for unavailable
+metrics, separates medians/distributions/intervals and failures, and compares
+efficiency only for equal correction and coverage.
 
 Generate derived reports while transcripts still exist:
 

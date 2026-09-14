@@ -137,6 +137,49 @@ checkout while calling it an installed-release measurement.
    artifacts are immutable. Compare efficiency only between rows with equal
    correction and coverage, and publish failures and unavailable fields.
 
+## Final reporting and publication
+
+The versioned report destination is
+`definitive-agent-benchmark-results-2026-09-15.md`.
+The campaign is not complete until the coordinator has analyzed and rendered
+the retained original artifacts, updated the versioned report and evidence,
+and shown the readable comparison table to the user. Do not hand-report
+figures copied from a transcript or combine unlike tasks. Run the existing
+analyzer and renderer from the immutable raw paths, for example:
+
+```bash
+for BENCH_TRANSCRIPT in "$BENCH_RAW"/*/transcript.jsonl; do
+  "$BENCH_NODE" release/benchmarks/analyze-agent-matched.mjs \
+    "$BENCH_TRANSCRIPT" > "$BENCH_DERIVED/$(basename "$(dirname "$BENCH_TRANSCRIPT")").tokens.json"
+done
+"$BENCH_NODE" release/benchmarks/replay-agent-context.mjs \
+  --output "$BENCH_DERIVED/replay.json" "$BENCH_RAW"/*
+"$BENCH_NODE" release/benchmarks/render-expanded-agent-report.mjs \
+  --audit "$BENCH_AUDIT" --comparison-report "$BENCH_COMPARISON" \
+  --output "$BENCH_DERIVED/definitive-agent-benchmark-results"
+```
+
+The published report must contain a row for every `repo/task/arm` cell and
+show runs and passes, grader/correctness, declared coverage and omissions,
+total plus input/output/reasoning/cached tokens, estimated cost and the rate
+card/policy, agent/setup/readiness cold/warm/time-to-first-query (TTFQ)/E2E
+timings, hook/MCP/shell/tgrep/tool-output/full-context measurements (including
+the host's full context when exposed),
+continuations, duplication/density, and fallback observations whenever the
+retained artifacts measure them. Include the exact model, harness, repository
+and Urdira commits, release archive/worker/launcher hashes, and the raw path
+manifest. Use `null, never 0` for unavailable values, distinguish medians from
+distributions and intervals, and retain every failed run separately. Compare
+efficiency only between rows with equal correction and coverage; a missing or
+non-comparable field makes that comparison unavailable.
+
+Raw transcripts and host-local artifacts remain outside the repository under
+the registered campaign root, with their hashes and path manifest retained in
+the evidence. The repository contains only the sanitized derived report and a
+dated evidence note. The final report must state whether the 45-run campaign
+and all 18 readiness probes completed; until the table and documents are
+updated, the campaign is not complete.
+
 The release archive binding is also a pending Phase 0 prerequisite: the runner
 must bind each invocation to the extracted, hash-verified release archive and
 fail closed when that binding cannot be proven. Until Phase 0 passes, the
@@ -339,4 +382,7 @@ product-wide performance, semantic quality, or statistical superiority.
 The Luna worker hands Sol the exact changed files, tests, commands and results,
 retained artifact paths, hashes, cleanup bytes, failed rows, and unresolved
 `null` fields. Sol reviews the result and proposes a commit set; no worker
-creates a commit before that independent review.
+creates a commit before that independent review. After committing the results,
+run `git status --short` and require empty output. Any generated change from a
+gate must be resolved or documented and included in the reviewed commit before
+the handoff can close.

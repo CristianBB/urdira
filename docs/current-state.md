@@ -115,6 +115,13 @@ statistical ranking across repositories. See the [v69/v70 record](evidence/2026-
 [v71/v72 record](evidence/2026-09-14-agent-context-density.md), and
 [V86 evidence](evidence/2026-09-14-prompt-hook-context-reuse.md).
 
+The canonical status and reporting contract for the pending three-campaign
+comparison is [the 2026-09-15 derived benchmark report](benchmarks/definitive-agent-benchmark-results-2026-09-15.md).
+It does not replace the accepted directed observations above. The comparison
+remains incomplete until original artifacts have been analyzed and rendered,
+all rows are shown by repository/task/arm, unavailable fields are `null`, and
+the final table is published to the user.
+
 The August agent-comparison reports remain useful historical evidence but
 predate v4 and its September query fixes. The September 8 snippet experiment
 retained the ordinary compact-renderer default of no inline snippets; see

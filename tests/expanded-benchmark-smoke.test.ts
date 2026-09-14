@@ -268,6 +268,20 @@ describe("expanded campaign smoke scope", () => {
     expect(handoff).toContain("only records cleanup booleans");
     expect(handoff).toContain("release archive binding");
     expect(handoff).toContain("must not start a model");
+    expect(handoff).toContain("Final reporting and publication");
+    expect(handoff).toContain("analyze-agent-matched.mjs");
+    expect(handoff).toContain("render-expanded-agent-report.mjs");
+    expect(handoff).toContain("repo/task/arm");
+    expect(handoff).toContain("input/output/reasoning/cached");
+    expect(handoff).toContain("TTFQ");
+    expect(handoff).toContain("full context");
+    expect(handoff).toContain("continuations");
+    expect(handoff).toContain("null, never 0");
+    expect(handoff).toContain("equal correction and coverage");
+    expect(handoff).toContain("campaign is not complete");
+    expect(handoff).toContain("definitive-agent-benchmark-results-2026-09-15.md");
+    expect(handoff).toContain("git status --short");
+    expect(handoff).toContain("empty");
   });
 
   it.each(["playwright", "prisma", "vscode"])("accepts the two-task smoke for %s", (id) => {
