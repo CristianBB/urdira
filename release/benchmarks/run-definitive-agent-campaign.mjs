@@ -9,6 +9,7 @@ import { assertCleanupGateOpen, DEFINITIVE_MINIMUM_FREE_BYTES, parseMinimumFreeB
 import { assertReleaseBinding } from "./release-binding.mjs";
 import { inspectProcessInventory, processTable, verifiedOwnedProcesses } from "./benchmark-process-inventory.mjs";
 import { materializeAgentDependencyClosure } from "./agent-validation-environment.mjs";
+import { buildCodexMcpArgs, validateCodexArgv } from "./expanded-agent-codex-argv.mjs";
 
 const root = fileURLToPath(new globalThis.URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -146,7 +147,7 @@ export const runCommand = (command, args, options = {}) => new Promise((resolveP
 const run = runCommand;
 
 /** Execute the frozen cells with injected runner/cleanup ports for offline regression tests. */
-export async function runDefinitiveCells({ plan, outputRoot, worktreeRoot, releaseRoot, releaseArchive, outputManifest, releaseBinding, minimumFreeBytes, runner = run, prepareDependencies, cleanup = cleanupCell, isCancelled = () => cancellationRequested }) {
+export async function runDefinitiveCells({ plan, outputRoot, worktreeRoot, releaseRoot, releaseArchive, outputManifest, releaseBinding, minimumFreeBytes, runner = run, prepareDependencies, cleanup = cleanupCell, validateCodex = null, isCancelled = () => cancellationRequested }) {
   const auditPath = join(outputRoot, "campaign-audit.json");
   const audit = { schema_version: 1, definitive_protocol: "selected-15", campaign: plan.campaign, expected_runs: plan.expected_runs, readiness_expected_probes: 6, minimum_free_bytes: minimumFreeBytes, failure_policy: plan.failure_policy, cell_manifest: outputManifest, cell_manifest_sha256: createHash("sha256").update(readFileSync(outputManifest)).digest("hex"), release_binding: releaseBinding, runs: [] };
   for (const cell of plan.cells) {
@@ -155,8 +156,13 @@ export async function runDefinitiveCells({ plan, outputRoot, worktreeRoot, relea
     if (!existsSync(join(cell.repository_root, ".git"))) throw new Error(`Repository checkout is unavailable: ${cell.repository_root}`);
     mkdirSync(cell.output_root, { recursive: true });
     mkdirSync(worktreeRoot, { recursive: true });
-    let result; let manifest; let dependencySetup; let postCellError; let runnerInvoked = false; let preflightFailure;
+    let result; let manifest; let dependencySetup; let postCellError; let runnerInvoked = false; let preflightFailure; let codexPreflight;
     try {
+      if (validateCodex !== null) {
+        const mcpArgs = buildCodexMcpArgs({ arm: cell.arm, codebaseMemory: cell.codebase_memory, codegraph: cell.codegraph, benchmarkTimeoutMs: cell.supervisor_timeout_ms });
+        codexPreflight = await validateCodex({ codex: cell.codex, model: cell.model, worktree: cell.worktree, integrated: cell.arm === "urdira-typescript", mcpArgs, cell });
+        if (codexPreflight?.ok !== true) throw new Error(`Codex argv preflight failed for ${cell.run_id}: ${codexPreflight?.first?.stderr || codexPreflight?.resume?.stderr || codexPreflight?.binary_version_stderr || "unknown parser failure"}`);
+      }
       const worktreeResult = await runner("git", ["worktree", "add", "--detach", cell.worktree, cell.commit], { cwd: cell.repository_root, phase: "worktree", stdoutPath: join(cell.output_root, `${cell.run_id}.worktree.stdout.log`), stderrPath: join(cell.output_root, `${cell.run_id}.worktree.stderr.log`) });
       if (worktreeResult.code !== 0) postCellError = new Error(`Unable to create worktree ${cell.worktree}: ${worktreeResult.stderr}`);
       if (postCellError === undefined) {
@@ -164,7 +170,7 @@ export async function runDefinitiveCells({ plan, outputRoot, worktreeRoot, relea
         dependencySetup = await prepare({ repositoryId: cell.repository_id, repositoryRoot: cell.repository_root, worktree: cell.worktree, nodeExecutable: cell.node, taskId: cell.task_id });
         const args = [join(root, "release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", cell.repository_id, "--task-id", cell.task_id, "--arm", cell.arm, "--sample", String(cell.campaign), "--phase", cell.phase, "--commit", cell.commit, "--worktree", cell.worktree, "--data-root", cell.data_root, "--output-dir", cell.output_root, "--model", cell.model, "--codex", cell.codex, "--node", cell.node, "--indexing-worker", cell.indexing_worker ?? "", "--codebase-memory", cell.codebase_memory ?? "", "--codegraph", cell.codegraph ?? "", "--tgrep", cell.tgrep ?? "", "--release-root", releaseRoot, "--release-archive", releaseArchive];
         runnerInvoked = true;
-        result = await runner(cell.node, args, { cwd: root, env: { URDIRA_SEMANTIC_INDEX: "0" }, phase: "cell", stdoutPath: join(cell.output_root, `${cell.run_id}.stdout.log`), stderrPath: join(cell.output_root, `${cell.run_id}.stderr.log`) });
+        result = await runner(cell.node, args, { cwd: root, env: { URDIRA_SEMANTIC_INDEX: "0", URDIRA_BENCHMARK_TIMEOUT_MS: String(cell.supervisor_timeout_ms) }, phase: "cell", stdoutPath: join(cell.output_root, `${cell.run_id}.stdout.log`), stderrPath: join(cell.output_root, `${cell.run_id}.stderr.log`) });
         result = persistCommandOutput(cell, result);
         try { manifest = JSON.parse(readFileSync(join(cell.output_root, `${cell.run_id}.json`), "utf8")); } catch { manifest = null; }
         if (manifest !== null) { manifest.dependency_setup = dependencySetup; writeFileSync(join(cell.output_root, `${cell.run_id}.json`), `${JSON.stringify(manifest, null, 2)}\n`); }
@@ -174,18 +180,27 @@ export async function runDefinitiveCells({ plan, outputRoot, worktreeRoot, relea
       if (error?.command_output !== undefined) result = { code: 1, signal: null, timed_out: false, capture_error: error.capture_error ?? null, ...error.command_output };
       postCellError ??= error instanceof Error ? error : new Error(String(error));
     } finally {
-      const cellCleanup = await cleanup(cell, manifest, minimumFreeBytes);
+      let cellCleanup;
+      let cleanupError;
+      try {
+        cellCleanup = await cleanup(cell, manifest, minimumFreeBytes);
+      } catch (error) {
+        cleanupError = error instanceof Error ? error : new Error(String(error));
+        cellCleanup = { status: "blocked", blockers: [cleanupError.message], error: cleanupError.message };
+      }
       if (!runnerInvoked && postCellError) {
         mkdirSync(cell.output_root, { recursive: true });
         const failurePath = join(cell.output_root, `${cell.run_id}.preflight-failure.json`);
-        if (!existsSync(failurePath)) writeFileSync(failurePath, `${JSON.stringify({ ok: false, stage: "worktree-or-dependency-setup", run_id: cell.run_id, repository_id: cell.repository_id, task_id: cell.task_id, arm: cell.arm, commit: cell.commit, worktree: cell.worktree, model_invoked: false, dependency_setup: dependencySetup, error: postCellError.message }, null, 2)}\n`, { flag: "wx" });
-        preflightFailure = { path: failurePath, sha256: createHash("sha256").update(readFileSync(failurePath)).digest("hex") };
+        const stage = codexPreflight === undefined ? "worktree-or-dependency-setup" : "codex-argv";
+        if (!existsSync(failurePath)) writeFileSync(failurePath, `${JSON.stringify({ ok: false, stage, run_id: cell.run_id, repository_id: cell.repository_id, task_id: cell.task_id, arm: cell.arm, commit: cell.commit, worktree: cell.worktree, model_invoked: false, dependency_setup: dependencySetup, codex_preflight: codexPreflight ?? null, error: postCellError.message }, null, 2)}\n`, { flag: "wx" });
+        preflightFailure = { stage, path: failurePath, sha256: createHash("sha256").update(readFileSync(failurePath)).digest("hex") };
       }
-      audit.runs.push({ ...cell, result: result === undefined ? null : { code: result.code, signal: result.signal, timed_out: result.timed_out ?? false, capture_error: result.capture_error ?? null, stdout_path: result.stdout_path ?? null, stdout_bytes: result.stdout_bytes ?? null, stdout_sha256: result.stdout_sha256 ?? null, stderr_path: result.stderr_path ?? null, stderr_bytes: result.stderr_bytes ?? null, stderr_sha256: result.stderr_sha256 ?? null }, model_invoked: manifest?.model_invoked ?? (runnerInvoked ? null : false), dependency_setup: dependencySetup ?? null, preflight_failure: preflightFailure ?? null, error: postCellError?.message ?? null, manifest, cleanup: cellCleanup });
+      audit.runs.push({ ...cell, result: result === undefined ? null : { code: result.code, signal: result.signal, timed_out: result.timed_out ?? false, capture_error: result.capture_error ?? null, stdout_path: result.stdout_path ?? null, stdout_bytes: result.stdout_bytes ?? null, stdout_sha256: result.stdout_sha256 ?? null, stderr_path: result.stderr_path ?? null, stderr_bytes: result.stderr_bytes ?? null, stderr_sha256: result.stderr_sha256 ?? null }, model_invoked: manifest?.model_invoked ?? (runnerInvoked ? null : false), dependency_setup: dependencySetup ?? null, codex_preflight: codexPreflight ?? null, preflight_failure: preflightFailure ?? null, error: postCellError?.message ?? null, cleanup_error: cleanupError?.message ?? null, manifest, cleanup: cellCleanup });
       writeFileSync(auditPath, `${JSON.stringify(audit, null, 2)}\n`);
       if (cellCleanup.status === "blocked") {
-        writeFileSync(join(outputRoot, "cleanup-block.json"), `${JSON.stringify(cellCleanup, null, 2)}\n`, { flag: "wx" });
-        postCellError = new Error(`Cleanup checkpoint blocked campaign after ${cell.run_id}`);
+        const cleanupBlockPath = join(outputRoot, "cleanup-block.json");
+        if (!existsSync(cleanupBlockPath)) writeFileSync(cleanupBlockPath, `${JSON.stringify(cellCleanup, null, 2)}\n`, { flag: "wx" });
+        if (postCellError === undefined) postCellError = new Error(`Cleanup checkpoint blocked campaign after ${cell.run_id}`);
       }
       if (isCancelled()) postCellError ??= new Error(`Campaign cancelled during ${cell.run_id}`);
     }
@@ -291,6 +306,19 @@ async function cleanupCell(cell, manifest, minimumFreeBytes) {
   });
 }
 
+function persistDriverPreflightFailure({ outputRoot, stage, error, command, args, commandOutput = null }) {
+  const message = error instanceof Error ? error.message : String(error);
+  const failure = { ok: false, stage, failure_stage: stage, model_invoked: false, completed_successfully: false, command, args, command_output: commandOutput, error: message };
+  try {
+    mkdirSync(outputRoot, { recursive: true });
+    const path = join(outputRoot, "campaign-preflight-failure.json");
+    if (!existsSync(path)) writeFileSync(path, `${JSON.stringify(failure, null, 2)}\n`, { flag: "wx" });
+  } catch (persistError) {
+    try { process.stderr.write(`Unable to persist campaign preflight failure: ${persistError instanceof Error ? persistError.message : String(persistError)}\n`); } catch { /* stderr may be unavailable */ }
+  }
+  try { process.stderr.write(`${message}\n`); } catch { /* stderr may be unavailable */ }
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const campaign = Number(value(argv, "--campaign", "1"));
@@ -301,22 +329,48 @@ async function main() {
   const repositoriesRoot = resolve(value(argv, "--repositories-root", join("/tmp", "urdira-definitive", "repos")));
   const nodeBin = value(argv, "--node", process.execPath);
   const model = value(argv, "--model", corpus.model);
-  if (model !== corpus.model) throw new Error(`Frozen definitive model mismatch: expected ${corpus.model}, received ${model}`);
-  const nodeVersion = await run(nodeBin, ["--version"]);
-  if (nodeVersion.code !== 0 || nodeVersion.stdout.trim() !== "v24.18.1") throw new Error(`Frozen definitive Node mismatch: expected v24.18.1, received ${nodeVersion.stdout.trim() || nodeVersion.stderr}`);
+  mkdirSync(outputRoot, { recursive: true });
+  if (model !== corpus.model) {
+    const error = new Error(`Frozen definitive model mismatch: expected ${corpus.model}, received ${model}`);
+    persistDriverPreflightFailure({ outputRoot, stage: "frozen-model", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
   const minimumFreeBytes = parseMinimumFreeBytes(process.env.BENCH_MIN_FREE_BYTES) ?? DEFINITIVE_MINIMUM_FREE_BYTES;
-  if (minimumFreeBytes !== DEFINITIVE_MINIMUM_FREE_BYTES) throw new Error(`definitive protocol requires BENCH_MIN_FREE_BYTES=${DEFINITIVE_MINIMUM_FREE_BYTES}`);
+  if (minimumFreeBytes !== DEFINITIVE_MINIMUM_FREE_BYTES) {
+    const error = new Error(`definitive protocol requires BENCH_MIN_FREE_BYTES=${DEFINITIVE_MINIMUM_FREE_BYTES}`);
+    persistDriverPreflightFailure({ outputRoot, stage: "freeze", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
   const timeoutText = process.env.BENCH_CELL_TIMEOUT_MS;
-  if (timeoutText !== undefined && !/^\d+$/u.test(timeoutText)) throw new Error("BENCH_CELL_TIMEOUT_MS must be a non-negative integer");
+  if (timeoutText !== undefined && !/^\d+$/u.test(timeoutText)) {
+    const error = new Error("BENCH_CELL_TIMEOUT_MS must be a non-negative integer");
+    persistDriverPreflightFailure({ outputRoot, stage: "timeout", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
   const supervisorTimeoutMs = timeoutText === undefined ? 900_000 : Number(timeoutText);
-  if (!Number.isSafeInteger(supervisorTimeoutMs) || supervisorTimeoutMs < 1) throw new Error("BENCH_CELL_TIMEOUT_MS must be a positive integer");
+  if (!Number.isSafeInteger(supervisorTimeoutMs) || supervisorTimeoutMs < 1) {
+    const error = new Error("BENCH_CELL_TIMEOUT_MS must be a positive integer");
+    persistDriverPreflightFailure({ outputRoot, stage: "timeout", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
+  let nodeVersion;
+  try {
+    nodeVersion = await run(nodeBin, ["--version"], { stdoutPath: join(outputRoot, "node.stdout.log"), stderrPath: join(outputRoot, "node.stderr.log") });
+  } catch (error) {
+    persistDriverPreflightFailure({ outputRoot, stage: "runtime", error, command: nodeBin, args: ["--version"], commandOutput: error?.command_output ?? null });
+    throw error;
+  }
+  if (nodeVersion.code !== 0 || nodeVersion.stdout.trim() !== "v24.18.1") {
+    const error = new Error(`Frozen definitive Node mismatch: expected v24.18.1, received ${nodeVersion.stdout.trim() || nodeVersion.stderr}`);
+    persistDriverPreflightFailure({ outputRoot, stage: "runtime", error, command: nodeBin, args: ["--version"], commandOutput: nodeVersion });
+    throw error;
+  }
   const releaseRoot = value(argv, "--release-root", process.env.URDIRA_RELEASE_ROOT);
   const releaseArchive = value(argv, "--release-archive", process.env.URDIRA_RELEASE_ARCHIVE);
   const onSignal = (signal) => { cancellationRequested = true; if (activeChild?.pid !== undefined) terminateProcessTree(activeChild.pid); process.exitCode = signal === "SIGINT" ? 130 : 143; };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   const outputManifest = join(outputRoot, "cell-manifest.json");
-  mkdirSync(outputRoot, { recursive: true });
   const plan = buildCellManifest({ campaign, outputRoot, worktreeRoot, dataRoot, runRoot, repositoriesRoot, model, nodeBin, codex: value(argv, "--codex", "/Applications/ChatGPT.app/Contents/Resources/codex"), indexingWorker: value(argv, "--indexing-worker", process.env.URDIRA_INDEXING_CORE_WORKER_PATH), codebaseMemory: value(argv, "--codebase-memory"), codegraph: value(argv, "--codegraph"), tgrep: value(argv, "--tgrep"), supervisorTimeoutMs, minimumFreeBytes });
   writeFileSync(outputManifest, `${JSON.stringify(plan, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
   if (argv.includes("--plan-only")) {
@@ -330,8 +384,14 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ output_manifest: readinessPath, probes: readiness.probes.length, model_invoked: false })}\n`);
     return;
   }
-  const releaseBinding = assertReleaseBinding({ archiveRoot: releaseRoot, archivePath: releaseArchive });
-  const audit = await runDefinitiveCells({ plan, outputRoot, worktreeRoot, releaseRoot, releaseArchive, outputManifest, releaseBinding, minimumFreeBytes });
+  let releaseBinding;
+  try {
+    releaseBinding = assertReleaseBinding({ archiveRoot: releaseRoot, archivePath: releaseArchive });
+  } catch (error) {
+    persistDriverPreflightFailure({ outputRoot, stage: "release-binding", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
+  const audit = await runDefinitiveCells({ plan, outputRoot, worktreeRoot, releaseRoot, releaseArchive, outputManifest, releaseBinding, minimumFreeBytes, validateCodex: (options) => validateCodexArgv(options) });
   process.stdout.write(`${JSON.stringify({ audit: join(outputRoot, "campaign-audit.json"), cells: audit.runs.length, model_invoked: true })}\n`);
 }
 

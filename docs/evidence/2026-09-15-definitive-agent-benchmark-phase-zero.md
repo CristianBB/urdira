@@ -378,3 +378,22 @@ owned processes or process residue. Global caches, pre-existing iteration roots,
 the immutable archive, binding, gate logs, and raw diagnostics were preserved.
 The v5 proposal now serves as historical provenance; any future series must
 freshly provision its source roots from the recorded commits.
+
+## Orchestrator corrective revision (offline, no new measurements)
+
+After the retained v5 failures, the direct orchestrator was corrected without
+starting another cell, model, or readiness probe. The production runner and
+orchestrator now share `expanded-agent-codex-argv.mjs`; the orchestrator checks
+the exact first and resume argv with `--help` before creating a cell worktree
+and retains the binary path, version, SHA-256, args, stdout, stderr, and status.
+The effective per-cell `BENCH_CELL_TIMEOUT_MS` is passed to the runner as
+`URDIRA_BENCHMARK_TIMEOUT_MS` and is used for MCP timeout construction.
+
+Runtime, release-binding, frozen-model, timeout, and free-space failures in the
+outer driver, plus runtime/binding/freeze failures in readiness, now retain a
+durable preflight envelope with `model_invoked: false` before a manifest exists.
+Cleanup exceptions preserve both the original execution error and the cleanup
+error; readiness worktree and phase failures retain cold and blocked-warm rows.
+The focused offline suite is 35/35 and `pnpm typecheck` passes. This evidence
+describes the correction only; the definitive campaign remains blocked and no
+new measurement was started.

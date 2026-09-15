@@ -816,9 +816,11 @@ Run the separate no-model cold/warm readiness path with
 extracted release root and its matching `--release-archive`, plus the frozen
 repository checkouts. The definitive protocol freezes
 `BENCH_MIN_FREE_BYTES=53687091200` (50 GiB); every campaign and readiness
-manifest records and enforces that value. Set `BENCH_CELL_TIMEOUT_MS` to bound the direct orchestrator, and
-`URDIRA_BENCHMARK_TIMEOUT_MS` to bound the cell runner; cleanup checkpoints record
-registered paths, bytes, raw `df`, process ownership, and the next-cell gate.
+manifest records and enforces that value. Set `BENCH_CELL_TIMEOUT_MS` to bound
+the direct orchestrator. It passes that frozen per-cell value to the runner as
+`URDIRA_BENCHMARK_TIMEOUT_MS`, so the supervisor and runner use one timeout
+source; cleanup checkpoints record registered paths, bytes, raw `df`, process
+ownership, and the next-cell gate.
 After all three campaign audits and readiness manifests exist, assemble the
 immutable renderer input with `assemble-definitive-agent-audit.mjs`, passing
 each `--campaign-audit` and `--readiness-manifest` once and one `--output`;
@@ -842,6 +844,13 @@ failures separately from campaign-1, which stopped after two cell attempts:
 one baseline model/grader failure and one Urdira execution with no manifest,
 classified `model_invoked: null`. It records zero readiness probes and no
 retries.
+
+Before creating a cell worktree, the direct orchestrator uses the same shared
+Codex argv builder as the production runner and runs both first-turn and resume
+argv with `--help` only. It records the pinned binary path, version, SHA-256,
+args, stdout, stderr, and parser status in the preflight envelope when the
+check fails. Runtime, release-binding, model, timeout, and readiness preflight
+failures receive the same durable envelope before any model or probe starts.
 
 The pinned Codex CLI `0.154.0-alpha.6.2` rejects the legacy `-a never` flag;
 the benchmark runner now uses the supported

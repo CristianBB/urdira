@@ -157,7 +157,8 @@ describe("expanded campaign smoke scope", () => {
     expect(runner).not.toContain('mcp_servers.urdira.env.URDIRA_ENDPOINT=${JSON.stringify(codexIntegration.endpoint)}');
     expect(runner).toContain('ignore_user_config: false');
     expect(runner).toContain('hook_trust: "dangerously-bypass-hook-trust"');
-    expect(runner).toContain('"--dangerously-bypass-hook-trust"');
+    const codexArgv = readFileSync(resolve("release/benchmarks/expanded-agent-codex-argv.mjs"), "utf8");
+    expect(codexArgv).toContain('"--dangerously-bypass-hook-trust"');
     expect(runner).toContain('const urdiraShimPath = join(urdiraBinDir, "urdira")');
     expect(runner).toContain('writeUrdiraIsolatedShim(urdiraShimPath');
     const shim = readFileSync(resolve("release/benchmarks/urdira-isolated-shim.mjs"), "utf8");
@@ -178,8 +179,9 @@ describe("expanded campaign smoke scope", () => {
     expect(runner).toContain('URDIRA_ENDPOINT: codexIntegration.endpoint');
     expect(shim).toContain('[ -S "$ENDPOINT" ]');
     expect(shim).toContain('export URDIRA_ENDPOINT="$ENDPOINT"');
-    expect(runner).toContain('const codexApprovalArgs = ["--dangerously-bypass-approvals-and-sandbox"]');
-    expect(runner).toContain('...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"])');
+    expect(runner).toContain('buildCodexExecArgs({ model, worktree');
+    expect(runner).toContain('buildCodexResumeArgs({ model, worktree');
+    expect(codexArgv).toContain('"--dangerously-bypass-approvals-and-sandbox"');
     expect(runner).toContain("cleanupCodexIntegration();");
     const promptSource = runner.slice(runner.indexOf("const initialInstruction"), runner.indexOf("let host;"));
     expect(promptSource).not.toMatch(/Use Urdira MCP|urdira_context|urdira_query|call urdira_index_status/u);

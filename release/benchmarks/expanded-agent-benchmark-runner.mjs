@@ -14,6 +14,7 @@ import { writeUrdiraIsolatedShim } from "./urdira-isolated-shim.mjs";
 import { retainCodexHostSessions } from "./codex-host-evidence.mjs";
 import { assertReleaseBinding } from "./release-binding.mjs";
 import { deriveHostTokenEvidence } from "./benchmark-token-evidence.mjs";
+import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs } from "./expanded-agent-codex-argv.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -51,15 +52,27 @@ const task = repo?.tasks.find((entry) => entry.id === taskId);
 if (!repo || !task || !["baseline", "urdira-typescript", "codebase-memory", "codegraph", "tgrep"].includes(arm)) throw new Error("Invalid repository, task, or arm");
 const preflightOnly = argv.includes("--preflight-only");
 const definitiveProtocol = argv.includes("--definitive");
+const runId = `${repositoryId}-${taskId}-${arm}-${sample}`;
 if ((!preflightOnly && (!worktree || !commit)) || !Number.isSafeInteger(sample) || sample < 1) throw new Error("--worktree, --commit, and a positive --sample are required");
 if (!Number.isSafeInteger(benchmarkTimeoutMs) || benchmarkTimeoutMs < 1_000) throw new Error("URDIRA_BENCHMARK_TIMEOUT_MS must be an integer of at least 1000ms");
 
 function validateRuntimePreflight() {
   const version = spawnSync(nodeBin, ["--version"], { encoding: "utf8" });
-  if (version.status !== 0) throw new Error(`Urdira benchmark preflight: unable to execute ${nodeBin}: ${version.stderr}`);
+  const invocation = { command: nodeBin, args: ["--version"], status: version.status, signal: version.signal ?? null, stdout: version.stdout ?? "", stderr: version.stderr ?? "", error: version.error?.message ?? null };
+  if (version.status !== 0) {
+    const error = new Error(`Urdira benchmark preflight: unable to execute ${nodeBin}: ${version.stderr || version.error?.message || "unknown error"}`);
+    error.failure_stage = "runtime";
+    error.preflight_invocation = invocation;
+    throw error;
+  }
   const match = /^v(\d+)\.(\d+)\.(\d+)/u.exec((version.stdout ?? "").trim());
   const major = Number(match?.[1]); const minor = Number(match?.[2]); const patch = Number(match?.[3]);
-  if (!match || major < 24 || (major === 24 && (minor < 18 || minor === 18 && patch < 1)) || (definitiveProtocol && (major !== 24 || minor !== 18 || patch !== 1))) throw new Error(`Urdira benchmark preflight: ${definitiveProtocol ? "definitive protocol requires Node v24.18.1" : "Node >=24.18.1 is required"}, found ${(version.stdout ?? "").trim()}.`);
+  if (!match || major < 24 || (major === 24 && (minor < 18 || minor === 18 && patch < 1)) || (definitiveProtocol && (major !== 24 || minor !== 18 || patch !== 1))) {
+    const error = new Error(`Urdira benchmark preflight: ${definitiveProtocol ? "definitive protocol requires Node v24.18.1" : "Node >=24.18.1 is required"}, found ${(version.stdout ?? "").trim()}.`);
+    error.failure_stage = "runtime";
+    error.preflight_invocation = invocation;
+    throw error;
+  }
   if (!model || model.trim().length === 0) throw new Error("Urdira benchmark preflight: --model must be non-empty.");
   for (const requiredPath of ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json", "packages/mcp/dist/index.js", "packages/cli/dist/agent-integration.js", "apps/urdira/dist/cli.js", "apps/urdira/package.json"]) {
     if (!existsSync(join(root, requiredPath))) throw new Error(`Urdira benchmark preflight: required project artifact is missing: ${requiredPath}`);
@@ -75,7 +88,41 @@ function validateRuntimePreflight() {
   return { node: (version.stdout ?? "").trim(), model, lockfile: join(root, "pnpm-lock.yaml"), plugin: "urdira:javascript_typescript", dist: join(root, "packages/mcp/dist/index.js") };
 }
 
-const preflight = validateRuntimePreflight();
+function persistRuntimePreflightFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const failure = {
+    run_id: runId,
+    protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1",
+    repository_id: repositoryId,
+    task_id: taskId,
+    arm,
+    phase,
+    sample,
+    model,
+    commit,
+    worktree,
+    model_invoked: false,
+    completed_successfully: false,
+    failure_stage: error?.failure_stage ?? "runtime",
+    preflight_invocation: error?.preflight_invocation ?? null,
+    error: message,
+  };
+  try {
+    mkdirSync(outputDir, { recursive: true });
+    writeFileSync(join(outputDir, `${runId}.preflight-failure.json`), `${JSON.stringify(failure, null, 2)}\n`, { flag: "wx" });
+  } catch (persistError) {
+    try { process.stderr.write(`Unable to persist benchmark preflight failure: ${persistError instanceof Error ? persistError.message : String(persistError)}\n`); } catch { /* stderr may be unavailable */ }
+  }
+  try { process.stderr.write(`${message}\n`); } catch { /* stderr may be unavailable */ }
+}
+
+let preflight;
+try {
+  preflight = validateRuntimePreflight();
+} catch (error) {
+  persistRuntimePreflightFailure(error);
+  process.exit(1);
+}
 if (arm === "urdira-typescript" && preflight.indexing_worker !== undefined) {
   const boundWorker = realpathSync(preflight.indexing_worker);
   if (typeof requestedIndexingWorker === "string" && requestedIndexingWorker.trim().length > 0 && (!existsSync(requestedIndexingWorker) || realpathSync(requestedIndexingWorker) !== boundWorker)) throw new Error(`Urdira benchmark preflight: custom indexing worker is not the verified archive worker: ${requestedIndexingWorker}`);
@@ -91,7 +138,6 @@ if (preflightOnly) {
 }
 
 mkdirSync(outputDir, { recursive: true });
-const runId = `${repositoryId}-${taskId}-${arm}-${sample}`;
 // Every Urdira cell receives a fresh data root from the campaign driver. Do
 // not collapse it into a shared temporary directory: v1 rejection and
 // worktree isolation are part of the benchmark contract.
@@ -293,25 +339,10 @@ if (arm === "urdira-typescript") {
 if (codexSessionHome === undefined) codexSessionHome = mkdtempSync(join("/tmp", "urdira-expanded-codex-session-home-"));
 const setupElapsedMs = Date.now() - setupStartedAt;
 
-// Codex 0.154 removed the legacy `-a/--ask-for-approval` option. This
-// explicit switch preserves the frozen benchmark intent: full access with no
-// interactive approval prompt, and is accepted by both `exec` and `resume`.
-const codexApprovalArgs = ["--dangerously-bypass-approvals-and-sandbox"];
-const codexArgs = ["-m", model, ...codexApprovalArgs, "exec", "--json", "--skip-git-repo-check", "-C", worktree, ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"])]
-const addMcp = (args) => {
-  // The production Codex integration injects Urdira through UserPromptSubmit
-  // and PreToolUse hooks. Loading the complete MCP catalog as well would send
-  // the same discovery surface on every model interaction. A needed MORE
-  // envelope remains executable through the installed `urdira query` CLI.
-  if (arm === "codebase-memory") {
-    const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
-    args.push("-c", `mcp_servers.codebase-memory.command=${JSON.stringify(codebaseMemoryBin)}`, "-c", "mcp_servers.codebase-memory.startup_timeout_sec=120", "-c", `mcp_servers.codebase-memory.tool_timeout_sec=${mcpToolTimeoutSec}`);
-  } else if (arm === "codegraph") {
-    const mcpToolTimeoutSec = Math.max(300, Math.ceil(benchmarkTimeoutMs / 1_000));
-    args.push("-c", `mcp_servers.codegraph.command=${JSON.stringify(codegraphBin)}`, "-c", `mcp_servers.codegraph.args=["serve","--mcp"]`, "-c", "mcp_servers.codegraph.startup_timeout_sec=120", "-c", `mcp_servers.codegraph.tool_timeout_sec=${mcpToolTimeoutSec}`);
-  }
-};
-addMcp(codexArgs);
+// Keep the first and resume invocations on one production argv builder. The
+// orchestrator runs the same builder through a help-only parser preflight.
+const codexMcpArgs = buildCodexMcpArgs({ arm, codebaseMemory: codebaseMemoryBin, codegraph: codegraphBin, benchmarkTimeoutMs });
+const codexArgs = buildCodexExecArgs({ model, worktree, integrated: codexIntegration !== undefined, mcpArgs: codexMcpArgs });
 const firstInstructionMs = Date.now();
 const codexEnvironment = codexIntegration === undefined
   ? { ...releaseNativeEnvironment, CODEX_HOME: join(codexSessionHome, ".codex") }
@@ -391,8 +422,7 @@ if (first.code === 0) {
   const firstEvents = first.stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
   sessionId = firstEvents.find((event) => event.type === "thread.started")?.thread_id;
   if (!sessionId) throw new Error("Codex transcript did not expose a resumable session id");
-  const resume = ["-m", model, ...codexApprovalArgs, "-C", worktree, "exec", "resume", sessionId, "--json", ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"]), "--skip-git-repo-check"];
-  addMcp(resume);
+  const resume = buildCodexResumeArgs({ model, worktree, sessionId, integrated: codexIntegration !== undefined, mcpArgs: codexMcpArgs });
   const second = await run(codex, [...resume, "-"], { cwd: worktree, env: codexEnvironment, input: followUpInstruction, timing_label: "turn-2" });
   if (second.timing) { codexTimingCaptures.push(second.timing); writeTimingSidecar(); }
   appendFileSync(transcript, second.stdout, "utf8");

@@ -1,17 +1,31 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DEFINITIVE_ARMS, DEFINITIVE_CELLS, DEFINITIVE_READINESS_PHASES, buildCellManifest, buildReadinessManifest, effectiveProcessOwner, isProcessInventoryProbe, retainableCellFailure, runCommand, runDefinitiveCells, stopOwnedProcesses } from "../release/benchmarks/run-definitive-agent-campaign.mjs";
-import { blockedWarmProbe, buildReadinessQuery, executeReadinessPair, runReadinessPhase } from "../release/benchmarks/run-definitive-readiness-probes.mjs";
+import { blockedWarmProbe, buildReadinessQuery, executeReadinessPair, runReadinessCampaign, runReadinessPhase } from "../release/benchmarks/run-definitive-readiness-probes.mjs";
 import { assembleDefinitiveAudit } from "../release/benchmarks/assemble-definitive-agent-audit.mjs";
+import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs, validateCodexArgv } from "../release/benchmarks/expanded-agent-codex-argv.mjs";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("definitive direct campaign orchestrator", () => {
+  it("validates the exact production Codex first/resume argv without starting a task", () => {
+    const first = buildCodexExecArgs({ model: "gpt-5.6-luna", worktree: "/tmp", integrated: false });
+    const resume = buildCodexResumeArgs({ model: "gpt-5.6-luna", worktree: "/tmp", sessionId: "session-placeholder", integrated: false });
+    expect(first).toEqual(["-m", "gpt-5.6-luna", "--dangerously-bypass-approvals-and-sandbox", "exec", "--json", "--skip-git-repo-check", "-C", "/tmp", "--ignore-user-config"]);
+    expect(resume).toEqual(["-m", "gpt-5.6-luna", "--dangerously-bypass-approvals-and-sandbox", "-C", "/tmp", "exec", "resume", "session-placeholder", "--json", "--ignore-user-config", "--skip-git-repo-check"]);
+    expect(buildCodexMcpArgs({ arm: "codegraph", codegraph: "/bin/echo", benchmarkTimeoutMs: 900_000 })).toEqual(["-c", "mcp_servers.codegraph.command=\"/bin/echo\"", "-c", "mcp_servers.codegraph.args=[\"serve\",\"--mcp\"]", "-c", "mcp_servers.codegraph.startup_timeout_sec=120", "-c", "mcp_servers.codegraph.tool_timeout_sec=900"]);
+    const diagnostic = validateCodexArgv({ codex: "/Applications/ChatGPT.app/Contents/Resources/codex", model: "gpt-5.6-luna", worktree: "/tmp", integrated: false });
+    expect(diagnostic.ok).toBe(true);
+    expect(diagnostic.first.args).toEqual(first.concat("--help"));
+    expect(diagnostic.resume.args).toEqual(resume.concat("--help"));
+    expect(diagnostic.binary_sha256).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
   it("uses approval and sandbox flags admitted by the pinned Codex exec/resume help", () => {
     const codex = "/Applications/ChatGPT.app/Contents/Resources/codex";
     const approval = "--dangerously-bypass-approvals-and-sandbox";
@@ -237,6 +251,26 @@ describe("definitive direct campaign orchestrator", () => {
     expect(audit.runs[0]).toMatchObject({ result: { code: 0, capture_error: "synthetic spool failure" }, cleanup: { status: "passed" } });
   });
 
+  it("retains the original cell failure when the cleanup checkpoint itself throws", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-definitive-cleanup-throw-"));
+    roots.push(root);
+    const repositoryRoot = join(root, "repo");
+    mkdirSync(join(repositoryRoot, ".git"), { recursive: true });
+    const plan = buildCellManifest({ campaign: 1, outputRoot: root, worktreeRoot: join(root, "worktrees"), dataRoot: join(root, "data"), runRoot: join(root, "runs"), repositoriesRoot: root });
+    const cell = { ...plan.cells[0]!, repository_root: repositoryRoot };
+    const manifestPath = join(root, "cell-manifest.json");
+    writeFileSync(manifestPath, JSON.stringify(plan));
+    await expect(runDefinitiveCells({ plan: { ...plan, cells: [cell], expected_runs: 1 }, outputRoot: root, worktreeRoot: join(root, "worktrees"), releaseRoot: "/release", releaseArchive: "/archive", outputManifest: manifestPath, releaseBinding: { status: "passed" }, minimumFreeBytes: 0,
+      runner: async (_command: string, _args: string[], options: { phase?: string }) => options.phase === "cell" ? { code: 1, signal: null, stdout: "original stdout\n", stderr: "original stderr\n", timed_out: false } : { code: 0, signal: null, stdout: "", stderr: "", timed_out: false },
+      prepareDependencies: async () => ({ repository_id: "playwright", prepared_roots: [], commands: [] }),
+      cleanup: async () => { throw new Error("cleanup exploded"); },
+    })).rejects.toThrow(/not recorded as a model\/grader result/iu);
+    const audit = JSON.parse(readFileSync(join(root, "campaign-audit.json"), "utf8"));
+    expect(audit.runs[0]).toMatchObject({ error: expect.stringContaining("not recorded as a model/grader result"), cleanup_error: "cleanup exploded" });
+    expect(audit.runs[0].result).toMatchObject({ code: 1, stdout_bytes: 16, stderr_bytes: 16 });
+    expect(JSON.parse(readFileSync(join(root, "cleanup-block.json"), "utf8"))).toMatchObject({ status: "blocked", error: "cleanup exploded" });
+  });
+
   it("runs a successful injected cold readiness phase and stops its runtime", async () => {
     let stopped = false;
     const runtime = { stop: async () => { stopped = true; } };
@@ -334,6 +368,117 @@ describe("definitive direct campaign orchestrator", () => {
     expect(existsSync(audit.runs[0].preflight_failure.path)).toBe(true);
   });
 
+  it("fails the cell before worktree creation when the production Codex argv preflight is invalid", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-definitive-codex-preflight-"));
+    roots.push(root);
+    const repositoryRoot = join(root, "repo");
+    mkdirSync(join(repositoryRoot, ".git"), { recursive: true });
+    const plan = buildCellManifest({ campaign: 1, outputRoot: root, worktreeRoot: join(root, "worktrees"), dataRoot: join(root, "data"), runRoot: join(root, "runs"), repositoriesRoot: root });
+    const cell = { ...plan.cells[0]!, repository_root: repositoryRoot };
+    const manifestPath = join(root, "cell-manifest.json");
+    writeFileSync(manifestPath, JSON.stringify(plan));
+    const phases: string[] = [];
+    await expect(runDefinitiveCells({ plan: { ...plan, cells: [cell], expected_runs: 1 }, outputRoot: root, worktreeRoot: join(root, "worktrees"), releaseRoot: "/release", releaseArchive: "/archive", outputManifest: manifestPath, releaseBinding: { status: "passed" }, minimumFreeBytes: 0,
+      validateCodex: async () => ({ ok: false, binary_path: "/pinned/codex", binary_sha256: "a".repeat(64), first: { args: ["exec", "--help"], status: 2, stdout: "", stderr: "unexpected argument", }, resume: { args: ["resume", "--help"], status: 2, stdout: "", stderr: "unexpected argument" } }),
+      runner: async (_command: string, _args: string[], options: { phase?: string }) => { phases.push(options.phase ?? "unknown"); return { code: 0, signal: null, stdout: "", stderr: "", timed_out: false }; },
+      prepareDependencies: async () => ({ repository_id: "playwright", prepared_roots: [], commands: [] }),
+      cleanup: async () => ({ status: "passed", blockers: [] }),
+    })).rejects.toThrow(/Codex argv preflight failed/iu);
+    expect(phases).toEqual([]);
+    const audit = JSON.parse(readFileSync(join(root, "campaign-audit.json"), "utf8"));
+    expect(audit.runs[0]).toMatchObject({ model_invoked: false, preflight_failure: { stage: "codex-argv" }, codex_preflight: { ok: false } });
+    expect(readFileSync(audit.runs[0].preflight_failure.path, "utf8")).toMatch(/unexpected argument/iu);
+  });
+
+  it("uses the cell supervisor timeout for both argv preflight and the production runner", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-definitive-timeout-source-"));
+    roots.push(root);
+    const repositoryRoot = join(root, "repo");
+    mkdirSync(join(repositoryRoot, ".git"), { recursive: true });
+    const plan = buildCellManifest({ campaign: 1, outputRoot: root, worktreeRoot: join(root, "worktrees"), dataRoot: join(root, "data"), runRoot: join(root, "runs"), repositoriesRoot: root, codegraph: "/bin/echo" });
+    const sourceCell = plan.cells.find((entry) => entry.arm === "codegraph")!;
+    const cell = { ...sourceCell, repository_root: repositoryRoot, supervisor_timeout_ms: 120_000 };
+    const manifestPath = join(root, "cell-manifest.json");
+    writeFileSync(manifestPath, JSON.stringify(plan));
+    let preflightArgs: string[] | undefined;
+    let runnerTimeout: string | undefined;
+    await runDefinitiveCells({ plan: { ...plan, cells: [cell], expected_runs: 1 }, outputRoot: root, worktreeRoot: join(root, "worktrees"), releaseRoot: "/release", releaseArchive: "/archive", outputManifest: manifestPath, releaseBinding: { status: "passed" }, minimumFreeBytes: 0,
+      validateCodex: async (options: { mcpArgs: string[] }) => { preflightArgs = options.mcpArgs; return { ok: true, first: { stderr: "" }, resume: { stderr: "" } }; },
+      runner: async (_command: string, _args: string[], options: { phase?: string; env?: Record<string, string> }) => { if (options.phase === "cell") runnerTimeout = options.env?.["URDIRA_BENCHMARK_TIMEOUT_MS"]; return { code: 0, signal: null, stdout: "", stderr: "", timed_out: false }; },
+      prepareDependencies: async () => ({ repository_id: "playwright", prepared_roots: [], commands: [] }),
+      cleanup: async () => ({ status: "passed", blockers: [] }),
+    });
+    expect(preflightArgs).toContain("mcp_servers.codegraph.tool_timeout_sec=300");
+    expect(runnerTimeout).toBe("120000");
+  });
+
+  it("retains a runner runtime preflight failure before its manifest exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-runner-preflight-failure-"));
+    roots.push(root);
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--preflight-only", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", join(root, "missing-node"), "--output-dir", root], { encoding: "utf8" });
+    expect(result.status).toBe(1);
+    const files = readdirSync(root);
+    const failureName = files.find((name) => name.endsWith(".preflight-failure.json"));
+    expect(failureName).toBeDefined();
+    const failure = JSON.parse(readFileSync(join(root, failureName!), "utf8"));
+    expect(failure).toMatchObject({ model_invoked: false, failure_stage: "runtime" });
+    expect(failure.error).toMatch(/unable to execute/iu);
+    expect(failure.preflight_invocation).toMatchObject({ command: join(root, "missing-node"), args: ["--version"] });
+  });
+
+  it("retains the outer orchestrator runtime preflight failure before a cell manifest exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-driver-preflight-failure-"));
+    roots.push(root);
+    const missingNode = join(root, "missing-node");
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/run-definitive-agent-campaign.mjs"), "--campaign", "1", "--output-root", root, "--node", missingNode], { encoding: "utf8" });
+    expect(result.status).not.toBe(0);
+    const failurePath = join(root, "campaign-preflight-failure.json");
+    expect(existsSync(failurePath)).toBe(true);
+    const failure = JSON.parse(readFileSync(failurePath, "utf8"));
+    expect(failure).toMatchObject({ model_invoked: false, failure_stage: "runtime" });
+    expect(failure.command_output.stdout_path).toContain("node.stdout.log");
+    expect(failure.command_output.stderr_path).toContain("node.stderr.log");
+    expect(failure.command_output.stdout_sha256).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("retains an outer release binding failure after plan creation and before a cell", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-driver-binding-failure-"));
+    roots.push(root);
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/run-definitive-agent-campaign.mjs"), "--campaign", "1", "--output-root", root, "--release-root", join(root, "missing-release"), "--release-archive", join(root, "missing-release.tar.gz")], { encoding: "utf8" });
+    expect(result.status).not.toBe(0);
+    const failure = JSON.parse(readFileSync(join(root, "campaign-preflight-failure.json"), "utf8"));
+    expect(failure).toMatchObject({ model_invoked: false, failure_stage: "release-binding" });
+    expect(failure.error).toMatch(/release|archive|binding/iu);
+  });
+
+  it("retains readiness runtime preflight failure before its manifest exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-readiness-preflight-failure-"));
+    roots.push(root);
+    const outputRoot = join(root, "output");
+    const missingNode = join(root, "missing-node");
+    await expect(runReadinessCampaign({ campaign: 1, releaseRoot: "/release", releaseArchive: "/archive", repositoriesRoot: join(root, "repos"), outputRoot, dataRoot: join(root, "data"), nodeBin: missingNode, minimumFreeBytes: 0 })).rejects.toThrow(/unable to execute|Node mismatch/iu);
+    const failure = JSON.parse(readFileSync(join(outputRoot, "readiness-preflight-failure.json"), "utf8"));
+    expect(failure).toMatchObject({ model_invoked: false, failure_stage: "runtime" });
+    expect(failure.command_output.stdout_path).toContain("node.stdout.log");
+    expect(failure.command_output.stdout_sha256).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it("retains driver freeze and timeout validation failures before creating a cell", () => {
+    const cases = [
+      { name: "model", args: ["--model", "wrong-model"], env: {}, stage: "frozen-model" },
+      { name: "free-space", args: [], env: { BENCH_MIN_FREE_BYTES: "1" }, stage: "freeze" },
+      { name: "timeout", args: [], env: { BENCH_CELL_TIMEOUT_MS: "invalid" }, stage: "timeout" },
+    ];
+    for (const entry of cases) {
+      const root = mkdtempSync(join(tmpdir(), `urdira-driver-${entry.name}-failure-`));
+      roots.push(root);
+      const result = spawnSync(process.execPath, [resolve("release/benchmarks/run-definitive-agent-campaign.mjs"), "--campaign", "1", "--output-root", root, ...entry.args], { encoding: "utf8", env: { ...process.env, BENCH_MIN_FREE_BYTES: "53687091200", BENCH_CELL_TIMEOUT_MS: "900000", ...entry.env } });
+      expect(result.status).not.toBe(0);
+      const failure = JSON.parse(readFileSync(join(root, "campaign-preflight-failure.json"), "utf8"));
+      expect(failure).toMatchObject({ model_invoked: false, failure_stage: entry.stage });
+    }
+  });
+
   it("keeps the cold failure, blocks warm, and always checkpoints the readiness pair", async () => {
     const root = mkdtempSync(join(tmpdir(), "urdira-readiness-pair-"));
     roots.push(root);
@@ -371,5 +516,39 @@ describe("definitive direct campaign orchestrator", () => {
     expect(rows.every((row) => row["model_invoked"] === false && row["passed"] === false)).toBe(true);
     expect(rows.every((row) => row["setup_elapsed_ms"] === null && row["structural_readiness_ms"] === null && row["time_to_first_query_ms"] === null)).toBe(true);
     expect(rows[1]?.["failure"]).toMatch(/warm probe blocked by cold failure/iu);
+  });
+
+  it("retains blocked cold and warm rows when readiness worktree creation fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-readiness-worktree-failure-"));
+    roots.push(root);
+    const rows: Record<string, unknown>[] = [];
+    await expect(executeReadinessPair({ probeRows: rows, releaseRoot: "/release", repositoryRoot: join(root, "repo"), repositoryId: "playwright", campaign: 1, outputRoot: join(root, "output"), dataRoot: join(root, "data"), minimumFreeBytes: 0, verifiedWorker: "/worker", nodeVersion: "v24.18.1", prepareDependencies: async () => ({ repository_id: "playwright", prepared_roots: [], commands: [] }), adapters: {
+      addWorktree: async () => ({ status: 1, stdout: "", stderr: "worktree unavailable" }),
+      runCleanupCheckpoint: async (options: { cleanup: () => Promise<unknown> }) => { await options.cleanup(); return { status: "passed", blockers: [] }; },
+      terminateOwnedProcesses: async () => ({ stopped_processes: [], unverified_processes: [] }),
+      removeWorktree: async () => ({ status: 0, stdout: "", stderr: "" }),
+      listOwnedProcesses: () => [],
+    } })).rejects.toThrow(/worktree unavailable/iu);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row["phase"])).toEqual(["cold", "warm"]);
+    expect(rows.every((row) => row["model_invoked"] === false && row["passed"] === false)).toBe(true);
+    expect(rows[0]?.["failure"]).toMatch(/worktree unavailable/iu);
+    expect(rows[1]?.["failure"]).toMatch(/warm probe blocked by cold failure/iu);
+  });
+
+  it("blocks readiness progression when its cleanup checkpoint is blocked", async () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-readiness-cleanup-block-"));
+    roots.push(root);
+    const rows: Record<string, unknown>[] = [];
+    await expect(executeReadinessPair({ probeRows: rows, releaseRoot: "/release", repositoryRoot: join(root, "repo"), repositoryId: "playwright", campaign: 1, outputRoot: join(root, "output"), dataRoot: join(root, "data"), minimumFreeBytes: 0, verifiedWorker: "/worker", nodeVersion: "v24.18.1", prepareDependencies: async () => ({ repository_id: "playwright", prepared_roots: [], commands: [] }), adapters: {
+      addWorktree: async () => ({ status: 0, stdout: "", stderr: "" }),
+      validateDependencies: async () => ({ ready: true, missing_dependencies: [], missing_runtime_artifacts: [] }),
+      runPhase: async ({ phase }: { phase: string }) => ({ workspace_id: `workspace:${phase}`, passed: true, snapshot_identity: "snapshot:1" }),
+      runCleanupCheckpoint: async (options: { cleanup: () => Promise<unknown> }) => { await options.cleanup(); return { status: "blocked", blockers: ["residue"] }; },
+      terminateOwnedProcesses: async () => ({ stopped_processes: [], unverified_processes: [] }),
+      removeWorktree: async () => ({ status: 0, stdout: "", stderr: "" }),
+      listOwnedProcesses: () => [],
+    } })).rejects.toThrow(/cleanup checkpoint blocked/iu);
+    expect(existsSync(join(root, "output", "cleanup-block.json"))).toBe(true);
   });
 });

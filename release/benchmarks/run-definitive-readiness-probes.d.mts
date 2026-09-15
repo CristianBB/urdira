@@ -20,3 +20,4 @@ export function buildReadinessQuery(workspaceId: string): ReadinessQuery;
 export function blockedWarmProbe(input: { readonly workspace_id?: string | null; readonly failure?: string | null }): BlockedWarmProbe;
 export function runReadinessPhase(options: Record<string, unknown>): Promise<Record<string, unknown>>;
 export function executeReadinessPair(options: Record<string, unknown>): Promise<Record<string, unknown>>;
+export function runReadinessCampaign(options: Record<string, unknown>): Promise<Record<string, unknown>>;

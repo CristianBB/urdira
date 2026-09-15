@@ -2,6 +2,7 @@
 /* Execute the no-model cold/warm readiness probes for one definitive campaign. */
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -90,6 +91,28 @@ function semanticSidecarCreated(dataRoot) {
   };
   visit(dataRoot);
   return names;
+}
+
+function fileDigest(path) {
+  try {
+    const bytes = readFileSync(path);
+    return { path, bytes: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
+  } catch {
+    return { path, bytes: null, sha256: null };
+  }
+}
+
+function persistReadinessPreflightFailure({ outputRoot, stage, error, command, args, commandOutput = null }) {
+  const message = error instanceof Error ? error.message : String(error);
+  const failure = { ok: false, stage, failure_stage: stage, model_invoked: false, completed: false, command, args, command_output: commandOutput, error: message };
+  try {
+    mkdirSync(outputRoot, { recursive: true });
+    const path = join(outputRoot, "readiness-preflight-failure.json");
+    if (!existsSync(path)) writeFileSync(path, `${JSON.stringify(failure, null, 2)}\n`, { flag: "wx" });
+  } catch (persistError) {
+    try { process.stderr.write(`Unable to persist readiness preflight failure: ${persistError instanceof Error ? persistError.message : String(persistError)}\n`); } catch { /* stderr may be unavailable */ }
+  }
+  try { process.stderr.write(`${message}\n`); } catch { /* stderr may be unavailable */ }
 }
 
 function queryPublication(response, status) {
@@ -233,13 +256,14 @@ export async function executeReadinessPair({ probeRows, releaseRoot, repositoryR
   let workspaceId;
   let cleanup;
   let dependencySetup = null;
+  let operationError;
   const probeIdentity = { task_id: frozen.task, prompt_sha256: frozen.prompt_sha256, commit: repository.commit, node_version: nodeVersion, model_invoked: false, semantic_index: false, semantic_materialization: false };
   try {
-    const addWorktree = adapters.addWorktree ?? ((path, commit, cwd) => spawnSync("git", ["worktree", "add", "--detach", path, commit], { cwd, encoding: "utf8" }));
-    const added = await addWorktree(worktree, repository.commit, repositoryRoot);
-    if (added.status !== 0) throw new Error(`unable to create readiness worktree: ${added.stderr || added.stdout}`);
-    const prepare = prepareDependencies ?? ((options) => materializeAgentDependencyClosure(options));
     try {
+      const addWorktree = adapters.addWorktree ?? ((path, commit, cwd) => spawnSync("git", ["worktree", "add", "--detach", path, commit], { cwd, encoding: "utf8" }));
+      const added = await addWorktree(worktree, repository.commit, repositoryRoot);
+      if (added.status !== 0) throw new Error(`unable to create readiness worktree: ${added.stderr || added.stdout}`);
+      const prepare = prepareDependencies ?? ((options) => materializeAgentDependencyClosure(options));
       dependencySetup = await prepare({ repositoryId, repositoryRoot, worktree, nodeExecutable });
       const task = repository.tasks.find((entry) => entry.id === frozen.task);
       const validate = adapters.validateDependencies ?? ((options) => inspectAgentValidationEnvironment(options.worktree, options.targetPaths, "/bin/zsh", options.nodeExecutable));
@@ -247,48 +271,90 @@ export async function executeReadinessPair({ probeRows, releaseRoot, repositoryR
       dependencySetup = { ...dependencySetup, validation_environment: validation };
       if (validation.ready !== true) throw new Error(`Readiness dependency validation failed: ${JSON.stringify(validation)}`);
     } catch (error) {
+      operationError = error instanceof Error ? error : new Error(String(error));
       const failure = error instanceof Error ? error.message : String(error);
       const coldFailure = blockedWarmProbe({ workspace_id: null, failure });
-      probeRows.push({ probe_id: `${repositoryId}-cold-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "cold", dependency_setup: dependencySetup, ...coldFailure });
-      probeRows.push({ probe_id: `${repositoryId}-warm-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "warm", dependency_setup: dependencySetup, ...blockedWarmProbe({ workspace_id: null, failure: `warm probe blocked by cold failure: ${failure}` }) });
-      throw error;
+      if (!probeRows.some((row) => row.probe_id === `${repositoryId}-cold-${campaign}`)) probeRows.push({ probe_id: `${repositoryId}-cold-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "cold", dependency_setup: dependencySetup, ...coldFailure });
+      if (!probeRows.some((row) => row.probe_id === `${repositoryId}-warm-${campaign}`)) probeRows.push({ probe_id: `${repositoryId}-warm-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "warm", dependency_setup: dependencySetup, ...blockedWarmProbe({ workspace_id: null, failure: `warm probe blocked by cold failure: ${failure}` }) });
     }
-    const phaseRunner = adapters.runPhase ?? runReadinessPhase;
-    const cold = await phaseRunner({ phase: "cold", releaseRoot, dataRoot: pairDataRoot, worktree, verifiedWorker, adapters: adapters.phaseAdapters });
-    workspaceId = cold.workspace_id;
-    probeRows.push({ probe_id: `${repositoryId}-cold-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "cold", dependency_setup: dependencySetup, ...cold });
-    const warm = cold.passed !== true
-      ? blockedWarmProbe(cold)
-      : await phaseRunner({ phase: "warm", releaseRoot, dataRoot: pairDataRoot, worktree, previousWorkspaceId: workspaceId, expectedSnapshotId: cold.snapshot_identity, verifiedWorker, adapters: adapters.phaseAdapters });
-    probeRows.push({ probe_id: `${repositoryId}-warm-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "warm", dependency_setup: dependencySetup, ...warm });
+    if (operationError === undefined) {
+      try {
+        const phaseRunner = adapters.runPhase ?? runReadinessPhase;
+        const cold = await phaseRunner({ phase: "cold", releaseRoot, dataRoot: pairDataRoot, worktree, verifiedWorker, adapters: adapters.phaseAdapters });
+        workspaceId = cold.workspace_id;
+        probeRows.push({ probe_id: `${repositoryId}-cold-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "cold", dependency_setup: dependencySetup, ...cold });
+        const warm = cold.passed !== true
+          ? blockedWarmProbe(cold)
+          : await phaseRunner({ phase: "warm", releaseRoot, dataRoot: pairDataRoot, worktree, previousWorkspaceId: workspaceId, expectedSnapshotId: cold.snapshot_identity, verifiedWorker, adapters: adapters.phaseAdapters });
+        probeRows.push({ probe_id: `${repositoryId}-warm-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "warm", dependency_setup: dependencySetup, ...warm });
+      } catch (error) {
+        operationError = error instanceof Error ? error : new Error(String(error));
+        const failure = operationError.message;
+        if (!probeRows.some((row) => row.probe_id === `${repositoryId}-cold-${campaign}`)) probeRows.push({ probe_id: `${repositoryId}-cold-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "cold", dependency_setup: dependencySetup, ...blockedWarmProbe({ workspace_id: workspaceId ?? null, failure }) });
+        if (!probeRows.some((row) => row.probe_id === `${repositoryId}-warm-${campaign}`)) probeRows.push({ probe_id: `${repositoryId}-warm-${campaign}`, campaign, repository: repository.repository, repository_id: repositoryId, ...probeIdentity, phase: "warm", dependency_setup: dependencySetup, ...blockedWarmProbe({ workspace_id: workspaceId ?? null, failure: `warm probe blocked by cold failure: ${failure}` }) });
+      }
+    }
   } finally {
     const checkpoint = adapters.runCleanupCheckpoint ?? runCleanupCheckpoint;
-    cleanup = await checkpoint({
-      manifestPath: join(pairRoot, "cleanup.json"), registeredPaths: [worktree, pairDataRoot], filesystemPath: pairRoot,
-      minimumFreeBytes, cleanup: async () => {
-        const stop = adapters.terminateOwnedProcesses ?? terminateOwnedProcesses;
-        const stopped = await stop([worktree, pairDataRoot]);
-        const remove = adapters.removeWorktree ?? (() => spawnSync("git", ["worktree", "remove", "--force", worktree], { cwd: repositoryRoot, encoding: "utf8" }));
-        const removed = await remove(worktree, repositoryRoot);
-        const errors = [];
-        if (removed.status !== 0 && existsSync(worktree)) errors.push(`worktree: ${removed.stderr || removed.stdout}`);
-        try { rmSync(pairDataRoot, { recursive: true, force: true }); } catch (error) { errors.push(`data: ${error instanceof Error ? error.message : String(error)}`); }
-        return { stopped_processes: stopped, errors };
-      },
-      listOwnedProcesses: adapters.listOwnedProcesses ?? (() => processInventory([worktree, pairDataRoot])), metadata: { pair_id: pairId, campaign, repository_id: repositoryId },
-    });
-    if (cleanup.status === "blocked") writeFileSync(join(outputRoot, "cleanup-block.json"), `${JSON.stringify(cleanup, null, 2)}\n`, { flag: "wx" });
+    try {
+      cleanup = await checkpoint({
+        manifestPath: join(pairRoot, "cleanup.json"), registeredPaths: [worktree, pairDataRoot], filesystemPath: pairRoot,
+        minimumFreeBytes, cleanup: async () => {
+          const stop = adapters.terminateOwnedProcesses ?? terminateOwnedProcesses;
+          const stopped = await stop([worktree, pairDataRoot]);
+          const remove = adapters.removeWorktree ?? (() => spawnSync("git", ["worktree", "remove", "--force", worktree], { cwd: repositoryRoot, encoding: "utf8" }));
+          const removed = await remove(worktree, repositoryRoot);
+          const errors = [];
+          if (removed.status !== 0 && existsSync(worktree)) errors.push(`worktree: ${removed.stderr || removed.stdout}`);
+          try { rmSync(pairDataRoot, { recursive: true, force: true }); } catch (error) { errors.push(`data: ${error instanceof Error ? error.message : String(error)}`); }
+          return { stopped_processes: stopped, errors };
+        },
+        listOwnedProcesses: adapters.listOwnedProcesses ?? (() => processInventory([worktree, pairDataRoot])), metadata: { pair_id: pairId, campaign, repository_id: repositoryId },
+      });
+    } catch (error) {
+      const cleanupError = error instanceof Error ? error : new Error(String(error));
+      cleanup = { status: "blocked", blockers: [cleanupError.message], error: cleanupError.message };
+      if (operationError === undefined) operationError = cleanupError;
+    }
+    if (cleanup.status === "blocked") {
+      const cleanupBlockPath = join(outputRoot, "cleanup-block.json");
+      if (!existsSync(cleanupBlockPath)) writeFileSync(cleanupBlockPath, `${JSON.stringify(cleanup, null, 2)}\n`, { flag: "wx" });
+      if (operationError === undefined) operationError = new Error(`Cleanup checkpoint blocked readiness pair ${pairId}`);
+    }
   }
+  if (operationError !== undefined) throw operationError;
   if (cancellationRequested) throw new Error(`Readiness campaign cancelled during ${pairId}`);
   return cleanup;
 }
 
 export async function runReadinessCampaign({ campaign, releaseRoot, releaseArchive, repositoriesRoot, outputRoot, dataRoot, nodeBin = process.execPath, minimumFreeBytes = (parseMinimumFreeBytes(process.env.BENCH_MIN_FREE_BYTES) ?? DEFINITIVE_MINIMUM_FREE_BYTES) }) {
   if (!Number.isSafeInteger(campaign) || campaign < 1 || campaign > 3) throw new Error("campaign must be 1, 2, or 3");
+  mkdirSync(outputRoot, { recursive: true });
+  const nodeStdoutPath = join(outputRoot, "node.stdout.log");
+  const nodeStderrPath = join(outputRoot, "node.stderr.log");
   const version = spawnSync(nodeBin, ["--version"], { encoding: "utf8" });
-  if (version.status !== 0 || version.stdout.trim() !== "v24.18.1") throw new Error(`Frozen definitive Node mismatch: expected v24.18.1, received ${version.stdout.trim() || version.stderr}`);
-  const binding = assertReleaseBinding({ archiveRoot: releaseRoot, archivePath: releaseArchive });
-  if (minimumFreeBytes !== DEFINITIVE_MINIMUM_FREE_BYTES) throw new Error(`definitive protocol requires BENCH_MIN_FREE_BYTES=${DEFINITIVE_MINIMUM_FREE_BYTES}`);
+  try { writeFileSync(nodeStdoutPath, version.stdout ?? "", { flag: "wx" }); } catch { /* preserve existing diagnostic */ }
+  try { writeFileSync(nodeStderrPath, version.stderr ?? "", { flag: "wx" }); } catch { /* preserve existing diagnostic */ }
+  const stdoutFile = fileDigest(nodeStdoutPath);
+  const stderrFile = fileDigest(nodeStderrPath);
+  const measuredCommandOutput = { code: version.status, signal: version.signal ?? null, stdout_path: stdoutFile.path, stdout_bytes: stdoutFile.bytes, stdout_sha256: stdoutFile.sha256, stderr_path: stderrFile.path, stderr_bytes: stderrFile.bytes, stderr_sha256: stderrFile.sha256 };
+  if (version.status !== 0 || (version.stdout ?? "").trim() !== "v24.18.1") {
+    const error = new Error(`Frozen definitive Node mismatch: expected v24.18.1, received ${(version.stdout ?? "").trim() || version.stderr || version.error?.message || "unknown error"}`);
+    persistReadinessPreflightFailure({ outputRoot, stage: "runtime", error, command: nodeBin, args: ["--version"], commandOutput: measuredCommandOutput });
+    throw error;
+  }
+  let binding;
+  try {
+    binding = assertReleaseBinding({ archiveRoot: releaseRoot, archivePath: releaseArchive });
+  } catch (error) {
+    persistReadinessPreflightFailure({ outputRoot, stage: "release-binding", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
+  if (minimumFreeBytes !== DEFINITIVE_MINIMUM_FREE_BYTES) {
+    const error = new Error(`definitive protocol requires BENCH_MIN_FREE_BYTES=${DEFINITIVE_MINIMUM_FREE_BYTES}`);
+    persistReadinessPreflightFailure({ outputRoot, stage: "freeze", error, command: null, args: [], commandOutput: null });
+    throw error;
+  }
   const manifest = buildReadinessManifest({ campaign, outputRoot, dataRoot, runRoot: outputRoot, repositoriesRoot, nodeBin, indexingWorker: binding.components.indexing_worker.path, minimumFreeBytes });
   mkdirSync(outputRoot, { recursive: true });
   mkdirSync(dataRoot, { recursive: true });
