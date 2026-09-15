@@ -4,15 +4,17 @@
 
 This evidence records offline rendering completed on 2026-09-16 after the
 three agent campaigns and the 18 readiness attempts were retained. It does not
-launch models, probes, or tests. The agent matrix remains 45 rows with 42
-correctness passes, two explicit nonpasses, and one unavailable correctness
-value. The readiness matrix has 18 persisted failed, blocked, or interrupted
+launch models, probes, or tests. The agent matrix remains 45 rows: 43 task-solved rows, 42 strict grader passes, two strict grader nonpasses, and one unavailable infrastructure outcome. The C3 Urdira VS Code row is task-solved with a tool-validation incident; its strict grader is a nonpass. The readiness matrix has 18 persisted failed, blocked, or interrupted
 rows, zero successful probes, and no readiness qualification.
 The readiness measurement objective was not achieved. This note records
 offline rendering and retained attempt evidence only; the post-campaign PATH
 fix is not retroactive validation and produced no new readiness evidence.
 
-The readiness source composition is
+The append-only reporting-axis correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
+(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`);
+it leaves the v3 raw-derived consolidation unchanged. The readiness source
+composition is
 `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-final-composition-v1.json`
 (SHA-256 `5a3be1432ac047084abdd24fbb4491c9219769c19683f4a51af06f5a616898a7`).
 The append-only normalized status view is

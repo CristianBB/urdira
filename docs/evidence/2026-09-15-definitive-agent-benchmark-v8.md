@@ -15,7 +15,7 @@ both retain all measured fields.
 
 | Measure | Observed state |
 |---|---|
-| Agent rows | 45 observed; 42 grader passes, 2 explicit nonpasses, 1 correctness value `null` after infrastructure failure |
+| Agent rows | 45 observed; 43 task-solved, 42 strict grader passes, 2 strict grader nonpasses, 1 infrastructure outcome unavailable |
 | Target coverage | 43 rows at 2/2; one infrastructure row `null`; one execution-failure row at 0/2 |
 | Campaign samples | 1 per identity in each of C1, C2, and C3 |
 | Outer turns | 3 where the agent execution produced turns; `null` where unavailable |
@@ -85,19 +85,28 @@ qualify readiness as successful.
 
 ## Explicit nonpass evidence
 
-The C3 VS Code/Urdira row has target coverage 2/2 but a grader validation
-failure. The retained diagnostic
+The C3 VS Code/Urdira row is task-solved with target coverage 2/2, but its
+strict grader is false because of a tool-validation incident. The retained diagnostic
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-c3-final-15-v3/summary/c3-15-grader-diagnostic-v1.json`
 has SHA-256
 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`.
 Its raw transcript line 10 contains `core:unknown_field` for `/request/query`.
 The row's agent exit is `0`, outer runner exit is `1`, and grader exit is `1`;
-no rm-f or test-blocked cause is inferred.
+its task outcome is solved because target coverage and final changes are
+present. The strict grader nonpass is the tool-validation incident, not a
+task-correctness failure. No rm-f or test-blocked cause is inferred.
+
+The corrected reporting axes are retained in the append-only sidecar
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
+(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`):
+`task_solved`, `grader_pass`, and `tool_validation_incident` are separate and
+the v3 raw-derived consolidation is unchanged.
 
 The other explicit nonpass is the C1 VS Code/codebase-memory execution
-failure. The C1 Prisma/Urdira infrastructure row has no correctness result;
-its missing measurements remain `null`. These rows are counted separately
-from the 42 grader passes.
+failure. The C1 Prisma/Urdira infrastructure row has unavailable task outcome and grader
+fields; its missing measurements remain `null`. The C1 VS Code/codebase-memory
+row is an execution-capacity failure at 0/2. These are separate from the 43
+rows whose task outcome is solved and the 42 strict grader passes.
 
 The v7 and v6 campaign snapshots and their partial renderings are historical
 and remain separate from v8. This evidence note does not certify readiness or

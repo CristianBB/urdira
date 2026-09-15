@@ -830,14 +830,18 @@ These commands produce evidence only after the Phase 0 gates in the
 [definitive handoff](docs/benchmarks/definitive-agent-benchmark-handoff.md)
 pass.
 
-The current v8 evidence records 45 observed agent cells with 42 grader passes,
-two explicit nonpasses, and one correctness value unavailable after
-infrastructure failure. The 18 readiness attempts are closed with failures,
+The current v8 evidence records 45 observed agent cells: 43 task-solved rows
+(target coverage 2/2 with final changes present), 42 strict grader passes, two
+strict grader nonpasses, and one infrastructure row with unavailable outcome
+evidence. One task-solved Urdira VS Code row has a tool-validation incident;
+its grader remains a nonpass. The 18 readiness attempts are closed with failures,
 zero successful probes, and no readiness qualification; P95 remains `null`
 because three campaign samples do not meet the frozen eligibility rule. See
 the [versioned results report](docs/benchmarks/definitive-agent-benchmark-results-2026-09-15.md)
 for the complete measured table and separate failure, coverage, efficiency,
-and distribution fields.
+and distribution fields. The report's append-only axis correction preserves the
+raw-derived consolidation while separating `task_solved`, `grader_pass`, and
+`tool_validation_incident`.
 The readiness measurement objective was not achieved: the persisted attempts
 contain no successful readiness measurement. The post-campaign PATH fix is not
 retroactive validation and produced no new readiness evidence.

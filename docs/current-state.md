@@ -3,9 +3,11 @@
 ## Definitive agent campaign status (v8, 2026-09-15)
 
 The v8 agent phase has 45 observed rows across three campaigns, one sample per
-repository/task/arm identity. The external additive consolidation records 42
-grader passes, two explicit nonpasses, and one correctness value unavailable
-after infrastructure failure. Target coverage is 2/2 for 43 rows. The
+repository/task/arm identity. Forty-three rows are task-solved (target coverage
+2/2 with final changes present), 42 have strict grader passes, two have strict
+grader nonpasses, and one infrastructure row has unavailable outcome evidence.
+The C3 Urdira VS Code row is task-solved but has a tool-validation incident; its
+strict grader remains a nonpass. Target coverage is 2/2 for 43 rows. The
 [complete 45-row table](benchmarks/definitive-agent-benchmark-results-2026-09-15.md#complete-45-cell-measured-table)
 is embedded in the versioned results report. The full JSON measurements are
 retained outside the repository at
@@ -61,12 +63,17 @@ retroactive validation and produced no new readiness evidence.
 Per-campaign renderer outputs and the rejected aggregate-render attempt are
 recorded in the dated [post-campaign rendering evidence](evidence/2026-09-16-definitive-agent-benchmark-v8-postcampaign.md).
 
-The exact C3 VS Code/Urdira validation nonpass is `core:unknown_field` at
-`/request/query`, evidenced by diagnostic artifact
+The exact C3 VS Code/Urdira tool-validation incident has strict grader
+nonpass `core:unknown_field` at `/request/query`, evidenced by diagnostic artifact
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-c3-final-15-v3/summary/c3-15-grader-diagnostic-v1.json`
 (SHA-256 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`).
 The row has agent exit 0, runner exit 1, grader exit 1, and target coverage
-2/2. This is separate from the C1 infrastructure-null row. v7 and v6
+2/2. Its task outcome is solved; the strict grader nonpass is the recorded
+tool-validation incident, not a task-correctness failure. This is separate
+from the C1 infrastructure-null row. The axis correction sidecar is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
+(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`).
+v7 and v6
 evidence below remain historical and are not mixed into v8.
 
 ## Historical v7 retained definitive agent campaign status (2026-09-15)

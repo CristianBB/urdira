@@ -5,11 +5,12 @@
 Status: **45 agent cells observed; 18 readiness attempts persisted with zero
 successful probes** (2026-09-16). The three campaign audits contain
 one sample for each of the 45 repository/task/arm identities. The additive
-offline consolidation records 42 grader passes, two explicit nonpasses, and
-one unavailable correctness result caused by an infrastructure failure. It
-records target coverage of 2/2 for 43 rows; the remaining two rows are the
-unavailable Prisma/Urdira infrastructure row and the VS Code/codebase-memory
-execution failure with 0/2. The complete row index is embedded below and backed
+offline consolidation records 43 task-solved rows (target coverage 2/2 with
+final changes present), 42 strict grader passes, two strict grader nonpasses,
+and one infrastructure row with unavailable outcome evidence. The C3 VS
+Code/Urdira row is task-solved and covered 2/2, but its strict grader reported
+a tool-validation incident. The remaining unsolved row is the C1 VS
+Code/codebase-memory execution-capacity failure at 0/2. The complete row index is embedded below and backed
 by the external v8 consolidation Markdown at
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.md`
 and JSON at
@@ -20,11 +21,16 @@ which retain all measured fields.
 
 | Result set | Planned | Observed/started | Completed | Failed or blocked | Pending | Status |
 |---|---:|---:|---:|---:|---:|---|
-| Agent cells | 45 | 45 | 42 grader passes | 2 explicit nonpasses + 1 correctness null | 0 | complete as observed, with failures |
+| Agent cells | 45 | 45 | 43 task-solved; 42 grader passes | 1 task unsolved + 1 infrastructure outcome unavailable; 2 strict grader nonpasses | 0 | complete as observed, with separated outcome axes |
 | Readiness probes | 18 | 18 persisted attempts | 0 | 18 failed, blocked, or interrupted | 0 | complete with failures; not readiness-qualified |
 
-The campaign is not a claim that all 45 cells are correct: correctness,
-coverage, execution, and grader outcomes remain separate. Agent, runner, and
+The campaign separates task outcome, target coverage, execution, and strict
+grader outcome. Forty-three rows are task-solved from complete target coverage
+and retained final changes. The C3 VS Code/Urdira row is task-solved despite a
+strict grader nonpass caused by the recorded tool-validation incident at
+`/request/query`; this is not classified as a task-correctness failure. The C1
+VS Code/codebase-memory row is an execution-capacity failure, and the C1
+Prisma/Urdira row has unavailable task outcome evidence. Agent, runner, and
 grader exit codes are retained separately. A configured Urdira arm is also
 separate from observed tool use. Missing measurements are `null`, never zero.
 The cost card is input/cached input `$2/M` and output/reasoning `$8/M`; input,
@@ -86,16 +92,24 @@ Readiness timestamps and storage/process/publication/freshness measurements rema
 readiness attempt record with no successful readiness result; it does not
 qualify the benchmark as a successful readiness run.
 
-The exact C3 VS Code/Urdira validation nonpass is retained in
+The exact C3 VS Code/Urdira tool-validation incident and strict grader nonpass are retained in
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-c3-final-15-v3/summary/c3-15-grader-diagnostic-v1.json`
 (SHA-256 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`).
 The raw transcript records `core:unknown_field` for `/request/query` on line
 10; the agent exit was `0`, outer runner exit was `1`, and grader exit was
-`1`, with target coverage 2/2. No rm-f or test-blocked cause is attributed.
+`1`, with target coverage 2/2. The task outcome is solved because the target
+set and final changes are present; the strict grader is false because the
+request used an unregistered field. This is a tool-validation incident, not a
+task-correctness failure. No rm-f or test-blocked cause is attributed.
 The external v8 consolidation JSON SHA is
 `622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`; its
 Markdown SHA is
-`030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`.
+`030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`. The
+append-only reporting-axis correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
+(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`);
+it leaves the v3 raw-derived consolidation unchanged and defines
+`task_solved`, `grader_pass`, and `tool_validation_incident` separately.
 
 The v7 and v6 reports below remain historical and are not mixed into these 45
 rows. The dated v8 evidence note is
@@ -108,53 +122,53 @@ frozen repository/arm identity (0-14); execution order was not measured and
 is null. Cleanup raw and effective statuses are separate, and repair
 references identify the retained external repair evidence.
 
-|campaign|canonical cell|repository|task|arm|model invoked|turns|setup ms|elapsed ms|execution ordinal|input|cached input|output|reasoning|cost USD|hooks total/served/fallback|shell|MCP|agent exit|runner exit|grader exit|target coverage|correctness|cleanup raw|cleanup effective|repair reference|P95 ms|
+|campaign|canonical cell|repository|task|arm|model invoked|turns|setup ms|elapsed ms|execution ordinal|input|cached input|output|reasoning|cost USD|hooks total/served/fallback|shell|MCP|agent exit|runner exit|grader exit|target coverage|task solved|grader pass|tool validation incident|cleanup raw|cleanup effective|repair reference|P95 ms|
 |---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---|---|---|---|---:|
-|1|0|playwright|affected-tests-deterministic|baseline|true|3|1270|209857|null|899391|838400|9020|3357|1.897798|0/0/null|21|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|1|playwright|affected-tests-deterministic|urdira-typescript|true|3|7033|179244|null|658500|614656|6832|2669|1.393008|22/14/8|6|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|2|playwright|affected-tests-deterministic|tgrep|true|3|1607|237641|null|1259710|1141760|9448|3119|2.619956|0/0/null|22|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|3|playwright|affected-tests-deterministic|codegraph|true|3|11652|229631|null|1129906|1021696|8993|2931|2.355204|0/0/null|24|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-1-codegraph-orphan-cleanup-v1.json (0d81e04761b19c805713b50f512e01311f9a85ddebe4f317b3e1f828790f82bf)|null|
-|1|4|playwright|affected-tests-deterministic|codebase-memory|true|3|68347|211819|null|938147|851456|8067|2922|1.964206|0/0/null|15|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|5|prisma|wire-name-validation|baseline|true|3|4756|261287|null|1416425|1329408|10114|4117|2.946698|0/0/null|8|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|6|prisma|wire-name-validation|urdira-typescript|null|null|null|null|null|null|null|null|null|null|null/null/null|null|null|null|1|null|null/null|null|passed|passed|null|null|
-|1|7|prisma|wire-name-validation|tgrep|true|3|5601|315205|null|2148247|2025472|10564|4285|4.415286|0/0/null|14|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|8|prisma|wire-name-validation|codegraph|true|3|15802|262732|null|1612897|1520640|10799|3995|3.344146|0/0/null|16|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/resume-coordinator/campaign-1-codegraph-orphan-cleanup-v2.json (312bb5eb69d29422a3b2c50ebc6b3c9dbee90e3de050c37d377e569757efb47c)|null|
-|1|9|prisma|wire-name-validation|codebase-memory|true|3|267757|239536|null|1191420|1119488|10805|4642|2.506416|0/0/null|10|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|10|vscode|language-provider-registration-idempotence|baseline|true|3|1623|256349|null|1468110|1389312|10283|4480|3.054324|0/0/null|17|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|11|vscode|language-provider-registration-idempotence|urdira-typescript|true|3|41035|240098|null|670920|585728|7631|3290|1.429208|17/3/14|12|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|12|vscode|language-provider-registration-idempotence|tgrep|true|3|4384|282006|null|1443328|1367552|10665|4771|3.010144|0/0/null|17|0|0|0|0|2/2|true|passed|passed|null|null|
-|1|13|vscode|language-provider-registration-idempotence|codegraph|true|3|79050|265936|null|1089584|1024768|11705|6031|2.321056|0/0/null|13|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/resume-coordinator/vscode-c1-14-codegraph-orphan-cleanup-v2.json (c4bbbb7bedbae24d59a298571536ea00a3f146099ff6e431b67df208ccb8f32e)|null|
-|1|14|vscode|language-provider-registration-idempotence|codebase-memory|true|0|214728|25559|null|null|null|null|null|null|0/0/null|1|0|1|1|1|0/2|false|passed|passed|null|null|
-|2|0|playwright|affected-tests-deterministic|baseline|true|3|901|257581|null|660613|610048|7227|2384|1.398114|0/0/null|16|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|1|playwright|affected-tests-deterministic|urdira-typescript|true|3|7185|271655|null|778170|717568|7342|2890|1.638196|17/11/6|5|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|2|playwright|affected-tests-deterministic|tgrep|true|3|1543|398978|null|660120|613888|8136|2604|1.40616|0/0/null|23|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|3|playwright|affected-tests-deterministic|codegraph|true|3|10555|318113|null|993531|893952|10682|3599|2.10131|0/0/null|25|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-2-codegraph-orphan-cleanup-v2.json (7dfb642d7d00d7e6a6de53637be45049163abf10b1d51684726280d7e46ac279)|null|
-|2|4|playwright|affected-tests-deterministic|codebase-memory|true|3|6119|447866|null|1305561|1236992|10854|3584|2.726626|0/0/null|27|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|5|prisma|wire-name-validation|baseline|true|3|4600|228446|null|1551382|1473792|10070|3569|3.211876|0/0/null|13|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|6|prisma|wire-name-validation|urdira-typescript|true|3|13643|279289|null|983483|884992|8294|3280|2.059558|17/9/8|7|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|7|prisma|wire-name-validation|tgrep|true|3|5416|323169|null|1620615|1539840|10047|4284|3.355878|0/0/null|11|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|8|prisma|wire-name-validation|codegraph|true|3|16340|230493|null|945018|870144|8999|3704|1.99166|0/0/null|8|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-2-codegraph-orphan-cleanup-v3.json (441cc6378ee497788b45ff3108f4c7905d7743341dfc7ba4ea089744484873fb)|null|
-|2|9|prisma|wire-name-validation|codebase-memory|true|3|13083|242944|null|1348890|1263104|10068|4249|2.812316|0/0/null|12|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|10|vscode|language-provider-registration-idempotence|baseline|true|3|2409|280427|null|962498|898816|8627|3687|2.023508|0/0/null|13|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|11|vscode|language-provider-registration-idempotence|urdira-typescript|true|3|41202|320106|null|1084393|968192|9519|3958|2.276602|20/3/17|14|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|12|vscode|language-provider-registration-idempotence|tgrep|true|3|4114|223492|null|1274124|1201408|9397|3791|2.653752|0/0/null|15|0|0|0|0|2/2|true|passed|passed|null|null|
-|2|13|vscode|language-provider-registration-idempotence|codegraph|true|3|79603|286550|null|1667235|1579264|12287|5112|3.473662|0/0/null|16|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-2-codegraph-orphan-cleanup-c2-13-v1.json (e914ee80acf665fa1e8142e6190f351ce7d78f558b5bf5954ebb37008a2d1052)|null|
-|2|14|vscode|language-provider-registration-idempotence|codebase-memory|true|3|75729|223812|null|1063379|976896|9241|4255|2.234726|0/0/null|14|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|0|playwright|affected-tests-deterministic|baseline|true|3|1331|235103|null|876178|806144|10833|4990|1.87894|0/0/null|18|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|1|playwright|affected-tests-deterministic|urdira-typescript|true|3|7766|244131|null|780770|707328|9048|3213|1.659628|25/12/13|10|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|2|playwright|affected-tests-deterministic|tgrep|true|3|1546|230859|null|876664|811776|9978|3362|1.860048|0/0/null|25|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|3|playwright|affected-tests-deterministic|codegraph|true|3|11304|194388|null|588513|537344|8893|3533|1.276434|0/0/null|16|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-3-codegraph-orphan-cleanup-c3-02-v1.json (874646adb71b49005b722ae62049a039753184bd3fc90fec49bda881372c0da4)|null|
-|3|4|playwright|affected-tests-deterministic|codebase-memory|true|3|6218|204452|null|704845|628224|7791|2428|1.491442|0/0/null|17|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|5|prisma|wire-name-validation|baseline|true|3|4434|247725|null|1495494|1403648|10534|3651|3.104468|0/0/null|13|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|6|prisma|wire-name-validation|urdira-typescript|true|3|13579|197334|null|678648|614400|8126|3904|1.453536|14/6/8|7|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|7|prisma|wire-name-validation|tgrep|true|3|5925|301022|null|3146462|3028992|12105|4672|6.42714|0/0/null|13|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|8|prisma|wire-name-validation|codegraph|true|3|18437|252541|null|1229793|1157120|9485|3977|2.567282|0/0/null|9|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-3-codegraph-orphan-cleanup-c3-07-v1.json (d8bb453982b06750c4bef878fa6f12e1e123e24cbb436a28a4e37224ffe380fa)|null|
-|3|9|prisma|wire-name-validation|codebase-memory|true|3|13210|292775|null|2173238|2016768|12014|3935|4.474068|0/0/null|22|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|10|vscode|language-provider-registration-idempotence|baseline|true|3|1253|291782|null|1742177|1642240|11781|4571|3.61517|0/0/null|18|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|11|vscode|language-provider-registration-idempotence|urdira-typescript|true|3|41284|386208|null|1602345|1471488|13334|4656|3.34861|27/11/16|15|0|0|1|1|2/2|false|passed|passed|null|null|
-|3|12|vscode|language-provider-registration-idempotence|tgrep|true|3|4770|371465|null|1586864|1501952|12894|5731|3.322728|0/0/null|16|0|0|0|0|2/2|true|passed|passed|null|null|
-|3|13|vscode|language-provider-registration-idempotence|codegraph|true|3|78699|252472|null|1266196|1196288|11642|5737|2.671424|0/0/null|13|0|0|0|0|2/2|true|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-3-codegraph-orphan-cleanup-c3-12-v1.json (SHA-256 8dd5a14120c1e694187c53d8f3e870b519ad41629dc2009d58be82102ba2fb2b)|null|
-|3|14|vscode|language-provider-registration-idempotence|codebase-memory|true|3|79348|302910|null|1257967|1149440|10765|4487|2.63795|0/0/null|11|0|0|0|0|2/2|true|passed|passed|null|null|
+|1|0|playwright|affected-tests-deterministic|baseline|true|3|1270|209857|null|899391|838400|9020|3357|1.897798|0/0/null|21|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|1|playwright|affected-tests-deterministic|urdira-typescript|true|3|7033|179244|null|658500|614656|6832|2669|1.393008|22/14/8|6|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|2|playwright|affected-tests-deterministic|tgrep|true|3|1607|237641|null|1259710|1141760|9448|3119|2.619956|0/0/null|22|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|3|playwright|affected-tests-deterministic|codegraph|true|3|11652|229631|null|1129906|1021696|8993|2931|2.355204|0/0/null|24|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-1-codegraph-orphan-cleanup-v1.json (0d81e04761b19c805713b50f512e01311f9a85ddebe4f317b3e1f828790f82bf)|null|
+|1|4|playwright|affected-tests-deterministic|codebase-memory|true|3|68347|211819|null|938147|851456|8067|2922|1.964206|0/0/null|15|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|5|prisma|wire-name-validation|baseline|true|3|4756|261287|null|1416425|1329408|10114|4117|2.946698|0/0/null|8|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|6|prisma|wire-name-validation|urdira-typescript|null|null|null|null|null|null|null|null|null|null|null/null/null|null|null|null|1|null|null/null|null|null|null|passed|passed|null|null|
+|1|7|prisma|wire-name-validation|tgrep|true|3|5601|315205|null|2148247|2025472|10564|4285|4.415286|0/0/null|14|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|8|prisma|wire-name-validation|codegraph|true|3|15802|262732|null|1612897|1520640|10799|3995|3.344146|0/0/null|16|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/resume-coordinator/campaign-1-codegraph-orphan-cleanup-v2.json (312bb5eb69d29422a3b2c50ebc6b3c9dbee90e3de050c37d377e569757efb47c)|null|
+|1|9|prisma|wire-name-validation|codebase-memory|true|3|267757|239536|null|1191420|1119488|10805|4642|2.506416|0/0/null|10|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|10|vscode|language-provider-registration-idempotence|baseline|true|3|1623|256349|null|1468110|1389312|10283|4480|3.054324|0/0/null|17|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|11|vscode|language-provider-registration-idempotence|urdira-typescript|true|3|41035|240098|null|670920|585728|7631|3290|1.429208|17/3/14|12|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|12|vscode|language-provider-registration-idempotence|tgrep|true|3|4384|282006|null|1443328|1367552|10665|4771|3.010144|0/0/null|17|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|1|13|vscode|language-provider-registration-idempotence|codegraph|true|3|79050|265936|null|1089584|1024768|11705|6031|2.321056|0/0/null|13|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/resume-coordinator/vscode-c1-14-codegraph-orphan-cleanup-v2.json (c4bbbb7bedbae24d59a298571536ea00a3f146099ff6e431b67df208ccb8f32e)|null|
+|1|14|vscode|language-provider-registration-idempotence|codebase-memory|true|0|214728|25559|null|null|null|null|null|null|0/0/null|1|0|1|1|1|0/2|false|false|false|passed|passed|null|null|
+|2|0|playwright|affected-tests-deterministic|baseline|true|3|901|257581|null|660613|610048|7227|2384|1.398114|0/0/null|16|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|1|playwright|affected-tests-deterministic|urdira-typescript|true|3|7185|271655|null|778170|717568|7342|2890|1.638196|17/11/6|5|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|2|playwright|affected-tests-deterministic|tgrep|true|3|1543|398978|null|660120|613888|8136|2604|1.40616|0/0/null|23|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|3|playwright|affected-tests-deterministic|codegraph|true|3|10555|318113|null|993531|893952|10682|3599|2.10131|0/0/null|25|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-2-codegraph-orphan-cleanup-v2.json (7dfb642d7d00d7e6a6de53637be45049163abf10b1d51684726280d7e46ac279)|null|
+|2|4|playwright|affected-tests-deterministic|codebase-memory|true|3|6119|447866|null|1305561|1236992|10854|3584|2.726626|0/0/null|27|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|5|prisma|wire-name-validation|baseline|true|3|4600|228446|null|1551382|1473792|10070|3569|3.211876|0/0/null|13|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|6|prisma|wire-name-validation|urdira-typescript|true|3|13643|279289|null|983483|884992|8294|3280|2.059558|17/9/8|7|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|7|prisma|wire-name-validation|tgrep|true|3|5416|323169|null|1620615|1539840|10047|4284|3.355878|0/0/null|11|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|8|prisma|wire-name-validation|codegraph|true|3|16340|230493|null|945018|870144|8999|3704|1.99166|0/0/null|8|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-2-codegraph-orphan-cleanup-v3.json (441cc6378ee497788b45ff3108f4c7905d7743341dfc7ba4ea089744484873fb)|null|
+|2|9|prisma|wire-name-validation|codebase-memory|true|3|13083|242944|null|1348890|1263104|10068|4249|2.812316|0/0/null|12|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|10|vscode|language-provider-registration-idempotence|baseline|true|3|2409|280427|null|962498|898816|8627|3687|2.023508|0/0/null|13|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|11|vscode|language-provider-registration-idempotence|urdira-typescript|true|3|41202|320106|null|1084393|968192|9519|3958|2.276602|20/3/17|14|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|12|vscode|language-provider-registration-idempotence|tgrep|true|3|4114|223492|null|1274124|1201408|9397|3791|2.653752|0/0/null|15|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|2|13|vscode|language-provider-registration-idempotence|codegraph|true|3|79603|286550|null|1667235|1579264|12287|5112|3.473662|0/0/null|16|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-2-codegraph-orphan-cleanup-c2-13-v1.json (e914ee80acf665fa1e8142e6190f351ce7d78f558b5bf5954ebb37008a2d1052)|null|
+|2|14|vscode|language-provider-registration-idempotence|codebase-memory|true|3|75729|223812|null|1063379|976896|9241|4255|2.234726|0/0/null|14|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|0|playwright|affected-tests-deterministic|baseline|true|3|1331|235103|null|876178|806144|10833|4990|1.87894|0/0/null|18|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|1|playwright|affected-tests-deterministic|urdira-typescript|true|3|7766|244131|null|780770|707328|9048|3213|1.659628|25/12/13|10|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|2|playwright|affected-tests-deterministic|tgrep|true|3|1546|230859|null|876664|811776|9978|3362|1.860048|0/0/null|25|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|3|playwright|affected-tests-deterministic|codegraph|true|3|11304|194388|null|588513|537344|8893|3533|1.276434|0/0/null|16|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-3-codegraph-orphan-cleanup-c3-02-v1.json (874646adb71b49005b722ae62049a039753184bd3fc90fec49bda881372c0da4)|null|
+|3|4|playwright|affected-tests-deterministic|codebase-memory|true|3|6218|204452|null|704845|628224|7791|2428|1.491442|0/0/null|17|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|5|prisma|wire-name-validation|baseline|true|3|4434|247725|null|1495494|1403648|10534|3651|3.104468|0/0/null|13|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|6|prisma|wire-name-validation|urdira-typescript|true|3|13579|197334|null|678648|614400|8126|3904|1.453536|14/6/8|7|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|7|prisma|wire-name-validation|tgrep|true|3|5925|301022|null|3146462|3028992|12105|4672|6.42714|0/0/null|13|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|8|prisma|wire-name-validation|codegraph|true|3|18437|252541|null|1229793|1157120|9485|3977|2.567282|0/0/null|9|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-3-codegraph-orphan-cleanup-c3-07-v1.json (d8bb453982b06750c4bef878fa6f12e1e123e24cbb436a28a4e37224ffe380fa)|null|
+|3|9|prisma|wire-name-validation|codebase-memory|true|3|13210|292775|null|2173238|2016768|12014|3935|4.474068|0/0/null|22|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|10|vscode|language-provider-registration-idempotence|baseline|true|3|1253|291782|null|1742177|1642240|11781|4571|3.61517|0/0/null|18|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|11|vscode|language-provider-registration-idempotence|urdira-typescript|true|3|41284|386208|null|1602345|1471488|13334|4656|3.34861|27/11/16|15|0|0|1|1|2/2|true|false|true|passed|passed|null|null|
+|3|12|vscode|language-provider-registration-idempotence|tgrep|true|3|4770|371465|null|1586864|1501952|12894|5731|3.322728|0/0/null|16|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
+|3|13|vscode|language-provider-registration-idempotence|codegraph|true|3|78699|252472|null|1266196|1196288|11642|5737|2.671424|0/0/null|13|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-3-codegraph-orphan-cleanup-c3-12-v1.json (SHA-256 8dd5a14120c1e694187c53d8f3e870b519ad41629dc2009d58be82102ba2fb2b)|null|
+|3|14|vscode|language-provider-registration-idempotence|codebase-memory|true|3|79348|302910|null|1257967|1149440|10765|4487|2.63795|0/0/null|11|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
 
 ### Additional per-cell measured context and accounting panel
 
@@ -165,10 +179,12 @@ character count when available, while “known output” is the retained lower
 bound. Component character counts are classifications and are not additive.
 The source has no numeric test-coverage or full-model-context field, so those
 columns are explicitly `null`; test execution counts remain reported. The
+append-only axis correction that maps each row to `task_solved`, `grader_pass`,
+and `tool_validation_incident` is retained in the v4 sidecar cited above. The
 configured arm remains separate from observed tool use, and P95 remains
 `null` under the three-sample rule.
 
-|campaign|cell|repository|task|arm|outer turns observed/requested|command actions|repository read calls|observed shell/MCP/tgrep|hook total/served/fallback|completed output chars total|completed output chars shell|completed output chars hook|completed output chars MCP|completed output chars tgrep|known output chars total|known output chars shell|known output chars hook|known output chars MCP|known output chars tgrep|exact repeated output chars|exact shell repeated after MCP chars|source reads total/before/after|source overlap/nonoverlap/unclassified|test attempts/passes/failures/unknown|numeric coverage|full model context chars|timed out|retry count|token evidence status|counter mode|host/transcript turns|turn completion observed|correctness category|failure kind|failure reason|grader status|
+|campaign|cell|repository|task|arm|outer turns observed/requested|command actions|repository read calls|observed shell/MCP/tgrep|hook total/served/fallback|completed output chars total|completed output chars shell|completed output chars hook|completed output chars MCP|completed output chars tgrep|known output chars total|known output chars shell|known output chars hook|known output chars MCP|known output chars tgrep|exact repeated output chars|exact shell repeated after MCP chars|source reads total/before/after|source overlap/nonoverlap/unclassified|test attempts/passes/failures/unknown|numeric coverage|full model context chars|timed out|retry count|token evidence status|counter mode|host/transcript turns|turn completion observed|source correctness category|failure kind|failure reason|grader status|
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 |1|0|playwright|affected-tests-deterministic|baseline|3/3|30|21|21/0/0|0/0/null|129392|129392|null|null|null|null|129392|0|0|0|0|0|21/21/0|null/null/21|0/0/0/0|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
 |1|1|playwright|affected-tests-deterministic|urdira-typescript|3/3|19|20|6/0/0|22/14/8|null|null|null|null|null|null|19770|32864|0|0|21|0|12/12/0|null/null/12|1/0/1/0|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
@@ -218,17 +234,24 @@ configured arm remains separate from observed tool use, and P95 remains
 
 ### Measurement panels
 
-**Correctness and coverage.** There are 42 correctness=true grader outcomes,
-2 correctness=false outcomes, and 1 correctness=null infrastructure outcome.
-Target coverage is complete at 2/2 for 43 rows, 0/2 for the C1 VS Code/
-codebase-memory execution failure, and null for the C1 Prisma/Urdira
-infrastructure row. Coverage and correctness are separate dimensions.
+**Task outcome, grader, and coverage.** There are 43 `task_solved=true` rows
+(target coverage 2/2 with final changes present), 42 `grader_pass=true` rows,
+two `grader_pass=false` rows, and one `grader_pass=null` infrastructure row.
+The C3 VS Code/Urdira row is task-solved and covered 2/2, but has
+`grader_pass=false` and `tool_validation_incident=true` for
+`core:unknown_field` at `/request/query`. The C1 VS Code/codebase-memory row is
+`task_solved=false` at 0/2 after execution-capacity failure. The C1
+Prisma/Urdira row is `task_solved=null` and `grader_pass=null`. These axes are
+reported separately.
 
 **Tokens, cost, and timing.** Matched host evidence provides token fields for
 43 rows: input sum 53,231,751, cached input sum 49,232,384, output sum
 424,939, reasoning sum 168,406, and additive total sum 53,425,096. The
 corresponding frozen-card cost sum is $110.410262; this is a descriptive sum
-across observed rows, not a ranking. Setup and elapsed timing are available
+across task-solved observed and other observed rows, not a ranking. The C3
+VS Code/Urdira cost is included in observed descriptive aggregates despite its
+strict grader nonpass; strict-grader-qualified comparisons exclude that row.
+Setup and elapsed timing are available
 for 44 rows, with setup sum 1,296,191 ms and elapsed sum 11,554,988 ms. Costs
 use input/cached input $2/M and output/reasoning $8/M; provider totals remain
 separate.
@@ -244,14 +267,15 @@ overlap is null for all rows because the required source payload was
 unavailable; it is not interpreted as no overlap. Configured arm and observed
 tool use remain separate.
 
-**Failures and cleanup.** The three agent nonpass cases are the C1
-Prisma/Urdira infrastructure failure (model and correctness null), the C1
-VS Code/codebase-memory execution failure (agent/runner/grader exits 1/1/1,
-target 0/2), and the C3 VS Code/Urdira validation failure (agent/runner/grader
-exits 0/1/1, target 2/2, core:unknown_field at /request/query). Nine raw
-cleanup records were blocked by owned processes; each has separate retained
-repair evidence with effective pass status, while the other 36 raw cleanup
-records passed. No cleanup record is collapsed into the correctness result.
+**Failures and cleanup.** The C1 Prisma/Urdira row is an infrastructure
+failure with task outcome and grader unavailable. The C1 VS Code/codebase-memory
+row is an execution-capacity failure at 0/2. The C3 VS Code/Urdira row is
+task-solved at 2/2, with agent exit 0 and a strict grader exit 1 caused by the
+recorded tool-validation incident `core:unknown_field` at `/request/query`.
+Nine raw cleanup records were blocked by owned processes; each has separate
+retained repair evidence with effective pass status, while the other 36 raw
+cleanup records passed. No cleanup record is collapsed into task outcome or
+strict grader outcome.
 
 **Descriptive distributions.** The table retains one observation per identity
 per campaign. The following medians and min-max ranges are descriptive only;

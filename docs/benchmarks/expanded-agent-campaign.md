@@ -3,9 +3,12 @@
 ## Current v8 execution snapshot
 
 The v8 agent phase is complete as an observed three-campaign matrix: 45
-repository/task/arm rows, one sample per row, with 42 grader passes, two
-explicit nonpasses, and one correctness result unavailable after an
-infrastructure failure. Target coverage is 2/2 for 43 rows. The complete
+repository/task/arm rows, one sample per row. Forty-three rows are task-solved
+(target coverage 2/2 with final changes present), 42 have a strict grader pass,
+two have strict grader nonpasses, and one infrastructure row has unavailable
+outcome evidence. The C3 Urdira VS Code row is task-solved but has a
+tool-validation incident; its strict grader remains a nonpass. Target coverage
+is 2/2 for 43 rows. The complete
 per-row index is embedded in the versioned [definitive results table](definitive-agent-benchmark-results-2026-09-15.md#complete-45-cell-measured-table),
 backed by its external JSON source at
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.json`
@@ -16,6 +19,12 @@ The external JSON SHA-256 is
 `622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`; the
 Markdown SHA-256 is
 `030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`.
+
+The append-only reporting-axis correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
+(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`);
+it defines `task_solved`, `grader_pass`, and `tool_validation_incident`
+separately while leaving the v3 raw-derived consolidation unchanged.
 
 The v8 source summaries are C1 SHA-256
 `ae6fb0eaf943dd9fd9f93587a632c78a09718deaa8ab12513a32fffcc0f4795e`, C2
@@ -68,12 +77,14 @@ fix is not retroactive validation and produced no new readiness evidence.
 The final per-campaign renderer outputs and the aggregate-guard rejection are
 recorded in the dated [post-campaign rendering evidence](../evidence/2026-09-16-definitive-agent-benchmark-v8-postcampaign.md).
 
-The exact C3 VS Code/Urdira validation failure is
-`core:unknown_field` at `/request/query`, retained in diagnostic artifact
+The exact C3 VS Code/Urdira tool-validation incident has strict grader
+nonpass `core:unknown_field` at `/request/query`, retained in diagnostic artifact
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-c3-final-15-v3/summary/c3-15-grader-diagnostic-v1.json`
 (SHA-256 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`).
 The row had agent exit 0, outer runner exit 1, grader exit 1, and target
-coverage 2/2. No rm-f or test-blocked cause is inferred.
+coverage 2/2. Its task outcome is solved; the strict grader nonpass is the
+recorded tool-validation incident, not a task-correctness failure. No rm-f or
+test-blocked cause is inferred.
 
 ### Historical v7 execution snapshot
 
