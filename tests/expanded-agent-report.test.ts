@@ -178,6 +178,88 @@ describe("expanded agent report", () => {
     expect(report.readiness_gate.passed).toBe(false);
   });
 
+  it("separates observed cells and probes from planned not-started rows", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-partial-plan-"));
+    type PartialRepository = { id: string; tasks: Array<{ id: string }> };
+    type PartialRun = {
+      run_id: string;
+      campaign: number;
+      repository_id: string;
+      task_id: string;
+      arm: string;
+      model_invoked: boolean | null;
+      execution_status: string;
+      status: string;
+      manifest: Record<string, unknown> | null;
+      exit_code?: number;
+      result?: { code: number; signal: string | null };
+      error?: string;
+    };
+    type PartialReadinessProbe = {
+      probe_id: string;
+      campaign: number;
+      repository: string;
+      phase: string;
+      model_invoked: boolean;
+      execution_status: string;
+      setup_elapsed_ms: number;
+      structural_readiness_ms: number;
+      time_to_first_query_ms: number;
+      passed: null;
+      failure: string;
+    };
+    const repositories: PartialRepository[] = [
+      { id: "playwright", tasks: [{ id: "affected-tests-deterministic" }] },
+      { id: "prisma", tasks: [{ id: "wire-name-validation" }] },
+      { id: "vscode", tasks: [{ id: "language-provider-registration-idempotence" }] },
+    ];
+    const arms = ["baseline", "urdira-typescript", "tgrep", "codegraph", "codebase-memory"];
+    const runs: PartialRun[] = [];
+    for (let campaign = 1; campaign <= 3; campaign += 1) {
+      for (const repository of repositories) {
+        for (const task of repository.tasks) {
+          for (const arm of arms) {
+            const run: PartialRun = { run_id: `${repository.id}-${task.id}-${arm}-${campaign}`, campaign, repository_id: repository.id, task_id: task.id, arm, model_invoked: false, execution_status: "not_started", status: "not_started", manifest: null };
+            if (campaign === 1 && repository.id === "playwright" && task.id === "affected-tests-deterministic" && arm === "baseline") {
+              run.model_invoked = true;
+              run.execution_status = "attempted";
+              run.status = "failed";
+              run.exit_code = 2;
+              run.manifest = { completed_successfully: false, model_invoked: true, exit_code: 2 };
+            }
+            if (campaign === 1 && repository.id === "playwright" && task.id === "affected-tests-deterministic" && arm === "urdira-typescript") {
+              run.model_invoked = null;
+              run.execution_status = "blocked";
+              run.status = "blocked";
+              run.result = { code: 1, signal: null };
+              run.error = "cell execution was not recorded";
+            }
+            runs.push(run);
+          }
+        }
+      }
+    }
+    const readiness_probes: PartialReadinessProbe[] = [];
+    for (let campaign = 1; campaign <= 3; campaign += 1) {
+      for (const repository of repositories) {
+        for (const phase of ["cold", "warm"]) {
+          readiness_probes.push({ probe_id: `${repository.id}-${phase}-${campaign}`, campaign, repository: repository.id, phase, model_invoked: false, execution_status: "not_started", setup_elapsed_ms: 0, structural_readiness_ms: 0, time_to_first_query_ms: 0, passed: null, failure: "not started" });
+        }
+      }
+    }
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", definitive_protocol: "selected-45-partial", expected_runs: 45, readiness_expected_probes: 18, independent_campaigns: 3, p95_eligible: false, arms, repositories, runs, readiness_probes })}\n`, "utf8");
+    const output = join(root, "report");
+    const { stdout } = await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.benchmark).toMatchObject({ expected_runs: 45, observed_runs: 2, attempted_runs: 2, not_started_runs: 43, observed_readiness_probes: 0, not_started_readiness_probes: 18 });
+    expect(report.campaign_gate).toMatchObject({ expected_runs: 45, observed_runs: 2, successful_runs: 0, failed_or_blocked_runs: 2, passed: false });
+    expect(report.readiness_gate).toMatchObject({ expected_probes: 18, observed_probes: 0, not_started_probes: 18, passed: false });
+    expect(report.runs.find((run: { execution_status?: string }) => run.execution_status === "not_started")).toMatchObject({ model_invoked: null, completed_successfully: null, setup_elapsed_ms: null });
+    expect(report.readiness_probes[0]).toMatchObject({ model_invoked: null, setup_elapsed_ms: null, structural_readiness_ms: null, time_to_first_query_ms: null });
+    expect(JSON.parse(stdout)).toMatchObject({ observed_runs: 2, observed_readiness_probes: 0 });
+  });
+
   it("rejects a non-frozen renderer price override", async () => {
     const root = await mkdtemp(join(tmpdir(), "urdira-expanded-price-card-"));
     const auditPath = join(root, "audit.json");

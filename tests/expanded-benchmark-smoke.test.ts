@@ -164,7 +164,7 @@ describe("expanded campaign smoke scope", () => {
     const shim = readFileSync(resolve("release/benchmarks/urdira-isolated-shim.mjs"), "utf8");
     expect(shim).toContain('exec "$NODE" "$CLI" "$@"');
     expect(shim).toContain('if [ "\\${1:-}" = "--version" ]');
-    expect(runner).toContain('spawnSync(urdiraShimPath, ["--version"]');
+    expect(runner).toContain("validateInstalledUrdiraCli");
     expect(runner).toContain('cli_sha256: cliFingerprint');
     expect(runner).toContain('const urdiraEndpoint = join(effectiveDataRoot, "daemon.sock")');
     expect(runner).toContain('endpoint: urdiraEndpoint');
@@ -190,7 +190,9 @@ describe("expanded campaign smoke scope", () => {
   it("captures Codex timing in a sidecar without changing the transcript", () => {
     const runner = readFileSync(resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "utf8");
     expect(runner).toContain('import { createTimingCapture, summarizeTimingCaptures } from "./expanded-agent-timing.mjs";');
-    for (const turn of ["turn-1", "turn-2", "turn-3"]) expect(runner).toContain(`timing_label: "${turn}"`);
+    expect(runner).toContain('invokeCodex("turn-1", codexArgs, initialInstruction)');
+    expect(runner).toContain('invokeCodex("turn-2", resume, followUpInstruction)');
+    expect(runner).toContain('invokeCodex("turn-3", resume, finalInstruction)');
     expect(runner).toContain("timingCapture?.ingest(chunk)");
     expect(runner).toContain("writeFileSync(transcript, first.stdout");
     expect(runner).toContain("appendFileSync(transcript, second.stdout");

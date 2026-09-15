@@ -1,15 +1,39 @@
 # Expanded agent comparison runbook
 
 Status: operational procedure, checked against the runner on 2026-09-10;
-authorized v5 definitive campaign **BLOCKED after two cell attempts** on
+current v6 definitive campaign **BLOCKED after two cell attempts** on
 2026-09-15. No readiness probe executed.
 
 The current definitive reporting status is recorded in the [dated derived
-report](definitive-agent-benchmark-results-2026-09-15.md). The campaign is
+report](definitive-agent-benchmark-results-2026-09-15.md). The v6 campaign is
 blocked after a failed retained baseline and a blocked Urdira cell without a
-manifest; 43 cells were not attempted and all 18 readiness probes were
-blocked before execution. The complete planned 45/18 matrix and retained
-offline appendix are recorded in the dated results report.
+manifest; 43 cells were not attempted and all 18 readiness probes remained
+not started because readiness follows all 45 agent cells. The complete planned
+45/18 matrix and retained v6 derived artifacts are recorded in the dated
+results report and [v6 evidence](../evidence/2026-09-15-definitive-agent-benchmark-v6.md).
+
+### Current v6 execution snapshot
+
+The current series uses freeze v6 at commit
+`5de04b14305bf1399b200b57db70efb888b99436`, Node `v24.18.1`, Luna, and
+semantic indexing off. It attempted exactly two campaign-1 cells and stopped
+on the runner's infrastructure/preflight failure policy. The baseline's
+`model_invoked=true` is a harness field only: its transcript is empty and its
+host-session evidence is absent. The Urdira cell failed before an execution
+manifest because the extracted CLI rejected `urdira --version`; its
+`model_invoked` value remains `null`.
+
+The derived v6 audit retains all 45 cell identities (2 attempted, 43 not
+started) and all 18 readiness identities (0 observed, 18 not started). The
+corrected report was rendered from new external outputs under
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/derived-v6-blocked-20260915-v3`.
+The v1 and v2 outputs remain preserved as superseded renderer results. The v3
+JSON SHA is `0820b6c6a75f9692d6947f3f8efec137662bbd32604ea242283b017e07bfe8e8`;
+the Markdown SHA is
+`10bfaec018ec878a299ee47f648a32044c6cdf6d94149356bf51779a1f8f2cdf`.
+All missing values remain `null`, P95 is `null`, and the series does not claim
+completion or support efficiency comparison. The v5 snapshot below remains
+historical and separate.
 
 ### Earlier preflight attempts (separate from authorized v5)
 

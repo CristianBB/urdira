@@ -1,6 +1,44 @@
 # Definitive agent benchmark results — reporting status
 
-Status: **BLOCKED after two authorized v5 cell attempts** (2026-09-15).
+Status: **v6 blocked after two campaign-1 cell attempts** (2026-09-15).
+
+## Current v6 result
+
+The authoritative current series is v6, frozen at Urdira commit
+`5de04b14305bf1399b200b57db70efb888b99436`, Node `v24.18.1`, Luna, and
+semantic indexing off. It stopped after two campaign-1 cells because the
+Urdira cell failed preflight when the extracted CLI rejected `urdira --version`.
+The baseline cell has a failed retained manifest; its `model_invoked=true`
+field is not evidence of a real model request because its transcript is empty,
+its timing sidecar has one zero-line turn, and host session evidence is absent.
+
+The v6 matrix preserves all 45 expected cell identities: 2 attempted and 43
+not started. All 18 readiness identities are present as not started because
+readiness was scheduled after the 45 agent cells. The series is not complete,
+and no retry or replacement run was added.
+
+| Result set | Expected | Observed | Not started | Status |
+|---|---:|---:|---:|---|
+| Agent cells | 45 | 2 | 43 | blocked |
+| Readiness probes | 18 | 0 | 18 | not started |
+
+The v6 freeze, raw paths, cleanup evidence, hashes, analyzer output, replay,
+and rendered partial matrix are recorded in
+[`2026-09-15-definitive-agent-benchmark-v6.md`](../evidence/2026-09-15-definitive-agent-benchmark-v6.md).
+The external derived output is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/derived-v6-blocked-20260915-v3`.
+The v1 and v2 derived outputs remain preserved as superseded renderer results.
+The v3 report corrects planned-row accounting and its stdout summary: 2
+observed/attempted cells, 43 not started, 0 observed readiness probes, and 18
+not started. Its JSON SHA is
+`0820b6c6a75f9692d6947f3f8efec137662bbd32604ea242283b017e07bfe8e8` and its
+Markdown SHA is
+`10bfaec018ec878a299ee47f648a32044c6cdf6d94149356bf51779a1f8f2cdf`.
+Unavailable metrics remain `null`; P95 is `null`; correctness, coverage,
+efficiency, and distributions are not comparable for this incomplete series.
+
+The remainder of this document preserves the earlier v5 blocked snapshot as
+historical evidence. It is not merged into the v6 result.
 
 This is the canonical versioned report location for the selected three
 repository, five-arm, three-campaign measurement. The authorized v5 series is

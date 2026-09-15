@@ -15,6 +15,7 @@ import { retainCodexHostSessions } from "./codex-host-evidence.mjs";
 import { assertReleaseBinding } from "./release-binding.mjs";
 import { deriveHostTokenEvidence } from "./benchmark-token-evidence.mjs";
 import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs } from "./expanded-agent-codex-argv.mjs";
+import { validateInstalledUrdiraCli } from "./urdira-installed-cli-preflight.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -51,6 +52,7 @@ const repo = corpus.repositories.find((entry) => entry.id === repositoryId);
 const task = repo?.tasks.find((entry) => entry.id === taskId);
 if (!repo || !task || !["baseline", "urdira-typescript", "codebase-memory", "codegraph", "tgrep"].includes(arm)) throw new Error("Invalid repository, task, or arm");
 const preflightOnly = argv.includes("--preflight-only");
+const integrationPreflightOnly = argv.includes("--integration-preflight-only");
 const definitiveProtocol = argv.includes("--definitive");
 const runId = `${repositoryId}-${taskId}-${arm}-${sample}`;
 if ((!preflightOnly && (!worktree || !commit)) || !Number.isSafeInteger(sample) || sample < 1) throw new Error("--worktree, --commit, and a positive --sample are required");
@@ -154,6 +156,7 @@ const timingSummary = () => summarizeTimingCaptures(codexTimingCaptures);
 const writeTimingSidecar = () => writeFileSync(timingSidecar, `${JSON.stringify(timingSummary(), null, 2)}\n`, "utf8");
 writeTimingSidecar();
 const setupStartedAt = Date.now();
+const codexInvocations = [];
 let codexIntegrationHome;
 let codexSessionHome;
 let codexIntegration;
@@ -168,11 +171,18 @@ const cleanupCodexIntegration = () => {
 const deriveCounterEvidence = () => deriveHostTokenEvidence({ transcriptPath: transcript, hostSessionPaths: hostSessionEvidence?.sessions ?? [] });
 const recordFailure = (reason) => {
   const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
+  let cleanupError = null;
+  try { cleanupCodexIntegration(); } catch (error) { cleanupError = error instanceof Error ? error.message : String(error); }
+  let tokenCounterEvidence = null;
+  try { tokenCounterEvidence = deriveCounterEvidence(); } catch (error) { tokenCounterEvidence = { status: "unavailable", error: error instanceof Error ? error.message : String(error) }; }
+  const modelInvocationState = codexInvocations.length === 0
+    ? false
+    : codexInvocations.some((invocation) => invocation.code !== null || invocation.signal !== null) ? true : null;
+  const failureManifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), arm, phase, sample, model, node: preflight.node, commit, worktree, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, codex_invocations: codexInvocations, counter_mode: tokenCounterEvidence?.counter_mode ?? null, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), model_invoked: modelInvocationState, completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message, cleanup_error: cleanupError };
   try {
-    cleanupCodexIntegration();
-    const tokenCounterEvidence = deriveCounterEvidence();
-    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), arm, phase, sample, model, node: preflight.node, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), model_invoked: false, completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
-  } catch { /* retain the original failure when the output directory is unavailable */ }
+    mkdirSync(outputDir, { recursive: true });
+    writeFileSync(manifestPath, `${JSON.stringify(failureManifest, null, 2)}\n`, "utf8");
+  } catch (persistError) { try { process.stderr.write(`Unable to persist benchmark failure manifest: ${persistError instanceof Error ? persistError.message : String(persistError)}\n`); } catch { /* stderr may be unavailable */ } }
   process.stderr.write(`${message}\n`);
   process.exit(1);
 };
@@ -201,15 +211,28 @@ async function waitForSemanticPerfAttestation() {
   throw new Error(`Urdira worker startup attestation missing before profiled metrics acceptance; semantic_perf_enabled=true was requested. stderr_tail=${stderrTail}`);
 }
 
+const commandOutputMetadata = (path) => {
+  if (typeof path !== "string" || !existsSync(path)) return { path: path ?? null, bytes: null, sha256: null };
+  try {
+    const raw = readFileSync(path);
+    return { path, bytes: raw.byteLength, sha256: createHash("sha256").update(raw).digest("hex") };
+  } catch (error) {
+    return { path, bytes: null, sha256: null, read_error: error instanceof Error ? error.message : String(error) };
+  }
+};
 const run = (command, args, options = {}) => new Promise((resolve, reject) => {
   const child = spawn(command, args, { cwd: options.cwd, env: { ...process.env, ...(options.env ?? {}) }, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = ""; let stderr = "";
+  let captureError = null;
   const timingCapture = options.timing_label === undefined ? null : createTimingCapture({ label: options.timing_label });
-  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); timingCapture?.ingest(chunk); });
-  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+  const prepareCapture = (path) => { if (typeof path !== "string") return; try { writeFileSync(path, "", "utf8"); } catch (error) { captureError ??= error instanceof Error ? error.message : String(error); } };
+  const captureChunk = (path, chunk) => { if (typeof path !== "string") return; try { appendFileSync(path, chunk); } catch (error) { captureError ??= error instanceof Error ? error.message : String(error); } };
+  prepareCapture(options.stdoutPath); prepareCapture(options.stderrPath);
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); captureChunk(options.stdoutPath, chunk); timingCapture?.ingest(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); captureChunk(options.stderrPath, chunk); });
   if (options.input !== undefined) child.stdin.end(options.input); else child.stdin.end();
-  child.on("error", reject);
-  child.on("close", (code, signal) => resolve({ code: code ?? 1, signal, stdout, stderr, timing: timingCapture?.finish() }));
+  child.on("error", (error) => { error.capture_error = captureError; error.command_output = { ...commandOutputMetadata(options.stdoutPath), stdout_path: options.stdoutPath ?? null, stdout_bytes: commandOutputMetadata(options.stdoutPath).bytes, stdout_sha256: commandOutputMetadata(options.stdoutPath).sha256, stderr_path: options.stderrPath ?? null, stderr_bytes: commandOutputMetadata(options.stderrPath).bytes, stderr_sha256: commandOutputMetadata(options.stderrPath).sha256 }; reject(error); });
+  child.on("close", (code, signal) => resolve({ code: code ?? 1, signal, stdout, stderr, timing: timingCapture?.finish(), capture_error: captureError, stdout_path: options.stdoutPath ?? null, stderr_path: options.stderrPath ?? null, stdout_bytes: commandOutputMetadata(options.stdoutPath).bytes, stdout_sha256: commandOutputMetadata(options.stdoutPath).sha256, stderr_bytes: commandOutputMetadata(options.stderrPath).bytes, stderr_sha256: commandOutputMetadata(options.stderrPath).sha256 }));
 });
 const git = async (...args) => {
   const result = await run("git", args, { cwd: worktree });
@@ -265,11 +288,14 @@ if (arm === "urdira-typescript") {
   mkdirSync(urdiraBinDir, { recursive: true });
   const shimSource = writeUrdiraIsolatedShim(urdiraShimPath, { node: nodeBin, cli: urdiraCliPath, dataRoot: effectiveDataRoot, worker: indexingWorkerBin, endpoint: urdiraEndpoint });
   const shimSha256 = createHash("sha256").update(shimSource).digest("hex");
-  const shimVersion = spawnSync(urdiraShimPath, ["--version"], { encoding: "utf8", env: { ...process.env, ...releaseNativeEnvironment, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: urdiraEndpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin } });
-  if (shimVersion.status !== 0) throw new Error(`isolated urdira --version failed: ${shimVersion.stderr}`);
   const cliFingerprint = createHash("sha256").update(readFileSync(urdiraCliPath)).digest("hex");
   const boundLauncher = preflight.release_binding?.components?.launcher;
   if (preflight.release_root && (!boundLauncher || cliFingerprint !== boundLauncher.sha256 || boundLauncher.realpath !== urdiraCliPath)) throw new Error(`isolated launcher is not the verified release archive launcher: ${urdiraCliPath}`);
+  const cliPreflight = await validateInstalledUrdiraCli({ cliPath: urdiraCliPath, releaseRoot: preflight.release_root ?? root, expectedSha256: boundLauncher?.sha256, expectedVersion: urdiraCliVersion });
+  if (integrationPreflightOnly) {
+    process.stdout.write(`${JSON.stringify({ ok: true, repository_id: repositoryId, task_id: taskId, arm, cli_preflight: cliPreflight, model_invoked: false })}\n`);
+    process.exit(0);
+  }
   let installAgent;
   // Compatibility marker for the source-tree fallback contract:
   // const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");
@@ -296,7 +322,8 @@ if (arm === "urdira-typescript") {
     hook_trust: "dangerously-bypass-hook-trust",
     auth: authMode,
     executable: urdiraShimPath,
-    executable_version: String(shimVersion.stdout ?? "").trim(),
+    executable_version: cliPreflight.cli_version,
+    cli_preflight: cliPreflight,
     cli_version: urdiraCliVersion,
     cli_sha256: cliFingerprint,
     launcher_path: urdiraCliPath,
@@ -343,11 +370,31 @@ const setupElapsedMs = Date.now() - setupStartedAt;
 // orchestrator runs the same builder through a help-only parser preflight.
 const codexMcpArgs = buildCodexMcpArgs({ arm, codebaseMemory: codebaseMemoryBin, codegraph: codegraphBin, benchmarkTimeoutMs });
 const codexArgs = buildCodexExecArgs({ model, worktree, integrated: codexIntegration !== undefined, mcpArgs: codexMcpArgs });
+const invokeCodex = async (label, args, input) => {
+  const stdoutPath = join(outputDir, `${runId}.${label}.stdout.log`);
+  const stderrPath = join(outputDir, `${runId}.${label}.stderr.log`);
+  let recorded = false;
+  try {
+    const result = await run(codex, [...args, "-"], { cwd: worktree, env: codexEnvironment, input, timing_label: label, stdoutPath, stderrPath });
+    codexInvocations.push({ label, args, code: result.code, signal: result.signal, timed_out: false, capture_error: result.capture_error ?? null, stdout_path: result.stdout_path, stdout_bytes: result.stdout_bytes, stdout_sha256: result.stdout_sha256, stderr_path: result.stderr_path, stderr_bytes: result.stderr_bytes, stderr_sha256: result.stderr_sha256 });
+    recorded = true;
+    if (result.capture_error !== null) {
+      const error = new Error(`Codex output capture failed: ${result.capture_error}`);
+      error.capture_error = result.capture_error;
+      error.command_output = result;
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    if (!recorded) codexInvocations.push({ label, args, code: error?.command_output?.code ?? null, signal: error?.command_output?.signal ?? null, timed_out: false, capture_error: error?.capture_error ?? null, stdout_path: error?.command_output?.stdout_path ?? stdoutPath, stdout_bytes: error?.command_output?.stdout_bytes ?? commandOutputMetadata(stdoutPath).bytes, stdout_sha256: error?.command_output?.stdout_sha256 ?? commandOutputMetadata(stdoutPath).sha256, stderr_path: error?.command_output?.stderr_path ?? stderrPath, stderr_bytes: error?.command_output?.stderr_bytes ?? commandOutputMetadata(stderrPath).bytes, stderr_sha256: error?.command_output?.stderr_sha256 ?? commandOutputMetadata(stderrPath).sha256 });
+    throw error;
+  }
+};
 const firstInstructionMs = Date.now();
 const codexEnvironment = codexIntegration === undefined
   ? { ...releaseNativeEnvironment, CODEX_HOME: join(codexSessionHome, ".codex") }
   : { ...releaseNativeEnvironment, HOME: codexIntegrationHome, CODEX_HOME: join(codexIntegrationHome, ".codex"), ZDOTDIR: codexIntegrationHome, PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: codexIntegration.endpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_AGENT_HOOK_AUDIT_LOG: hookAuditPath };
-let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, env: codexEnvironment, input: initialInstruction, timing_label: "turn-1" });
+let first = await invokeCodex("turn-1", codexArgs, initialInstruction);
 if (first.timing) { codexTimingCaptures.push(first.timing); writeTimingSidecar(); }
 writeFileSync(transcript, first.stdout, "utf8");
 let exitCode = first.code;
@@ -423,13 +470,13 @@ if (first.code === 0) {
   sessionId = firstEvents.find((event) => event.type === "thread.started")?.thread_id;
   if (!sessionId) throw new Error("Codex transcript did not expose a resumable session id");
   const resume = buildCodexResumeArgs({ model, worktree, sessionId, integrated: codexIntegration !== undefined, mcpArgs: codexMcpArgs });
-  const second = await run(codex, [...resume, "-"], { cwd: worktree, env: codexEnvironment, input: followUpInstruction, timing_label: "turn-2" });
+  const second = await invokeCodex("turn-2", resume, followUpInstruction);
   if (second.timing) { codexTimingCaptures.push(second.timing); writeTimingSidecar(); }
   appendFileSync(transcript, second.stdout, "utf8");
   exitCode = second.code;
   if (second.code === 0) {
     interTurnFreshnessWaitsMs.push(await waitForCurrentStructuralFrontier(2));
-    const third = await run(codex, [...resume, "-"], { cwd: worktree, env: codexEnvironment, input: finalInstruction, timing_label: "turn-3" });
+    const third = await invokeCodex("turn-3", resume, finalInstruction);
     if (third.timing) { codexTimingCaptures.push(third.timing); writeTimingSidecar(); }
     appendFileSync(transcript, third.stdout, "utf8");
     exitCode = third.code;
@@ -446,7 +493,7 @@ let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
 cleanupCodexIntegration();
 const tokenCounterEvidence = deriveCounterEvidence();
-const manifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, node: preflight.node, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, release_binding: preflight.release_binding, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, model_invoked: true, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+const manifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, node: preflight.node, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, release_binding: preflight.release_binding, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, codex_invocations: codexInvocations, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, model_invoked: true, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;

@@ -6,17 +6,20 @@ for normative decisions and the [architecture map](architecture.md) for code pat
 
 ## Definitive agent campaign status (2026-09-15)
 
-The authorized v5 series is **blocked after two campaign-1 cell attempts**.
-The baseline has a failed retained manifest with `model_invoked=true`, which
-means the Codex process was launched but does not establish a successful model
-interaction. Its transcript is empty; the timing sidecar exposes one observed
-turn and zero MCP/command calls, while token, cost, correctness, coverage,
+The current v6 series is **blocked after two campaign-1 cell attempts**.
+The baseline has a failed retained manifest with `model_invoked=true`, but
+that harness field does not establish a real model interaction: its transcript
+is empty, its timing sidecar has one zero-line turn and zero MCP/command calls,
+and host-session evidence is absent. Token, cost, correctness, coverage,
 efficiency, and distribution measurements are `null`. The Urdira cell
-returned exit 1 without a retained manifest, so `model_invoked=null` and its
-status is `blocked`. Forty-three cells were not attempted. Of the 18 readiness
-probes, six campaign-1 probes are blocked by the stop after the two cell
-attempts, while the twelve campaign-2 and campaign-3 probes were not
-attempted. The authoritative stop ledger is
+returned exit 1 without a retained manifest because the extracted CLI rejected
+`urdira --version`, so `model_invoked=null` and its status is blocked.
+Forty-three cells were not attempted. All 18 readiness probes were not
+started because readiness follows the full 45-cell sequence. The v6 freeze and
+derived evidence are recorded in
+the [dated v6 evidence note](evidence/2026-09-15-definitive-agent-benchmark-v6.md).
+
+The v5 stop ledger remains historical and separate:
 `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/campaign-1/campaign-stop-ledger.json`
 (`sha256=4226c3b53ece6137c8c32b3ba18b687d799aa39b1e955b48b019ea37e3db0e24`).
 
@@ -39,6 +42,17 @@ Its partial JSON and Markdown renders have SHAs
 `8bc8421d949d94084f08d4e6053ae0ebb7d566528a3e1039d980191d90cb5467` and
 `92f93c6a48e653b0d3e8165338261813c57548621efe86a57e001664f6997873`;
 both are diagnostic and fail the incomplete 15-cell/6-probe gate.
+
+The corrected v6 renderer output is retained under
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/derived-v6-blocked-20260915-v3`.
+It reports 2 observed/attempted cells, 43 not started, 0 observed readiness
+probes, and 18 not started. The JSON SHA is
+`0820b6c6a75f9692d6947f3f8efec137662bbd32604ea242283b017e07bfe8e8`; the
+Markdown SHA is
+`10bfaec018ec878a299ee47f648a32044c6cdf6d94149356bf51779a1f8f2cdf`.
+The earlier v1 and v2 renderer outputs remain preserved as superseded
+diagnostic evidence. Missing values remain `null` and the incomplete series is not a
+completed 45-cell or 18-probe benchmark.
 
 Preparation evidence is kept separate from those campaign attempts. The
 retained v3 record

@@ -229,8 +229,19 @@ const failureCategoriesFor = (manifest, metrics, failure) => ({
   distributions: manifest?.distribution_failure ?? null,
   unclassified: failure ?? null,
 });
+const isNotStartedRun = (entry) => entry.execution_status === "not_started"
+  || entry.status === "not_started"
+  || (entry.manifest === null
+    && entry.model_invoked === false
+    && entry.result === undefined
+    && entry.error === undefined
+    && entry.stderr_tail === undefined
+    && entry.exit_code === undefined
+    && entry.signal === undefined
+    && entry.timed_out === undefined);
 const freshRuns = audit.runs.map((entry) => {
   const manifest = entry.manifest;
+  const notStarted = isNotStartedRun(entry);
   const repository = entry.repository ?? entry.repository_id ?? manifest?.repository_id;
   const task = entry.task ?? entry.task_id ?? manifest?.task_id;
   const processResult = entry.result && typeof entry.result === "object" ? entry.result : {};
@@ -257,7 +268,7 @@ const freshRuns = audit.runs.map((entry) => {
   const processFailure = processExitCode !== undefined && processExitCode !== null && processExitCode !== 0
     ? `process exited with code ${processExitCode}${processSignal ? ` (${processSignal})` : ""}`
     : processSignal ? `process terminated by ${processSignal}` : null;
-  const failure = manifest?.error || entry.stderr_tail || processFailure
+  const failure = notStarted ? null : manifest?.error || entry.stderr_tail || processFailure
     ? sanitizeText(manifest?.error ?? entry.stderr_tail ?? processFailure)
     : (transcriptMetrics?.mcp_failure_details?.join("; ") ?? graderFailureDetails(manifest));
   return {
@@ -273,17 +284,19 @@ const freshRuns = audit.runs.map((entry) => {
     process_signal: processSignal,
     process_timed_out: processTimedOut,
     process_evidence: processEvidence,
-    model_invoked: typeof manifest?.model_invoked === "boolean" ? manifest.model_invoked : (typeof entry.model_invoked === "boolean" ? entry.model_invoked : null),
-    process_completed_successfully: manifest?.completed_successfully === true,
+    model_invoked: notStarted ? null : typeof manifest?.model_invoked === "boolean" ? manifest.model_invoked : (typeof entry.model_invoked === "boolean" ? entry.model_invoked : null),
+    process_completed_successfully: notStarted ? null : manifest?.completed_successfully === true,
     // New manifests carry the runner's authoritative outcome, which includes
     // the repository grader result. Do not turn an agent process exit of zero
     // into a successful benchmark when the grader rejected the cell (for
     // example after an MCP request-validation failure). Keep the evidence
     // fallback only for older manifests that predate this field.
-    completed_successfully: typeof manifest?.completed_successfully === "boolean"
+    execution_status: notStarted ? "not_started" : entry.execution_status ?? "attempted",
+    attempted: !notStarted,
+    completed_successfully: notStarted ? null : typeof manifest?.completed_successfully === "boolean"
       ? manifest.completed_successfully
       : (manifest?.exit_code === 0 && evidencePass),
-    setup_elapsed_ms: manifest?.setup_elapsed_ms ?? null,
+    setup_elapsed_ms: notStarted ? null : manifest?.setup_elapsed_ms ?? null,
     elapsed_ms_from_first_instruction: manifest?.elapsed_ms_from_first_instruction ?? null,
     incremental_protocol: manifest?.incremental_protocol ?? null,
     cleanup: entry.cleanup ?? null,
@@ -302,7 +315,7 @@ const freshRuns = audit.runs.map((entry) => {
       readiness: manifest.setup.readiness ?? null,
     } : null,
     failure,
-    failure_categories: failureCategoriesFor(manifest, transcriptMetrics, failure),
+    failure_categories: notStarted ? null : failureCategoriesFor(manifest, transcriptMetrics, failure),
   };
 });
 const comparisonRuns = Array.isArray(comparisonReport?.runs) ? comparisonReport.runs : [];
@@ -327,16 +340,21 @@ const finiteOrNull = (value) => Number.isFinite(Number(value)) ? Number(value) :
 const readinessProbes = (Array.isArray(audit.readiness_probes) ? audit.readiness_probes : []).map((probe, index) => {
   if (probe === null || typeof probe !== "object") throw new Error(`readiness_probes[${index}] must be an object`);
   const phase = probe.phase;
+  const notStarted = probe.execution_status === "not_started"
+    || probe.status === "not_started"
+    || (probe.model_invoked === false && typeof probe.failure === "string" && /^not started:/u.test(probe.failure));
   if (phase !== "cold" && phase !== "warm") throw new Error(`readiness_probes[${index}].phase must be cold or warm`);
   const row = {
     ...probe,
+    execution_status: notStarted ? "not_started" : probe.execution_status ?? "observed",
+    model_invoked: notStarted ? null : typeof probe.model_invoked === "boolean" ? probe.model_invoked : null,
     probe_id: typeof probe.probe_id === "string" ? probe.probe_id : null,
     campaign: finiteOrNull(probe.campaign),
     repository: typeof probe.repository === "string" ? probe.repository : null,
     phase,
-    setup_elapsed_ms: finiteOrNull(probe.setup_elapsed_ms),
-    structural_readiness_ms: finiteOrNull(probe.structural_readiness_ms),
-    time_to_first_query_ms: finiteOrNull(probe.time_to_first_query_ms),
+    setup_elapsed_ms: notStarted ? null : finiteOrNull(probe.setup_elapsed_ms),
+    structural_readiness_ms: notStarted ? null : finiteOrNull(probe.structural_readiness_ms),
+    time_to_first_query_ms: notStarted ? null : finiteOrNull(probe.time_to_first_query_ms),
     snapshot_identity: probe.snapshot_identity ?? null,
     page_completeness: probe.page_completeness ?? null,
     semantic_index: typeof probe.semantic_index === "boolean" ? probe.semantic_index : null,
@@ -349,15 +367,18 @@ const readinessProbes = (Array.isArray(audit.readiness_probes) ? audit.readiness
 });
 const readinessKeys = readinessProbes.map((probe) => `${probe.campaign ?? "?"}:${probe.repository ?? "?"}:${probe.phase}`);
 if (new Set(readinessKeys).size !== readinessKeys.length) throw new Error("readiness_probes contains duplicate campaign/repository/phase keys");
+const observedReadinessProbes = readinessProbes.filter((probe) => probe.execution_status !== "not_started");
+const notStartedReadinessProbes = readinessProbes.filter((probe) => probe.execution_status === "not_started");
 const hasExplicitReadinessExpectation = Object.hasOwn(audit, "readiness_expected_probes");
 const expectedReadinessProbes = Number(audit.readiness_expected_probes ?? ((audit.repositories?.length ?? 0) * independentCampaigns * 2));
 const readinessGate = {
   expected_probes: Number.isFinite(expectedReadinessProbes) ? expectedReadinessProbes : null,
-  observed_probes: readinessProbes.length,
+  observed_probes: observedReadinessProbes.length,
+  not_started_probes: notStartedReadinessProbes.length,
   passed: Number.isFinite(expectedReadinessProbes) && (hasExplicitReadinessExpectation || expectedReadinessProbes > 0)
-    && readinessProbes.length === expectedReadinessProbes && readinessProbes.every((probe) => probe.passed === true),
+    && observedReadinessProbes.length === expectedReadinessProbes && observedReadinessProbes.every((probe) => probe.passed === true),
   failure: Number.isFinite(expectedReadinessProbes) && (hasExplicitReadinessExpectation || expectedReadinessProbes > 0)
-    && readinessProbes.length === expectedReadinessProbes && readinessProbes.every((probe) => probe.passed === true) ? null : "readiness probe expectation or probe outcome incomplete",
+    && observedReadinessProbes.length === expectedReadinessProbes && observedReadinessProbes.every((probe) => probe.passed === true) ? null : "readiness probe expectation or probe outcome incomplete",
 };
 if (audit.definitive_protocol === "selected-45") {
   if (Number(audit.expected_runs) !== 45 || Number(audit.readiness_expected_probes) !== 18) throw new Error("selected-45 definitive audits must declare expected_runs=45 and readiness_expected_probes=18");
@@ -369,19 +390,37 @@ const corpusExpectedRuns = Array.isArray(audit.repositories)
   ? audit.repositories.reduce((total, repository) => total + (repository.tasks?.length ?? 0), 0) * (audit.arms?.length ?? 0) * Number(audit.samples_per_cell ?? 1)
   : freshRuns.length;
 const expectedRuns = Number(audit.expected_runs ?? corpusExpectedRuns) + reusedRuns.length;
-const successfulRuns = runs.filter((run) => run.completed_successfully).length;
+const observedRuns = runs.filter((run) => run.execution_status !== "not_started");
+const notStartedRuns = runs.filter((run) => run.execution_status === "not_started");
+const successfulRuns = observedRuns.filter((run) => run.completed_successfully === true).length;
+const failedOrBlockedRuns = observedRuns.filter((run) => run.completed_successfully !== true).length;
 const benchmarkAudit = comparisonReport ? {
   ...audit,
   arms: armOrder.filter((arm) => runs.some((run) => run.arm === arm)),
   reused_arms: reusedArms,
   expected_runs: expectedRuns,
+  observed_runs: observedRuns.length,
+  attempted_runs: observedRuns.length,
+  not_started_runs: notStartedRuns.length,
+  observed_readiness_probes: observedReadinessProbes.length,
+  not_started_readiness_probes: notStartedReadinessProbes.length,
   successful_runs: successfulRuns,
-  failed_runs: runs.length - successfulRuns,
-  campaign_gate: { passed: runs.length === expectedRuns && successfulRuns === expectedRuns },
+  failed_runs: failedOrBlockedRuns,
+  campaign_gate: { passed: observedRuns.length === expectedRuns && successfulRuns === expectedRuns },
   rerun_status: freshRuns.length === Number(audit.expected_runs ?? freshRuns.length) ? "complete" : "partial",
   rerun_observed_runs: freshRuns.length,
   rerun_expected_runs: Number(audit.expected_runs ?? freshRuns.length),
-} : audit;
+} : {
+  ...audit,
+  expected_runs: expectedRuns,
+  observed_runs: observedRuns.length,
+  attempted_runs: observedRuns.length,
+  not_started_runs: notStartedRuns.length,
+  observed_readiness_probes: observedReadinessProbes.length,
+  not_started_readiness_probes: notStartedReadinessProbes.length,
+  successful_runs: successfulRuns,
+  failed_runs: failedOrBlockedRuns,
+};
 const groups = {};
 for (const run of runs) {
   const key = `${run.repository}:${run.task}:${run.arm}`;
@@ -559,7 +598,7 @@ const report = {
     process_evidence: run.process_evidence ?? null,
     process_tree_peak_rss_kib: run.process_metrics?.peak_rss_kib ?? null,
   })),
-  campaign_gate: { expected_runs: expectedRuns, observed_runs: runs.length, successful_runs: successfulRuns, failed_or_blocked_runs: runs.length - successfulRuns, passed: runs.length === expectedRuns && runs.every((run) => run.completed_successfully), independent_campaigns: independentCampaigns, p95_eligible: p95EligibleForCampaign },
+  campaign_gate: { expected_runs: expectedRuns, observed_runs: observedRuns.length, attempted_runs: observedRuns.length, not_started_runs: notStartedRuns.length, successful_runs: successfulRuns, failed_or_blocked_runs: failedOrBlockedRuns, passed: observedRuns.length === expectedRuns && successfulRuns === expectedRuns, independent_campaigns: independentCampaigns, p95_eligible: p95EligibleForCampaign },
 };
 const number = (value, digits = 0) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toLocaleString("en-US", digits ? { minimumFractionDigits: digits, maximumFractionDigits: digits } : undefined);
 const taskComparisonRows = runs.map((run) => {
@@ -740,4 +779,4 @@ ${readinessRuns.length ? readinessRuns.join("\n") : "| — | — | — | — | �
 `;
 writeFileSync(`${outputBase}.json`, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 writeFileSync(`${outputBase}.md`, markdown, "utf8");
-console.log(JSON.stringify({ json: `${outputBase}.json`, markdown: `${outputBase}.md`, observed_runs: runs.length, successful_runs: report.campaign_gate.successful_runs, failed_or_blocked_runs: report.campaign_gate.failed_or_blocked_runs }));
+console.log(JSON.stringify({ json: `${outputBase}.json`, markdown: `${outputBase}.md`, observed_runs: observedRuns.length, observed_readiness_probes: readinessGate.observed_probes, successful_runs: report.campaign_gate.successful_runs, failed_or_blocked_runs: report.campaign_gate.failed_or_blocked_runs }));

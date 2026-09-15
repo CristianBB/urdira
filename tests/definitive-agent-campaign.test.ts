@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -181,6 +181,88 @@ describe("definitive direct campaign orchestrator", () => {
     expect(readFileSync(join(root, "stderr.log"), "utf8")).toBe("signal diagnostic\n");
     expect(result.stdout_bytes).toBeGreaterThan(0);
     expect(result.stderr_bytes).toBeGreaterThan(0);
+  });
+
+  it("durably retains internal Codex stderr when the first invocation fails before JSONL", () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-codex-capture-regression-"));
+    roots.push(root);
+    const repository = join(root, "repository");
+    mkdirSync(join(repository, "packages/playwright/src/transform"), { recursive: true });
+    mkdirSync(join(repository, "tests"), { recursive: true });
+    writeFileSync(join(repository, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }));
+    writeFileSync(join(repository, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: { "": { name: "fixture", version: "1.0.0" } } }));
+    writeFileSync(join(repository, "packages/playwright/src/transform/compilationCache.ts"), "export const affectedTestFiles = (items: string[]) => [...items].sort();\n");
+    writeFileSync(join(repository, "tests/focused.test.ts"), "export {};\n");
+    const git = (args: string[]) => spawnSync("git", ["-C", repository, ...args], { encoding: "utf8" });
+    expect(git(["init", "-q"]).status).toBe(0);
+    expect(git(["add", "."]).status).toBe(0);
+    expect(spawnSync("git", ["-C", repository, "-c", "user.name=Benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "-qm", "fixture"], { encoding: "utf8" }).status).toBe(0);
+    const commit = spawnSync("git", ["-C", repository, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    const codex = join(root, "codex");
+    writeFileSync(codex, "#!/bin/sh\nprintf '{not-json}\\n'\necho 'synthetic Codex stderr' >&2\nexit 0\n");
+    chmodSync(codex, 0o755);
+    const output = join(root, "output");
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", codex, "--commit", commit, "--worktree", repository, "--output-dir", output], { encoding: "utf8" });
+    expect(result.status).toBe(1);
+    const runId = "playwright-affected-tests-deterministic-baseline-1";
+    const manifest = JSON.parse(readFileSync(join(output, `${runId}.json`), "utf8"));
+    expect(manifest.model_invoked).toBe(true);
+    expect(manifest.codex_invocations[0]).toMatchObject({ label: "turn-1", code: 0 });
+    expect(manifest.transcript).toMatch(/\.jsonl$/u);
+    expect(readFileSync(manifest.codex_invocations[0].stderr_path, "utf8")).toContain("synthetic Codex stderr");
+  });
+
+  it("fails closed when an internal Codex spool cannot be written", () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-codex-spool-capture-regression-"));
+    roots.push(root);
+    const repository = join(root, "repository");
+    mkdirSync(join(repository, "packages/playwright/src/transform"), { recursive: true });
+    mkdirSync(join(repository, "tests"), { recursive: true });
+    writeFileSync(join(repository, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }));
+    writeFileSync(join(repository, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: { "": { name: "fixture", version: "1.0.0" } } }));
+    writeFileSync(join(repository, "packages/playwright/src/transform/compilationCache.ts"), "export const affectedTestFiles = (items: string[]) => [...items].sort();\n");
+    writeFileSync(join(repository, "tests/focused.test.ts"), "export {};\n");
+    const git = (args: string[]) => spawnSync("git", ["-C", repository, ...args], { encoding: "utf8" });
+    expect(git(["init", "-q"]).status).toBe(0);
+    expect(git(["add", "."]).status).toBe(0);
+    expect(spawnSync("git", ["-C", repository, "-c", "user.name=Benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "-qm", "fixture"], { encoding: "utf8" }).status).toBe(0);
+    const commit = spawnSync("git", ["-C", repository, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    const codex = join(root, "codex");
+    writeFileSync(codex, "#!/bin/sh\nprintf '{\"type\":\"thread.started\",\"thread_id\":\"synthetic\"}\\n'\nexit 0\n");
+    chmodSync(codex, 0o755);
+    const output = join(root, "output");
+    mkdirSync(join(output, "playwright-affected-tests-deterministic-baseline-1.turn-1.stdout.log"), { recursive: true });
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", codex, "--commit", commit, "--worktree", repository, "--output-dir", output], { encoding: "utf8" });
+    expect(result.status).toBe(1);
+    const runId = "playwright-affected-tests-deterministic-baseline-1";
+    const manifest = JSON.parse(readFileSync(join(output, `${runId}.json`), "utf8"));
+    expect(manifest.model_invoked).toBe(true);
+    expect(manifest.codex_invocations).toHaveLength(1);
+    expect(manifest.codex_invocations[0].capture_error).toMatch(/EISDIR|is a directory/u);
+    expect(manifest.error).toMatch(/Codex output capture failed/u);
+  });
+
+  it("persists an installed Urdira CLI preflight failure before Codex", () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-cli-preflight-regression-"));
+    roots.push(root);
+    const repository = join(root, "repository");
+    mkdirSync(join(repository, "packages/playwright/src/transform"), { recursive: true });
+    mkdirSync(join(repository, "tests"), { recursive: true });
+    writeFileSync(join(repository, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }));
+    writeFileSync(join(repository, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: { "": { name: "fixture", version: "1.0.0" } } }));
+    writeFileSync(join(repository, "packages/playwright/src/transform/compilationCache.ts"), "export const affectedTestFiles = (items: string[]) => [...items].sort();\n");
+    writeFileSync(join(repository, "tests/focused.test.ts"), "export {};\n");
+    const git = (args: string[]) => spawnSync("git", ["-C", repository, ...args], { encoding: "utf8" });
+    expect(git(["init", "-q"]).status).toBe(0);
+    expect(git(["add", "."]).status).toBe(0);
+    expect(spawnSync("git", ["-C", repository, "-c", "user.name=Benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "-qm", "fixture"], { encoding: "utf8" }).status).toBe(0);
+    const commit = spawnSync("git", ["-C", repository, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    const output = join(root, "output");
+    const temporaryHomesBefore = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith("urdira-expanded-codex-home-")));
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--integration-preflight-only", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "urdira-typescript", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", "/Applications/ChatGPT.app/Contents/Resources/codex", "--commit", commit, "--worktree", repository, "--data-root", join(root, "data"), "--indexing-worker", "/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/release-extract/native/urdira-indexing-worker", "--output-dir", output, "--release-root", "/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/release-extract", "--release-archive", "/Users/Cristian/BenchmarkResults/urdira-final-release-archive-20260915-v5.tar.gz"], { encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ model_invoked: false, cli_preflight: { status: "passed", command: ["status", "--json"], daemon_started: false } });
+    expect(readdirSync(tmpdir()).filter((entry) => entry.startsWith("urdira-expanded-codex-home-") && !temporaryHomesBefore.has(entry))).toEqual([]);
   });
 
   it("settles with an explicit spool error and terminates the child when capture fails", async () => {
