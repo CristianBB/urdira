@@ -1,6 +1,6 @@
 /** Benchmark-only prerequisites; does not install dependencies or invoke a model. */
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
@@ -93,7 +93,9 @@ export async function materializeAgentDependencyClosure({ repositoryId, reposito
     if (!existsSync(lockfilePath)) throw new Error(`Frozen dependency lockfile is missing: ${lockfilePath}`);
     const manager = layout.manager === "pnpm" ? executableInNodeBin(nodeExecutable, "corepack") : executableInNodeBin(nodeExecutable, "npm");
     const cacheRoot = join(worktree, ".bench-cache", layout.relative_path === "." ? "root" : layout.relative_path);
+    const nodeBin = dirname(resolve(nodeExecutable));
     const cacheEnvironment = {
+      PATH: [nodeBin, process.env.PATH].filter(Boolean).join(delimiter),
       npm_config_cache: join(cacheRoot, "npm-cache"),
       npm_config_store_dir: join(cacheRoot, "pnpm-store"),
       COREPACK_HOME: join(cacheRoot, "corepack"),

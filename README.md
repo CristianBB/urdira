@@ -830,6 +830,18 @@ These commands produce evidence only after the Phase 0 gates in the
 [definitive handoff](docs/benchmarks/definitive-agent-benchmark-handoff.md)
 pass.
 
+The current v8 evidence records 45 observed agent cells with 42 grader passes,
+two explicit nonpasses, and one correctness value unavailable after
+infrastructure failure. The 18 readiness attempts are closed with failures,
+zero successful probes, and no readiness qualification; P95 remains `null`
+because three campaign samples do not meet the frozen eligibility rule. See
+the [versioned results report](docs/benchmarks/definitive-agent-benchmark-results-2026-09-15.md)
+for the complete measured table and separate failure, coverage, efficiency,
+and distribution fields.
+The readiness measurement objective was not achieved: the persisted attempts
+contain no successful readiness measurement. The post-campaign PATH fix is not
+retroactive validation and produced no new readiness evidence.
+
 Before a definitive cell or readiness pair starts, the orchestrator creates a
 fresh detached worktree and materializes that task's frozen dependency closure
 inside it. The setup uses the repository lockfiles, the exact Node runtime,
@@ -861,7 +873,7 @@ external evidence is
 `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/harness-revision-v8-diagnostic.json`.
 It does not change the v5 archive or authorize a retry.
 
-The current Phase 0 release gates passed sequentially with `CI=true pnpm
+The historical v5 Phase 0 release gates passed sequentially with `CI=true pnpm
 verify`, `URDIRA_RELEASE_TARGET=darwin-arm64 pnpm package:release`,
 `URDIRA_RELEASE_TARGET=darwin-arm64 pnpm release:acceptance`, and `git diff
 --check`. The measured archive is retained at

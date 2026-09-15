@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { assessAgentValidationEnvironment, inspectAgentValidationEnvironment, isCurrentStructuralFrontier, materializeAgentDependencyClosure } from "../release/benchmarks/agent-validation-environment.mjs";
 
@@ -61,7 +62,7 @@ describe("agent validation preflight", () => {
       expect(setup.prepared_roots).toHaveLength(repositoryId === "vscode" ? 3 : 1);
       expect(calls.every((call) => call.cwd.startsWith(repoWorktree))).toBe(true);
       expect(calls.every((call) => !call.cwd.startsWith(repoSource))).toBe(true);
-      expect(calls.every((call) => Object.values(call.env).every((value) => value.startsWith(repoWorktree)))).toBe(true);
+      expect(calls.every((call) => Object.entries(call.env).filter(([key]) => key !== "PATH").every(([, value]) => value.startsWith(repoWorktree)))).toBe(true);
       if (repositoryId === "prisma") expect(calls.some((call) => call.args.includes("--frozen-lockfile") && !call.args.includes("--offline"))).toBe(true);
       const firstRoot = setup.prepared_roots[0];
       expect(firstRoot).toBeDefined();
@@ -69,6 +70,80 @@ describe("agent validation preflight", () => {
       if (repositoryId === "vscode") expect(readFileSync(join(repoWorktree, "extensions/package-lock.json"), "utf8")).toBe("committed-extension-lock\n");
       expect(setup.commands).toHaveLength(calls.length);
     }
+  });
+
+  it("puts the pinned Node runtime first for shebang-based dependency managers", async () => {
+    const source = mkdtempSync(join(tmpdir(), "urdira-dependency-path-source-"));
+    const worktree = mkdtempSync(join(tmpdir(), "urdira-dependency-path-worktree-"));
+    mkdirSync(source, { recursive: true });
+    mkdirSync(worktree, { recursive: true });
+    writeFileSync(join(source, "package-lock.json"), "lock\n");
+    writeFileSync(join(worktree, "package-lock.json"), "lock\n");
+    const calls: { env: Record<string, string> }[] = [];
+    await materializeAgentDependencyClosure({ repositoryId: "playwright", repositoryRoot: source, worktree, nodeExecutable: "/pinned/node/bin/node", run: async (_command, args, options) => {
+      calls.push({ env: options?.["env"] as Record<string, string> });
+      return { code: 0, signal: null, stdout: args[0] === "--version" ? "11.16.0\n" : "", stderr: "" };
+    } });
+    expect(calls.length).toBe(2);
+    expect(calls.every(({ env }) => env["PATH"]?.startsWith("/pinned/node/bin") === true)).toBe(true);
+  });
+
+  it("runs a shebang dependency manager with the pinned Node under a hostile PATH", async () => {
+    const source = mkdtempSync(join(tmpdir(), "urdira-dependency-shebang-source-"));
+    const worktree = mkdtempSync(join(tmpdir(), "urdira-dependency-shebang-worktree-"));
+    writeFileSync(join(source, "package-lock.json"), "lock\n");
+    writeFileSync(join(worktree, "package-lock.json"), "lock\n");
+    const calls: { args: string[]; env: Record<string, string>; stdout: string; stderr: string }[] = [];
+    const previousPath = process.env["PATH"];
+    process.env["PATH"] = "/usr/local/bin:/usr/bin:/bin";
+    try {
+      await materializeAgentDependencyClosure({ repositoryId: "playwright", repositoryRoot: source, worktree, nodeExecutable: process.execPath, run: async (command, args, options) => {
+        const env: Record<string, string> = {};
+        for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+        Object.assign(env, options?.["env"] as Record<string, string>);
+        const result = args[0] === "--version"
+          ? spawnSync(command, args, { cwd: String(options?.["cwd"]), env, encoding: "utf8" })
+          : { status: 0, signal: null, stdout: "", stderr: "" };
+        const call = { args, env, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+        calls.push(call);
+        return { code: result.status ?? 0, signal: result.signal, stdout: call.stdout, stderr: call.stderr };
+      } });
+    } finally {
+      process.env["PATH"] = previousPath;
+    }
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.env["PATH"]?.split(":")[0]).toBe(dirname(process.execPath));
+    expect(calls[0]?.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(calls[0]?.stderr).not.toContain("SyntaxError");
+  });
+
+  it("runs Corepack with the pinned Node under a hostile PATH", async () => {
+    const source = mkdtempSync(join(tmpdir(), "urdira-dependency-corepack-source-"));
+    const worktree = mkdtempSync(join(tmpdir(), "urdira-dependency-corepack-worktree-"));
+    writeFileSync(join(source, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    writeFileSync(join(worktree, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    const calls: { args: string[]; env: Record<string, string>; stdout: string; stderr: string }[] = [];
+    const previousPath = process.env["PATH"];
+    process.env["PATH"] = "/usr/local/bin:/usr/bin:/bin";
+    try {
+      await materializeAgentDependencyClosure({ repositoryId: "prisma", repositoryRoot: source, worktree, nodeExecutable: process.execPath, run: async (command, args, options) => {
+        const env: Record<string, string> = {};
+        for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+        Object.assign(env, options?.["env"] as Record<string, string>);
+        const result = args[1] === "--version"
+          ? spawnSync(command, args, { cwd: String(options?.["cwd"]), env, encoding: "utf8" })
+          : { status: 0, signal: null, stdout: "", stderr: "" };
+        const call = { args, env, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+        calls.push(call);
+        return { code: result.status ?? 0, signal: result.signal, stdout: call.stdout, stderr: call.stderr };
+      } });
+    } finally {
+      process.env["PATH"] = previousPath;
+    }
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.env["PATH"]?.split(":")[0]).toBe(dirname(process.execPath));
+    expect(calls[0]?.stdout.trim()).toBe("10.27.0");
+    expect(calls[0]?.stderr).not.toContain("SyntaxError");
   });
 
   it("uses the generated snapshot only when the extension lockfile is absent", async () => {

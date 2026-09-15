@@ -1,6 +1,81 @@
 # Expanded agent comparison runbook
 
-## Current v7 execution snapshot
+## Current v8 execution snapshot
+
+The v8 agent phase is complete as an observed three-campaign matrix: 45
+repository/task/arm rows, one sample per row, with 42 grader passes, two
+explicit nonpasses, and one correctness result unavailable after an
+infrastructure failure. Target coverage is 2/2 for 43 rows. The complete
+per-row index is embedded in the versioned [definitive results table](definitive-agent-benchmark-results-2026-09-15.md#complete-45-cell-measured-table),
+backed by its external JSON source at
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.json`
+(SHA-256 `622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`),
+which retains all measured fields including timings, token fields, costs, hook
+totals, served/fallback counts, shell/MCP usage, exits, cleanup, and P95.
+The external JSON SHA-256 is
+`622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`; the
+Markdown SHA-256 is
+`030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`.
+
+The v8 source summaries are C1 SHA-256
+`ae6fb0eaf943dd9fd9f93587a632c78a09718deaa8ab12513a32fffcc0f4795e`, C2
+SHA-256 `54c61dbaaaa6a8c19dbcc3a3da8240edc4e355825fd3756e43a61cadb3ded2fd`,
+and C3 SHA-256
+`2dfe70e2734a18ad3ddda42082e64f5aafc09e41b2cf3854f79ac0e350dcb11b`.
+These are additive offline analyses of retained raw campaign inputs; v7 and
+v6 evidence remain separate historical records.
+
+Token accounting keeps input, cached input, output, reasoning, and additive
+total separate, using matched cumulative host evidence. The frozen planning
+card is input/cached input `$2/M` and output/reasoning `$8/M`. Hook totals use
+`observed_tool_usage.urdira_hook_calls`; served and fallback are separate, and
+output-bearing hook calls are not used as total invocation counts. Configured
+arm and observed tool use remain separate. Missing values are `null`, and
+shell overlap is `null` without payload evidence. P95 remains `null`: three
+campaign samples do not establish the required per-cell distribution.
+
+Readiness execution is complete with failures: 18 probes are planned, 18 are
+persisted as failed/blocked/interrupted, zero succeeded, and zero remain
+pending. No readiness probe achieved model invocation. The retained evidence
+records the prior cold `EINVAL` socket and dependency failures, the original
+Playwright and cancelled VS Code C2 interruptions, the Playwright C3 cold
+SIGTERM 143 with its warm probe blocked, and the C3 Prisma and VS Code
+cold/warm pairs blocked before model invocation by their recorded package
+manager failures. The latest audit is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-v8-resume-after-c1-playwright-v6/readiness-resume-audit.json`
+(SHA-256 `fb239152b49a9296cd5980b0aec89802211a295afc668bbd450b9fee3a0110d5`);
+the Prisma pair status is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-v8-resume-after-c1-playwright-v5/pair-prisma-3-status.json`
+(SHA-256 `e6ae15cafa9b518e8125ec3267c9402c1882ed5911ccdbb3b9fde335e6850855`).
+
+The retained C3 VS Code pair status is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-v8-resume-after-c1-playwright-v6/pair-vscode-3-status.json`
+(SHA-256 `cc11527d4faeb9bf6ce0cb10a92b6567b1bd53f63706ca95f32df7a67a2dbb9a`),
+with cleanup evidence SHA-256
+`90f8f17ffaacbd60f361b0c109e4893df05f459e0953cad63b6fb6a7fd916370`. The
+complete readiness composition is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-final-composition-v1.json`
+(SHA-256 `5a3be1432ac047084abdd24fbb4491c9219769c19683f4a51af06f5a616898a7`).
+The append-only normalized status view is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-final-composition-v2.json`
+(SHA-256 `2090d55be0745fe5f056b7058ecb1305ce22a7d34502595f087bf2bd0bb6328b`);
+it preserves the v1 outcome counters and reports row-level status as 3
+interrupted cold, 6 preflight failures, and 9 warm-blocked rows.
+No retry has been counted. The run is not readiness-qualified because no probe
+succeeded; readiness measurements remain separate from agent performance.
+The readiness measurement objective was not achieved. The post-campaign PATH
+fix is not retroactive validation and produced no new readiness evidence.
+The final per-campaign renderer outputs and the aggregate-guard rejection are
+recorded in the dated [post-campaign rendering evidence](../evidence/2026-09-16-definitive-agent-benchmark-v8-postcampaign.md).
+
+The exact C3 VS Code/Urdira validation failure is
+`core:unknown_field` at `/request/query`, retained in diagnostic artifact
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-c3-final-15-v3/summary/c3-15-grader-diagnostic-v1.json`
+(SHA-256 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`).
+The row had agent exit 0, outer runner exit 1, grader exit 1, and target
+coverage 2/2. No rm-f or test-blocked cause is inferred.
+
+### Historical v7 execution snapshot
 
 The retained v7 series is **blocked after two campaign-1 attempts**: one successful baseline measurement and one Urdira infrastructure failure before model invocation. It preserves all 45 frozen cell identities as 2 attempted/observed and 43 not started, and all 18 readiness identities as 0 observed and 18 not started. The user-authorized execution order is 45 agent cells followed by 18 readiness probes; no retry or replacement is counted.
 
@@ -142,8 +217,9 @@ It binds release binding v6
 and cleanup checkpoint v7
 (`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-release-v7.json`,
 `sha256=93525acf8a1a46e3b84a7bf069cd0484d9163105bd270764f2c2574e4589224d`).
-The current v8 verify, package, acceptance, and diff-check records all exit
-`0`. Their retained records are under
+The retained v8 verify, package, acceptance, and diff-check records all exit
+`0`. These records predate the post-campaign PATH fix and remain historical;
+their retained files are under
 `/Users/Cristian/BenchmarkResults/urdira-gates-20260915-v8/`:
 
 | Gate | Exit SHA-256 | stdout log SHA-256 | stderr log SHA-256 |
@@ -157,8 +233,41 @@ The earlier v7 `pnpm verify` record remains historical: it exited `1` because
 `tests/expanded-benchmark-smoke.test.ts:181` expected an outdated runner
 snippet; its exit SHA is
 `4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
-The v8 gates validate repository and release artifacts only; they add no
-measurements and do not lift the blocked 45-cell/18-probe campaign status.
+These historical v8 gate records predate the post-campaign PATH fix. They
+validate repository and release artifacts only and add no benchmark
+measurements. The v8 matrix is closed with retained failures; readiness remains
+unqualified, and no current gate result is claimed here.
+The current post-campaign PATH-fix gate record is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/runner-path-fix-v2/gates-final-manifest-v2.json`
+(SHA-256 `b9d170bed887bf06b2522a8b956a9434fb65d9d1909734052cab31af17cbd9ed`).
+The gate run recorded repository HEAD
+`b05bf226a78d5290807c92c21874d5d858b69c7b` with the PATH-fix working-tree
+changes present before commit; a later commit must retain this evidence
+separately.
+Its `verify-v2.log` passed with 90.06% total coverage and 100% critical branch
+coverage (SHA-256 `67143321d7e22fe2a9987272066d7cc7185699cb65d6df89950236a62b6a00cf`);
+`package-release-v1.log` passed (SHA-256
+`9a7b52db801bd734b6c4f4bf0d1e5fefdfe945d99d8f21800821fe0a53098665`),
+`release-acceptance-v1.log` passed (SHA-256
+`51e6b3d4489cdf093fdcea4ea60f92563204a73aa9ec8e1b34bb0918a5e2217a`), and
+`diff-check-v1.log` passed (SHA-256
+`53da44f38c61ac33d12c2f6799955f61db476c8aa34f89e02014d056e19db329`).
+These are repository and release checks only; they add no benchmark or
+readiness measurements and do not retroactively validate readiness.
+The post-gate cleanup chain is recorded by `global-cleanup-v1.json` (SHA-256
+`b324a69d173d557d42e644acb8d323303e94a99cd864fcfa1c8689d5cd7aa74c`),
+`global-cleanup-v2.json` (SHA-256
+`7761773e8cd776fc3fa95b9a87f73163f925f62747ad2cb1e552f2172ce86bae`), and
+`global-cleanup-v3.json` (SHA-256
+`e6d0cccd6df033e358277ac1492a7acbf0e1472400a2bc94d4d221771917bf97`), with
+zero active processes after v3 and 56,735 bytes of declared temporary files
+removed. The retained pre-gate, post-package, and post-acceptance archives
+are respectively 183,787,326 bytes (SHA-256
+`1b4fc4f064962206f1556242e946b53390aba08edf86232e646f3a296e4a4dd6`),
+183,788,002 bytes (SHA-256
+`d6e0e92f827ed6973516fa338b255c9d30b9269f43b2791e2a3fdc14a8bdb5ef`), and
+183,788,113 bytes (SHA-256
+`4f30c892880154a903a1c4685803f588b781bcabfe2faf49953e37cf319fef60`).
 The final cleanup checkpoint is
 `/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-gates-v10.json`
 (`sha256=6be8cb16b6a5aa6459f99f5fbf81faecd25bbf9be2a74575c24542dad2883eec`):

@@ -1,8 +1,77 @@
 # Current implementation and evidence
 
-## Definitive agent campaign status (v7 retained, 2026-09-15)
+## Definitive agent campaign status (v8, 2026-09-15)
 
-The current v7 series is **blocked after two campaign-1 attempts**: one completed baseline cell and one Urdira infrastructure failure before model invocation. The retained matrix contains 45 planned agent cells, 2 attempted/observed, 1 successful, 1 infrastructure failure, and 43 not started. Readiness follows the authorized 45-then-18 order; 0 of 18 probes ran. No retry or replacement run is counted.
+The v8 agent phase has 45 observed rows across three campaigns, one sample per
+repository/task/arm identity. The external additive consolidation records 42
+grader passes, two explicit nonpasses, and one correctness value unavailable
+after infrastructure failure. Target coverage is 2/2 for 43 rows. The
+[complete 45-row table](benchmarks/definitive-agent-benchmark-results-2026-09-15.md#complete-45-cell-measured-table)
+is embedded in the versioned results report. The full JSON measurements are
+retained outside the repository at
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.json`;
+JSON SHA-256 is
+`622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93` and
+Markdown SHA-256 is
+`030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`.
+
+Correctness, target coverage, execution, efficiency, failures, and
+distributions are reported as separate fields. Agent, runner, and grader exit
+codes are separate, as are configured arm and observed tool use. Input,
+cached input, output, reasoning, and additive total tokens remain separate;
+the frozen common card is input/cached input `$2/M` and output/reasoning
+`$8/M`. Hook totals use observed invocation counts with served and fallback
+separate. Missing measurements are `null`, shell overlap is `null` without
+payload evidence, and P95 is `null` because three campaign samples do not
+meet the frozen eligibility rule.
+
+Readiness execution is complete with failures. Of 18 planned probes, 18 are
+persisted as failed/blocked/interrupted, zero succeeded, and zero remain
+pending; no probe achieved model invocation. The retained evidence records the
+prior cold `EINVAL` socket and dependency failures, the original Playwright
+and cancelled VS Code C2 interruptions, the Playwright C3 cold SIGTERM 143
+with its warm probe blocked, and the C3 Prisma and VS Code cold/warm pairs
+blocked before model invocation by their recorded package-manager failures.
+The latest audit is:
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-v8-resume-after-c1-playwright-v6/readiness-resume-audit.json`
+(SHA-256 `fb239152b49a9296cd5980b0aec89802211a295afc668bbd450b9fee3a0110d5`).
+The Prisma pair status is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-v8-resume-after-c1-playwright-v5/pair-prisma-3-status.json`
+(SHA-256 `e6ae15cafa9b518e8125ec3267c9402c1882ed5911ccdbb3b9fde335e6850855`);
+its cleanup evidence SHA-256 is
+`f89d82adb28627ab471859817ace69137b515e4896f5819289efae1f0686c422`.
+The VS Code pair status is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-v8-resume-after-c1-playwright-v6/pair-vscode-3-status.json`
+(SHA-256 `cc11527d4faeb9bf6ce0cb10a92b6567b1bd53f63706ca95f32df7a67a2dbb9a`),
+with cleanup SHA-256
+`90f8f17ffaacbd60f361b0c109e4893df05f459e0953cad63b6fb6a7fd916370`. The
+complete readiness composition is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-final-composition-v1.json`
+(SHA-256 `5a3be1432ac047084abdd24fbb4491c9219769c19683f4a51af06f5a616898a7`).
+The append-only normalized status view is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/readiness-final-composition-v2.json`
+(SHA-256 `2090d55be0745fe5f056b7058ecb1305ce22a7d34502595f087bf2bd0bb6328b`);
+it preserves the v1 outcome counters and reports row-level status as 3
+interrupted cold, 6 preflight failures, and 9 warm-blocked rows.
+No retry is counted. This is a complete readiness attempt record with no
+successful readiness result; it does not claim readiness qualification.
+The readiness measurement objective was not achieved: no persisted probe
+produced a successful readiness measurement. The post-campaign PATH fix is not
+retroactive validation and produced no new readiness evidence.
+Per-campaign renderer outputs and the rejected aggregate-render attempt are
+recorded in the dated [post-campaign rendering evidence](evidence/2026-09-16-definitive-agent-benchmark-v8-postcampaign.md).
+
+The exact C3 VS Code/Urdira validation nonpass is `core:unknown_field` at
+`/request/query`, evidenced by diagnostic artifact
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-c3-final-15-v3/summary/c3-15-grader-diagnostic-v1.json`
+(SHA-256 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`).
+The row has agent exit 0, runner exit 1, grader exit 1, and target coverage
+2/2. This is separate from the C1 infrastructure-null row. v7 and v6
+evidence below remain historical and are not mixed into v8.
+
+## Historical v7 retained definitive agent campaign status (2026-09-15)
+
+The historical v7 series is **blocked after two campaign-1 attempts**: one completed baseline cell and one Urdira infrastructure failure before model invocation. The retained matrix contains 45 planned agent cells, 2 attempted/observed, 1 successful, 1 infrastructure failure, and 43 not started. Readiness follows the authorized 45-then-18 order; 0 of 18 probes ran. No retry or replacement run is counted.
 
 Raw campaign audit: `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7/execution-v7/campaign-1/campaign-audit.json`, SHA-256 `51f88c6e83cafd3016d897c0f959ba60a2db35afce8512359ba8899917140678`. Stop ledger: SHA-256 `10cdabce6ab2aa0b4bec1f39cc525ee83ee91da80ba49f6d0b8dcf6ef9d2997d`. Derived partial outputs: `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7-derived-20260915-v1`; report JSON SHA `2e7386c590337cee8528a55b7fb3825c8c522bf5a0f98533182a6898876a9de0`, Markdown SHA `af776329beb5e6153d3d1519df7277c5b3e20b843337e8dfbf9cc1e27949ffe7`, analyzer SHA `a9bfb18e7782e361a0d103b610b78417ede4cc3978aac77583a669a015e20def`, replay SHA `383b1395b08b900b7305875c20f1dc88a280fd43bef2d158bae185c0bbdea067`. The complete [v7 evidence note](evidence/2026-09-15-definitive-agent-benchmark-v7.md) records measured baseline values, null handling, provenance, and the correct incomplete-assembler rejection.
 
@@ -94,8 +163,9 @@ planned readiness probes, but `proposal-not-executed` and
 and cleanup checkpoint v7
 (`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-release-v7.json`,
 `sha256=93525acf8a1a46e3b84a7bf069cd0484d9163105bd270764f2c2574e4589224d`).
-The current v8 verify, package, acceptance, and diff-check records all exit
-`0`. Their retained records are under
+The retained v8 verify, package, acceptance, and diff-check records all exit
+`0`. These records predate the post-campaign PATH fix and remain historical;
+their retained files are under
 `/Users/Cristian/BenchmarkResults/urdira-gates-20260915-v8/`:
 
 | Gate | Exit SHA-256 | stdout log SHA-256 | stderr log SHA-256 |
@@ -109,8 +179,41 @@ The earlier v7 `pnpm verify` record remains historical: it exited `1` because
 `tests/expanded-benchmark-smoke.test.ts:181` expected an outdated runner
 snippet; its exit SHA is
 `4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
-The v8 gates validate repository and release artifacts only; they add no
-measurements and do not lift the blocked 45-cell/18-probe campaign status.
+These historical v8 gate records predate the post-campaign PATH fix. They
+validate repository and release artifacts only and add no benchmark
+measurements. The v8 matrix is closed with retained failures; readiness remains
+unqualified, and no current gate result is claimed here.
+The current post-campaign PATH-fix gate record is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/runner-path-fix-v2/gates-final-manifest-v2.json`
+(SHA-256 `b9d170bed887bf06b2522a8b956a9434fb65d9d1909734052cab31af17cbd9ed`).
+The gate run recorded repository HEAD
+`b05bf226a78d5290807c92c21874d5d858b69c7b` with the PATH-fix working-tree
+changes present before commit; a later commit must retain this evidence
+separately.
+Its `verify-v2.log` passed with 90.06% total coverage and 100% critical branch
+coverage (SHA-256 `67143321d7e22fe2a9987272066d7cc7185699cb65d6df89950236a62b6a00cf`);
+`package-release-v1.log` passed (SHA-256
+`9a7b52db801bd734b6c4f4bf0d1e5fefdfe945d99d8f21800821fe0a53098665`),
+`release-acceptance-v1.log` passed (SHA-256
+`51e6b3d4489cdf093fdcea4ea60f92563204a73aa9ec8e1b34bb0918a5e2217a`), and
+`diff-check-v1.log` passed (SHA-256
+`53da44f38c61ac33d12c2f6799955f61db476c8aa34f89e02014d056e19db329`).
+These are repository and release checks only; they add no benchmark or
+readiness measurements and do not retroactively validate readiness.
+The post-gate cleanup chain is recorded by `global-cleanup-v1.json` (SHA-256
+`b324a69d173d557d42e644acb8d323303e94a99cd864fcfa1c8689d5cd7aa74c`),
+`global-cleanup-v2.json` (SHA-256
+`7761773e8cd776fc3fa95b9a87f73163f925f62747ad2cb1e552f2172ce86bae`), and
+`global-cleanup-v3.json` (SHA-256
+`e6d0cccd6df033e358277ac1492a7acbf0e1472400a2bc94d4d221771917bf97`), with
+zero active processes after v3 and 56,735 bytes of declared temporary files
+removed. The retained pre-gate, post-package, and post-acceptance archives
+are respectively 183,787,326 bytes (SHA-256
+`1b4fc4f064962206f1556242e946b53390aba08edf86232e646f3a296e4a4dd6`),
+183,788,002 bytes (SHA-256
+`d6e0e92f827ed6973516fa338b255c9d30b9269f43b2791e2a3fdc14a8bdb5ef`), and
+183,788,113 bytes (SHA-256
+`4f30c892880154a903a1c4685803f588b781bcabfe2faf49953e37cf319fef60`).
 The final cleanup checkpoint is
 `/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-gates-v10.json`
 (`sha256=6be8cb16b6a5aa6459f99f5fbf81faecd25bbf9be2a74575c24542dad2883eec`):
@@ -239,12 +342,14 @@ statistical ranking across repositories. See the [v69/v70 record](evidence/2026-
 [v71/v72 record](evidence/2026-09-14-agent-context-density.md), and
 [V86 evidence](evidence/2026-09-14-prompt-hook-context-reuse.md).
 
-The canonical status and reporting contract for the pending three-campaign
-comparison is [the 2026-09-15 derived benchmark report](benchmarks/definitive-agent-benchmark-results-2026-09-15.md).
-It does not replace the accepted directed observations above. The comparison
-remains incomplete until original artifacts have been analyzed and rendered,
-all rows are shown by repository/task/arm, unavailable fields are `null`, and
-the final table is published to the user.
+The canonical status and reporting contract for the three-campaign comparison
+is [the 2026-09-15 derived benchmark report](benchmarks/definitive-agent-benchmark-results-2026-09-15.md).
+It does not replace the accepted directed observations above. The original
+artifacts have now been analyzed and rendered per campaign, and all rows are
+shown by repository/task/arm with unavailable fields as `null`. The aggregate
+frozen-renderer attempt remains rejected by its 45-cell identity guard, so no
+aggregate renderer pass or readiness qualification is claimed; see the dated
+[post-campaign evidence](evidence/2026-09-16-definitive-agent-benchmark-v8-postcampaign.md).
 
 The August agent-comparison reports remain useful historical evidence but
 predate v4 and its September query fixes. The September 8 snippet experiment
