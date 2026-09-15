@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -52,6 +52,7 @@ describe("agent validation preflight", () => {
         mkdirSync(join(repoSource, "extensions/node_modules"), { recursive: true });
         mkdirSync(join(repoWorktree, "extensions/typescript-language-features"), { recursive: true });
         writeFileSync(join(repoSource, "extensions/node_modules/.package-lock.json"), "snapshot-lock\n");
+        writeFileSync(join(repoWorktree, "extensions/package-lock.json"), "committed-extension-lock\n");
         writeFileSync(join(repoWorktree, "package-lock.json"), "root-lock\n");
         writeFileSync(join(repoWorktree, "extensions/typescript-language-features/package-lock.json"), "nested-lock\n");
       }
@@ -65,8 +66,26 @@ describe("agent validation preflight", () => {
       const firstRoot = setup.prepared_roots[0];
       expect(firstRoot).toBeDefined();
       expect(readFileSync(firstRoot!.source_lockfile, "utf8")).toContain("lock");
+      if (repositoryId === "vscode") expect(readFileSync(join(repoWorktree, "extensions/package-lock.json"), "utf8")).toBe("committed-extension-lock\n");
       expect(setup.commands).toHaveLength(calls.length);
     }
+  });
+
+  it("uses the generated snapshot only when the extension lockfile is absent", async () => {
+    const source = mkdtempSync(join(tmpdir(), "urdira-dependency-snapshot-source-"));
+    const worktree = mkdtempSync(join(tmpdir(), "urdira-dependency-snapshot-worktree-"));
+    mkdirSync(join(source, "extensions/node_modules"), { recursive: true });
+    mkdirSync(join(worktree, "extensions/typescript-language-features"), { recursive: true });
+    writeFileSync(join(source, "package-lock.json"), "root-lock\n");
+    writeFileSync(join(worktree, "package-lock.json"), "root-lock\n");
+    writeFileSync(join(source, "extensions/node_modules/.package-lock.json"), "snapshot-lock\n");
+    writeFileSync(join(worktree, "extensions/typescript-language-features/package-lock.json"), "nested-lock\n");
+    const setup = await materializeAgentDependencyClosure({ repositoryId: "vscode", repositoryRoot: source, worktree, nodeExecutable: "/runtime/node", run: async (_command, args) => ({ code: 0, signal: null, stdout: args[0] === "pnpm@10.27.0" ? "10.27.0\n" : "11.16.0\n", stderr: "" }) });
+    const extensionRoot = setup.prepared_roots.find((entry) => entry.relative_path === "extensions");
+    expect(extensionRoot).toBeDefined();
+    expect(extensionRoot!.source_lockfile).toBe(join(source, "extensions/node_modules/.package-lock.json"));
+    expect(readFileSync(extensionRoot!.source_lockfile, "utf8")).toBe("snapshot-lock\n");
+    expect(existsSync(join(worktree, "extensions/package-lock.json"))).toBe(false);
   });
 });
 

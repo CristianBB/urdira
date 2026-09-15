@@ -10,9 +10,8 @@ const FROZEN_DEPENDENCY_LAYOUTS = Object.freeze({
   prisma: Object.freeze([{ relative_path: ".", lockfile: "pnpm-lock.yaml", manager: "pnpm" }]),
   vscode: Object.freeze([
     { relative_path: ".", lockfile: "package-lock.json", manager: "npm" },
-    // The extensions package has no committed lockfile. Its npm-generated
-    // lock snapshot is retained by the validated source closure and copied
-    // into each fresh worktree before npm ci. It is removed after setup.
+    // Keep a generated npm lock snapshot available for a checkout that lacks
+    // the committed extension lockfile; it is used only as a fallback.
     { relative_path: "extensions", lockfile: "package-lock.json", snapshot_lockfile: "extensions/node_modules/.package-lock.json", manager: "npm" },
     { relative_path: "extensions/typescript-language-features", lockfile: "package-lock.json", manager: "npm" },
   ]),
@@ -78,11 +77,18 @@ export async function materializeAgentDependencyClosure({ repositoryId, reposito
     let temporaryLockfile = false;
     let sourceLockfile = lockfilePath;
     if (layout.snapshot_lockfile) {
-      sourceLockfile = resolve(repositoryRoot, layout.snapshot_lockfile);
-      if (!existsSync(sourceLockfile)) throw new Error(`Frozen dependency snapshot is missing: ${sourceLockfile}`);
-      mkdirSync(targetRoot, { recursive: true });
-      cpSync(sourceLockfile, lockfilePath, { force: false });
-      temporaryLockfile = true;
+      const snapshotLockfile = resolve(repositoryRoot, layout.snapshot_lockfile);
+      if (existsSync(lockfilePath)) {
+        // Prefer a committed lockfile in the fresh worktree. The generated
+        // snapshot is only a fallback for the lockless layout it supports.
+        sourceLockfile = lockfilePath;
+      } else {
+        if (!existsSync(snapshotLockfile)) throw new Error(`Frozen dependency snapshot is missing: ${snapshotLockfile}`);
+        mkdirSync(targetRoot, { recursive: true });
+        cpSync(snapshotLockfile, lockfilePath, { force: false });
+        sourceLockfile = snapshotLockfile;
+        temporaryLockfile = true;
+      }
     }
     if (!existsSync(lockfilePath)) throw new Error(`Frozen dependency lockfile is missing: ${lockfilePath}`);
     const manager = layout.manager === "pnpm" ? executableInNodeBin(nodeExecutable, "corepack") : executableInNodeBin(nodeExecutable, "npm");

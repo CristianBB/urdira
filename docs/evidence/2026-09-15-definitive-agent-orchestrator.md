@@ -57,3 +57,20 @@ Logs are retained under
 `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/` with
 the `orchestrator-*-v9` names. No campaign, model, probe, retry, or historical
 raw artifact was started or changed by this correction.
+
+## Frozen dependency closure follow-up
+
+The definitive source closure includes a committed VS Code
+`extensions/package-lock.json` and a read-only generated snapshot at
+`extensions/node_modules/.package-lock.json`. Dependency preparation uses the
+committed lockfile when it is present in a fresh worktree and removes a
+lockfile only when the helper created it as a snapshot fallback. This keeps
+the lockfile available for agent validation and preserves the source checkout
+contract.
+
+The regression first failed because the helper removed the committed extension
+lockfile during cleanup. The focused test passed after the minimal
+fallback-only cleanup change. A production-path VS Code worktree using the
+current helper passed dependency setup and validation with zero missing
+dependencies, preserved the lockfile bytes and digest, and cleaned its
+worktree and cache. No model, runner, or benchmark cell was started.
