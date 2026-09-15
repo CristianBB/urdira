@@ -1,10 +1,17 @@
 # Expanded agent comparison runbook
 
-Status: operational procedure, checked against the runner on 2026-09-10;
-current v6 definitive campaign **BLOCKED after two cell attempts** on
-2026-09-15. No readiness probe executed.
+## Current v7 execution snapshot
 
-The current definitive reporting status is recorded in the [dated derived
+The retained v7 series is **blocked after two campaign-1 attempts**: one successful baseline measurement and one Urdira infrastructure failure before model invocation. It preserves all 45 frozen cell identities as 2 attempted/observed and 43 not started, and all 18 readiness identities as 0 observed and 18 not started. The user-authorized execution order is 45 agent cells followed by 18 readiness probes; no retry or replacement is counted.
+
+The raw campaign audit is `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7/execution-v7/campaign-1/campaign-audit.json` (SHA-256 `51f88c6e83cafd3016d897c0f959ba60a2db35afce8512359ba8899917140678`). The stop ledger SHA is `10cdabce6ab2aa0b4bec1f39cc525ee83ee91da80ba49f6d0b8dcf6ef9d2997d`. The external partial analysis directory is `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7-derived-20260915-v1`; its partial audit, analyzer, replay, report JSON/Markdown, assembler-rejection log, and artifact-manifest SHAs are respectively `338740ef3d71ba0bff539f220019e0d0636e44ccbcff7c99ffb80b637567e453`, `a9bfb18e7782e361a0d103b610b78417ede4cc3978aac77583a669a015e20def`, `383b1395b08b900b7305875c20f1dc88a280fd43bef2d158bae185c0bbdea067`, `2e7386c590337cee8528a55b7fb3825c8c522bf5a0f98533182a6898876a9de0`, `af776329beb5e6153d3d1519df7277c5b3e20b843337e8dfbf9cc1e27949ffe7`, `c55f020b7877bf1fb8b453c309dcbb45faf0f8436cf9ea5f3f95a1dd916a52b1`, and `0f067f161376ff657f96eb9a044c66e0c43fbc239c391f7868c3f1678c6316bf`.
+
+The retained baseline has matched host token evidence and measured input 816,937, cached input 753,920, output 8,575, reasoning 3,000, normative total 828,512, and estimated cost 1.726474 USD under the frozen card. Provider total 825,512 is retained as a separate provider field. All absent measurements are `null`; P95 is `null`. The partial renderer is diagnostic only. The production assembler was checked against incomplete input and correctly rejected it; no partial output is presented as a completed selected-45 result. See the dated [v7 evidence](../evidence/2026-09-15-definitive-agent-benchmark-v7.md). The v6 procedure and artifacts below are historical and remain separate. v8 infrastructure-correction preparation is authorized but is not a retry or measurement.
+
+
+Status: operational procedure, checked against the runner on 2026-09-10. The v6 procedure and artifacts below are historical and separate.
+
+The historical v6 reporting status is recorded in the [dated derived
 report](definitive-agent-benchmark-results-2026-09-15.md). The v6 campaign is
 blocked after a failed retained baseline and a blocked Urdira cell without a
 manifest; 43 cells were not attempted and all 18 readiness probes remained
@@ -12,7 +19,7 @@ not started because readiness follows all 45 agent cells. The complete planned
 45/18 matrix and retained v6 derived artifacts are recorded in the dated
 results report and [v6 evidence](../evidence/2026-09-15-definitive-agent-benchmark-v6.md).
 
-### Current v6 execution snapshot
+### Historical v6 execution snapshot
 
 The current series uses freeze v6 at commit
 `5de04b14305bf1399b200b57db70efb888b99436`, Node `v24.18.1`, Luna, and

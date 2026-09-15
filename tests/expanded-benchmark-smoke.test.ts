@@ -30,6 +30,15 @@ function probe(ids: string[], rows: ReturnType<typeof rowsFor>, failedRuns = 0) 
 }
 
 describe("expanded campaign smoke scope", () => {
+  it("initializes host metrics before startup failures can be recorded", () => {
+    const runner = readFileSync(resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "utf8");
+    const hostMetricsDeclaration = runner.indexOf("let hostMetrics;");
+    const hostEntry = runner.indexOf('if (argv.includes("--host")) await hostMain();');
+    expect(hostMetricsDeclaration).toBeGreaterThanOrEqual(0);
+    expect(hostEntry).toBeGreaterThanOrEqual(0);
+    expect(hostMetricsDeclaration).toBeLessThan(hostEntry);
+  });
+
   it("runs version without a daemon and fails runtime hooks closed without the cell socket", () => {
     const dir = mkdtempSync(join(tmpdir(), "expanded-shim-test-"));
     try {

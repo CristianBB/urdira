@@ -1,10 +1,19 @@
 # Current implementation and evidence
 
+## Definitive agent campaign status (v7 retained, 2026-09-15)
+
+The current v7 series is **blocked after two campaign-1 attempts**: one completed baseline cell and one Urdira infrastructure failure before model invocation. The retained matrix contains 45 planned agent cells, 2 attempted/observed, 1 successful, 1 infrastructure failure, and 43 not started. Readiness follows the authorized 45-then-18 order; 0 of 18 probes ran. No retry or replacement run is counted.
+
+Raw campaign audit: `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7/execution-v7/campaign-1/campaign-audit.json`, SHA-256 `51f88c6e83cafd3016d897c0f959ba60a2db35afce8512359ba8899917140678`. Stop ledger: SHA-256 `10cdabce6ab2aa0b4bec1f39cc525ee83ee91da80ba49f6d0b8dcf6ef9d2997d`. Derived partial outputs: `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7-derived-20260915-v1`; report JSON SHA `2e7386c590337cee8528a55b7fb3825c8c522bf5a0f98533182a6898876a9de0`, Markdown SHA `af776329beb5e6153d3d1519df7277c5b3e20b843337e8dfbf9cc1e27949ffe7`, analyzer SHA `a9bfb18e7782e361a0d103b610b78417ede4cc3978aac77583a669a015e20def`, replay SHA `383b1395b08b900b7305875c20f1dc88a280fd43bef2d158bae185c0bbdea067`. The complete [v7 evidence note](evidence/2026-09-15-definitive-agent-benchmark-v7.md) records measured baseline values, null handling, provenance, and the correct incomplete-assembler rejection.
+
+The baseline token evidence is matched cumulative host evidence: input 816,937, cached input 753,920, output 8,575, reasoning 3,000, normative total 828,512, provider total 825,512 retained separately, and estimated cost 1.726474 USD under the frozen card. P95 and unavailable measurements are `null`. The Urdira failure is an infrastructure/coverage failure with no model result. v6 below is historical and separate. v8 infrastructure-correction preparation is authorized, but no new measurement is claimed.
+
+
 Reviewed: 2026-09-15. This is an implementation inventory, not a new product
 contract or a release certification. Follow the [product foundation](product-foundation.md)
 for normative decisions and the [architecture map](architecture.md) for code paths.
 
-## Definitive agent campaign status (2026-09-15)
+## Historical v6 definitive agent campaign status (2026-09-15)
 
 The current v6 series is **blocked after two campaign-1 cell attempts**.
 The baseline has a failed retained manifest with `model_invoked=true`, but

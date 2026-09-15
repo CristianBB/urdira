@@ -8,6 +8,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   FORBIDDEN_PRODUCTION_PATTERNS,
+  NATIVE_NPM_PACKAGES,
   PRODUCTION_PACKAGE_NAMES,
   SUPPORTED_TARGETS,
   buildReleaseMetadata,
@@ -150,6 +151,11 @@ async function stageProductionPackage(name, rootDir, stageRoot, copied, targetWa
   await mkdir(destination, { recursive: true });
   await copyBuildPayload(dist, join(destination, "dist"));
   const rewritten = { ...manifest, private: false, dependencies: { ...(manifest.dependencies ?? {}) } };
+  // The workspace package is intentionally private and therefore does not
+  // carry the public platform-package coordinates. A release archive still
+  // needs the same closed declaration as the published package because the
+  // installed native loader validates it before resolving a binding.
+  if (name === "@urdira/native") rewritten.optionalDependencies = Object.fromEntries(Object.values(NATIVE_NPM_PACKAGES).map((packageName) => [packageName, manifest.version]));
   for (const dependency of Object.keys(rewritten.dependencies)) {
     if (internalPackage(dependency)) {
       const dependencyManifest = await readJson(join(rootDir, packagePath(dependency), "package.json"));

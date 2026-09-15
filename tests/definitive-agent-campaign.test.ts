@@ -124,6 +124,21 @@ describe("definitive direct campaign orchestrator", () => {
     expect(readiness.probes.every((probe) => Object.values(probe.timestamps).every((value) => value === null))).toBe(true);
   });
 
+  it("uses one compact cold/warm pair root for readiness paths", () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-definitive-readiness-paths-"));
+    roots.push(root);
+    const dataRoot = join(root, "data");
+    const runRoot = join(root, "runs");
+    const readiness = buildReadinessManifest({ campaign: 1, outputRoot: root, dataRoot, runRoot, repositoriesRoot: join(root, "repos") });
+    for (const probe of readiness.probes) {
+      const pair = `${probe.repository_id}-1`;
+      expect(probe["data_root"]).toBe(join(dataRoot, pair));
+      expect(probe["output_root"]).toBe(join(runRoot, pair));
+    }
+    expect(new Set(readiness.probes.map((probe) => probe["data_root"])).size).toBe(3);
+    expect(new Set(readiness.probes.map((probe) => probe["output_root"])).size).toBe(3);
+  });
+
   it("builds an explicit scoped structural query for the no-model probe", () => {
     const request = buildReadinessQuery("workspace:probe");
     expect(request.request_type).toBe("query");

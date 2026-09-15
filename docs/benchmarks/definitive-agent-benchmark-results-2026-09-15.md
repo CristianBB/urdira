@@ -1,10 +1,28 @@
 # Definitive agent benchmark results — reporting status
 
-Status: **v6 blocked after two campaign-1 cell attempts** (2026-09-15).
+## Current v7 retained result
 
-## Current v6 result
+Status: **v7 blocked after two campaign-1 cell attempts** (2026-09-15). The retained v7 execution is the current measurement state: one completed baseline cell, one Urdira infrastructure failure before model invocation, 43 agent cells not started, and all 18 readiness probes not started. The user-authorized order is 45 agent cells followed by 18 readiness probes; the stop policy records no retry. This is a blocked partial result, not a completed 45-cell or 18-probe benchmark.
 
-The authoritative current series is v6, frozen at Urdira commit
+| Result set | Expected | Attempted / observed | Successful | Failed or blocked | Not started | Status |
+|---|---:|---:|---:|---:|---:|---|
+| Agent cells | 45 | 2 | 1 | 1 | 43 | blocked |
+| Readiness probes | 18 | 0 | 0 | 0 | 18 | not started |
+
+The retained raw campaign audit is `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7/execution-v7/campaign-1/campaign-audit.json` (SHA-256 `51f88c6e83cafd3016d897c0f959ba60a2db35afce8512359ba8899917140678`). The stop ledger is `.../series-v7/execution-v7/campaign-1/campaign-1-stop-ledger-v1.json` (SHA-256 `10cdabce6ab2aa0b4bec1f39cc525ee83ee91da80ba49f6d0b8dcf6ef9d2997d`) and the stop checkpoint is `.../campaign-1-stop-checkpoint-v1.json` (SHA-256 `9506ad6782b40cfb1b5fe8fca98cab67e0921f6f88e0402c5eb6456a2daa713a`). The three v7 cell manifest SHAs are `1500da83f9785090191cf1239fe5dfcc59e8b6ce0be6742d5ea644adc4e83d5d`, `376f0b6197de6335bcd0f6d6302d5ec8f37e6adca7ca7981ff869a1f9d9b2f0f`, and `7124780e7a9389e3cddffe550bee7b5781db983a006793e19d15dd6f46f84481`; the readiness manifest SHAs are `e007df8f43219a2965f27043763b39129c22b5e687268f4d218adc6cada685fd`, `172679656bbec427624c1de26a1936dc33d7b3a97e135f8d817d80ce10142e1d`, and `ea8a19187d95d3a82679290819e99647596a13a32eadca36d7e8c014c7aa7cf2`.
+
+The baseline has retained evidence of a real model interaction: `model_invoked=true`, three successful Codex invocations, three matched host root turns, three `turn.completed` records, and matched cumulative host token evidence. Its measured values are input `816,937`, cached input `753,920`, output `8,575`, reasoning `3,000`, normative additive total `828,512`, provider-reported total `825,512` retained separately, and estimated cost `$1.726474` under the frozen rate card (input/cached $2/M, output/reasoning $8/M). The baseline completed in `239,518 ms` after the first instruction, with `501 ms` setup, exit `0`, grader exit `0`, and P95 `null`. Context measurements include 3 outer turns, 24 shell command calls, 19 source-read shell calls, 0 MCP/hook/tgrep calls, 107,043 repository-context characters, 70,765 target-attributed characters, and 36,278 unattributed characters; shell overlap is `null` with 19 unclassified source reads because no MCP source was present. Correctness evidence matched 2/2 target paths and had no unsafe omissions; numeric test coverage was unavailable (`null`).
+
+The Urdira cell exited `1` during host readiness before model invocation; its retained error is `Urdira host exited before readiness (7/none)`, with `model_invoked=false` in the retained manifest. It is an infrastructure/coverage failure, not a model result. Its cleanup passed. Missing fields remain `null`; no zero is inferred. P95 is `null` because the definitive campaign has only one observed cell per identity and is incomplete.
+
+The offline analyzer, replay, and renderer used retained v7 raw paths only and wrote to the new external directory `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7-derived-20260915-v1`. The partial audit SHA is `338740ef3d71ba0bff539f220019e0d0636e44ccbcff7c99ffb80b637567e453`; analyzer SHA `a9bfb18e7782e361a0d103b610b78417ede4cc3978aac77583a669a015e20def`; replay SHA `383b1395b08b900b7305875c20f1dc88a280fd43bef2d158bae185c0bbdea067`; rendered JSON SHA `2e7386c590337cee8528a55b7fb3825c8c522bf5a0f98533182a6898876a9de0`; rendered Markdown SHA `af776329beb5e6153d3d1519df7277c5b3e20b843337e8dfbf9cc1e27949ffe7`; artifact manifest SHA `0f067f161376ff657f96eb9a044c66e0c43fbc239c391f7868c3f1678c6316bf`. The full assembler was deliberately given only one campaign audit and one readiness manifest and rejected it with exit `1`, “exactly three campaign audits and three readiness manifests are required” (log SHA `c55f020b7877bf1fb8b453c309dcbb45faf0f8436cf9ea5f3f95a1dd916a52b1`). The partial renderer output is diagnostic and does not bypass the completeness gate.
+
+The early baseline metric extraction is retained separately at `/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v7/early-metrics-baseline-v1/early-metrics-v1.json` (SHA-256 `7e4d5f7f368e59c42ec1fd78843d42a9bddc6773ac753f6e0e15ead956694e22`). v6 remains a historical blocked snapshot below and is not mixed with v7. Infrastructure-correction preparation for v8 is authorized, but it is preparation state rather than a new measurement or retry.
+
+
+## Historical v6 result
+
+The authoritative historical v6 series is frozen at Urdira commit
 `5de04b14305bf1399b200b57db70efb888b99436`, Node `v24.18.1`, Luna, and
 semantic indexing off. It stopped after two campaign-1 cells because the
 Urdira cell failed preflight when the extracted CLI rejected `urdira --version`.

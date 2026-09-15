@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { smokeNativeArchive } from "../scripts/smoke-native-archive.mjs";
 import { buildReleaseMetadata, sha256 } from "../scripts/release-contract.mjs";
-import { inspectProductionTree, inspectReleaseArchive, writeDeterministicArchive } from "../scripts/package-release.mjs";
+import { inspectProductionTree, inspectReleaseArchive, stageProductionTree, writeDeterministicArchive } from "../scripts/package-release.mjs";
+import { NATIVE_NPM_PACKAGE_NAMES, PRODUCTION_PACKAGE_NAMES } from "../scripts/release-contract.mjs";
 
 describe("Phase 14 deterministic package builder", () => {
   it("creates byte-identical archives from the same production tree", async () => {
@@ -50,6 +51,42 @@ describe("Phase 14 deterministic package builder", () => {
     expect(inspection.checksum_failures).toEqual([]);
     expect(inspection.forbidden).toEqual([]);
     expect(inspection.symlinks).toEqual([]);
+  });
+
+  it("retains native platform optional dependencies in a staged release package", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-phase14-native-deps-"));
+    const stage = join(root, "stage");
+    try {
+      await writeFile(join(root, "README.md"), "fixture\n");
+      await writeFile(join(root, "LICENSE"), "fixture\n");
+      for (const name of PRODUCTION_PACKAGE_NAMES) {
+        const directory = name === "urdira"
+          ? join(root, "apps", "bootstrap")
+          : name === "@urdira/runtime"
+            ? join(root, "apps", "urdira")
+            : join(root, "packages", name.slice("@urdira/".length));
+        await mkdir(join(directory, "dist"), { recursive: true });
+        await writeFile(join(directory, "dist", "index.js"), "export {};\n");
+        const manifest = { name, version: "0.3.0", type: "module" };
+        await writeFile(join(directory, "package.json"), `${JSON.stringify(manifest)}\n`);
+      }
+      for (const name of NATIVE_NPM_PACKAGE_NAMES) {
+        const directory = join(root, "node_modules", ...name.split("/"));
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, "package.json"), `${JSON.stringify({ name, version: "0.3.0" })}\n`);
+      }
+      await stageProductionTree({
+        rootDir: root,
+        stageRoot: stage,
+        targetId: "darwin-arm64",
+        metadata: buildReleaseMetadata({ gitCommit: "fixture", lockfileDigest: sha256("lock") }),
+        nativeRequired: false,
+      });
+      const staged = JSON.parse(await readFile(join(stage, "node_modules", "@urdira", "native", "package.json"), "utf8"));
+      expect(staged.optionalDependencies).toEqual(Object.fromEntries(NATIVE_NPM_PACKAGE_NAMES.map((packageName) => [packageName, "0.3.0"])));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -241,6 +241,10 @@ const git = async (...args) => {
   return result.stdout.trim();
 };
 
+// Host startup can fail before the parent creates its metrics sampler. Keep
+// the failure manifest path initialized so the host's primary error is
+// retained instead of being replaced by a temporal-dead-zone exception.
+let hostMetrics;
 if (argv.includes("--host")) await hostMain();
 
 await git("reset", "--hard", commit);
@@ -343,7 +347,6 @@ const followUpInstruction = `Continue the same ${repo.repository} task after you
 const finalInstruction = `Perform the final handoff review for the same task. Check the diff for the requested behavior, cross-file callers, public types/exports, and focused tests. Run only a narrow relevant check if dependencies already exist; otherwise do not install them. Use any available repository tools according to your normal coding workflow and report what you actually used. Report every changed file, exact verification command/result, and any limitation. Do not commit.`;
 
 let host;
-let hostMetrics;
 if (arm === "urdira-typescript") {
   host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot, "--indexing-worker", indexingWorkerBin, ...(releaseRoot ? ["--release-root", releaseRoot] : []), ...(releaseArchive ? ["--release-archive", releaseArchive] : [])], { cwd: root, env: { ...process.env, ...releaseNativeEnvironment, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1", ...(arm === "urdira-typescript" ? { URDIRA_DEBUG_TIMING: "1", URDIRA_STORAGE_DEBUG_TIMING: "1" } : {}) }, stdio: ["ignore", "pipe", "pipe"] });
   hostMetrics = startHostMetrics(host, effectiveDataRoot);
