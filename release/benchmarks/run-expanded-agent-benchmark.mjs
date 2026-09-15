@@ -9,6 +9,8 @@ import { arch, cpus, freemem, loadavg, platform, release, totalmem } from "node:
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sampleProcessTree } from "./benchmark-process-tree.mjs";
+import { assertCleanupGateOpen, parseMinimumFreeBytes, runCleanupCheckpoint } from "./benchmark-cleanup.mjs";
+import { assertReleaseBinding } from "./release-binding.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpusPath = join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json");
@@ -24,6 +26,10 @@ const nodeBin = value("--node", process.execPath);
 const codegraphBin = value("--codegraph", join("/tmp", "urdira-expanded-benchmark", "codegraph-cli", "node_modules", ".bin", "codegraph"));
 const codebaseMemoryBin = value("--codebase-memory", "/Users/Cristian/.local/bin/codebase-memory-mcp");
 const tgrepBin = value("--tgrep", join("/tmp", "urdira-expanded-benchmark", "tgrep", "tgrep"));
+const releaseRoot = value("--release-root", process.env.URDIRA_RELEASE_ROOT);
+const releaseArchive = value("--release-archive", process.env.URDIRA_RELEASE_ARCHIVE);
+const minimumFreeBytes = parseMinimumFreeBytes(process.env.BENCH_MIN_FREE_BYTES);
+const cleanupGuardPath = join(outputDir, "cleanup-block.json");
 const runner = join(root, "release/benchmarks/expanded-agent-benchmark-runner.mjs");
 // Large repositories need a longer structural publication budget. Keep the
 // policy deterministic and size-tier driven so every arm receives the same
@@ -49,6 +55,7 @@ if (!existsSync(codex)) throw new Error(`Codex executable not found: ${codex}`);
 if (arms.includes("codegraph") && !existsSync(codegraphBin)) throw new Error(`CodeGraph executable not found: ${codegraphBin}`);
 if (arms.includes("codebase-memory") && !existsSync(codebaseMemoryBin)) throw new Error(`codebase-memory executable not found: ${codebaseMemoryBin}`);
 if (arms.includes("tgrep") && !existsSync(tgrepBin)) throw new Error(`tgrep executable not found: ${tgrepBin}`);
+let releaseBinding = null;
 
 if (samples > 1) {
   const expectedTasks = new Set(repositories.flatMap((repository) => repository.tasks.map((task) => `${repository.id}:${task.id}`)));
@@ -159,6 +166,16 @@ const cleanupCell = async ({ repositoryRoot, worktree, dataRoot, codebaseMemoryB
     if (!evidence.codebase_project_removed) evidence.errors.push(`codebase-memory: ${deleted.stderr || deleted.stdout}`.slice(0, 1000));
   }
   return evidence;
+};
+
+const ownedProcessInventory = ({ roots: ownedRoots }) => {
+  const result = spawnSync("ps", ["-ax", "-o", "pid=,command="], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`ps failed: ${result.stderr || result.stdout || result.status}`);
+  const roots = ownedRoots.filter((path) => typeof path === "string" && path.length > 0);
+  return (result.stdout ?? "").split("\n").map((line) => {
+    const match = line.trim().match(/^(\d+)\s+(.*)$/u);
+    return match === null ? null : { pid: Number(match[1]), command: match[2] };
+  }).filter((entry) => entry !== null && entry.pid !== process.pid && roots.some((path) => entry.command.includes(path)));
 };
 
 const orderFor = (sample, repoIndex, taskIndex) => {
@@ -315,6 +332,7 @@ const audit = {
   smoke_gate: { required: samples > 1, passed: samples === 1 || smokeGateResults.length > 0, eligible: smokeGateResults, blocked: smokeBlockedArms },
   repositories: repositories.map(({ id, repository, source_ref, commit, size_tier, tasks }) => ({ id, repository, source_ref: source_ref ?? commit, commit, size_tier, tasks: tasks.map(({ id, complexity, scenario }) => ({ id, complexity, scenario })) })),
   output_dir: outputDir,
+  release_binding: releaseBinding,
   runs: [],
 };
 
@@ -323,9 +341,14 @@ for (let sample = 1; sample <= samples; sample += 1) {
     const repo = repositories[repoIndex];
     const repositoryRoot = join(repositoriesRoot, repo.id);
     if (!existsSync(join(repositoryRoot, ".git"))) throw new Error(`Repository checkout is unavailable: ${repositoryRoot}`);
+    if (releaseBinding === null && arms.includes("urdira-typescript")) {
+      releaseBinding = assertReleaseBinding({ archiveRoot: releaseRoot, archivePath: releaseArchive });
+      audit.release_binding = releaseBinding;
+    }
     for (let taskIndex = 0; taskIndex < repo.tasks.length; taskIndex += 1) {
       const task = repo.tasks[taskIndex];
       for (const arm of orderFor(sample, repoIndex, taskIndex)) {
+        assertCleanupGateOpen(cleanupGuardPath);
         const runId = `${repo.id}-${task.id}-${arm}-${sample}`;
         const worktree = join(worktreeRoot, runId);
         const runOutput = join(outputDir, "runs");
@@ -343,12 +366,21 @@ for (let sample = 1; sample <= samples; sample += 1) {
         let manifest;
         try {
           const timeoutMs = cellTimeoutMs(repo);
-          result = await run(nodeBin, [runner, "--repository-id", repo.id, "--task-id", task.id, "--arm", arm, "--sample", String(sample), "--phase", "warm", "--worktree", worktree, "--data-root", dataRoot, "--output-dir", runOutput, "--commit", repo.commit, "--model", corpus.model, "--codex", codex, "--node", nodeBin, "--codegraph", codegraphBin, "--codebase-memory", codebaseMemoryBin, "--tgrep", tgrepBin], { cwd: root, env: { URDIRA_SEMANTIC_INDEX: "0", URDIRA_BENCHMARK_TIMEOUT_MS: String(timeoutMs), ...(arm === "urdira-typescript" ? { URDIRA_INDEXING_CORE_TIMEOUT_MS: String(timeoutMs) } : {}) }, measureProcessTree: true });
+          result = await run(nodeBin, [runner, "--repository-id", repo.id, "--task-id", task.id, "--arm", arm, "--sample", String(sample), "--phase", "warm", "--worktree", worktree, "--data-root", dataRoot, "--output-dir", runOutput, "--commit", repo.commit, "--model", corpus.model, "--codex", codex, "--node", nodeBin, "--codegraph", codegraphBin, "--codebase-memory", codebaseMemoryBin, "--tgrep", tgrepBin, ...(releaseRoot ? ["--release-root", releaseRoot] : []), ...(releaseArchive ? ["--release-archive", releaseArchive] : [])], { cwd: root, env: { URDIRA_SEMANTIC_INDEX: "0", URDIRA_BENCHMARK_TIMEOUT_MS: String(timeoutMs), ...(arm === "urdira-typescript" ? { URDIRA_INDEXING_CORE_TIMEOUT_MS: String(timeoutMs) } : {}) }, measureProcessTree: true });
           const manifestPath = join(runOutput, `${runId}.json`);
           try { manifest = JSON.parse(await readFile(manifestPath, "utf8")); } catch { manifest = undefined; }
         } finally {
-          const cleanup = await cleanupCell({ repositoryRoot, worktree, dataRoot, codebaseMemoryBin, codebaseMemoryProject: arm === "codebase-memory" ? `${repo.id}-${task.id}-${arm}-${sample}` : undefined });
+          const cleanup = await runCleanupCheckpoint({
+            manifestPath: join(outputDir, "cleanup", `${runId}.json`),
+            registeredPaths: [worktree, dataRoot, manifest?.agent_integration?.home].filter((path) => typeof path === "string"),
+            filesystemPath: outputDir,
+            minimumFreeBytes,
+            cleanup: () => cleanupCell({ repositoryRoot, worktree, dataRoot, codebaseMemoryBin, codebaseMemoryProject: arm === "codebase-memory" ? `${repo.id}-${task.id}-${arm}-${sample}` : undefined }),
+            listOwnedProcesses: () => ownedProcessInventory({ roots: [worktree, dataRoot, manifest?.agent_integration?.home].filter((path) => typeof path === "string") }),
+            metadata: { run_id: runId, repository: repo.id, task: task.id, arm, sample },
+          });
           audit.runs.push({ run_id: runId, repository: repo.id, task: task.id, scenario: task.scenario ?? null, size_tier: repo.size_tier ?? null, arm, sample, order_index: orderFor(sample, repoIndex, taskIndex).indexOf(arm), timeout_ms: cellTimeoutMs(repo), exit_code: result?.code ?? 1, elapsed_ms: Date.now() - started, process_metrics: result?.process_metrics ?? null, manifest, cleanup, stdout_tail: result?.stdout?.slice(-6000) ?? "", stderr_tail: result?.stderr?.slice(-6000) ?? "" });
+          if (cleanup.status === "blocked") writeFileSync(cleanupGuardPath, `${JSON.stringify(cleanup, null, 2)}\n`, "utf8");
           writeFileSync(join(outputDir, "audit.json"), `${JSON.stringify(audit, null, 2)}\n`, "utf8");
         }
       }

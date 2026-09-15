@@ -1,8 +1,8 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { assessAgentValidationEnvironment, inspectAgentValidationEnvironment, isCurrentStructuralFrontier } from "../release/benchmarks/agent-validation-environment.mjs";
+import { assessAgentValidationEnvironment, inspectAgentValidationEnvironment, isCurrentStructuralFrontier, materializeAgentDependencyClosure } from "../release/benchmarks/agent-validation-environment.mjs";
 
 describe("agent validation preflight", () => {
   it("rejects a stale login-shell runtime even if the driver has a valid runtime", () => {
@@ -36,6 +36,37 @@ describe("agent validation preflight", () => {
     expect(result.ready).toBe(false);
     expect(result.missing_runtime_artifacts).toContain("package.json:./node_modules/@toolchain/compiler.js");
     expect(result.reasons).toContain("script_runtime_artifacts_missing");
+  });
+
+  it("materializes each frozen dependency layout inside the fresh worktree", async () => {
+    const source = mkdtempSync(join(tmpdir(), "urdira-dependency-source-"));
+    const worktree = mkdtempSync(join(tmpdir(), "urdira-dependency-worktree-"));
+    for (const repositoryId of ["playwright", "prisma", "vscode"]) {
+      const repoSource = join(source, repositoryId);
+      const repoWorktree = join(worktree, repositoryId);
+      mkdirSync(repoSource, { recursive: true });
+      mkdirSync(repoWorktree, { recursive: true });
+      writeFileSync(join(repoSource, repositoryId === "prisma" ? "pnpm-lock.yaml" : "package-lock.json"), `lock-${repositoryId}\n`);
+      writeFileSync(join(repoWorktree, repositoryId === "prisma" ? "pnpm-lock.yaml" : "package-lock.json"), `lock-${repositoryId}\n`);
+      if (repositoryId === "vscode") {
+        mkdirSync(join(repoSource, "extensions/node_modules"), { recursive: true });
+        mkdirSync(join(repoWorktree, "extensions/typescript-language-features"), { recursive: true });
+        writeFileSync(join(repoSource, "extensions/node_modules/.package-lock.json"), "snapshot-lock\n");
+        writeFileSync(join(repoWorktree, "package-lock.json"), "root-lock\n");
+        writeFileSync(join(repoWorktree, "extensions/typescript-language-features/package-lock.json"), "nested-lock\n");
+      }
+      const calls: { command: string; args: string[]; cwd: string; env: Record<string, string> }[] = [];
+      const setup = await materializeAgentDependencyClosure({ repositoryId, repositoryRoot: repoSource, worktree: repoWorktree, nodeExecutable: "/runtime/node", run: async (command, args, options) => { calls.push({ command, args, cwd: String(options?.["cwd"]), env: options?.["env"] as Record<string, string> }); return { code: 0, signal: null, stdout: args[0] === "pnpm@10.27.0" ? "10.27.0\n" : "11.16.0\n", stderr: "" }; } });
+      expect(setup.prepared_roots).toHaveLength(repositoryId === "vscode" ? 3 : 1);
+      expect(calls.every((call) => call.cwd.startsWith(repoWorktree))).toBe(true);
+      expect(calls.every((call) => !call.cwd.startsWith(repoSource))).toBe(true);
+      expect(calls.every((call) => Object.values(call.env).every((value) => value.startsWith(repoWorktree)))).toBe(true);
+      if (repositoryId === "prisma") expect(calls.some((call) => call.args.includes("--frozen-lockfile") && !call.args.includes("--offline"))).toBe(true);
+      const firstRoot = setup.prepared_roots[0];
+      expect(firstRoot).toBeDefined();
+      expect(readFileSync(firstRoot!.source_lockfile, "utf8")).toContain("lock");
+      expect(setup.commands).toHaveLength(calls.length);
+    }
   });
 });
 

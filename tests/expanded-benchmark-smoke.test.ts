@@ -178,7 +178,8 @@ describe("expanded campaign smoke scope", () => {
     expect(runner).toContain('URDIRA_ENDPOINT: codexIntegration.endpoint');
     expect(shim).toContain('[ -S "$ENDPOINT" ]');
     expect(shim).toContain('export URDIRA_ENDPOINT="$ENDPOINT"');
-    expect(runner).toContain('...(codexIntegration === undefined ? ["--ignore-user-config"] : [])');
+    expect(runner).toContain('const codexApprovalArgs = ["--dangerously-bypass-approvals-and-sandbox"]');
+    expect(runner).toContain('...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"])');
     expect(runner).toContain("cleanupCodexIntegration();");
     const promptSource = runner.slice(runner.indexOf("const initialInstruction"), runner.indexOf("let host;"));
     expect(promptSource).not.toMatch(/Use Urdira MCP|urdira_context|urdira_query|call urdira_index_status/u);

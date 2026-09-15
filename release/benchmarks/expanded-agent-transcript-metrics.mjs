@@ -142,6 +142,23 @@ const itemText = (item) => {
   return "";
 };
 
+const transportText = (item) => {
+  if (item?.type === "mcp_tool_call") {
+    if (typeof item.result === "string") return { text: item.result, characters: item.result.length };
+    if (!Array.isArray(item.result?.content)) return { text: "", characters: null };
+    const blocks = item.result.content.filter((part) => part?.type === "text");
+    if (blocks.some((part) => typeof part.text !== "string")) return { text: "", characters: null };
+    const text = blocks.map((part) => part.text).join("\n");
+    return { text, characters: blocks.reduce((sum, part) => sum + part.text.length, 0) };
+  }
+  if (item?.type === "command_execution") {
+    const key = ["aggregated_output", "output", "stdout"].find((candidate) => typeof item[candidate] === "string");
+    return key === undefined ? { text: "", characters: null } : { text: String(item[key]), characters: String(item[key]).length };
+  }
+  const hooked = hookServedText(item);
+  return hooked === null ? { text: "", characters: null } : { text: hooked, characters: hooked.length };
+};
+
 // This is transport text, not the host's full model context. Do not synthesize
 // missing output or count structured MCP aliases alongside their text blocks.
 const completedTextCharacters = (item) => {
@@ -159,14 +176,26 @@ const completedTextCharacters = (item) => {
   return streams.length === 0 ? null : streams.reduce((sum, value) => sum + value.length, 0);
 };
 
-const completedToolOutput = (completed) => {
-  const outputs = completed.flatMap(({ item }) => {
+const completedToolOutput = (completed, hookPayloadByEvent = new Map(), hookReplacementByEvent = new Map()) => {
+  const outputs = completed.flatMap(({ item }, eventIndex) => {
     const hooked = hookServedText(item);
     if (item?.type !== "mcp_tool_call" && item?.type !== "command_execution" && hooked === null) return [];
+    const replacement = hookReplacementByEvent.get(eventIndex);
+    if (replacement !== undefined) {
+      const rawCharacters = completedTextCharacters(item);
+      const markerCharacters = replacement.count * (URDIRA_HOOK_SERVED_MARKER.length + 1);
+      const shellCharacters = rawCharacters === null || replacement.characters === null
+        ? null
+        : Math.max(0, rawCharacters - replacement.characters - markerCharacters);
+      return [
+        { transport: "hook", tgrep: false, characters: replacement.characters },
+        ...(shellCharacters === null || shellCharacters === 0 ? (shellCharacters === null ? [{ transport: "shell", tgrep: false, characters: null }] : []) : [{ transport: "shell", tgrep: false, characters: shellCharacters }]),
+      ];
+    }
     return [{
       transport: item.type === "mcp_tool_call" ? "mcp" : item.type === "command_execution" ? "shell" : "hook",
       tgrep: item.type === "command_execution" && /(?:^|[\s;&|('"`])tgrep(?:\s|$)/u.test(String(item.command ?? "")),
-      characters: hooked === null ? completedTextCharacters(item) : hooked.length,
+      characters: hooked === null ? completedTextCharacters(item) : (hookPayloadByEvent.has(eventIndex) ? hookPayloadByEvent.get(eventIndex) : hooked.length),
     }];
   });
   const summarize = (items) => {
@@ -319,7 +348,7 @@ export function analyzeContextEfficiency(events, options = {}) {
   let observedSource = false;
   let sourceLineOverlap = 0;
   let firstMcpEventIndex;
-  const shellSourceReads = { total_calls: 0, before_first_mcp_calls: 0, after_first_mcp_calls: 0, overlapping_calls: 0, nonoverlapping_calls: 0 };
+  const shellSourceReads = { total_calls: 0, before_first_mcp_calls: 0, after_first_mcp_calls: 0, overlapping_calls: null, nonoverlapping_calls: null, unclassified_calls: 0 };
   const retainSource = (text) => {
     if (typeof text !== "string") return;
     observedSource = true;
@@ -339,12 +368,18 @@ export function analyzeContextEfficiency(events, options = {}) {
       shellSourceReads.total_calls++;
       if (firstMcpEventIndex === undefined) shellSourceReads.before_first_mcp_calls++;
       else shellSourceReads.after_first_mcp_calls++;
-      if (observedSource) {
+      if (observedSource && transportText(item).characters !== null) {
+        if (shellSourceReads.overlapping_calls === null) {
+          shellSourceReads.overlapping_calls = 0;
+          shellSourceReads.nonoverlapping_calls = 0;
+        }
         let callOverlap = 0;
         for (const line of text.split("\n")) if (sourceLines.has(line)) callOverlap += line.length;
         sourceLineOverlap += callOverlap;
         if (callOverlap > 0) shellSourceReads.overlapping_calls++;
         else shellSourceReads.nonoverlapping_calls++;
+      } else {
+        shellSourceReads.unclassified_calls++;
       }
     }
     const request = JSON.stringify(item.arguments ?? {});
@@ -424,17 +459,26 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
   const completed = events.filter((event) => event?.type === "item.completed");
   const servedPreToolAudit = hookAudit === null ? [] : hookAudit.filter((entry) => entry.hook_event_name === "PreToolUse" && entry.decision === "serve");
   const hookReplacementByEvent = new Map();
+  const hookPayloadByEvent = new Map();
   let servedPreToolIndex = 0;
   for (const [eventIndex, event] of completed.entries()) {
     const command = event.item?.type === "command_execution" ? String(event.item.command ?? "") : "";
     const replacementCount = [...command.matchAll(/urdira-hook-output-[^/'"\s]+\/result\.txt/gu)].length;
-    if (replacementCount === 0) continue;
-    const entries = servedPreToolAudit.slice(servedPreToolIndex, servedPreToolIndex + replacementCount);
+    const hookServed = hookServedText(event.item) !== null;
+    if (hookAudit === null || (replacementCount === 0 && !hookServed)) continue;
+    const entries = servedPreToolAudit.slice(servedPreToolIndex, servedPreToolIndex + Math.max(1, replacementCount));
     servedPreToolIndex += entries.length;
-    hookReplacementByEvent.set(eventIndex, {
-      count: entries.length,
-      characters: entries.reduce((sum, entry) => sum + (Number.isFinite(entry.output_characters) && entry.output_characters >= 0 ? entry.output_characters : 0), 0),
-    });
+    if (replacementCount > 0) {
+      hookReplacementByEvent.set(eventIndex, {
+        count: replacementCount,
+        characters: entries.length === replacementCount && entries.every((entry) => Number.isFinite(entry.output_characters) && entry.output_characters >= 0)
+          ? entries.reduce((sum, entry) => sum + entry.output_characters, 0)
+          : null,
+      });
+    } else {
+      const entry = entries[0];
+      hookPayloadByEvent.set(eventIndex, Number.isFinite(entry?.output_characters) && entry.output_characters >= 0 ? entry.output_characters : null);
+    }
   }
   const auditedPreToolReads = [...hookReplacementByEvent].map(([event_index, assignment]) => ({
     event_index,
@@ -458,7 +502,8 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
         : configuredMcpCall(item, arm) || (arm === "urdira-typescript" && hookServedText(item) !== null);
     if (!configured) return [];
     const response = itemText(item);
-    return [{ event_index: eventIndex, request: item?.type === "command_execution" ? command : JSON.stringify(item?.arguments ?? {}), response, response_characters: response.length }];
+    const transport = transportText(item);
+    return [{ event_index: eventIndex, request: item?.type === "command_execution" ? command : JSON.stringify(item?.arguments ?? {}), response, response_characters: transport.characters }];
   });
   const reads = [
     ...auditedPromptReads.map(({ event_index, request, response, response_characters }) => ({ event_index, request, response, response_characters })),
@@ -471,8 +516,8 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
     const item = event.item;
     const command = item?.type === "command_execution" ? String(item.command ?? "") : "";
     if (!isHostInstructionReadCommand(command)) return [];
-    const response = itemText(item);
-    return [{ event_index: eventIndex, response_characters: response.length }];
+    const transport = transportText(item);
+    return [{ event_index: eventIndex, response_characters: transport.characters }];
   });
   const observedTranscriptReads = completed.flatMap((event, eventIndex) => {
     const item = event.item;
@@ -485,15 +530,18 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
     const hookReplacement = hookReplacementByEvent.get(eventIndex);
     if (!isMcpDiscovery && !isShellDiscovery && !isTgrepDiscovery && !isUrdiraHookDiscovery && hookReplacement === undefined) return [];
     const response = itemText(item);
+    const transport = transportText(item);
     if (hookReplacement !== undefined) {
       const markerCharacters = hookReplacement.count * (URDIRA_HOOK_SERVED_MARKER.length + 1);
-      const shellCharacters = Math.max(0, response.length - hookReplacement.characters - markerCharacters);
+      const shellCharacters = hookReplacement.characters === null || transport.characters === null
+        ? null
+        : Math.max(0, transport.characters - hookReplacement.characters - markerCharacters);
       return [
         {
           event_index: eventIndex, method: "hook", urdira: true, invoked_tool: null, request: command,
           response: "", response_characters: hookReplacement.characters, components: [], mcp_components: null,
         },
-        ...(isShellDiscovery && shellCharacters > 0 ? [{
+        ...(isShellDiscovery && (shellCharacters === null || shellCharacters > 0) ? [{
           event_index: eventIndex, method: "shell", urdira: false, invoked_tool: isTgrepDiscovery ? "tgrep" : null, request: command,
           response, response_characters: shellCharacters, components: [], mcp_components: null,
         }] : []),
@@ -506,7 +554,7 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
       invoked_tool: isTgrepDiscovery ? "tgrep" : null,
       request: item?.type === "command_execution" ? command : JSON.stringify(item?.arguments ?? {}),
       response,
-      response_characters: response.length,
+      response_characters: hookPayloadByEvent.has(eventIndex) ? hookPayloadByEvent.get(eventIndex) : transport.characters,
       // Component accounting is intentionally protocol-only. Shell text can
       // mention these words without exposing a typed snippets/hydration/
       // evidence/registry payload.
@@ -541,14 +589,19 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
   });
   const testAttempts = verificationAttempts.filter((attempt) => attempt.kind === "test");
   const methodReads = (method) => observedReads.filter((read) => method === "tgrep" ? read.invoked_tool === "tgrep" : read.method === method);
+  const characterSum = (readsToSum) => readsToSum.some((read) => read.response_characters === null)
+    ? null
+    : readsToSum.reduce((sum, read) => sum + read.response_characters, 0);
   const methodCharacters = (method) => {
     const readsForMethod = methodReads(method);
-    return readsForMethod.length === 0 ? null : readsForMethod.reduce((sum, read) => sum + read.response_characters, 0);
+    return readsForMethod.length === 0 || readsForMethod.some((read) => read.response_characters === null)
+      ? null
+      : readsForMethod.reduce((sum, read) => sum + read.response_characters, 0);
   };
   const targetReads = patterns.length === 0 ? null : observedReads.filter((read) => patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`)));
   const componentCharacters = Object.fromEntries(DISCOVERY_COMPONENTS.map((component) => {
     const matching = observedReads.filter((read) => read.components.includes(component));
-    return [component, matching.length === 0 ? null : matching.reduce((sum, read) => sum + read.response_characters, 0)];
+    return [component, matching.length === 0 ? null : characterSum(matching)];
   }));
   const componentCalls = Object.fromEntries(DISCOVERY_COMPONENTS.map((component) => {
     const matching = observedReads.filter((read) => read.components.includes(component));
@@ -580,8 +633,8 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
   const configuredEventIndices = new Set(reads.map((read) => read.event_index));
   const configuredReadsBeforeFirstEdit = readsBeforeFirstEdit.filter((read) => configuredEventIndices.has(read.event_index)
     && !(arm === "urdira-typescript" && read.method === "shell" && hookReplacementByEvent.has(read.event_index)));
-  const configuredCharactersBeforeFirstEdit = configuredReadsBeforeFirstEdit.reduce((sum, read) => sum + read.response_characters, 0);
-  const totalCharactersBeforeFirstEdit = readsBeforeFirstEdit.reduce((sum, read) => sum + read.response_characters, 0);
+  const configuredCharactersBeforeFirstEdit = characterSum(configuredReadsBeforeFirstEdit);
+  const totalCharactersBeforeFirstEdit = characterSum(readsBeforeFirstEdit);
   const firstConfigured = reads.at(0)?.event_index;
   const hookIndices = observedReads.filter((read) => read.method === "hook").map((read) => read.event_index);
   const directUrdiraMcpCalls = observedReads.filter((read) => read.urdira && read.method === "mcp").length;
@@ -589,7 +642,7 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
   const urdiraEffectiveCalls = directUrdiraMcpCalls + auditedHookCalls;
   return {
     ...codexActions,
-    completed_tool_output: completedToolOutput(completed),
+    completed_tool_output: completedToolOutput(completed, hookPayloadByEvent, hookReplacementByEvent),
     context_efficiency: analyzeContextEfficiency(events, options),
     context_lead: {
       first_repository_discovery_transport: firstRepositoryRead?.method ?? null,
@@ -600,17 +653,21 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
       mcp_calls_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "mcp").length,
       hook_calls_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "hook").length,
       shell_source_calls_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "shell").length,
-      mcp_characters_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "mcp").reduce((sum, read) => sum + read.response_characters, 0),
-      hook_characters_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "hook").reduce((sum, read) => sum + read.response_characters, 0),
-      shell_source_characters_before_first_edit: readsBeforeFirstEdit.filter((read) => read.method === "shell").reduce((sum, read) => sum + read.response_characters, 0),
-      configured_character_share_before_first_edit: totalCharactersBeforeFirstEdit === 0 ? null : configuredCharactersBeforeFirstEdit / totalCharactersBeforeFirstEdit,
+      mcp_characters_before_first_edit: characterSum(readsBeforeFirstEdit.filter((read) => read.method === "mcp")),
+      hook_characters_before_first_edit: characterSum(readsBeforeFirstEdit.filter((read) => read.method === "hook")),
+      shell_source_characters_before_first_edit: characterSum(readsBeforeFirstEdit.filter((read) => read.method === "shell")),
+      configured_character_share_before_first_edit: totalCharactersBeforeFirstEdit === null || totalCharactersBeforeFirstEdit === 0 || configuredCharactersBeforeFirstEdit === null ? null : configuredCharactersBeforeFirstEdit / totalCharactersBeforeFirstEdit,
     },
     repository_read_calls: observedReads.length,
     configured_repository_read_calls: reads.length,
     assigned_tgrep_calls: arm === "tgrep" ? reads.length : 0,
-    repository_context_characters: observedReads.reduce((sum, read) => sum + read.response_characters, 0),
+    repository_context_characters: observedReads.length === 0 || observedReads.some((read) => read.response_characters === null)
+      ? null
+      : observedReads.reduce((sum, read) => sum + read.response_characters, 0),
     host_instruction_read_calls: hostInstructionReads.length,
-    host_instruction_context_characters: hostInstructionReads.reduce((sum, read) => sum + read.response_characters, 0),
+    host_instruction_context_characters: hostInstructionReads.length === 0 || hostInstructionReads.some((read) => read.response_characters === null)
+      ? null
+      : hostInstructionReads.reduce((sum, read) => sum + read.response_characters, 0),
     tool_output_characters: outputCharactersByMethod.mcp,
     hook_output_characters: outputCharactersByMethod.hook,
     shell_output_characters: outputCharactersByMethod.shell,
@@ -618,13 +675,13 @@ export function analyzeExpandedTranscript(events, arm, task, options = {}) {
     output_characters_by_method: outputCharactersByMethod,
     mcp_component_bytes: mcpComponentBytes,
     mcp_component_classification: mcpComponentClassification,
-    target_attributed_characters: targetReads === null ? null : targetReads.reduce((sum, read) => sum + read.response_characters, 0),
-    target_unattributed_characters: targetReads === null ? null : observedReads.filter((read) => !targetReads.includes(read)).reduce((sum, read) => sum + read.response_characters, 0),
+    target_attributed_characters: targetReads === null ? null : characterSum(targetReads),
+    target_unattributed_characters: targetReads === null ? null : characterSum(observedReads.filter((read) => !targetReads.includes(read))),
     context_component_characters: componentCharacters,
     context_component_calls: componentCalls,
     context_calls_attributed_to_declared_targets: patterns.length === 0 ? null : observedReads.filter((read) => patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`))).length,
     context_calls_unattributed_to_declared_targets: patterns.length === 0 ? null : observedReads.filter((read) => !patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`))).length,
-    context_characters_unattributed_to_declared_targets: patterns.length === 0 ? null : observedReads.filter((read) => !patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`))).reduce((sum, read) => sum + read.response_characters, 0),
+    context_characters_unattributed_to_declared_targets: patterns.length === 0 ? null : characterSum(observedReads.filter((read) => !patterns.some((pattern) => pattern.test(`${read.request}\n${read.response}`)))),
     observed_discovery_calls: observedReads.length,
     observed_discovery_before_edit: observedDiscoveryIndices.length > 0 && (observedFirstEdit === undefined || observedDiscoveryIndices[0] < observedFirstEdit),
     observed_post_edit_discovery_calls: observedFirstEdit === undefined ? 0 : observedDiscoveryIndices.filter((index) => index > observedFirstEdit).length,

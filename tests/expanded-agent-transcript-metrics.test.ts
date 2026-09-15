@@ -5,6 +5,13 @@ const task = {
   required_patterns: [{ path: "src/services/transpile.ts", regex: "onDiagnostic" }],
 };
 
+type CharacterMetrics = {
+  output_characters_by_method: { mcp: number | null; hook: number | null };
+  hook_output_characters: number | null;
+  host_instruction_context_characters: number | null;
+};
+const characterMetrics = (value: unknown) => value as CharacterMetrics;
+
 describe("expanded agent transcript metrics", () => {
   it("accounts for all completed transport text without adding tgrep twice", () => {
     const events = [
@@ -473,4 +480,72 @@ it("retains a source read combined with a diff review without counting the outpu
   const command = "cat src/a.ts; git diff | sed -n '1,20p'";
   expect(isShellSourceReadCommand(command)).toBe(true);
   expect(analyzeExpandedTranscript([{ type: "item.completed", item: { type: "command_execution", command, aggregated_output: "source and review", exit_code: 0 } }], "baseline", task)).toMatchObject({ repository_read_calls: 1, shell_output_characters: 17 });
+});
+
+it("keeps missing discovery response characters null while explicit empty content is zero", () => {
+  const explicitEmpty = characterMetrics(analyzeExpandedTranscript([
+    { type: "item.completed", item: { type: "mcp_tool_call", server: "urdira", tool: "urdira_context", result: { content: [] } } },
+  ], "urdira-typescript", task));
+  const missing = characterMetrics(analyzeExpandedTranscript([
+    { type: "item.completed", item: { type: "mcp_tool_call", server: "urdira", tool: "urdira_context", result: {} } },
+  ], "urdira-typescript", task));
+  expect(explicitEmpty.output_characters_by_method.mcp).toBe(0);
+  expect(missing.output_characters_by_method.mcp).toBeNull();
+});
+
+it("does not turn an unavailable served hook payload into zero characters", () => {
+  const metrics = characterMetrics(analyzeExpandedTranscript([
+    { type: "item.completed", item: { type: "error", message: "Command blocked by PreToolUse hook: [urdira hook served]\n" } },
+  ], "urdira-typescript", task, {
+    hook_audit: [{ hook_event_name: "PreToolUse", operation: "grep", decision: "serve" }],
+  }));
+  expect(metrics.hook_output_characters).toBeNull();
+});
+
+it("leaves shell overlap call classification null when no typed source was observed", () => {
+  const metrics = analyzeContextEfficiency([
+    { type: "item.completed", item: { type: "command_execution", command: "cat src/a.ts", aggregated_output: "source" } },
+  ]);
+  expect(metrics.shell_source_reads).toMatchObject({ total_calls: 1, overlapping_calls: null, nonoverlapping_calls: null, unclassified_calls: 1 });
+});
+
+it("does not classify a later shell call as nonoverlapping when its output is missing", () => {
+  const metrics = analyzeContextEfficiency([
+    { type: "item.completed", item: { type: "mcp_tool_call", result: { content: [{ type: "text", text: "source:1 {\"span\":{}}\n    const value = 1;" }] } } },
+    { type: "item.completed", item: { type: "command_execution", command: "cat src/a.ts" } },
+  ]);
+  expect(metrics.shell_source_reads).toMatchObject({ total_calls: 1, overlapping_calls: null, nonoverlapping_calls: null });
+});
+
+it("counts MCP text blocks without inserting a separator", () => {
+  const metrics = characterMetrics(analyzeExpandedTranscript([
+    { type: "item.completed", item: { type: "mcp_tool_call", server: "urdira", tool: "urdira_context", result: { content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] } } },
+  ], "urdira-typescript", task));
+  expect(metrics.output_characters_by_method.mcp).toBe(2);
+});
+
+it("keeps unavailable host instruction output null", () => {
+  const metrics = characterMetrics(analyzeExpandedTranscript([
+    { type: "item.completed", item: { type: "command_execution", command: "cat /tmp/.codex/skills/example/SKILL.md" } },
+  ], "baseline", task));
+  expect(metrics.host_instruction_context_characters).toBeNull();
+});
+
+it("assigns mixed hook audit entries in transcript order", () => {
+  const metrics = characterMetrics(analyzeExpandedTranscript([
+    { type: "item.completed", item: { type: "error", message: "Command blocked by PreToolUse hook: [urdira hook served]\nfirst" } },
+    { type: "item.completed", item: { type: "command_execution", command: "rg --files src && cat '/tmp/urdira-hook-output-abc/result.txt'", aggregated_output: "native\n[urdira hook served]\nsecond", exit_code: 0 } },
+  ], "urdira-typescript", task, { hook_audit: [
+    { hook_event_name: "PreToolUse", decision: "serve", output_characters: 5 },
+    { hook_event_name: "PreToolUse", decision: "serve", output_characters: 6 },
+  ] }));
+  expect(metrics.output_characters_by_method.hook).toBe(11);
+});
+
+it("subtracts hook replacement bytes from completed shell transport accounting", () => {
+  const item = { type: "command_execution", command: "rg --files src && cat '/tmp/urdira-hook-output-abc/result.txt'", aggregated_output: "native\n[urdira hook served]\nhooked", exit_code: 0 };
+  const metrics = analyzeExpandedTranscript([{ type: "item.completed", item }], "urdira-typescript", task, {
+    hook_audit: [{ hook_event_name: "PreToolUse", operation: "grep", decision: "serve", output_characters: 6 }],
+  });
+  expect(metrics.completed_tool_output).toMatchObject({ hook: { characters: 6 }, shell: { characters: 7 }, total_characters: 13 });
 });

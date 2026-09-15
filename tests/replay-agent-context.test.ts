@@ -31,4 +31,18 @@ describe("agent-context replay", () => {
       urdira_hook_fallback_calls: 1,
     });
   });
+
+  it("ignores a bare hook-audit JSONL file", () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-replay-bare-hook-audit-"));
+    const transcript = join(root, "run.jsonl");
+    const output = join(root, "replay.json");
+    writeFileSync(transcript, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1 } })}\n`);
+    writeFileSync(join(root, "hook-audit.jsonl"), `${JSON.stringify({ client: "codex", decision: "fallback" })}\n`);
+    writeFileSync(join(root, "run.json"), `${JSON.stringify({ arm: "baseline" })}\n`);
+
+    execFileSync(process.execPath, ["release/benchmarks/replay-agent-context.mjs", "--output", output, root], { cwd: process.cwd() });
+    const replay = JSON.parse(readFileSync(output, "utf8")) as { runs: Array<{ raw: { transcript: string } }> };
+    expect(replay.runs).toHaveLength(1);
+    expect(replay.runs[0]?.raw.transcript).toBe(transcript);
+  });
 });

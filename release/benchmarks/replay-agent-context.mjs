@@ -16,7 +16,7 @@ const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const corpus = JSON.parse(readFileSync(new URL("./expanded-typescript-agent-benchmark.json", import.meta.url), "utf8"));
 const runs = [];
 for (const root of roots) {
-  for (const name of readdirSync(root).filter((name) => name.endsWith(".jsonl") && !name.endsWith(".hook-audit.jsonl")).sort()) {
+  for (const name of readdirSync(root).filter((name) => name.endsWith(".jsonl") && !/(^|[.-])hook-audit\.jsonl$/.test(name)).sort()) {
     const path = join(root, name);
     const raw = readFileSync(path);
     const events = raw.toString("utf8").split("\n").filter(Boolean).map(JSON.parse);

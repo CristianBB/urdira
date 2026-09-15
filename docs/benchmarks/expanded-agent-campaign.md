@@ -1,13 +1,142 @@
 # Expanded agent comparison runbook
 
-Status: operational procedure, checked against the runner on 2026-09-10.
-No benchmark was executed during this documentation preparation.
+Status: operational procedure, checked against the runner on 2026-09-10;
+authorized v5 definitive campaign **BLOCKED after two cell attempts** on
+2026-09-15. No readiness probe executed.
 
 The current definitive reporting status is recorded in the [dated derived
-report](definitive-agent-benchmark-results-2026-09-15.md). It is a pending
-campaign until the final analyzer/render/publication phase in the [self-contained
-handoff](definitive-agent-benchmark-handoff.md) has produced and shown the
-complete table.
+report](definitive-agent-benchmark-results-2026-09-15.md). The campaign is
+blocked after a failed retained baseline and a blocked Urdira cell without a
+manifest; 43 cells were not attempted and all 18 readiness probes were
+blocked before execution. The complete planned 45/18 matrix and retained
+offline appendix are recorded in the dated results report.
+
+### Earlier preflight attempts (separate from authorized v5)
+
+The immutable preflight ledger is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/preflight-attempt-ledger.json`
+with SHA-256
+`210a98e91cd89d0a57936cc6f11eb5302d2a9576668efc7085928ea7f7c6ae36`.
+Two earlier campaign-1 Playwright baseline startup attempts stopped before
+Codex/model spawn: both reported `ready=false`, reason
+`declared_dependencies_missing`, and 110 missing dependencies. Their timing
+sidecars contain empty `turns`, `mcp_calls`, and `command_calls`. The first is retained under
+`campaign-1-preflight-failure`; the second is under `campaign-1`.
+
+The first audit has a path/hash collision after the attempt directory move:
+`campaign-1-preflight-failure/campaign-audit.json` declares
+`cell_manifest_sha256=d1d98ebb54361d95a876eefb55bc2f8f1650134c770951059f39807502870e13`
+but its `cell_manifest` path points to the current `campaign-1/cell-manifest.json`,
+whose hash is `181ae2436700ea753588215d3be708c58ea903034d1c918c26f6810eeefa881c`.
+The first and second audit hashes are
+`a53a6fd89314ceb3a05eb3e71e45e35392ae6858d8d6527648b25b490f01d91d` and
+`46dcff6c2c874e0b1c2e16e0a53c1d8eb27ccd8e56017ce99f3a7a71459d38b2`.
+These earlier preflight attempts are separate from the authorized v5 execution
+snapshot below; they do not describe its two cell attempts.
+
+### Authorized v5 execution snapshot
+
+The authoritative stop ledger is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/campaign-1/campaign-stop-ledger.json`
+(`sha256=4226c3b53ece6137c8c32b3ba18b687d799aa39b1e955b48b019ea37e3db0e24`).
+It records two started cells out of 15 and `no_retry=true`: the baseline has a
+failed retained manifest with `model_invoked=true` (Codex process launched,
+not proof of successful model interaction), while Urdira returned exit 1
+without a manifest, so `model_invoked=null`. Forty-three cells were not
+attempted. No readiness probe executed; all 18 readiness rows are blocked
+before execution with `null` measurements.
+
+The complete partial state table is
+`/Users/Cristian/BenchmarkResults/urdira-renderer-analysis-revision-20260915/partial-plan-table-v2.json`
+(`sha256=a9cd99468a8c078f4358a30182a1ab8eeeb584406faea4cd39ecfba77094f4a4`).
+The report-only renderer analysis revision is
+`/Users/Cristian/BenchmarkResults/urdira-renderer-analysis-revision-20260915/analysis-revision-v3.json`
+(`sha256=369f5bdd9c42bc7f9997c5d089f93d13778a48ee49463e5a27ba22dbc42441f7`);
+it is separate from the frozen v5 proposal and raw artifacts. The revision
+normalizes nested `result.code`/`signal`/`timed_out` and preserves available
+stream references while leaving unknown model and metric values `null`.
+
+The offline analyzer and partial renderer were run on retained raw paths only.
+The partial render observed 2/15 cells and 0/6 readiness probes, with a false
+gate; it is diagnostic output and cannot satisfy the selected-45 requirement
+of 45 cells and 18 probes.
+The analyzer output is
+`/Users/Cristian/BenchmarkResults/urdira-renderer-analysis-revision-20260915/baseline-token-analysis-v2.json`
+(`sha256=32fb4fbc45e969c3969a6da1164972259a835e9f169990d65cf17ecfb2e5f361`);
+the partial renderer outputs are JSON
+(`sha256=8bc8421d949d94084f08d4e6053ae0ebb7d566528a3e1039d980191d90cb5467`)
+and Markdown
+(`sha256=92f93c6a48e653b0d3e8165338261813c57548621efe86a57e001664f6997873`).
+
+### Dependency preparation records
+
+The retained v3 preparation record is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/dependency-worktree-validation-v3.json`
+(`sha256=f134f45df6e912541535d869fa560bff946f8ac2eb23f625acc2edfc5ed5ceeb`).
+It is a blocked offline dependency-install attempt with
+`model_invoked=false` and `runner_invoked=false`; pnpm reported
+`ERR_PNPM_NO_OFFLINE_TARBALL` for `@biomejs/biome/-/biome-2.5.8.tgz`. It is
+not a model run, runner run, or one of the two campaign-1 preflight failures.
+
+The subsequent per-worktree validation passed in
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/dependency-worktree-validation-v4.json`
+(`sha256=7e1ec668265773ca0142fe0b9965326150e448148deb6fc7bcba5628e6882148`).
+It covers exactly `playwright`, `prisma`, and `vscode`: each worktree was
+ready with no missing dependency or runtime artifact, and each cleanup removed
+the worktree (`3/3`); `global_cache_used=false`, `model_invoked=false`, and
+`runner_invoked=false`. Independent review reported no blockers. This is a
+preparation gate only. The immutable no-retry stop still blocks a new
+45-cell/18-probe series until the user explicitly authorizes it.
+
+The current proposed v5 freeze is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/series-freeze-proposal.json`
+(`sha256=9328d888cc30f11799faa305ed33db965e44d882780eb049626f6df9ba47a89e`),
+verified by
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/proposal-reference-verification.json`
+(`sha256=30458467475c0ba85f4b9a75b307acb0ded0824fe366d4ccb204d8ff98b470bf`).
+The proposal carries 68 exact references; the sidecar checks 71 references
+including additional gate and retention references, plus six manifests; the proposal is
+explicitly `proposal-not-executed`, with `model_invoked=false`, 45 planned
+cells, 18 planned readiness probes, model `gpt-5.6-luna`, Node `v24.18.1`, and
+`minimum_free_bytes=53687091200`. The six manifest hashes are, by campaign
+(cell/readiness order): `1=db8279aa8c190c617aaf1345ddbf9edc4c6912b914a2ba1ac328f50a06f73de9 /
+9fa4155df5a992e30ac286462db780cdeea0a5fc0eb17f591e47a5a9e9458280`,
+`2=ef00ee3dbfac49b2a80305005618c9bf74349bbe588303b845806e738c90e4cb /
+9c86e9649e5157a0093f36ae3200af02c31e1a91163609e3a192de5ad2390c40`, and
+`3=29aefe62fe7f3b1502fe6bd064b0de3f00bcd7aafe2272223235c9ad48000b71 /
+e2cd3451285e22a4f3030ec7cfb1142962c258110c42285d1547a0938d9fd7ad`.
+It binds release binding v6
+(`/Users/Cristian/BenchmarkResults/urdira-final-release-binding-20260915-v6.json`,
+`sha256=352e9d7d49760178864ce64c015918e5d80861d167ab0c7b0e92bc30b691b6fc`)
+and cleanup checkpoint v7
+(`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-release-v7.json`,
+`sha256=93525acf8a1a46e3b84a7bf069cd0484d9163105bd270764f2c2574e4589224d`).
+The current v8 verify, package, acceptance, and diff-check records all exit
+`0`. Their retained records are under
+`/Users/Cristian/BenchmarkResults/urdira-gates-20260915-v8/`:
+
+| Gate | Exit SHA-256 | stdout log SHA-256 | stderr log SHA-256 |
+|---|---|---|---|
+| `pnpm verify` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `adcb5d4078644907dac388606828ad9c7af119a140fcd1c1569866c3cf38d96e` | `2293a8217f4f0912132672b3148c0b66a9c14efe7d15e9776a5235490a2ce430` |
+| `pnpm package:release` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `07efd646a402b386c8b4b54d60a525bd665998e9f26074cb631009b52abaf5bc` | `ea66be16e7e8d99813ccbe29de831ed1a434fa5ed0fe84885d5972795dd56d36` |
+| `pnpm release:acceptance` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `75e7679588e35d6848a279372662a6f1e0cb78e2aa4a4ea797a1b5eb928b1879` | `62ebcde7919e6bb90c422dad33e37186b824101f687188029ab75bc90f42580e` |
+| `git diff --check` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+
+The earlier v7 `pnpm verify` record remains historical: it exited `1` because
+`tests/expanded-benchmark-smoke.test.ts:181` expected an outdated runner
+snippet; its exit SHA is
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
+The v8 gates validate repository and release artifacts only; they add no
+measurements and do not lift the blocked 45-cell/18-probe campaign status.
+The final cleanup checkpoint is
+`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-gates-v10.json`
+(`sha256=6be8cb16b6a5aa6459f99f5fbf81faecd25bbf9be2a74575c24542dad2883eec`):
+free bytes were `367785205760` against the `53687091200` threshold, with zero
+owned processes and zero residue; three source clones, their dependency roots,
+and two extraction roots were deleted. Raw data, the archive, release-binding
+metadata, and frozen harness metadata were retained. The v5 proposal and
+preflight artifacts are historical evidence, not current readiness; a new
+execution would require reprovisioning and a new freeze.
 
 ## Authority and scope
 
@@ -377,6 +506,12 @@ Generate derived reports while transcripts still exist:
   --audit "$BENCH_OUT/full/audit.json" --output "$BENCH_OUT/report"
 ```
 
+For the current definitive 45-cell audit, all five arms are fresh and the
+comparison report must contain no rows. The renderer rejects comparator rows
+unless the audit explicitly opts into historical reuse and rejects any
+repo/task/arm overlap with fresh rows. A historical comparison cannot silently
+fill missing cells or mix unlike campaigns.
+
 Retain each manifest, transcript, host log, audit, environment manifest, raw
 hashes, manual review, and generated JSON/Markdown outside the public tree.
 Publish sanitized derived evidence and a dated note under `docs/evidence/`.
@@ -465,10 +600,58 @@ therefore a profiling result cannot silently become an uninstrumented result.
 The renderer defaults to a planning card of USD 2/M input, 8/M output and
 8/M reasoning tokens; freeze and disclose the accounting convention, including
 cached/reasoning token treatment. These estimates are not provider invoices.
+Every definitive manifest must carry `counter_mode: "cumulative"` or
+`counter_mode: "per_turn"`, backed by the harness/provider event contract.
+Repeated monotonic counters alone do not prove cumulative semantics. When the
+mode is absent, multi-turn token totals and cost are `null`; available
+single-turn counters remain separate observations. The normative comparable
+total is `input_tokens + output_tokens + reasoning_output_tokens`, with
+`cached_input_tokens` reported separately and never subtracted from the
+reported input total. Cost is `null` unless input, cached input, output and
+reasoning counters are all available; use the explicit cached-input rate card.
+
+The Codex host-session binding is the accepted evidence shape for this field.
+The runner retains the session JSONL for every arm and calls
+`deriveHostTokenEvidence` from `release/benchmarks/benchmark-token-evidence.mjs`
+before cleanup. The helper reads only structural records and emits hashes and
+line references, never message contents. It groups unique
+`token_usage_record` events by ordered `root_turn_id`, keeps the final
+`turn_token_usage` and `thread_token_usage` for each root turn, and checks the
+transcript `turn.completed` records against exactly one labeled sequence. A
+`turn_token_usage` match proves `counter_mode: "per_turn"`; a
+`thread_token_usage` match proves `counter_mode: "cumulative"`. The returned
+evidence records `session_path`, `session_sha256`, `cli_version`, ordered root
+turn IDs, transcript and host line references, and token-count event counts.
+`event_msg` `token_count` records are corroborating observations and must not
+be added to `token_usage_record` values. Duplicate response IDs are counted
+once. CLI version alone, monotonicity, or a partial host session cannot set the
+mode. Missing host evidence, a transcript/host mismatch, conflicting duplicate
+records, or an unverified association leaves `counter_mode`, multi-turn totals,
+and cost `null`.
+
+The current retained historical set demonstrates why this binding is required:
+Codex CLI `0.153.4` transcripts match `turn_token_usage`, while
+`0.154.0-alpha.6.2` transcripts match `thread_token_usage`. This observation
+does not authorize using a version as a proxy in a future campaign; every cell
+must retain and match its own host evidence.
 Three samples in one campaign are not three independent campaigns. The driver's
-`--independent-campaigns` flag only writes metadata and the renderer trusts it;
-never set it to three without three genuinely independent, retained campaigns.
-Decision 08 requires those before reporting P95.
+`--independent-campaigns` flag only writes metadata; never set it to three
+without three genuinely independent, retained campaigns. Three observations
+provide median/range only. P95 additionally requires explicit audit evidence
+for each sufficient group; an exact three-observation group always retains
+`p95: null`. Missing fields remain `null`, never zero.
+
+The definitive readiness sidecar is separate from agent cells. The audit may
+carry `readiness_probes`, one row per campaign/repository/phase, with
+`phase: "cold" | "warm"`, `probe_id`, `setup_elapsed_ms`,
+`structural_readiness_ms`, `time_to_first_query_ms`, `snapshot_identity`,
+`page_completeness`, semantic-off booleans, `passed`, and `failure`. Preserve
+the host's monotonic timestamps (`data_root_created`, `source_ready`,
+`structural_ready`, `validated_first_query`, `first_query_complete`) and any
+storage/process/publication/freshness measurements. The current selected
+protocol expects 3 campaigns x 3 repositories x 2 phases = 18 probes; the
+renderer reports missing probes as an incomplete readiness gate and does not
+fold them into task summaries.
 
 Verify cleanup for each owned worktree, data root, comparator project and
 process; investigate false cleanup flags. Preserve transcripts/reports before

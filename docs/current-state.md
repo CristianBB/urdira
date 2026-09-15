@@ -1,8 +1,109 @@
 # Current implementation and evidence
 
-Reviewed: 2026-09-14. This is an implementation inventory, not a new product
+Reviewed: 2026-09-15. This is an implementation inventory, not a new product
 contract or a release certification. Follow the [product foundation](product-foundation.md)
 for normative decisions and the [architecture map](architecture.md) for code paths.
+
+## Definitive agent campaign status (2026-09-15)
+
+The authorized v5 series is **blocked after two campaign-1 cell attempts**.
+The baseline has a failed retained manifest with `model_invoked=true`, which
+means the Codex process was launched but does not establish a successful model
+interaction. Its transcript is empty; the timing sidecar exposes one observed
+turn and zero MCP/command calls, while token, cost, correctness, coverage,
+efficiency, and distribution measurements are `null`. The Urdira cell
+returned exit 1 without a retained manifest, so `model_invoked=null` and its
+status is `blocked`. Forty-three cells were not attempted. Of the 18 readiness
+probes, six campaign-1 probes are blocked by the stop after the two cell
+attempts, while the twelve campaign-2 and campaign-3 probes were not
+attempted. The authoritative stop ledger is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/campaign-1/campaign-stop-ledger.json`
+(`sha256=4226c3b53ece6137c8c32b3ba18b687d799aa39b1e955b48b019ea37e3db0e24`).
+
+Earlier preflight diagnostics, separate from authorized v5, retain a path/hash
+collision: the first audit's declared cell-manifest
+hash is `d1d98ebb54361d95a876eefb55bc2f8f1650134c770951059f39807502870e13`,
+but its path points at the current second-attempt manifest, whose hash is
+`181ae2436700ea753588215d3be708c58ea903034d1c918c26f6810eeefa881c`.
+The complete planned 45-cell and 18-probe matrix, with unavailable fields
+represented as `null` and attempted observations called out separately, is in
+the [dated benchmark report](benchmarks/definitive-agent-benchmark-results-2026-09-15.md).
+
+The complete partial state table is
+`/Users/Cristian/BenchmarkResults/urdira-renderer-analysis-revision-20260915/partial-plan-table-v2.json`
+(`sha256=a9cd99468a8c078f4358a30182a1ab8eeeb584406faea4cd39ecfba77094f4a4`).
+The report-only renderer revision is
+`/Users/Cristian/BenchmarkResults/urdira-renderer-analysis-revision-20260915/analysis-revision-v3.json`
+(`sha256=369f5bdd9c42bc7f9997c5d089f93d13778a48ee49463e5a27ba22dbc42441f7`).
+Its partial JSON and Markdown renders have SHAs
+`8bc8421d949d94084f08d4e6053ae0ebb7d566528a3e1039d980191d90cb5467` and
+`92f93c6a48e653b0d3e8165338261813c57548621efe86a57e001664f6997873`;
+both are diagnostic and fail the incomplete 15-cell/6-probe gate.
+
+Preparation evidence is kept separate from those campaign attempts. The
+retained v3 record
+(`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/dependency-worktree-validation-v3.json`,
+`sha256=f134f45df6e912541535d869fa560bff946f8ac2eb23f625acc2edfc5ed5ceeb`)
+is a blocked offline install with `ERR_PNPM_NO_OFFLINE_TARBALL` for
+`@biomejs/biome/-/biome-2.5.8.tgz`; it records no runner or model invocation.
+The later v4 per-worktree validation
+(`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/dependency-worktree-validation-v4.json`,
+`sha256=7e1ec668265773ca0142fe0b9965326150e448148deb6fc7bcba5628e6882148`)
+passed for exactly the three selected repositories: all were ready, no
+dependency or runtime artifacts were missing, cleanup succeeded `3/3`, and no
+global cache, runner, or model was used. Independent review found no blockers.
+This preparation pass does not authorize a new series; the existing no-retry
+stop and explicit-user-authorization gate remain in force.
+
+The prepared v5 freeze proposal is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/series-freeze-proposal.json`
+(`sha256=9328d888cc30f11799faa305ed33db965e44d882780eb049626f6df9ba47a89e`),
+with reference-verification sidecar
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/proposal-reference-verification.json`
+(`sha256=30458467475c0ba85f4b9a75b307acb0ded0824fe366d4ccb204d8ff98b470bf`).
+The proposal carries 68 references; its verification sidecar checks 71
+references including additional gate and retention references, six plan
+manifests, 45 planned cells and 18
+planned readiness probes, but `proposal-not-executed` and
+`model_invoked=false`. The proposal binds release binding v6
+(`/Users/Cristian/BenchmarkResults/urdira-final-release-binding-20260915-v6.json`,
+`sha256=352e9d7d49760178864ce64c015918e5d80861d167ab0c7b0e92bc30b691b6fc`)
+and cleanup checkpoint v7
+(`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-release-v7.json`,
+`sha256=93525acf8a1a46e3b84a7bf069cd0484d9163105bd270764f2c2574e4589224d`).
+The current v8 verify, package, acceptance, and diff-check records all exit
+`0`. Their retained records are under
+`/Users/Cristian/BenchmarkResults/urdira-gates-20260915-v8/`:
+
+| Gate | Exit SHA-256 | stdout log SHA-256 | stderr log SHA-256 |
+|---|---|---|---|
+| `pnpm verify` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `adcb5d4078644907dac388606828ad9c7af119a140fcd1c1569866c3cf38d96e` | `2293a8217f4f0912132672b3148c0b66a9c14efe7d15e9776a5235490a2ce430` |
+| `pnpm package:release` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `07efd646a402b386c8b4b54d60a525bd665998e9f26074cb631009b52abaf5bc` | `ea66be16e7e8d99813ccbe29de831ed1a434fa5ed0fe84885d5972795dd56d36` |
+| `pnpm release:acceptance` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `75e7679588e35d6848a279372662a6f1e0cb78e2aa4a4ea797a1b5eb928b1879` | `62ebcde7919e6bb90c422dad33e37186b824101f687188029ab75bc90f42580e` |
+| `git diff --check` | `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+
+The earlier v7 `pnpm verify` record remains historical: it exited `1` because
+`tests/expanded-benchmark-smoke.test.ts:181` expected an outdated runner
+snippet; its exit SHA is
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
+The v8 gates validate repository and release artifacts only; they add no
+measurements and do not lift the blocked 45-cell/18-probe campaign status.
+The final cleanup checkpoint is
+`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-gates-v10.json`
+(`sha256=6be8cb16b6a5aa6459f99f5fbf81faecd25bbf9be2a74575c24542dad2883eec`):
+free bytes were `367785205760` against the `53687091200` threshold, with zero
+owned processes and zero residue; three source clones, their dependency roots,
+and two extraction roots were deleted. Raw data, the archive, release-binding
+metadata, and frozen harness metadata were retained. The v5 proposal and
+preflight artifacts are historical evidence, not current readiness; a new
+execution would require reprovisioning and a new freeze.
+
+The separate historical offline appendix reprocessed 47 retained raw rows:
+40 had matched host token evidence, 7 lacked host evidence, 34 were successful
+historical outcomes, and 13 were failed or blocked. It is not campaign or
+readiness evidence and is not combined with current-state capability claims.
+The corrected v6 artifacts remain at
+`/Users/Cristian/BenchmarkResults/urdira-definitive-offline-20260915-metrics-final-v6`.
 
 ## Version and deployment boundary
 

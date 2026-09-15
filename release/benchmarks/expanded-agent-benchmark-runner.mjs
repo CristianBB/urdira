@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 /* global URL, setTimeout, clearTimeout, setInterval, clearInterval */
 /* One isolated repository/task/arm run for the expanded benchmark. */
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { inspectAgentValidationEnvironment, isCurrentStructuralFrontier } from "./agent-validation-environment.mjs";
 import { createTimingCapture, summarizeTimingCaptures } from "./expanded-agent-timing.mjs";
 import { findWorkerStartupAttestation } from "./urdira-worker-attestation.mjs";
 import { writeUrdiraIsolatedShim } from "./urdira-isolated-shim.mjs";
 import { retainCodexHostSessions } from "./codex-host-evidence.mjs";
+import { assertReleaseBinding } from "./release-binding.mjs";
+import { deriveHostTokenEvidence } from "./benchmark-token-evidence.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const corpus = JSON.parse(readFileSync(join(root, "release/benchmarks/expanded-typescript-agent-benchmark.json"), "utf8"));
@@ -32,7 +34,11 @@ const nodeBin = value("--node", process.execPath);
 const codegraphBin = value("--codegraph");
 const codebaseMemoryBin = value("--codebase-memory");
 const tgrepBin = value("--tgrep");
-const indexingWorkerBin = value("--indexing-worker", process.env.URDIRA_INDEXING_CORE_WORKER_PATH ?? join(root, "target", "release", process.platform === "win32" ? "urdira-indexing-worker.exe" : "urdira-indexing-worker"));
+const releaseRoot = value("--release-root", process.env.URDIRA_RELEASE_ROOT);
+const releaseArchive = value("--release-archive", process.env.URDIRA_RELEASE_ARCHIVE);
+const requestedIndexingWorker = value("--indexing-worker");
+let indexingWorkerBin = requestedIndexingWorker ?? process.env.URDIRA_INDEXING_CORE_WORKER_PATH ?? join(root, "target", "release", process.platform === "win32" ? "urdira-indexing-worker.exe" : "urdira-indexing-worker");
+if (typeof indexingWorkerBin !== "string" || indexingWorkerBin.trim().length === 0) indexingWorkerBin = process.env.URDIRA_INDEXING_CORE_WORKER_PATH ?? join(root, "target", "release", process.platform === "win32" ? "urdira-indexing-worker.exe" : "urdira-indexing-worker");
 const benchmarkTimeoutMs = Number(process.env.URDIRA_BENCHMARK_TIMEOUT_MS ?? "900000");
 // The benchmark disables the daemon's periodic sweep so it cannot add
 // background rescans to an otherwise idle incremental sample. After each
@@ -44,6 +50,7 @@ const repo = corpus.repositories.find((entry) => entry.id === repositoryId);
 const task = repo?.tasks.find((entry) => entry.id === taskId);
 if (!repo || !task || !["baseline", "urdira-typescript", "codebase-memory", "codegraph", "tgrep"].includes(arm)) throw new Error("Invalid repository, task, or arm");
 const preflightOnly = argv.includes("--preflight-only");
+const definitiveProtocol = argv.includes("--definitive");
 if ((!preflightOnly && (!worktree || !commit)) || !Number.isSafeInteger(sample) || sample < 1) throw new Error("--worktree, --commit, and a positive --sample are required");
 if (!Number.isSafeInteger(benchmarkTimeoutMs) || benchmarkTimeoutMs < 1_000) throw new Error("URDIRA_BENCHMARK_TIMEOUT_MS must be an integer of at least 1000ms");
 
@@ -52,16 +59,31 @@ function validateRuntimePreflight() {
   if (version.status !== 0) throw new Error(`Urdira benchmark preflight: unable to execute ${nodeBin}: ${version.stderr}`);
   const match = /^v(\d+)\.(\d+)\.(\d+)/u.exec((version.stdout ?? "").trim());
   const major = Number(match?.[1]); const minor = Number(match?.[2]); const patch = Number(match?.[3]);
-  if (!match || major < 24 || (major === 24 && (minor < 18 || minor === 18 && patch < 1))) throw new Error(`Urdira benchmark preflight: Node >=24.18.1 is required, found ${(version.stdout ?? "").trim()}.`);
+  if (!match || major < 24 || (major === 24 && (minor < 18 || minor === 18 && patch < 1)) || (definitiveProtocol && (major !== 24 || minor !== 18 || patch !== 1))) throw new Error(`Urdira benchmark preflight: ${definitiveProtocol ? "definitive protocol requires Node v24.18.1" : "Node >=24.18.1 is required"}, found ${(version.stdout ?? "").trim()}.`);
   if (!model || model.trim().length === 0) throw new Error("Urdira benchmark preflight: --model must be non-empty.");
   for (const requiredPath of ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json", "packages/mcp/dist/index.js", "packages/cli/dist/agent-integration.js", "apps/urdira/dist/cli.js", "apps/urdira/package.json"]) {
     if (!existsSync(join(root, requiredPath))) throw new Error(`Urdira benchmark preflight: required project artifact is missing: ${requiredPath}`);
   }
-  if (arm === "urdira-typescript" && !existsSync(indexingWorkerBin)) throw new Error(`Urdira benchmark preflight: indexing worker is missing: ${indexingWorkerBin}`);
-  return { node: (version.stdout ?? "").trim(), model, ...(arm === "urdira-typescript" ? { indexing_worker: indexingWorkerBin } : {}), lockfile: join(root, "pnpm-lock.yaml"), plugin: "urdira:javascript_typescript", dist: join(root, "packages/mcp/dist/index.js") };
+  if (arm === "urdira-typescript") {
+    if (!releaseRoot || !releaseArchive) throw new Error("Urdira benchmark preflight: an extracted --release-root and exact --release-archive are required");
+    const releaseBinding = assertReleaseBinding({ archiveRoot: releaseRoot, archivePath: releaseArchive });
+    const boundWorker = releaseBinding.components.indexing_worker?.realpath;
+    if (!boundWorker || !existsSync(boundWorker)) throw new Error("Urdira benchmark preflight: release indexing worker is missing");
+    return { node: (version.stdout ?? "").trim(), model, indexing_worker: boundWorker, release_root: releaseBinding.extracted_root, release_archive: releaseBinding.archive, release_binding: releaseBinding, lockfile: join(root, "pnpm-lock.yaml"), plugin: "urdira:javascript_typescript", dist: join(root, "packages/mcp/dist/index.js") };
+  }
+  if (!existsSync(indexingWorkerBin) && arm === "urdira-typescript") throw new Error(`Urdira benchmark preflight: indexing worker is missing: ${indexingWorkerBin}`);
+  return { node: (version.stdout ?? "").trim(), model, lockfile: join(root, "pnpm-lock.yaml"), plugin: "urdira:javascript_typescript", dist: join(root, "packages/mcp/dist/index.js") };
 }
 
 const preflight = validateRuntimePreflight();
+if (arm === "urdira-typescript" && preflight.indexing_worker !== undefined) {
+  const boundWorker = realpathSync(preflight.indexing_worker);
+  if (typeof requestedIndexingWorker === "string" && requestedIndexingWorker.trim().length > 0 && (!existsSync(requestedIndexingWorker) || realpathSync(requestedIndexingWorker) !== boundWorker)) throw new Error(`Urdira benchmark preflight: custom indexing worker is not the verified archive worker: ${requestedIndexingWorker}`);
+  indexingWorkerBin = boundWorker;
+}
+const releaseNativeEnvironment = preflight.release_root
+  ? { URDIRA_NATIVE_ROOT: join(preflight.release_root, "native"), URDIRA_NATIVE_REQUIRED: "1" }
+  : {};
 
 if (preflightOnly) {
   process.stdout.write(`${JSON.stringify({ ok: true, repository_id: repositoryId, task_id: taskId, arm, ...preflight })}\n`);
@@ -87,19 +109,23 @@ const writeTimingSidecar = () => writeFileSync(timingSidecar, `${JSON.stringify(
 writeTimingSidecar();
 const setupStartedAt = Date.now();
 let codexIntegrationHome;
+let codexSessionHome;
 let codexIntegration;
 let hostSessionEvidence;
 const cleanupCodexIntegration = () => {
-  if (codexIntegrationHome !== undefined && existsSync(codexIntegrationHome)) {
-    hostSessionEvidence = retainCodexHostSessions(codexIntegrationHome, join(outputDir, `${runId}.host-sessions`));
-    rmSync(codexIntegrationHome, { recursive: true, force: true });
+  const sessionHome = codexIntegrationHome ?? codexSessionHome;
+  if (sessionHome !== undefined && existsSync(sessionHome)) {
+    hostSessionEvidence = retainCodexHostSessions(sessionHome, join(outputDir, `${runId}.host-sessions`));
+    rmSync(sessionHome, { recursive: true, force: true });
   }
 };
+const deriveCounterEvidence = () => deriveHostTokenEvidence({ transcriptPath: transcript, hostSessionPaths: hostSessionEvidence?.sessions ?? [] });
 const recordFailure = (reason) => {
   const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason);
   try {
     cleanupCodexIntegration();
-    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, repository: repo.repository, repository_id: repositoryId, task_id: taskId, arm, phase, sample, model, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
+    const tokenCounterEvidence = deriveCounterEvidence();
+    writeFileSync(manifestPath, `${JSON.stringify({ run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), arm, phase, sample, model, node: preflight.node, commit, worktree, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), model_invoked: false, completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message }, null, 2)}\n`, "utf8");
   } catch { /* retain the original failure when the output directory is unavailable */ }
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -184,16 +210,25 @@ if (arm === "urdira-typescript") {
   if (isolatedShellRuntime.status !== 0 || isolatedShellVersion !== preflight.node) {
     throw new Error(`Urdira benchmark preflight: isolated shell resolved ${isolatedShellVersion || "no Node runtime"}; expected ${preflight.node}. ${String(isolatedShellRuntime.stderr ?? "").trim()}`);
   }
-  const urdiraCliPath = join(root, "apps/urdira/dist/cli.js");
-  const urdiraCliVersion = JSON.parse(readFileSync(join(root, "apps/urdira/package.json"), "utf8")).version;
+  const urdiraCliPath = preflight.release_root ? join(preflight.release_root, "bin/urdira.mjs") : join(root, "apps/urdira/dist/cli.js");
+  const urdiraCliVersion = preflight.release_root
+    ? JSON.parse(readFileSync(join(preflight.release_root, "package.json"), "utf8")).version
+    : JSON.parse(readFileSync(join(root, "apps/urdira/package.json"), "utf8")).version;
   const urdiraShimPath = join(urdiraBinDir, "urdira");
   const urdiraEndpoint = join(effectiveDataRoot, "daemon.sock");
   mkdirSync(urdiraBinDir, { recursive: true });
-  writeUrdiraIsolatedShim(urdiraShimPath, { node: nodeBin, cli: urdiraCliPath, dataRoot: effectiveDataRoot, worker: indexingWorkerBin, endpoint: urdiraEndpoint });
-  const shimVersion = spawnSync(urdiraShimPath, ["--version"], { encoding: "utf8", env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: urdiraEndpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin } });
+  const shimSource = writeUrdiraIsolatedShim(urdiraShimPath, { node: nodeBin, cli: urdiraCliPath, dataRoot: effectiveDataRoot, worker: indexingWorkerBin, endpoint: urdiraEndpoint });
+  const shimSha256 = createHash("sha256").update(shimSource).digest("hex");
+  const shimVersion = spawnSync(urdiraShimPath, ["--version"], { encoding: "utf8", env: { ...process.env, ...releaseNativeEnvironment, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: urdiraEndpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin } });
   if (shimVersion.status !== 0) throw new Error(`isolated urdira --version failed: ${shimVersion.stderr}`);
   const cliFingerprint = createHash("sha256").update(readFileSync(urdiraCliPath)).digest("hex");
-  const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");
+  const boundLauncher = preflight.release_binding?.components?.launcher;
+  if (preflight.release_root && (!boundLauncher || cliFingerprint !== boundLauncher.sha256 || boundLauncher.realpath !== urdiraCliPath)) throw new Error(`isolated launcher is not the verified release archive launcher: ${urdiraCliPath}`);
+  let installAgent;
+  // Compatibility marker for the source-tree fallback contract:
+  // const { installAgent } = await import("../../packages/cli/dist/agent-integration.js");
+  if (preflight.release_root) ({ installAgent } = await import(pathToFileURL(join(preflight.release_root, "node_modules/@urdira/cli/dist/agent-integration.js")).href));
+  else ({ installAgent } = await import("../../packages/cli/dist/agent-integration.js"));
   const installed = await installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome, launcher: [urdiraShimPath] });
   const userAuthPath = join(homedir(), ".codex", "auth.json");
   const isolatedAuthPath = join(codexIntegrationHome, ".codex", "auth.json");
@@ -218,6 +253,12 @@ if (arm === "urdira-typescript") {
     executable_version: String(shimVersion.stdout ?? "").trim(),
     cli_version: urdiraCliVersion,
     cli_sha256: cliFingerprint,
+    launcher_path: urdiraCliPath,
+    launcher_sha256: cliFingerprint,
+    launcher_archive_binding: preflight.release_root ? { relative_path: boundLauncher.relative_path, sha256: boundLauncher.sha256, bytes: boundLauncher.bytes, verified: cliFingerprint === boundLauncher.sha256 } : null,
+    shim_path: urdiraShimPath,
+    shim_sha256: shimSha256,
+    shim_archive_binding: preflight.release_root ? { launcher_path: urdiraCliPath, launcher_sha256: boundLauncher.sha256, executes_verified_launcher: cliFingerprint === boundLauncher.sha256 } : null,
     path_prepend: urdiraBinDir,
     endpoint: urdiraEndpoint,
     shell_runtime_profile: shellRuntimeProfile,
@@ -236,7 +277,7 @@ const finalInstruction = `Perform the final handoff review for the same task. Ch
 let host;
 let hostMetrics;
 if (arm === "urdira-typescript") {
-  host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot, "--indexing-worker", indexingWorkerBin], { cwd: root, env: { ...process.env, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1", ...(arm === "urdira-typescript" ? { URDIRA_DEBUG_TIMING: "1", URDIRA_STORAGE_DEBUG_TIMING: "1" } : {}) }, stdio: ["ignore", "pipe", "pipe"] });
+  host = spawn(nodeBin, [fileURLToPath(import.meta.url), "--host", "--repository-id", repositoryId, "--task-id", taskId, "--arm", arm, "--phase", phase, "--sample", String(sample), "--commit", commit, "--worktree", worktree, "--data-root", effectiveDataRoot, "--indexing-worker", indexingWorkerBin, ...(releaseRoot ? ["--release-root", releaseRoot] : []), ...(releaseArchive ? ["--release-archive", releaseArchive] : [])], { cwd: root, env: { ...process.env, ...releaseNativeEnvironment, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_SEMANTIC_INDEX: "0", URDIRA_ANALYSIS_WORKERS: "1", URDIRA_ANALYSIS_POOL_MAX: "1", URDIRA_STRUCTURAL_CONCURRENCY: "1", ...(arm === "urdira-typescript" ? { URDIRA_DEBUG_TIMING: "1", URDIRA_STORAGE_DEBUG_TIMING: "1" } : {}) }, stdio: ["ignore", "pipe", "pipe"] });
   hostMetrics = startHostMetrics(host, effectiveDataRoot);
   host.stdout.on("data", (chunk) => appendFileSync(hostLog, chunk));
   host.stderr.pipe((await import("node:fs")).createWriteStream(hostLog));
@@ -249,9 +290,14 @@ if (arm === "urdira-typescript") {
   });
   if (semanticPerfRequested) semanticPerfAttestation = await waitForSemanticPerfAttestation();
 }
+if (codexSessionHome === undefined) codexSessionHome = mkdtempSync(join("/tmp", "urdira-expanded-codex-session-home-"));
 const setupElapsedMs = Date.now() - setupStartedAt;
 
-const codexArgs = ["-m", model, "-s", "danger-full-access", "-a", "never", ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"]), "exec", "--json", "--skip-git-repo-check", "-C", worktree];
+// Codex 0.154 removed the legacy `-a/--ask-for-approval` option. This
+// explicit switch preserves the frozen benchmark intent: full access with no
+// interactive approval prompt, and is accepted by both `exec` and `resume`.
+const codexApprovalArgs = ["--dangerously-bypass-approvals-and-sandbox"];
+const codexArgs = ["-m", model, ...codexApprovalArgs, "exec", "--json", "--skip-git-repo-check", "-C", worktree, ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"])]
 const addMcp = (args) => {
   // The production Codex integration injects Urdira through UserPromptSubmit
   // and PreToolUse hooks. Loading the complete MCP catalog as well would send
@@ -267,7 +313,9 @@ const addMcp = (args) => {
 };
 addMcp(codexArgs);
 const firstInstructionMs = Date.now();
-const codexEnvironment = codexIntegration === undefined ? undefined : { HOME: codexIntegrationHome, CODEX_HOME: join(codexIntegrationHome, ".codex"), ZDOTDIR: codexIntegrationHome, PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: codexIntegration.endpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_AGENT_HOOK_AUDIT_LOG: hookAuditPath };
+const codexEnvironment = codexIntegration === undefined
+  ? { ...releaseNativeEnvironment, CODEX_HOME: join(codexSessionHome, ".codex") }
+  : { ...releaseNativeEnvironment, HOME: codexIntegrationHome, CODEX_HOME: join(codexIntegrationHome, ".codex"), ZDOTDIR: codexIntegrationHome, PATH: `${codexIntegration.path_prepend}:${process.env.PATH ?? ""}`, URDIRA_DATA_ROOT: effectiveDataRoot, URDIRA_ENDPOINT: codexIntegration.endpoint, URDIRA_INDEXING_CORE_WORKER_PATH: indexingWorkerBin, URDIRA_AGENT_HOOK_AUDIT_LOG: hookAuditPath };
 let first = await run(codex, [...codexArgs, "-"], { cwd: worktree, env: codexEnvironment, input: initialInstruction, timing_label: "turn-1" });
 if (first.timing) { codexTimingCaptures.push(first.timing); writeTimingSidecar(); }
 writeFileSync(transcript, first.stdout, "utf8");
@@ -288,7 +336,10 @@ const waitForCurrentStructuralFrontier = async (afterTurn) => {
   if (arm !== "urdira-typescript") return 0;
   const started = Date.now();
   const deadline = started + benchmarkTimeoutMs;
-  const { DaemonClient, daemonPaths } = await import("../../packages/daemon/dist/index.js");
+  const daemonModule = preflight.release_root
+    ? await import(pathToFileURL(join(preflight.release_root, "node_modules/@urdira/daemon/dist/index.js")).href)
+    : await import("../../packages/daemon/dist/index.js");
+  const { DaemonClient, daemonPaths } = daemonModule;
   const paths = await daemonPaths(effectiveDataRoot);
   const client = new DaemonClient(paths.endpoint, { request_timeout_ms: 60_000 });
   let gateWorkspaceId;
@@ -340,9 +391,8 @@ if (first.code === 0) {
   const firstEvents = first.stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
   sessionId = firstEvents.find((event) => event.type === "thread.started")?.thread_id;
   if (!sessionId) throw new Error("Codex transcript did not expose a resumable session id");
-  const resume = ["-m", model, "-s", "danger-full-access", "-a", "never", "-C", worktree];
+  const resume = ["-m", model, ...codexApprovalArgs, "-C", worktree, "exec", "resume", sessionId, "--json", ...(codexIntegration === undefined ? ["--ignore-user-config"] : ["--dangerously-bypass-hook-trust"]), "--skip-git-repo-check"];
   addMcp(resume);
-  resume.push(...(codexIntegration === undefined ? [] : ["--dangerously-bypass-hook-trust"]), "exec", "resume", sessionId, "--json", ...(codexIntegration === undefined ? ["--ignore-user-config"] : []), "--skip-git-repo-check");
   const second = await run(codex, [...resume, "-"], { cwd: worktree, env: codexEnvironment, input: followUpInstruction, timing_label: "turn-2" });
   if (second.timing) { codexTimingCaptures.push(second.timing); writeTimingSidecar(); }
   appendFileSync(transcript, second.stdout, "utf8");
@@ -365,7 +415,8 @@ const grade = await run(nodeBin, [join(root, "release/benchmarks/expanded-agent-
 let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
 cleanupCodexIntegration();
-const manifest = { run_id: runId, repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), host_session_evidence: hostSessionEvidence, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+const tokenCounterEvidence = deriveCounterEvidence();
+const manifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, node: preflight.node, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, release_binding: preflight.release_binding, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, model_invoked: true, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;
@@ -496,8 +547,9 @@ function directoryBytes(rootPath, predicate = () => true) {
 async function hostMain() {
   process.env.URDIRA_DATA_ROOT = dataRoot;
   const hostStartedAt = Date.now();
-  const { defaultDaemonOptions } = await import("../../apps/urdira/dist/index.js");
-  const { DaemonRuntime, DaemonClient } = await import("../../packages/daemon/dist/index.js");
+  const runtimeRoot = preflight.release_root ?? root;
+  const { defaultDaemonOptions } = await import(pathToFileURL(join(runtimeRoot, preflight.release_root ? "app/dist/index.js" : "apps/urdira/dist/index.js")).href);
+  const { DaemonRuntime, DaemonClient } = await import(pathToFileURL(join(runtimeRoot, preflight.release_root ? "node_modules/@urdira/daemon/dist/index.js" : "packages/daemon/dist/index.js")).href);
   // A benchmark cell owns one frozen worktree and records every agent edit
   // through the live watcher. Keep the periodic sweep disabled so no
   // background scan can contaminate the idle interval. The runner's explicit

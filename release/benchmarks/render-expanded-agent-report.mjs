@@ -6,6 +6,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyzeExpandedTranscript, analyzeUrdiraPipelineContract } from "./expanded-agent-transcript-metrics.mjs";
+import { summarizeTokenUsage, withTokenCost } from "./benchmark-token-metrics.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const argv = process.argv.slice(2);
@@ -20,6 +21,8 @@ const generatedDate = String(audit.generated_at ?? "").slice(0, 10);
 if (!/^\d{4}-\d{2}-\d{2}$/u.test(generatedDate) && !value("--output")) throw new Error("The audit requires a YYYY-MM-DD generated_at when --output is omitted.");
 const outputBase = value("--output", join(root, `release/benchmarks/expanded-typescript-agent-benchmark-results-${generatedDate}`));
 const comparisonReport = comparisonReportPath ? JSON.parse(readFileSync(comparisonReportPath, "utf8")) : null;
+const overriddenRateNames = ["BENCH_INPUT_USD_PER_MILLION", "BENCH_CACHED_INPUT_USD_PER_MILLION", "BENCH_OUTPUT_USD_PER_MILLION", "BENCH_REASONING_USD_PER_MILLION"].filter((name) => process.env[name] !== undefined);
+if (overriddenRateNames.length > 0) throw new Error(`Renderer price card is frozen; remove environment overrides: ${overriddenRateNames.join(", ")}`);
 const rateCard = {
   input: Number(process.env.BENCH_INPUT_USD_PER_MILLION ?? 2),
   cached_input: Number(process.env.BENCH_CACHED_INPUT_USD_PER_MILLION ?? process.env.BENCH_INPUT_USD_PER_MILLION ?? 2),
@@ -28,7 +31,9 @@ const rateCard = {
 };
 const percentile = (values, p) => { const sorted = values.filter(Number.isFinite).sort((a, b) => a - b); return sorted.length ? sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1)] : null; };
 const independentCampaigns = Number(audit.independent_campaigns ?? 1);
-const p95Eligible = independentCampaigns >= 3;
+// Decision 08 requires an explicit sufficiency decision. Three campaigns are
+// retained as observations, but do not authorize a P95 claim by themselves.
+const p95Eligible = audit.p95_eligible === true && independentCampaigns >= 3;
 const mean = (values) => { const usable = values.filter(Number.isFinite); return usable.length ? usable.reduce((sum, value) => sum + value, 0) / usable.length : null; };
 const sanitizeText = (value) => String(value).replaceAll(/\/private\/tmp\/[^\s"']+/g, "<temp>").replaceAll(/\/tmp\/[^\s"']+/g, "<temp>");
 const timingFor = (manifest) => {
@@ -95,23 +100,28 @@ const metricsFor = (manifest, arm, task) => {
     ? Math.max(0, Date.parse(firstDiscoveryTimestamp) - Date.parse(firstTimestamp))
     : null;
   const usage = events.filter((event) => event.type === "turn.completed").map((event) => event.usage ?? {});
-  const threadIds = events.filter((event) => event.type === "thread.started" && typeof event.thread_id === "string").map((event) => event.thread_id);
-  const counters = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"];
-  const oneResumedThread = usage.length > 1 && threadIds.length === usage.length && new Set(threadIds).size === 1;
-  const monotonicCounters = counters.every((field) => usage.every((item, index) => index === 0 || Number(item[field] ?? 0) >= Number(usage[index - 1]?.[field] ?? 0)));
-  const cumulativeUsage = oneResumedThread && monotonicCounters;
-  const total = (field) => cumulativeUsage ? Number(usage.at(-1)?.[field] ?? 0) : usage.reduce((sum, item) => sum + Number(item[field] ?? 0), 0);
-  const input = total("input_tokens");
-  const cached = total("cached_input_tokens");
-  const output = total("output_tokens");
-  const reasoning = total("reasoning_output_tokens");
+  const tokenCounterEvidence = manifest.token_counter_evidence;
+  const directCounterMode = manifest.counter_mode ?? manifest.token_counter_mode ?? manifest.usage?.counter_mode;
+  const evidenceCounterMode = tokenCounterEvidence?.status === "matched" ? tokenCounterEvidence.counter_mode : null;
+  const counterEvidenceConflict = tokenCounterEvidence !== undefined
+    && (tokenCounterEvidence.status !== "matched"
+      || (directCounterMode !== undefined && directCounterMode !== evidenceCounterMode));
+  // Any explicit disagreement invalidates the whole aggregate. Do not let the
+  // matched host mode silently win over a conflicting manifest declaration.
+  const counterMode = counterEvidenceConflict ? null : tokenCounterEvidence === undefined ? directCounterMode : evidenceCounterMode;
+  const tokenMetrics = withTokenCost(summarizeTokenUsage(usage, {
+    counterMode,
+    requireCounterEvidence: counterEvidenceConflict,
+  }), rateCard);
   const transcriptMetrics = analyzeExpandedTranscript(events, arm, task, { hook_audit: hookAudit });
   const compositionMetrics = arm === "urdira-typescript" ? analyzeUrdiraPipelineContract(events) : null;
-  const uncached = Math.max(0, input - cached);
   return {
     ...transcriptMetrics,
     composition_metrics: compositionMetrics,
-    token_usage_semantics: cumulativeUsage ? "cumulative_thread" : "per_turn",
+    token_usage_semantics: tokenMetrics.token_usage_semantics,
+    token_usage_semantics_evidence: tokenMetrics.counter_mode === "cumulative" || tokenMetrics.counter_mode === "per_turn"
+      ? `explicit manifest counter_mode=${tokenMetrics.counter_mode}`
+      : "counter_mode absent; multi-turn aggregate is unknown and raw versus reasoning inclusion remains unknown",
     outer_turns: usage.length,
     observable_agent_iterations: completed.filter((event) => event.item?.type === "agent_message").length,
     command_actions: completed.filter((event) => event.item?.type === "command_execution").length,
@@ -143,13 +153,13 @@ const metricsFor = (manifest, arm, task) => {
         || encoded.includes("core:request_validation_failed");
     }).length,
     file_change_batches: completed.filter((event) => event.item?.type === "file_change").length,
-    input_tokens: input,
-    cached_input_tokens: cached,
-    uncached_input_tokens: uncached,
-    output_tokens: output,
-    reasoning_tokens: reasoning,
-    total_tokens: input + output + reasoning,
-    estimated_cost_usd: (uncached * rateCard.input + cached * rateCard.cached_input + output * rateCard.output + reasoning * rateCard.reasoning) / 1_000_000,
+    input_tokens: tokenMetrics.input_tokens,
+    cached_input_tokens: tokenMetrics.cached_input_tokens,
+    uncached_input_tokens: tokenMetrics.uncached_input_tokens,
+    output_tokens: tokenMetrics.output_tokens,
+    reasoning_tokens: tokenMetrics.reasoning_tokens,
+    total_tokens: tokenMetrics.total_tokens,
+    estimated_cost_usd: tokenMetrics.estimated_cost_usd,
     mcp_failure_details: mcpFailureDetails,
   };
 };
@@ -212,9 +222,31 @@ const graderFailureDetails = (manifest) => {
   if (missingPatterns.length > 0) details.push(`missing required implementation evidence: ${missingPatterns.join(", ")}`);
   return details.length > 0 ? details.join("; ") : "grader rejected the correctness evidence";
 };
+const failureCategoriesFor = (manifest, metrics, failure) => ({
+  correctness: graderFailureDetails(manifest) ?? manifest?.correctness?.failure ?? null,
+  coverage: manifest?.coverage_failure ?? (metrics?.core_coverage_incomplete > 0 ? `incomplete coverage responses: ${metrics.core_coverage_incomplete}` : null),
+  efficiency: manifest?.efficiency_failure ?? null,
+  distributions: manifest?.distribution_failure ?? null,
+  unclassified: failure ?? null,
+});
 const freshRuns = audit.runs.map((entry) => {
   const manifest = entry.manifest;
-  const taskContract = corpus.repositories.find((repository) => repository.id === entry.repository)?.tasks.find((task) => task.id === entry.task);
+  const repository = entry.repository ?? entry.repository_id ?? manifest?.repository_id;
+  const task = entry.task ?? entry.task_id ?? manifest?.task_id;
+  const processResult = entry.result && typeof entry.result === "object" ? entry.result : {};
+  const processExitCode = entry.exit_code ?? manifest?.exit_code ?? processResult.code;
+  const processSignal = entry.signal ?? manifest?.signal ?? processResult.signal ?? null;
+  const processTimedOut = entry.timed_out ?? manifest?.timed_out ?? processResult.timed_out ?? null;
+  const processEvidence = {
+    stdout_path: entry.stdout_path ?? manifest?.stdout_path ?? processResult.stdout_path ?? null,
+    stdout_sha256: entry.stdout_sha256 ?? manifest?.stdout_sha256 ?? processResult.stdout_sha256 ?? null,
+    stdout_bytes: entry.stdout_bytes ?? manifest?.stdout_bytes ?? processResult.stdout_bytes ?? null,
+    stderr_path: entry.stderr_path ?? manifest?.stderr_path ?? processResult.stderr_path ?? null,
+    stderr_sha256: entry.stderr_sha256 ?? manifest?.stderr_sha256 ?? processResult.stderr_sha256 ?? null,
+    stderr_bytes: entry.stderr_bytes ?? manifest?.stderr_bytes ?? processResult.stderr_bytes ?? null,
+    output_root: entry.output_root ?? manifest?.output_root ?? null,
+  };
+  const taskContract = corpus.repositories.find((candidate) => candidate.id === repository)?.tasks.find((candidate) => candidate.id === task);
   const transcriptMetrics = metricsFor(manifest, entry.arm, taskContract);
   const rawEvidence = manifest?.correctness?.evidence;
   const evidence = rawEvidence ? { ...rawEvidence, diff_clean: rawEvidence.diff_clean === true || normalizedDiffClean(manifest.worktree) } : rawEvidence;
@@ -222,16 +254,26 @@ const freshRuns = audit.runs.map((entry) => {
     && evidence.focused_test_changed === true
     && evidence.diff_clean === true
     && Object.values(evidence.required_patterns ?? {}).every(Boolean);
+  const processFailure = processExitCode !== undefined && processExitCode !== null && processExitCode !== 0
+    ? `process exited with code ${processExitCode}${processSignal ? ` (${processSignal})` : ""}`
+    : processSignal ? `process terminated by ${processSignal}` : null;
+  const failure = manifest?.error || entry.stderr_tail || processFailure
+    ? sanitizeText(manifest?.error ?? entry.stderr_tail ?? processFailure)
+    : (transcriptMetrics?.mcp_failure_details?.join("; ") ?? graderFailureDetails(manifest));
   return {
     run_id: entry.run_id,
-    repository: entry.repository,
-    task: entry.task,
+    repository,
+    task,
     scenario: entry.scenario ?? manifest?.scenario ?? null,
     size_tier: entry.size_tier ?? manifest?.size_tier ?? null,
     arm: entry.arm,
     sample: entry.sample,
     order_index: entry.order_index,
-    process_exit_code: entry.exit_code,
+    process_exit_code: processExitCode ?? null,
+    process_signal: processSignal,
+    process_timed_out: processTimedOut,
+    process_evidence: processEvidence,
+    model_invoked: typeof manifest?.model_invoked === "boolean" ? manifest.model_invoked : (typeof entry.model_invoked === "boolean" ? entry.model_invoked : null),
     process_completed_successfully: manifest?.completed_successfully === true,
     // New manifests carry the runner's authoritative outcome, which includes
     // the repository grader result. Do not turn an agent process exit of zero
@@ -259,12 +301,20 @@ const freshRuns = audit.runs.map((entry) => {
       semantic_index: manifest.setup.semantic_index ?? null,
       readiness: manifest.setup.readiness ?? null,
     } : null,
-    failure: manifest?.error || entry.stderr_tail
-      ? sanitizeText(manifest?.error ?? entry.stderr_tail)
-      : (transcriptMetrics?.mcp_failure_details?.join("; ") ?? graderFailureDetails(manifest)),
+    failure,
+    failure_categories: failureCategoriesFor(manifest, transcriptMetrics, failure),
   };
 });
-const reusedRuns = comparisonReport?.runs?.filter((run) => run.arm !== "urdira-typescript") ?? [];
+const comparisonRuns = Array.isArray(comparisonReport?.runs) ? comparisonReport.runs : [];
+if (comparisonRuns.length > 0 && audit.allow_comparison_reuse !== true) {
+  throw new Error("Historical comparison rows require audit.allow_comparison_reuse=true; current definitive audits must not mix comparator rows.");
+}
+const freshCellKeys = new Set(freshRuns.map((run) => `${run.repository}:${run.task}:${run.arm}`));
+const overlappingComparisonRows = comparisonRuns.filter((run) => freshCellKeys.has(`${run.repository}:${run.task}:${run.arm}`));
+if (overlappingComparisonRows.length > 0) {
+  throw new Error(`Comparison report overlaps current audit cells: ${overlappingComparisonRows.map((run) => `${run.repository}:${run.task}:${run.arm}`).join(", ")}`);
+}
+const reusedRuns = comparisonRuns.filter((run) => run.arm !== "urdira-typescript");
 const reusedArms = [...new Set(reusedRuns.map((run) => run.arm))];
 const armOrder = ["baseline", "urdira-typescript", "codebase-memory", "codegraph", "tgrep"];
 const repositoryOrder = new Map((audit.repositories ?? []).map((repository, index) => [repository.id, index]));
@@ -273,6 +323,48 @@ const runs = [...reusedRuns, ...freshRuns].sort((left, right) =>
   (repositoryOrder.get(left.repository) ?? Number.MAX_SAFE_INTEGER) - (repositoryOrder.get(right.repository) ?? Number.MAX_SAFE_INTEGER)
   || (taskOrder.get(`${left.repository}:${left.task}`) ?? Number.MAX_SAFE_INTEGER) - (taskOrder.get(`${right.repository}:${right.task}`) ?? Number.MAX_SAFE_INTEGER)
   || armOrder.indexOf(left.arm) - armOrder.indexOf(right.arm));
+const finiteOrNull = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
+const readinessProbes = (Array.isArray(audit.readiness_probes) ? audit.readiness_probes : []).map((probe, index) => {
+  if (probe === null || typeof probe !== "object") throw new Error(`readiness_probes[${index}] must be an object`);
+  const phase = probe.phase;
+  if (phase !== "cold" && phase !== "warm") throw new Error(`readiness_probes[${index}].phase must be cold or warm`);
+  const row = {
+    ...probe,
+    probe_id: typeof probe.probe_id === "string" ? probe.probe_id : null,
+    campaign: finiteOrNull(probe.campaign),
+    repository: typeof probe.repository === "string" ? probe.repository : null,
+    phase,
+    setup_elapsed_ms: finiteOrNull(probe.setup_elapsed_ms),
+    structural_readiness_ms: finiteOrNull(probe.structural_readiness_ms),
+    time_to_first_query_ms: finiteOrNull(probe.time_to_first_query_ms),
+    snapshot_identity: probe.snapshot_identity ?? null,
+    page_completeness: probe.page_completeness ?? null,
+    semantic_index: typeof probe.semantic_index === "boolean" ? probe.semantic_index : null,
+    semantic_materialization: typeof probe.semantic_materialization === "boolean" ? probe.semantic_materialization : null,
+    semantic_sidecar_created: typeof probe.semantic_sidecar_created === "boolean" ? probe.semantic_sidecar_created : null,
+    passed: typeof probe.passed === "boolean" ? probe.passed : null,
+    failure: typeof probe.failure === "string" ? probe.failure : null,
+  };
+  return row;
+});
+const readinessKeys = readinessProbes.map((probe) => `${probe.campaign ?? "?"}:${probe.repository ?? "?"}:${probe.phase}`);
+if (new Set(readinessKeys).size !== readinessKeys.length) throw new Error("readiness_probes contains duplicate campaign/repository/phase keys");
+const hasExplicitReadinessExpectation = Object.hasOwn(audit, "readiness_expected_probes");
+const expectedReadinessProbes = Number(audit.readiness_expected_probes ?? ((audit.repositories?.length ?? 0) * independentCampaigns * 2));
+const readinessGate = {
+  expected_probes: Number.isFinite(expectedReadinessProbes) ? expectedReadinessProbes : null,
+  observed_probes: readinessProbes.length,
+  passed: Number.isFinite(expectedReadinessProbes) && (hasExplicitReadinessExpectation || expectedReadinessProbes > 0)
+    && readinessProbes.length === expectedReadinessProbes && readinessProbes.every((probe) => probe.passed === true),
+  failure: Number.isFinite(expectedReadinessProbes) && (hasExplicitReadinessExpectation || expectedReadinessProbes > 0)
+    && readinessProbes.length === expectedReadinessProbes && readinessProbes.every((probe) => probe.passed === true) ? null : "readiness probe expectation or probe outcome incomplete",
+};
+if (audit.definitive_protocol === "selected-45") {
+  if (Number(audit.expected_runs) !== 45 || Number(audit.readiness_expected_probes) !== 18) throw new Error("selected-45 definitive audits must declare expected_runs=45 and readiness_expected_probes=18");
+  const cellKeys = freshRuns.map((run) => `${run.repository}:${run.task}:${run.arm}`);
+  if (cellKeys.length !== 45 || new Set(cellKeys).size !== 45) throw new Error("selected-45 definitive audit must contain 45 unique repo/task/arm cells");
+  if (readinessProbes.length !== 18 || new Set(readinessKeys).size !== 18) throw new Error("selected-45 definitive audit must contain 18 unique readiness probes");
+}
 const corpusExpectedRuns = Array.isArray(audit.repositories)
   ? audit.repositories.reduce((total, repository) => total + (repository.tasks?.length ?? 0), 0) * (audit.arms?.length ?? 0) * Number(audit.samples_per_cell ?? 1)
   : freshRuns.length;
@@ -295,15 +387,21 @@ for (const run of runs) {
   const key = `${run.repository}:${run.task}:${run.arm}`;
   (groups[key] ??= []).push(run);
 }
+const p95EligibleForCampaign = p95Eligible && Object.values(groups).every((rows) => rows.length !== 3);
 const summaries = Object.fromEntries(Object.entries(groups).map(([key, rows]) => {
   const numeric = (field) => rows.map((row) => Number(row.metrics?.[field] ?? NaN));
+  const groupP95Eligible = p95Eligible && rows.length !== 3 && Array.isArray(audit.p95_eligible_groups) && audit.p95_eligible_groups.includes(key);
   return [key, {
     count: rows.length,
+    sample_range: (() => {
+      const samples = rows.map((row) => Number(row.sample)).filter(Number.isFinite);
+      return samples.length === 0 ? null : { min: Math.min(...samples), max: Math.max(...samples) };
+    })(),
     successful: rows.filter((row) => row.completed_successfully).length,
     setup_elapsed_ms: { median: percentile(rows.map((row) => Number(row.setup_elapsed_ms ?? NaN)), 0.5), mean: mean(rows.map((row) => Number(row.setup_elapsed_ms ?? NaN))) },
-    elapsed_ms_from_first_instruction: { median: percentile(rows.map((row) => Number(row.elapsed_ms_from_first_instruction ?? NaN)), 0.5), mean: mean(rows.map((row) => Number(row.elapsed_ms_from_first_instruction ?? NaN))), p95: p95Eligible ? percentile(rows.map((row) => Number(row.elapsed_ms_from_first_instruction ?? NaN)), 0.95) : null },
-    total_tokens: { median: percentile(numeric("total_tokens"), 0.5), mean: mean(numeric("total_tokens")), p95: p95Eligible ? percentile(numeric("total_tokens"), 0.95) : null },
-    estimated_cost_usd: { median: percentile(numeric("estimated_cost_usd"), 0.5), mean: mean(numeric("estimated_cost_usd")), p95: p95Eligible ? percentile(numeric("estimated_cost_usd"), 0.95) : null },
+    elapsed_ms_from_first_instruction: { median: percentile(rows.map((row) => Number(row.elapsed_ms_from_first_instruction ?? NaN)), 0.5), mean: mean(rows.map((row) => Number(row.elapsed_ms_from_first_instruction ?? NaN))), p95: groupP95Eligible ? percentile(rows.map((row) => Number(row.elapsed_ms_from_first_instruction ?? NaN)), 0.95) : null },
+    total_tokens: { median: percentile(numeric("total_tokens"), 0.5), mean: mean(numeric("total_tokens")), p95: groupP95Eligible ? percentile(numeric("total_tokens"), 0.95) : null },
+    estimated_cost_usd: { median: percentile(numeric("estimated_cost_usd"), 0.5), mean: mean(numeric("estimated_cost_usd")), p95: groupP95Eligible ? percentile(numeric("estimated_cost_usd"), 0.95) : null },
     outer_turns: { median: percentile(numeric("outer_turns"), 0.5), mean: mean(numeric("outer_turns")) },
     mcp_calls: { median: percentile(numeric("mcp_calls"), 0.5), mean: mean(numeric("mcp_calls")) },
     mcp_failed_calls: { median: percentile(numeric("mcp_failed_calls"), 0.5), mean: mean(numeric("mcp_failed_calls")) },
@@ -360,7 +458,7 @@ const report = {
   price_card_usd_per_million_tokens: rateCard,
   source_audit: { sha256: `sha256:${createHash("sha256").update(auditText).digest("hex")}`, raw_evidence: "Raw transcripts, host logs, manifests, and the environment record are retained outside the public repository under the campaign retention policy; this report retains derived metrics and grader evidence." },
   measurement_contract: {
-    readiness: "Urdira setup ends at current complete structural readiness. Semantic indexing, semantic materialization, and semantic-sidecar creation are disabled and excluded.",
+    readiness: "Urdira setup ends at current complete structural readiness. Semantic indexing, semantic materialization, and semantic-sidecar creation are disabled and excluded. Readiness-only probes use readiness_probes[{probe_id,campaign,repository,phase:cold|warm,setup_elapsed_ms,structural_readiness_ms,time_to_first_query_ms,snapshot_identity,page_completeness,semantic_index,semantic_materialization,semantic_sidecar_created,passed,failure}] and are reported separately from agent cells.",
     correctness: "The repository grader checks declared changed paths, required implementation patterns, a focused test-file change, diff whitespace, and real integration failures. It does not require use of a configured tool or MCP. It is reported separately from executed test outcomes.",
     unsafe_omissions: "Declared omissions are corpus paths or required patterns missing from the final diff. This is a bounded corpus rubric, not proof that every possible semantic omission was detected.",
     evidence_grounded_plan: "An observational flag indicating whether configured discovery evidence appeared before the first edit and again after edit batches; it is not a correctness gate.",
@@ -379,23 +477,32 @@ const report = {
     resources: "process_tree_peak_rss_kib covers the benchmark cell runner and all descendants, including the agent and any configured MCP. Urdira host-only RSS is retained separately for readiness diagnostics.",
     codex_timing: "The timing sidecar observes monotonic receipt times for complete Codex JSONL lines without modifying the original transcript. MCP and command item.started/item.completed events are paired by item id; unpaired items retain a null duration and an explicit pairing_status. Each Codex turn has its own clock origin.",
     missing_values: "Unavailable measurements are null and are never imputed as zero.",
+    token_semantics: "Each manifest must provide counter_mode=cumulative or counter_mode=per_turn from harness/provider evidence. Without it, multi-turn aggregates are null; missing counters keep only single-turn available totals and cost remains null. Provider raw-versus-reasoning inclusion remains unproven and does not alter the normative additive total.",
+    percentile: "Three independent campaigns provide median and range observations only. P95 is emitted only when the audit explicitly sets p95_eligible=true and the campaign count is at least three.",
   },
   ...(comparisonReport ? { reused_comparison: { report: `external-temporary:${basename(resolve(comparisonReportPath))}`, source_audit: comparisonReport.source_audit ?? null } } : {}),
   groups: summaries,
   runs,
+  readiness_probes: readinessProbes,
+  readiness_gate: readinessGate,
   task_comparisons: runs.map((run) => ({
     repository: run.repository,
     size_tier: run.size_tier ?? taskMetadata.get(run.task)?.size_tier ?? null,
     scenario: run.scenario ?? taskMetadata.get(run.task)?.scenario ?? null,
     task: run.task,
     arm: run.arm,
+    sample: run.sample ?? null,
     completed_successfully: run.completed_successfully,
+    failure: run.failure ?? null,
+    failure_categories: run.failure_categories ?? null,
     setup_elapsed_ms: run.setup_elapsed_ms ?? null,
     agent_elapsed_ms: run.elapsed_ms_from_first_instruction ?? null,
     total_elapsed_ms: Number.isFinite(run.setup_elapsed_ms) && Number.isFinite(run.elapsed_ms_from_first_instruction)
       ? run.setup_elapsed_ms + run.elapsed_ms_from_first_instruction
       : null,
     input_tokens: run.metrics?.input_tokens ?? null,
+    cached_input_tokens: run.metrics?.cached_input_tokens ?? null,
+    uncached_input_tokens: run.metrics?.uncached_input_tokens ?? null,
     output_tokens: run.metrics?.output_tokens ?? null,
     reasoning_tokens: run.metrics?.reasoning_tokens ?? null,
     total_tokens: run.metrics?.total_tokens ?? null,
@@ -445,9 +552,14 @@ const report = {
     structural_readiness_ms: run.host_metrics?.structural_readiness_ms ?? run.host_metrics?.ready_elapsed_ms ?? null,
     semantic_index_enabled: run.host_metrics?.semantic_index ?? run.setup?.semantic_index ?? null,
     semantic_sidecar_created: run.host_metrics?.semantic_sidecar_created ?? null,
+    model_invoked: run.model_invoked ?? null,
+    process_exit_code: run.process_exit_code ?? null,
+    process_signal: run.process_signal ?? null,
+    process_timed_out: run.process_timed_out ?? null,
+    process_evidence: run.process_evidence ?? null,
     process_tree_peak_rss_kib: run.process_metrics?.peak_rss_kib ?? null,
   })),
-  campaign_gate: { expected_runs: expectedRuns, observed_runs: runs.length, successful_runs: successfulRuns, failed_or_blocked_runs: runs.length - successfulRuns, passed: runs.length === expectedRuns && runs.every((run) => run.completed_successfully), independent_campaigns: independentCampaigns, p95_eligible: p95Eligible },
+  campaign_gate: { expected_runs: expectedRuns, observed_runs: runs.length, successful_runs: successfulRuns, failed_or_blocked_runs: runs.length - successfulRuns, passed: runs.length === expectedRuns && runs.every((run) => run.completed_successfully), independent_campaigns: independentCampaigns, p95_eligible: p95EligibleForCampaign },
 };
 const number = (value, digits = 0) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toLocaleString("en-US", digits ? { minimumFractionDigits: digits, maximumFractionDigits: digits } : undefined);
 const taskComparisonRows = runs.map((run) => {
@@ -455,7 +567,7 @@ const taskComparisonRows = runs.map((run) => {
   const totalElapsed = Number.isFinite(run.setup_elapsed_ms) && Number.isFinite(run.elapsed_ms_from_first_instruction)
     ? run.setup_elapsed_ms + run.elapsed_ms_from_first_instruction
     : null;
-  return `| ${run.repository} | ${run.task} | ${run.scenario ?? metadata.scenario ?? "—"} | ${run.arm} | ${run.completed_successfully ? "yes" : "no"} | ${number(run.setup_elapsed_ms)} | ${number(run.elapsed_ms_from_first_instruction)} | ${number(totalElapsed)} | ${number(run.metrics?.total_tokens)} | ${number(run.metrics?.estimated_cost_usd, 4)} | ${number(run.metrics?.outer_turns)} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.context_calls_unattributed_to_declared_targets)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} | ${number(run.process_metrics?.peak_rss_kib)} |`;
+  return `| ${run.repository} | ${run.task} | ${run.scenario ?? metadata.scenario ?? "—"} | ${run.arm} | ${number(run.sample)} | ${run.completed_successfully ? "yes" : "no"} | ${number(run.setup_elapsed_ms)} | ${number(run.elapsed_ms_from_first_instruction)} | ${number(totalElapsed)} | ${number(run.metrics?.input_tokens)} | ${number(run.metrics?.cached_input_tokens)} | ${number(run.metrics?.output_tokens)} | ${number(run.metrics?.reasoning_tokens)} | ${number(run.metrics?.total_tokens)} | ${number(run.metrics?.estimated_cost_usd, 4)} | ${number(run.metrics?.outer_turns)} | ${number(run.metrics?.repository_read_calls)} | ${number(run.metrics?.repository_context_characters)} | ${number(run.metrics?.context_calls_unattributed_to_declared_targets)} | ${number(run.metrics?.test_attempts)}/${number(run.metrics?.test_passes)}/${number(run.metrics?.test_failures)}/${number(run.metrics?.test_results_unknown)} | ${number(run.process_metrics?.peak_rss_kib)} |`;
 });
 const timingRows = runs.map((run) => {
   const timing = run.timing_metrics;
@@ -514,15 +626,16 @@ const readinessRuns = runs.filter((run) => run.host_metrics).map((run) => {
   const timings = metrics.stage_timings ?? {};
   return `| ${run.repository} | ${run.task} | ${number(metrics.structural_readiness_ms)} | ${number(firstFrontierMs(metrics, (event) => event.source_ready === true))} | ${number(firstFrontierMs(metrics, (event) => event.structural_ready === true))} | ${number(timings.source_catalog_ms ?? timings.source_catalogue_ms ?? timings.source_catalog)} | ${number(timings.plugin_analysis_ms ?? timings.plugin_analyze)} | ${number(timings.publish_ms ?? timings.publish)} | ${number(metrics.structural_readiness_peak_rss_kib)} | ${metrics.semantic_index === false ? "disabled" : "—"} | ${metrics.semantic_sidecar_created === false ? "no" : metrics.semantic_sidecar_created === true ? "yes (invalid)" : "—"} |`;
 });
-const failureRuns = runs.filter((run) => run.failure).map((run) =>
-  `| ${run.repository} | ${run.task} | ${run.arm} | ${String(run.failure).replaceAll("|", "/")} |`);
+const readinessProbeRows = readinessProbes.map((probe) => `| ${probe.probe_id ?? "—"} | ${number(probe.campaign)} | ${probe.repository ?? "—"} | ${probe.phase} | ${number(probe.setup_elapsed_ms)} | ${number(probe.structural_readiness_ms)} | ${number(probe.time_to_first_query_ms)} | ${probe.passed === true ? "yes" : probe.passed === false ? "no" : "—"} | ${probe.failure ?? "—"} |`);
+const failureRuns = runs.filter((run) => run.completed_successfully === false || run.failure || Object.values(run.failure_categories ?? {}).some((value) => value !== null)).map((run) =>
+  `| ${run.repository} | ${run.task} | ${run.arm} | ${String(run.failure_categories?.correctness ?? "—").replaceAll("|", "/")} | ${String(run.failure_categories?.coverage ?? "—").replaceAll("|", "/")} | ${String(run.failure_categories?.efficiency ?? "—").replaceAll("|", "/")} | ${String(run.failure_categories?.distributions ?? "—").replaceAll("|", "/")} | ${String(run.failure ?? "—").replaceAll("|", "/")} |`);
 const executedArms = audit.arms ?? [...new Set(runs.map((run) => run.arm))];
 const campaignProvenance = benchmarkAudit.rerun_status !== undefined || benchmarkAudit.rerun_observed_runs !== undefined || reusedArms.length > 0
   ? `The Urdira arm was rerun in this campaign (${benchmarkAudit.rerun_status ?? "status unavailable"}: ${benchmarkAudit.rerun_observed_runs ?? "?"}/${benchmarkAudit.rerun_expected_runs ?? "?"} cells). Existing comparison-arm rows were reused from the prior audited campaign: ${reusedArms.length ? reusedArms.join(", ") : "none"}. They were not re-executed in this run.${benchmarkAudit.rerun_stop_reason ? ` The rerun stopped after a controlled resource guard: ${benchmarkAudit.rerun_stop_reason}` : ""}`
   : `This campaign executed only the following arm${executedArms.length === 1 ? "" : "s"}: ${executedArms.join(", ")}. No comparison-arm result was reused or implied.`;
 const markdown = `# Expanded TypeScript agent benchmark results
 
-Generated from the sequential audit for four frozen TypeScript repositories. A cell is successful only when the repository grader passes; index/setup failures remain visible as failed or blocked runs.
+Generated from the sequential audit for ${audit.repositories?.length ?? "the selected"} frozen TypeScript repositories. A cell is successful only when the repository grader passes; index/setup failures remain visible as failed or blocked runs.
 
 ${campaignProvenance}
 
@@ -541,8 +654,8 @@ characters by method. Target-attributed characters are a lexical declared-
 target proxy; component fields remain null when the protocol does not identify
 snippets, hydration, evidence, or registry payloads.
 
-| Repository | Task | Scenario | Option | Grader | Setup ms | Agent ms | Total ms | Total tokens | Cost USD | Turns | Repository reads | Context chars | Unattributed calls | Tests A/P/F/? | Process-tree peak RSS KiB |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Repository | Task | Scenario | Option | Sample | Grader | Setup ms | Agent ms | Total ms | Input tokens | Cached input | Output tokens | Reasoning tokens | Total tokens | Cost USD | Turns | Repository reads | Context chars | Unattributed calls | Tests A/P/F/? | Process-tree peak RSS KiB |
+|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 ${taskComparisonRows.join("\n")}
 
 ## External Codex call timing
@@ -609,11 +722,17 @@ statistics, setup evidence, correctness evidence, and failure messages.
 
 ## Failures and recovery details
 
-${failureRuns.length ? "| Repository | Task | Arm | Recorded failure |\n|---|---|---|---|\n" + failureRuns.join("\n") : "No failure details were recorded."}
+${failureRuns.length ? "| Repository | Task | Arm | Correctness | Coverage | Efficiency | Distributions | Recorded failure |\n|---|---|---|---|---|---|---|---|\n" + failureRuns.join("\n") : "No failure details were recorded."}
 
 ## Indexing and readiness evidence
 
 The Urdira host records every published frontier transition. \`structural readiness ms\` is the time from host start until the full current structural snapshot is queryable. Semantic indexing and materialization are disabled, the semantic sidecar is not created, and none of that work is part of readiness. Stage timings are emitted by the indexer and are not inferred from agent elapsed time.
+
+Readiness-only probes: ${readinessGate.observed_probes}/${readinessGate.expected_probes ?? "?"} observed; gate passed: ${readinessGate.passed}. ${readinessGate.failure ?? ""} Cold and warm probes are kept separate from the ${audit.expected_runs ?? "selected"} agent cells and are not folded into task summaries.
+
+| Probe | Campaign | Repository | Phase | Setup ms | Structural readiness ms | Time to first query ms | Passed | Failure |
+|---|---:|---|---|---:|---:|---:|---|---|
+${readinessProbeRows.length ? readinessProbeRows.join("\n") : "| — | — | — | — | — | — | — | — | — |"}
 
 | Repository | Task | Structural readiness ms | Source ready ms | Structural frontier ms | Source catalog ms | Plugin analysis ms | Publish ms | Readiness peak RSS KiB | Semantic | Semantic sidecar created |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|---|

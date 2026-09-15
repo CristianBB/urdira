@@ -807,6 +807,77 @@ are not part of the public contract and may change without notice.
 
 For the next four-arm comparison, use the [expanded agent campaign runbook](docs/benchmarks/expanded-agent-campaign.md). It records the smoke scoped to selected repositories, small/medium/large examples, 32/96-run full-corpus matrix, executable commands, audit requirements, measured fields, and known historical provenance discrepancies. Urdira readiness is structural only; semantic indexing, materialization, and semantic-sidecar creation are excluded.
 
+The definitive selected campaign uses the direct orchestrator
+`release/benchmarks/run-definitive-agent-campaign.mjs`: one immutable 15-cell
+manifest per campaign, three campaigns in sequence, and no retries after a
+failed cell. Use `--plan-only` to inspect a manifest without invoking a model.
+Run the separate no-model cold/warm readiness path with
+`release/benchmarks/run-definitive-readiness-probes.mjs`; it requires an
+extracted release root and its matching `--release-archive`, plus the frozen
+repository checkouts. The definitive protocol freezes
+`BENCH_MIN_FREE_BYTES=53687091200` (50 GiB); every campaign and readiness
+manifest records and enforces that value. Set `BENCH_CELL_TIMEOUT_MS` to bound the direct orchestrator, and
+`URDIRA_BENCHMARK_TIMEOUT_MS` to bound the cell runner; cleanup checkpoints record
+registered paths, bytes, raw `df`, process ownership, and the next-cell gate.
+After all three campaign audits and readiness manifests exist, assemble the
+immutable renderer input with `assemble-definitive-agent-audit.mjs`, passing
+each `--campaign-audit` and `--readiness-manifest` once and one `--output`;
+only this six-input step emits the consolidated `selected-45` expectation of
+45 cells and 18 readiness probes.
+These commands produce evidence only after the Phase 0 gates in the
+[definitive handoff](docs/benchmarks/definitive-agent-benchmark-handoff.md)
+pass.
+
+Before a definitive cell or readiness pair starts, the orchestrator creates a
+fresh detached worktree and materializes that task's frozen dependency closure
+inside it. The setup uses the repository lockfiles, the exact Node runtime,
+Corepack `pnpm@10.27.0` for Prisma, and nested lock roots required by VS Code.
+Package-manager caches and stores are scoped below the worktree's
+`.bench-cache` directory, recorded with paths, bytes, versions, lockfile
+digests, and closure digests, and removed by the cell or pair cleanup
+checkpoint. A dependency or validation failure is retained as a preflight
+failure with `model_invoked: false`; it does not start the runner or count as a
+measurement. The current Phase 0 evidence retains two earlier preflight
+failures separately from campaign-1, which stopped after two cell attempts:
+one baseline model/grader failure and one Urdira execution with no manifest,
+classified `model_invoked: null`. It records zero readiness probes and no
+retries.
+
+The pinned Codex CLI `0.154.0-alpha.6.2` rejects the legacy `-a never` flag;
+the benchmark runner now uses the supported
+`--dangerously-bypass-approvals-and-sandbox` switch for both `exec` and
+`resume`, with `-C` kept global where the CLI requires it. This is harness
+revision v7, validated by help-only CLI checks and focused regressions; its
+external evidence is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/harness-revision-v8-diagnostic.json`.
+It does not change the v5 archive or authorize a retry.
+
+The current Phase 0 release gates passed sequentially with `CI=true pnpm
+verify`, `URDIRA_RELEASE_TARGET=darwin-arm64 pnpm package:release`,
+`URDIRA_RELEASE_TARGET=darwin-arm64 pnpm release:acceptance`, and `git diff
+--check`. The measured archive is retained at
+`/Users/Cristian/BenchmarkResults/urdira-final-release-archive-20260915-v5.tar.gz`
+with SHA-256
+`157a9e293a895cf35460d9628f8dca8cbd1e238a59d2625f7f2e685f2df31a2d`; its
+byte-bound extraction and installed no-model structural smoke are recorded in
+the v5 binding and scoped-query evidence. The historical v5 freeze record for
+the planned 45-cell and 18-probe series is
+`/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/proposed-series-v5/series-freeze-proposal.json`;
+it records the exact source commits, task plans, runtime, release components,
+dependency closures, raw replay, and cleanup guard. The proposal is now an
+immutable historical record; its source clones and release extraction roots
+were removed after their commit, tree, component, and checksum metadata were
+retained. Campaign-1 later started two cells and stopped after retaining one
+baseline grader failure and one Urdira row with unknown model invocation because
+its runner manifest was missing. No readiness probe was started or retried. Any
+future series requires fresh provisioning from the recorded commits. The final
+owned-resource cleanup is
+`/Users/Cristian/BenchmarkResults/urdira-phase0-cleanup-checkpoint-20260915-luna-post-gates-v10.json`
+(SHA-256
+`6be8cb16b6a5aa6459f99f5fbf81faecd25bbf9be2a74575c24542dad2883eec`). See the
+dated Phase 0 evidence for the retained audit, diagnostic hashes, and the
+separate harness-retention correction.
+
 ### Current directed context-density samples
 
 The latest accepted Urdira-only samples are Playwright v72 at **569,904**

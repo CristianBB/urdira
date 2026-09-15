@@ -23,7 +23,7 @@ describe("expanded agent report", () => {
     await writeFile(transcript, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
     await writeFile(hookAudit, `${JSON.stringify({ hook_event_name: "UserPromptSubmit", operation: "context", decision: "serve", output_characters: 1200 })}\n`, "utf8");
     const auditPath = join(root, "audit.json");
-    await writeFile(auditPath, `${JSON.stringify({ campaign_id: "test", model: "test", expected_runs: 1, independent_campaigns: 1, arms: ["urdira-typescript"], repositories: [{ id: "repo", repository: "owner/repo", commit: "abc", tasks: [{ id: "task", complexity: "small" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "urdira-typescript", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript, hook_audit_path: hookAudit, correctness: { evidence: {} } } }] }, null, 2)}\n`, "utf8");
+    await writeFile(auditPath, `${JSON.stringify({ campaign_id: "test", model: "test", expected_runs: 1, independent_campaigns: 1, arms: ["urdira-typescript"], repositories: [{ id: "repo", repository: "owner/repo", commit: "abc", tasks: [{ id: "task", complexity: "small" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "urdira-typescript", sample: 1, exit_code: 0, manifest: { completed_successfully: true, counter_mode: "cumulative", transcript, hook_audit_path: hookAudit, correctness: { evidence: {} } } }] }, null, 2)}\n`, "utf8");
     const comparisonPath = join(root, "comparison.json");
     await writeFile(comparisonPath, `${JSON.stringify({ runs: [] })}\n`, "utf8");
     const output = join(root, "report");
@@ -39,6 +39,150 @@ describe("expanded agent report", () => {
       observed_tool_usage: { urdira_hook_calls: 1, urdira_hook_served_calls: 1, urdira_effective_calls: 1 },
       discovery_adoption: { zero_urdira_effective_use: false },
     });
+  });
+
+  it("keeps missing token counters and derived cost unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-missing-usage-"));
+    const transcript = join(root, "run.jsonl");
+    await writeFile(transcript, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, output_tokens: 10, reasoning_output_tokens: 4 } })}\n`, "utf8");
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "baseline", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript } }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0].metrics).toMatchObject({ input_tokens: 100, cached_input_tokens: null, output_tokens: 10, reasoning_tokens: 4, total_tokens: 114, estimated_cost_usd: null });
+  });
+
+  it("uses only matched host evidence when the manifest omits a direct counter mode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-host-counter-evidence-"));
+    const transcript = join(root, "run.jsonl");
+    const usage = { input_tokens: 100, cached_input_tokens: 50, output_tokens: 10, reasoning_output_tokens: 4 };
+    await writeFile(transcript, `${JSON.stringify({ type: "turn.completed", usage })}\n`, "utf8");
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "baseline", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript, token_counter_evidence: { status: "matched", counter_mode: "per_turn", source: { kind: "codex_host_session" } } } }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0].metrics).toMatchObject({ token_usage_semantics: "per_turn", total_tokens: 114 });
+  });
+
+  it("keeps token aggregates and cost null when declared host evidence is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-missing-host-evidence-"));
+    const transcript = join(root, "run.jsonl");
+    await writeFile(transcript, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 5, output_tokens: 2, reasoning_output_tokens: 1 } })}\n${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 20, cached_input_tokens: 10, output_tokens: 3, reasoning_output_tokens: 1 } })}\n`, "utf8");
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "baseline", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript, counter_mode: null, token_counter_evidence: { status: "missing_host", counter_mode: null } } }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0].metrics).toMatchObject({ input_tokens: null, total_tokens: null, estimated_cost_usd: null });
+  });
+
+  it("does not let a direct counter mode override mismatched host evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-counter-evidence-conflict-"));
+    const transcript = join(root, "run.jsonl");
+    await writeFile(transcript, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 5, output_tokens: 2, reasoning_output_tokens: 1 } })}\n${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 20, cached_input_tokens: 10, output_tokens: 3, reasoning_output_tokens: 1 } })}\n`, "utf8");
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "baseline", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript, counter_mode: "cumulative", token_counter_evidence: { status: "matched", counter_mode: "per_turn" } } }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0].metrics).toMatchObject({ input_tokens: null, total_tokens: null, estimated_cost_usd: null });
+  });
+
+  it("does not report P95 from exactly three independent observations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-p95-"));
+    const transcript = join(root, "run.jsonl");
+    await writeFile(transcript, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 50, output_tokens: 10, reasoning_output_tokens: 4 } })}\n`, "utf8");
+    const runs = [1, 2, 3].map((sample) => ({ run_id: `run-${sample}`, repository: "repo", task: "task", arm: "baseline", sample, exit_code: 0, manifest: { completed_successfully: true, transcript, elapsed_ms_from_first_instruction: sample } }));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 3, independent_campaigns: 3, p95_eligible: true, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.groups["repo:task:baseline"].elapsed_ms_from_first_instruction.p95).toBeNull();
+    expect(report.campaign_gate.p95_eligible).toBe(false);
+  });
+
+  it("rejects historical comparator rows when the current audit has the same cell", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-overlap-"));
+    const transcript = join(root, "run.jsonl");
+    await writeFile(transcript, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 1 } })}\n`, "utf8");
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "baseline", sample: 1, exit_code: 0, manifest: { completed_successfully: true, transcript } }] })}\n`, "utf8");
+    const comparisonPath = join(root, "comparison.json");
+    await writeFile(comparisonPath, `${JSON.stringify({ runs: [{ run_id: "old", repository: "repo", task: "task", arm: "baseline" }] })}\n`, "utf8");
+    await expect(execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--comparison-report", comparisonPath, "--output", join(root, "report")])).rejects.toThrow();
+  });
+
+  it("reports separate cold and warm readiness probes from the declared probe shape", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-readiness-"));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 0, independent_campaigns: 1, arms: [], repositories: [{ id: "repo", tasks: [] }], runs: [], readiness_probes: [
+      { probe_id: "r1-cold", campaign: 1, repository: "repo", phase: "cold", structural_readiness_ms: 12, time_to_first_query_ms: 20, timestamps: { data_root_created: 1, source_ready: 2, structural_ready: 3, validated_first_query: 4, first_query_complete: 5 }, storage: { catalog_bytes: 10 }, process: { peak_rss_kib: 11 }, publication: { records: 12 }, freshness: { complete: true }, passed: true },
+      { probe_id: "r1-warm", campaign: 1, repository: "repo", phase: "warm", structural_readiness_ms: 3, time_to_first_query_ms: 7, passed: true },
+    ] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.readiness_gate).toMatchObject({ expected_probes: 2, observed_probes: 2, passed: true });
+    expect(report.readiness_probes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: "cold", structural_readiness_ms: 12, timestamps: expect.objectContaining({ first_query_complete: 5 }), storage: { catalog_bytes: 10 }, process: { peak_rss_kib: 11 }, publication: { records: 12 }, freshness: { complete: true } }),
+      expect.objectContaining({ phase: "warm", structural_readiness_ms: 3 }),
+    ]));
+  });
+
+  it("keeps repository_id/task_id aliases and failed process outcomes visible", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-alias-failure-"));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository_id: "repo", task_id: "task", arm: "baseline", sample: 1, exit_code: 137, signal: "SIGKILL", manifest: { completed_successfully: false } }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0]).toMatchObject({ repository: "repo", task: "task" });
+    expect(report.runs[0].failure).toContain("137");
+    expect(report.task_comparisons[0].failure_categories).toBeTruthy();
+  });
+
+  it("keeps a failed cell in the failure table when no detail field is available", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-undescribed-failure-"));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["baseline"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository: "repo", task: "task", arm: "baseline", sample: 1, exit_code: 0, grader_exit_code: 1, manifest: { completed_successfully: false, correctness: {} } }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const markdown = await readFile(`${output}.md`, "utf8");
+    const failureSection = markdown.split("## Failures and recovery details\n", 2)[1]?.split("## Indexing and readiness evidence\n", 2)[0] ?? "";
+    expect(failureSection).toContain("| repo | task | baseline |");
+  });
+
+  it("normalizes nested process results and preserves blocked-cell evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-nested-process-result-"));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 1, independent_campaigns: 1, arms: ["urdira-typescript"], repositories: [{ id: "repo", tasks: [{ id: "task" }] }], runs: [{ run_id: "run", repository_id: "repo", task_id: "task", arm: "urdira-typescript", sample: 1, model_invoked: null, result: { code: 1, signal: null, timed_out: true, stdout_path: "/retained/stdout.log", stdout_sha256: "a".repeat(64), stdout_bytes: 12, stderr_path: "/retained/stderr.log", stderr_sha256: "b".repeat(64), stderr_bytes: 34 }, manifest: null }] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.runs[0]).toMatchObject({ process_exit_code: 1, process_signal: null, process_timed_out: true, model_invoked: null, process_evidence: { stdout_path: "/retained/stdout.log", stdout_bytes: 12, stderr_path: "/retained/stderr.log", stderr_bytes: 34 } });
+    const markdown = await readFile(`${output}.md`, "utf8");
+    const failureSection = markdown.split("## Failures and recovery details\n", 2)[1]?.split("## Indexing and readiness evidence\n", 2)[0] ?? "";
+    expect(failureSection).toContain("process exited with code 1");
+  });
+
+  it("does not pass an empty readiness gate without an explicit expected probe count", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-empty-gate-"));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 0, independent_campaigns: 1, arms: [], repositories: [], runs: [] })}\n`, "utf8");
+    const output = join(root, "report");
+    await execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", output]);
+    const report = JSON.parse(await readFile(`${output}.json`, "utf8"));
+    expect(report.readiness_gate.passed).toBe(false);
+  });
+
+  it("rejects a non-frozen renderer price override", async () => {
+    const root = await mkdtemp(join(tmpdir(), "urdira-expanded-price-card-"));
+    const auditPath = join(root, "audit.json");
+    await writeFile(auditPath, `${JSON.stringify({ generated_at: "2026-09-15", expected_runs: 0, independent_campaigns: 1, arms: [], repositories: [], runs: [] })}\n`, "utf8");
+    await expect(execFileAsync(process.execPath, [resolve("release/benchmarks/render-expanded-agent-report.mjs"), "--audit", auditPath, "--output", join(root, "report")], { env: { ...process.env, BENCH_OUTPUT_USD_PER_MILLION: "0" } })).rejects.toThrow();
   });
 
   it("separates recoverable selector narrowing from unexpected MCP failure", async () => {
