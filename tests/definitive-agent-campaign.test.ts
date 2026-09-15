@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,12 +7,35 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DEFINITIVE_ARMS, DEFINITIVE_CELLS, DEFINITIVE_READINESS_PHASES, buildCellManifest, buildReadinessManifest, effectiveProcessOwner, isProcessInventoryProbe, retainableCellFailure, runCommand, runDefinitiveCells, stopOwnedProcesses } from "../release/benchmarks/run-definitive-agent-campaign.mjs";
 import { blockedWarmProbe, buildReadinessQuery, executeReadinessPair, runReadinessCampaign, runReadinessPhase } from "../release/benchmarks/run-definitive-readiness-probes.mjs";
 import { assembleDefinitiveAudit } from "../release/benchmarks/assemble-definitive-agent-audit.mjs";
-import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs, validateCodexArgv } from "../release/benchmarks/expanded-agent-codex-argv.mjs";
+import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs, effectiveCodexHome, resolveCodexAuthRoute, validateCodexArgv } from "../release/benchmarks/expanded-agent-codex-argv.mjs";
+import { validateInstalledUrdiraCli } from "../release/benchmarks/urdira-installed-cli-preflight.mjs";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("definitive direct campaign orchestrator", () => {
+  it("requires a common effective CODEX_HOME auth route without reading auth contents", () => {
+    const root = mkdtempSync(join(tmpdir(), "urdira-codex-auth-route-regression-"));
+    roots.push(root);
+    const parentHome = join(root, "parent-codex");
+    const isolatedHome = join(root, "isolated-codex");
+    mkdirSync(parentHome, { recursive: true, mode: 0o700 });
+    writeFileSync(join(parentHome, "auth.json"), "synthetic-auth-metadata-only", { mode: 0o600 });
+    const route = resolveCodexAuthRoute({ parentCodexHome: parentHome, isolatedCodexHome: isolatedHome });
+    expect(route).toMatchObject({ ok: true, route: "symlink", parent_codex_home: parentHome, isolated_codex_home: isolatedHome });
+    expect(route.source_mode).toBe(0o600);
+    expect(route.source_bytes).toBeGreaterThan(0);
+    expect(readlinkSync(join(isolatedHome, "auth.json"))).toBe(join(parentHome, "auth.json"));
+    const missing = resolveCodexAuthRoute({ parentCodexHome: join(root, "missing-parent"), isolatedCodexHome: join(root, "missing-isolated") });
+    expect(missing).toMatchObject({ ok: false, failure: "missing-auth" });
+    expect(effectiveCodexHome({ env: { CODEX_HOME: parentHome }, home: join(root, "unused-home") })).toBe(parentHome);
+    writeFileSync(join(parentHome, "auth.json"), "", { mode: 0o600 });
+    expect(resolveCodexAuthRoute({ parentCodexHome: parentHome, isolatedCodexHome: join(root, "empty-isolated") })).toMatchObject({ ok: false, failure: "empty-auth" });
+    writeFileSync(join(parentHome, "auth.json"), "synthetic-auth-metadata-only", { mode: 0o600 });
+    chmodSync(join(parentHome, "auth.json"), 0o644);
+    expect(resolveCodexAuthRoute({ parentCodexHome: parentHome, isolatedCodexHome: join(root, "permissive-isolated") })).toMatchObject({ ok: true, route: "symlink", source_mode: 0o644, source_bytes: expect.any(Number) });
+  });
+
   it("validates the exact production Codex first/resume argv without starting a task", () => {
     const first = buildCodexExecArgs({ model: "gpt-5.6-luna", worktree: "/tmp", integrated: false });
     const resume = buildCodexResumeArgs({ model: "gpt-5.6-luna", worktree: "/tmp", sessionId: "session-placeholder", integrated: false });
@@ -242,27 +265,19 @@ describe("definitive direct campaign orchestrator", () => {
     expect(manifest.error).toMatch(/Codex output capture failed/u);
   });
 
-  it("persists an installed Urdira CLI preflight failure before Codex", () => {
+  it("validates an installed Urdira CLI parser without starting its daemon", async () => {
     const root = mkdtempSync(join(tmpdir(), "urdira-cli-preflight-regression-"));
     roots.push(root);
-    const repository = join(root, "repository");
-    mkdirSync(join(repository, "packages/playwright/src/transform"), { recursive: true });
-    mkdirSync(join(repository, "tests"), { recursive: true });
-    writeFileSync(join(repository, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }));
-    writeFileSync(join(repository, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: { "": { name: "fixture", version: "1.0.0" } } }));
-    writeFileSync(join(repository, "packages/playwright/src/transform/compilationCache.ts"), "export const affectedTestFiles = (items: string[]) => [...items].sort();\n");
-    writeFileSync(join(repository, "tests/focused.test.ts"), "export {};\n");
-    const git = (args: string[]) => spawnSync("git", ["-C", repository, ...args], { encoding: "utf8" });
-    expect(git(["init", "-q"]).status).toBe(0);
-    expect(git(["add", "."]).status).toBe(0);
-    expect(spawnSync("git", ["-C", repository, "-c", "user.name=Benchmark", "-c", "user.email=benchmark@example.invalid", "commit", "-qm", "fixture"], { encoding: "utf8" }).status).toBe(0);
-    const commit = spawnSync("git", ["-C", repository, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
-    const output = join(root, "output");
-    const temporaryHomesBefore = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith("urdira-expanded-codex-home-")));
-    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--integration-preflight-only", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "urdira-typescript", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", "/Applications/ChatGPT.app/Contents/Resources/codex", "--commit", commit, "--worktree", repository, "--data-root", join(root, "data"), "--indexing-worker", "/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/release-extract/native/urdira-indexing-worker", "--output-dir", output, "--release-root", "/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v6/release-extract", "--release-archive", "/Users/Cristian/BenchmarkResults/urdira-final-release-archive-20260915-v5.tar.gz"], { encoding: "utf8" });
-    expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ model_invoked: false, cli_preflight: { status: "passed", command: ["status", "--json"], daemon_started: false } });
-    expect(readdirSync(tmpdir()).filter((entry) => entry.startsWith("urdira-expanded-codex-home-") && !temporaryHomesBefore.has(entry))).toEqual([]);
+    const releaseRoot = join(root, "release");
+    const cliModule = join(releaseRoot, "node_modules/@urdira/cli/dist/index.js");
+    const cliPath = join(releaseRoot, "bin/urdira.mjs");
+    mkdirSync(join(releaseRoot, "node_modules/@urdira/cli/dist"), { recursive: true });
+    mkdirSync(join(releaseRoot, "bin"), { recursive: true });
+    writeFileSync(join(releaseRoot, "package.json"), JSON.stringify({ name: "fixture-release", version: "1.0.0", type: "module" }));
+    writeFileSync(cliModule, "export const parseCliArgs = (args) => args[0] === 'status' && args[1] === '--json' ? { name: 'status', options: { json: true } } : null;\n");
+    writeFileSync(cliPath, "#!/usr/bin/env node\n");
+    const cliSha256 = (await import("node:crypto")).createHash("sha256").update(readFileSync(cliPath)).digest("hex");
+    await expect(validateInstalledUrdiraCli({ cliPath, releaseRoot, expectedSha256: cliSha256, expectedVersion: "1.0.0" })).resolves.toMatchObject({ status: "passed", command: ["status", "--json"], model_invoked: false, daemon_started: false });
   });
 
   it("settles with an explicit spool error and terminates the child when capture fails", async () => {

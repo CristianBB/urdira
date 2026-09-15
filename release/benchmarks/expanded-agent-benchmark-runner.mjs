@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 /* global URL, setTimeout, clearTimeout, setInterval, clearInterval */
 /* One isolated repository/task/arm run for the expanded benchmark. */
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { homedir } from "node:os";
 import { inspectAgentValidationEnvironment, isCurrentStructuralFrontier } from "./agent-validation-environment.mjs";
 import { createTimingCapture, summarizeTimingCaptures } from "./expanded-agent-timing.mjs";
 import { findWorkerStartupAttestation } from "./urdira-worker-attestation.mjs";
@@ -14,7 +13,7 @@ import { writeUrdiraIsolatedShim } from "./urdira-isolated-shim.mjs";
 import { retainCodexHostSessions } from "./codex-host-evidence.mjs";
 import { assertReleaseBinding } from "./release-binding.mjs";
 import { deriveHostTokenEvidence } from "./benchmark-token-evidence.mjs";
-import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs } from "./expanded-agent-codex-argv.mjs";
+import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs, effectiveCodexHome, resolveCodexAuthRoute } from "./expanded-agent-codex-argv.mjs";
 import { validateInstalledUrdiraCli } from "./urdira-installed-cli-preflight.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -160,6 +159,8 @@ const codexInvocations = [];
 let codexIntegrationHome;
 let codexSessionHome;
 let codexIntegration;
+let codexAuthRoute;
+const parentCodexHome = effectiveCodexHome();
 let hostSessionEvidence;
 const cleanupCodexIntegration = () => {
   const sessionHome = codexIntegrationHome ?? codexSessionHome;
@@ -178,7 +179,7 @@ const recordFailure = (reason) => {
   const modelInvocationState = codexInvocations.length === 0
     ? false
     : codexInvocations.some((invocation) => invocation.code !== null || invocation.signal !== null) ? true : null;
-  const failureManifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), arm, phase, sample, model, node: preflight.node, commit, worktree, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, codex_invocations: codexInvocations, counter_mode: tokenCounterEvidence?.counter_mode ?? null, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), model_invoked: modelInvocationState, completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message, cleanup_error: cleanupError };
+  const failureManifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), arm, phase, sample, model, node: preflight.node, commit, worktree, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, codex_auth_route: codexAuthRoute ?? null, codex_invocations: codexInvocations, counter_mode: tokenCounterEvidence?.counter_mode ?? null, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, ...(codexIntegration === undefined ? {} : { agent_integration: { ...codexIntegration, cleaned_up: true } }), ...(arm === "urdira-typescript" ? { data_root: effectiveDataRoot, host_log: hostLog, hook_audit_path: hookAuditPath, host_metrics: finalizeHostMetrics() } : {}), setup_started_at: new Date().toISOString(), model_invoked: modelInvocationState, completed_successfully: false, failure_stage: argv.includes("--host") ? "urdira_host" : "runner", error: message, cleanup_error: cleanupError };
   try {
     mkdirSync(outputDir, { recursive: true });
     writeFileSync(manifestPath, `${JSON.stringify(failureManifest, null, 2)}\n`, "utf8");
@@ -302,15 +303,8 @@ if (arm === "urdira-typescript") {
   if (preflight.release_root) ({ installAgent } = await import(pathToFileURL(join(preflight.release_root, "node_modules/@urdira/cli/dist/agent-integration.js")).href));
   else ({ installAgent } = await import("../../packages/cli/dist/agent-integration.js"));
   const installed = await installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome, launcher: [urdiraShimPath] });
-  const userAuthPath = join(homedir(), ".codex", "auth.json");
-  const isolatedAuthPath = join(codexIntegrationHome, ".codex", "auth.json");
-  let authMode = "external-or-missing";
-  if (existsSync(userAuthPath)) {
-    // Keep authentication available without copying credentials into the
-    // disposable configuration root or changing the user's Codex directory.
-    symlinkSync(userAuthPath, isolatedAuthPath);
-    authMode = "user-auth-symlink";
-  }
+  codexAuthRoute = resolveCodexAuthRoute({ parentCodexHome, isolatedCodexHome: join(codexIntegrationHome, ".codex") });
+  if (!codexAuthRoute.ok) throw new Error(`Codex authentication preflight failed: ${codexAuthRoute.failure}`);
   codexIntegration = {
     mode: "installed-integration",
     client: "codex",
@@ -320,7 +314,8 @@ if (arm === "urdira-typescript") {
     mcp: "hook-first-cli-continuations",
     ignore_user_config: false,
     hook_trust: "dangerously-bypass-hook-trust",
-    auth: authMode,
+    auth: codexAuthRoute.route,
+    auth_route: codexAuthRoute,
     executable: urdiraShimPath,
     executable_version: cliPreflight.cli_version,
     cli_preflight: cliPreflight,
@@ -364,6 +359,8 @@ if (arm === "urdira-typescript") {
   if (semanticPerfRequested) semanticPerfAttestation = await waitForSemanticPerfAttestation();
 }
 if (codexSessionHome === undefined) codexSessionHome = mkdtempSync(join("/tmp", "urdira-expanded-codex-session-home-"));
+if (codexAuthRoute === undefined) codexAuthRoute = resolveCodexAuthRoute({ parentCodexHome, isolatedCodexHome: join(codexSessionHome, ".codex") });
+if (!codexAuthRoute.ok) throw new Error(`Codex authentication preflight failed: ${codexAuthRoute.failure}`);
 const setupElapsedMs = Date.now() - setupStartedAt;
 
 // Keep the first and resume invocations on one production argv builder. The
@@ -493,7 +490,7 @@ let grader;
 try { grader = JSON.parse(grade.stdout); } catch { grader = { completed_successfully: false, parse_error: grade.stdout.slice(-2000) }; }
 cleanupCodexIntegration();
 const tokenCounterEvidence = deriveCounterEvidence();
-const manifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, node: preflight.node, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, release_binding: preflight.release_binding, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, codex_invocations: codexInvocations, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, model_invoked: true, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
+const manifest = { run_id: runId, protocol: definitiveProtocol ? "definitive-selected-v1" : "expanded-agent-v1", repository: repo.repository, repository_id: repositoryId, source_ref: repo.source_ref ?? commit, commit, size_tier: repo.size_tier, task_id: taskId, prompt_sha256: createHash("sha256").update(task.prompt).digest("hex"), scenario: task.scenario, incremental_protocol: "staged-incremental", complexity: task.complexity, arm, phase, sample, model, node: preflight.node, worktree, data_root: arm === "urdira-typescript" ? effectiveDataRoot : undefined, release_binding: preflight.release_binding, transcript, timing_sidecar: timingSidecar, timing_metrics: timingSummary(), benchmark_timeout_ms: benchmarkTimeoutMs, codex_auth_route: codexAuthRoute, counter_mode: tokenCounterEvidence.counter_mode, token_counter_evidence: tokenCounterEvidence, host_session_evidence: hostSessionEvidence, codex_invocations: codexInvocations, agent_integration: codexIntegration === undefined ? undefined : { ...codexIntegration, cleaned_up: true }, host_log: arm === "urdira-typescript" ? hostLog : undefined, hook_audit_path: arm === "urdira-typescript" ? hookAuditPath : undefined, host_metrics: arm === "urdira-typescript" ? hostMetrics : undefined, semantic_perf_requested: arm === "urdira-typescript" ? semanticPerfRequested : undefined, semantic_perf_attestation: arm === "urdira-typescript" ? semanticPerfAttestation : undefined, inter_turn_freshness_waits_ms: arm === "urdira-typescript" ? interTurnFreshnessWaitsMs : undefined, inter_turn_reconcile_requests: arm === "urdira-typescript" ? interTurnReconcileRequests : undefined, setup_started_at: new Date(setupStartedAt).toISOString(), first_instruction_sent_at: new Date(firstInstructionMs).toISOString(), finished_at: new Date(agentFinishedMs).toISOString(), setup_elapsed_ms: setupElapsedMs, elapsed_ms_from_first_instruction: agentFinishedMs - firstInstructionMs, outer_turns_requested: 3, model_invoked: true, exit_code: exitCode, grader_exit_code: grade.code, completed_successfully: exitCode === 0 && grade.code === 0 && grader.completed_successfully === true, setup, correctness: grader };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(JSON.stringify(manifest));
 if (!manifest.completed_successfully) process.exitCode = 1;

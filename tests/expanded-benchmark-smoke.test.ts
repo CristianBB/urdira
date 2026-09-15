@@ -148,9 +148,9 @@ describe("expanded campaign smoke scope", () => {
     expect(runner).toContain('installAgent("codex", { dry_run: false, confirm: true, home: codexIntegrationHome, launcher: [urdiraShimPath] })');
     expect(runner).toContain('mkdtempSync(join("/tmp", "urdira-expanded-codex-home-"))');
     expect(runner).toContain('CODEX_HOME: join(codexIntegrationHome, ".codex")');
-    expect(runner).toContain('const userAuthPath = join(homedir(), ".codex", "auth.json")');
-    expect(runner).toContain('symlinkSync(userAuthPath, isolatedAuthPath)');
-    expect(runner).toContain('auth: authMode');
+    expect(runner).toContain('const parentCodexHome = effectiveCodexHome()');
+    expect(runner).toContain('resolveCodexAuthRoute({ parentCodexHome');
+    expect(runner).toContain('auth_route: codexAuthRoute');
     expect(runner.indexOf("let codexIntegrationHome;")).toBeLessThan(runner.indexOf("const recordFailure"));
     expect(runner.indexOf("const cleanupCodexIntegration")).toBeLessThan(runner.indexOf("const recordFailure"));
     expect(runner).toContain('mcp: "hook-first-cli-continuations"');
