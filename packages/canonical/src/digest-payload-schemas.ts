@@ -122,13 +122,23 @@ function splitTopLevel(value: string): string[] {
   return result;
 }
 
-function logicalType(logical: string, field?: { readonly schema_bound_coordinates?: readonly [string, string] }): CanonicalTypeExpression {
+function logicalCollectionType(logical: string): CanonicalTypeExpression | undefined {
   const sequence = logical.match(/^Sequence<(.+)>$/);
   if (sequence) return { type_kind: "sequence", element_type: logicalType(sequence[1]!) };
   const set = logical.match(/^Set<(.+)>$/);
   if (set) return { type_kind: "set", element_type: logicalType(set[1]!) };
   const ordered = logical.match(/^OrderedSet<(.+),\s*(core:[^>]+)>$/);
   if (ordered) return { type_kind: "ordered_set", element_type: logicalType(ordered[1]!), comparator_id: ordered[2]!.replace(/@\d+$/, ""), comparator_version: 1 };
+  return undefined;
+}
+
+function logicalType(logical: string, field?: { readonly schema_bound_coordinates?: readonly [string, string] }): CanonicalTypeExpression {
+  const collection = logicalCollectionType(logical);
+  if (collection) return collection;
+  return logicalScalarType(logical, field);
+}
+
+function logicalScalarType(logical: string, field?: { readonly schema_bound_coordinates?: readonly [string, string] }): CanonicalTypeExpression {
   const union = logical.split("|").map((value) => value.trim()).filter(Boolean);
   if (union.length > 1) return { type_kind: "enum", values: union };
   if (logical === "Boolean") return { type_kind: "boolean" };

@@ -297,12 +297,11 @@ function splitOversizedSpan(text: string, tokenize: TextTokenizer, start: number
  * at there) -- a documented, line-granularity approximation of R7's token
  * overlap, not the precise offset-based path's guarantee.
  */
-function segmentByLines(text: string, tokenize: TextTokenizer, windowTokens: number, overlapTokens: number, maxSegments: number): Segmentation {
-  // See `splitOversizedSpan`'s own doc comment for why an oversized line's
-  // pieces are sized at `overlapTokens` (when configured), never at a
-  // maximal `windowTokens` chunk.
+type LineSpan = { readonly start: number; readonly end: number; readonly tokenCount: number };
+
+function collectLineSpans(text: string, tokenize: TextTokenizer, windowTokens: number, overlapTokens: number): readonly LineSpan[] {
   const oversizedPieceTokens = overlapTokens > 0 ? Math.min(windowTokens, overlapTokens) : windowTokens;
-  const lines: Array<{ readonly start: number; readonly end: number; readonly tokenCount: number }> = [];
+  const lines: LineSpan[] = [];
   let cursor = 0;
   while (cursor < text.length) {
     const newlineIndex = text.indexOf("\n", cursor);
@@ -312,6 +311,14 @@ function segmentByLines(text: string, tokenize: TextTokenizer, windowTokens: num
     else lines.push({ start: cursor, end, tokenCount });
     cursor = end;
   }
+  return lines;
+}
+
+function segmentByLines(text: string, tokenize: TextTokenizer, windowTokens: number, overlapTokens: number, maxSegments: number): Segmentation {
+  // See `splitOversizedSpan`'s own doc comment for why an oversized line's
+  // pieces are sized at `overlapTokens` (when configured), never at a
+  // maximal `windowTokens` chunk.
+  const lines = collectLineSpans(text, tokenize, windowTokens, overlapTokens);
   if (lines.length === 0) return { segments: [], truncated: false };
 
   const segments: SegmentSpan[] = [];
@@ -360,13 +367,17 @@ function segmentByLines(text: string, tokenize: TextTokenizer, windowTokens: num
  * that require at least one segment (e.g. `windowsFor` below, for the
  * "no extractable content" empty-text throw) must check for this themselves.
  */
+function validateSegmentationOptions(windowTokens: number, overlapTokens: number, maxSegments: number): void {
+  if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) throw new Error("segmentByTokens window_tokens must be a positive integer.");
+  if (!Number.isSafeInteger(overlapTokens) || overlapTokens < 0 || overlapTokens >= windowTokens) throw new Error("segmentByTokens overlap_tokens must be a non-negative integer smaller than window_tokens.");
+  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("segmentByTokens max_segments must be a positive integer.");
+}
+
 export function segmentByTokens(text: string, tokenizer: TextTokenizer | undefined, options: SegmentByTokensOptions = {}): Segmentation {
   const windowTokens = options.window_tokens ?? DEFAULT_SEGMENT_WINDOW_TOKENS;
   const overlapTokens = options.overlap_tokens ?? DEFAULT_SEGMENT_OVERLAP_TOKENS;
   const maxSegments = options.max_segments ?? DEFAULT_MAX_SEGMENTS;
-  if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) throw new Error("segmentByTokens window_tokens must be a positive integer.");
-  if (!Number.isSafeInteger(overlapTokens) || overlapTokens < 0 || overlapTokens >= windowTokens) throw new Error("segmentByTokens overlap_tokens must be a non-negative integer smaller than window_tokens.");
-  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("segmentByTokens max_segments must be a positive integer.");
+  validateSegmentationOptions(windowTokens, overlapTokens, maxSegments);
   if (text.length === 0) return { segments: [], truncated: false };
   const tokenize = tokenizer ?? charEstimateTokenizer;
   const whole = tokenize(text);
@@ -743,6 +754,27 @@ export async function createLocalTokenCounter(options: LocalNeuralProviderOption
   };
 }
 
+function validateLocalNeuralProviderOptions(options: LocalNeuralProviderOptions, windowTokens: number, overlapTokens: number, maxSegments: number): void {
+  if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) throw new Error("Local neural embedding provider window_tokens must be a positive integer.");
+  if (!Number.isSafeInteger(overlapTokens) || overlapTokens < 0 || overlapTokens >= windowTokens) throw new Error("Local neural embedding provider overlap_tokens must be a non-negative integer smaller than window_tokens.");
+  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("Local neural embedding provider max_segments must be a positive integer.");
+  // Deprecated aliases are accepted for compatibility but never affect the
+  // segmenter. Warn once per provider construction, not once per generation.
+  if (options.window_chars !== undefined) console.warn(`[urdira] LocalNeuralProviderOptions.window_chars is deprecated and ignored -- the segmenter now uses window_tokens (default ${DEFAULT_SEGMENT_WINDOW_TOKENS}).`);
+  if (options.max_windows !== undefined) console.warn(`[urdira] LocalNeuralProviderOptions.max_windows is deprecated and ignored -- the segmenter now uses max_segments (default ${DEFAULT_MAX_SEGMENTS}).`);
+}
+
+function segmentsForLocalNeuralInput(extractor: EmbeddingExtractor, input: GenerateVectorInput, windowTokens: number, overlapTokens: number, maxSegments: number): readonly SegmentSpan[] {
+  if (input.text.trim().length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
+  const segmentation = segmentByTokens(input.text, extractor.tokenizeWithOffsets, {
+    window_tokens: windowTokens,
+    overlap_tokens: overlapTokens,
+    max_segments: input.purpose === "query" ? 1 : maxSegments,
+  });
+  if (segmentation.segments.length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
+  return segmentation.segments;
+}
+
 export async function createLocalNeuralProvider(options: LocalNeuralProviderOptions = {}): Promise<ResolvedSemanticProvider> {
   const modelId = options.model_id ?? DEFAULT_MODEL_ID;
   const dtype = options.dtype ?? DEFAULT_DTYPE;
@@ -750,16 +782,7 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
   const overlapTokens = options.overlap_tokens ?? DEFAULT_SEGMENT_OVERLAP_TOKENS;
   const maxSegments = options.max_segments ?? DEFAULT_MAX_SEGMENTS;
   const allowDownload = options.allow_download ?? true;
-  if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) throw new Error("Local neural embedding provider window_tokens must be a positive integer.");
-  if (!Number.isSafeInteger(overlapTokens) || overlapTokens < 0 || overlapTokens >= windowTokens) throw new Error("Local neural embedding provider overlap_tokens must be a non-negative integer smaller than window_tokens.");
-  if (!Number.isSafeInteger(maxSegments) || maxSegments <= 0) throw new Error("Local neural embedding provider max_segments must be a positive integer.");
-  // DEPRECATED aliases (Frente S-B, 2026-09-06): accepted, never consulted
-  // for behavior -- see `LocalNeuralProviderOptions.window_chars`'s own doc
-  // comment. Warn exactly once per construction call, not once per
-  // generate call, so a long-lived provider built with a deprecated option
-  // does not spam the log on every embed.
-  if (options.window_chars !== undefined) console.warn(`[urdira] LocalNeuralProviderOptions.window_chars is deprecated and ignored -- the segmenter now uses window_tokens (default ${DEFAULT_SEGMENT_WINDOW_TOKENS}).`);
-  if (options.max_windows !== undefined) console.warn(`[urdira] LocalNeuralProviderOptions.max_windows is deprecated and ignored -- the segmenter now uses max_segments (default ${DEFAULT_MAX_SEGMENTS}).`);
+  validateLocalNeuralProviderOptions(options, windowTokens, overlapTokens, maxSegments);
 
   const extractorFactory = options.extractor_factory ?? defaultExtractorFactory;
   const extractor = await extractorFactory({
@@ -816,28 +839,6 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
   // hash/HTTP providers (`semantic-provider.ts`'s `segmenterIdentity`).
   const executableBindingDigest = digestOf({ runtime: "transformers.js", package_version: packageVersion, model_id: modelId, dtype, segmenter: segmenterIdentity(maxSegments, windowTokens, overlapTokens), pooling: "mean-l2" });
 
-  /**
-   * Builds ONE input's segments via `segmentByTokens`, using this provider's
-   * OWN extractor's `tokenizeWithOffsets` when present (see
-   * `EmbeddingExtractor`'s own doc comment) -- document purpose segments the
-   * full text up to `maxSegments`; query purpose is always exactly the FIRST
-   * segment (`max_segments: 1`), regardless of `maxSegments`, mirroring the
-   * pre-segmenter "query is always the first window" behavior exactly.
-   * Throws the identical "no extractable content" error `generateVector`
-   * throws for empty/whitespace text -- shared here so `generateVectors`'
-   * batch segmentation can never silently diverge from the single-input path.
-   */
-  function segmentsFor(input: GenerateVectorInput): readonly SegmentSpan[] {
-    if (input.text.trim().length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
-    const segmentation = segmentByTokens(input.text, extractor.tokenizeWithOffsets, {
-      window_tokens: windowTokens,
-      overlap_tokens: overlapTokens,
-      max_segments: input.purpose === "query" ? 1 : maxSegments,
-    });
-    if (segmentation.segments.length === 0) throw new Error("Local neural embedding provider found no extractable content in the given text.");
-    return segmentation.segments;
-  }
-
   /** Same bounded input_digest discipline as `createLocalHashProvider` -- see the module doc comment above for the regression this avoids. Shared by `generateVector` and `generateVectors` so both compute it identically. `segment_index` (Frente S-B) folds in when the caller is embedding one pre-cut segment of a larger entity document (see `SemanticGenerateInput.segment_index`'s own doc comment). */
   function inputDigestFor(input: GenerateVectorInput): string {
     return digestOf({ purpose: input.purpose, profile_digest: input.profile.profile_digest, text_digest: digestBytes(new TextEncoder().encode(input.text)), ...(input.segment_index === undefined ? {} : { segment_index: input.segment_index }) });
@@ -865,7 +866,7 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
       runtime_binding_id: runtimeBindingId,
       executable_binding_digest: executableBindingDigest,
       generateVector: async (input) => {
-        const segments = segmentsFor(input);
+        const segments = segmentsForLocalNeuralInput(extractor, input, windowTokens, overlapTokens, maxSegments);
         const texts = segments.map((segment) => segment.text);
         const embedded = await extractor(texts);
         if (embedded.length !== texts.length) throw new Error(`Local neural embedding extractor returned ${embedded.length} vectors for ${texts.length} input segments.`);
@@ -895,7 +896,7 @@ export async function createLocalNeuralProvider(options: LocalNeuralProviderOpti
        * method's.
        */
       generateVectors: async (inputs) => {
-        const perInputSegments = inputs.map((input) => segmentsFor(input));
+        const perInputSegments = inputs.map((input) => segmentsForLocalNeuralInput(extractor, input, windowTokens, overlapTokens, maxSegments));
 
         const flatTexts: string[] = [];
         const ranges: Array<{ readonly start: number; readonly count: number }> = [];

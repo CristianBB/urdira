@@ -1,3 +1,8 @@
+/**
+ * JavaScript/TypeScript analyzer adapter. It translates TypeScript's view of
+ * one frozen source partition into Urdira's language-neutral candidate model;
+ * publication, identity, ordering, and query policy stay core-owned.
+ */
 import { createHash } from "node:crypto";
 import { version as TYPESCRIPT_VERSION } from "typescript";
 import { createVirtualFileSystem, type FileSystem } from "typescript/unstable/fs";
@@ -214,6 +219,40 @@ export interface JsTsDiagnostic {
   readonly end?: number;
 }
 
+interface JsTsNodeClassification {
+  readonly kind: string;
+  readonly universalKind: string;
+}
+
+/** Maps declaration syntax to the language-neutral kind published by the plugin. */
+function classifyNode(node: Node): JsTsNodeClassification | undefined {
+  if (isFunctionDeclaration(node)) return { kind: "function", universalKind: "core:callable" };
+  if (isClassDeclaration(node)) return { kind: "class", universalKind: "core:type" };
+  if (isInterfaceDeclaration(node)) return { kind: "interface", universalKind: "core:type" };
+  if (isTypeAliasDeclaration(node)) return { kind: "type", universalKind: "core:type" };
+  if (isEnumDeclaration(node)) return { kind: "enum", universalKind: "core:type" };
+  if (isModuleDeclaration(node)) return { kind: "namespace", universalKind: "core:type" };
+  if (isVariableDeclaration(node)) return { kind: "variable", universalKind: "core:value" };
+  if (isParameterDeclaration(node)) return { kind: "parameter", universalKind: "core:parameter" };
+  if (isMethodDeclaration(node) || isMethodSignatureDeclaration(node)) return { kind: "method", universalKind: "core:callable" };
+  if (isConstructorDeclaration(node)) return { kind: "constructor", universalKind: "core:callable" };
+  if (isGetAccessorDeclaration(node)) return { kind: "getter", universalKind: "core:callable" };
+  if (isSetAccessorDeclaration(node)) return { kind: "setter", universalKind: "core:callable" };
+  if (isPropertyDeclaration(node)) return { kind: "property", universalKind: "core:value" };
+  return undefined;
+}
+
+/** Returns the stable textual name of a declaration, including constructors. */
+function nodeName(node: Node): string | undefined {
+  if (isConstructorDeclaration(node)) return "constructor";
+  const value = (node as Node & { readonly name?: Node }).name;
+  if (value === undefined) return undefined;
+  const candidate = value as Node & { readonly text?: string; readonly escapedText?: string | number };
+  if (typeof candidate.text === "string") return candidate.text;
+  if (typeof candidate.escapedText === "string" || typeof candidate.escapedText === "number") return String(candidate.escapedText);
+  return undefined;
+}
+
 /**
  * One scanned file's import-closure: the set of scanned files (identified by
  * their `AnalyzerFile.path`, always including the file itself) it
@@ -301,6 +340,75 @@ function resolveLargeSyntaxModule(available: ReadonlySet<string>, from: string, 
   return undefined;
 }
 
+function boundedDeclarationKind(declarationKind: string): { readonly kind: string; readonly universalKind: string } {
+  const kind = declarationKind === "function" ? "function" : declarationKind === "class" ? "class" : declarationKind === "interface" ? "interface" : declarationKind === "type" ? "type" : declarationKind === "enum" ? "enum" : "variable";
+  return { kind, universalKind: kind === "function" ? "core:callable" : kind === "variable" ? "core:value" : "core:type" };
+}
+
+function analysisLanguage(rootNames: readonly string[]): JsTsLanguage {
+  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
+  const hasTypeScript = rootNames.some((path) => languageForPath(path) === "typescript");
+  return hasJavaScript && !hasTypeScript ? "javascript" : "typescript";
+}
+
+function boundedDependencyClosures(sourceFiles: readonly AnalyzerFile[], directEdges: ReadonlyMap<string, ReadonlySet<string>>, incomplete: ReadonlySet<string>): Record<string, JsTsDependencyClosure> {
+  const dependencyClosures: Record<string, JsTsDependencyClosure> = {};
+  for (const file of sourceFiles) {
+    const visited = new Set<string>([file.path]);
+    const stack = [file.path];
+    let complete = true;
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      if (incomplete.has(current)) complete = false;
+      for (const next of directEdges.get(current) ?? []) {
+        if (!visited.has(next)) { visited.add(next); stack.push(next); }
+      }
+    }
+    dependencyClosures[file.path] = { files: [...visited].sort(), complete };
+  }
+  return dependencyClosures;
+}
+
+function syntaxDependencyClosures(sourceFiles: readonly AnalyzerFile[], directEdges: ReadonlyMap<string, ReadonlySet<string>>, incomplete: ReadonlySet<string>): Record<string, JsTsDependencyClosure> {
+  return boundedDependencyClosures(sourceFiles, directEdges, incomplete);
+}
+
+const BOUNDED_DECLARATION_PATTERN = /\b(?:export\s+)?(?:default\s+)?(?:async\s+)?(function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/gu;
+
+type BoundedRelationAdder = (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, path: string, start: number, end: number, classification: "confirmed" | "possible") => void;
+
+function scanBoundedDeclarations(sourceFiles: readonly AnalyzerFile[], modules: ReadonlyMap<string, JsTsEntity>, entities: JsTsEntity[], addRelation: BoundedRelationAdder): void {
+  for (const file of sourceFiles) {
+    const moduleEntity = modules.get(file.path)!;
+    for (const match of file.text.matchAll(BOUNDED_DECLARATION_PATTERN)) {
+      const name = match[2]; const declarationKind = match[1];
+      if (name === undefined || declarationKind === undefined) continue;
+      const start = match.index + match[0].lastIndexOf(name);
+      if (start < 0) continue;
+      const { kind, universalKind } = boundedDeclarationKind(declarationKind);
+      const entity: JsTsEntity = { id: stableId(kind, file.path, start, name), name, kind, universal_kind: universalKind, path: file.path, start, end: start + name.length, parent_id: moduleEntity.id, qualified_name: `${file.path}.${name}` };
+      entities.push(entity);
+      addRelation("contains", moduleEntity, entity, file.path, start, start + name.length, "confirmed");
+    }
+  }
+}
+
+function scanBoundedImports(sourceFiles: readonly AnalyzerFile[], available: ReadonlySet<string>, modules: ReadonlyMap<string, JsTsEntity>, directEdges: Map<string, Set<string>>, incomplete: Set<string>, addRelation: BoundedRelationAdder): void {
+  for (const file of sourceFiles) {
+    const moduleEntity = modules.get(file.path)!;
+    for (const match of file.text.matchAll(JS_TS_IMPORT_SPECIFIER_PATTERN)) {
+      const specifier = match[2] ?? match[3]; if (specifier === undefined) continue;
+      const targetPath = resolveLargeSyntaxModule(available, file.path, specifier); const target = targetPath === undefined ? undefined : modules.get(targetPath);
+      const start = match.index; addRelation(match[1] === "export" ? "export" : "import", moduleEntity, target, file.path, start, start + match[0].length, target === undefined ? "possible" : "confirmed");
+      if (targetPath !== undefined) {
+        const edges = directEdges.get(file.path);
+        if (edges === undefined) directEdges.set(file.path, new Set([targetPath]));
+        else edges.add(targetPath);
+      } else if (specifier.startsWith(".") && !relativeAssetSpecifier(specifier)) incomplete.add(file.path);
+    }
+  }
+}
+
 // Shared with `analyzeBoundedSyntaxProject`'s own import scan, below, and
 // exported (P3-3b) so a host-side pre-seed (`apps/urdira/src/index.ts`) can
 // extract the identical specifier set from a file's text WITHOUT
@@ -359,6 +467,29 @@ export function analyzeSyntaxDependencyGraph(input: { readonly files: readonly A
   return resolveSyntaxDependencyGraph(sourceFiles.map((file) => file.path), specifiersByPath);
 }
 
+interface PreparedSyntaxProject {
+  readonly rootNames: readonly string[];
+  readonly sourceFiles: readonly AnalyzerFile[];
+  readonly virtualRoot: string;
+  readonly configPath: string;
+  readonly compilerOptions: Readonly<Record<string, unknown>>;
+  readonly virtualFiles: Readonly<Record<string, string>>;
+}
+
+function prepareSyntaxProject(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[]; readonly compiler_options?: Readonly<Record<string, unknown>> }): PreparedSyntaxProject {
+  const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].sort();
+  const sourceFiles = input.files.filter((candidate) => rootNames.includes(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
+  const virtualRoot = "/urdira-workspace";
+  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
+  const configPath = `${virtualRoot}/__urdira_project__.json`;
+  const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
+  const virtualFiles: Record<string, string> = Object.fromEntries([
+    ...sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const),
+    [configPath, JSON.stringify({ compilerOptions, files: rootNames })],
+  ]);
+  return { rootNames, sourceFiles, virtualRoot, configPath, compilerOptions, virtualFiles };
+}
+
 /** Always use the bounded, checker-free stage-1 scanner. */
 export function analyzeBoundedSyntaxProject(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[] }): JsTsAnalysisResult {
   const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].filter((path) => languageForPath(path) !== undefined).sort();
@@ -374,43 +505,14 @@ export function analyzeBoundedSyntaxProject(input: { readonly files: readonly An
     const moduleEntity: JsTsEntity = { id: stableId("module", file.path, 0, file.path), name: file.path, kind: "module", universal_kind: "core:container", path: file.path, start: 0, end: file.text.length, ...(file.text.includes('from "node:test"') || file.text.includes("from 'node:test'") ? { is_test: true } : {}) };
     modules.set(file.path, moduleEntity); entities.push(moduleEntity);
   }
-  const declarationPattern = /\b(?:export\s+)?(?:default\s+)?(?:async\s+)?(function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/gu;
   const addRelation = (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, path: string, start: number, end: number, classification: "confirmed" | "possible"): void => {
     relations.push({ id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:${kind}:${path}:${start}:${end}:${source.id}:${target?.id ?? "unresolved"}`, kind: `core:${kind}`, source_id: source.id, ...(target === undefined ? {} : { target_id: target.id }), path, start, end, classification });
   };
-  for (const file of sourceFiles) {
-    const moduleEntity = modules.get(file.path)!;
-    for (const match of file.text.matchAll(declarationPattern)) {
-      const name = match[2]; const declarationKind = match[1];
-      if (name === undefined || declarationKind === undefined) continue;
-      const start = match.index + match[0].lastIndexOf(name);
-      if (start < 0) continue;
-      const kind = declarationKind === "function" ? "function" : declarationKind === "class" ? "class" : declarationKind === "interface" ? "interface" : declarationKind === "type" ? "type" : declarationKind === "enum" ? "enum" : "variable";
-      const universalKind = kind === "function" ? "core:callable" : kind === "variable" ? "core:value" : "core:type";
-      const entity: JsTsEntity = { id: stableId(kind, file.path, start, name), name, kind, universal_kind: universalKind, path: file.path, start, end: start + name.length, parent_id: moduleEntity.id, qualified_name: `${file.path}.${name}` };
-      entities.push(entity);
-      addRelation("contains", moduleEntity, entity, file.path, start, start + name.length, "confirmed");
-    }
-    for (const match of file.text.matchAll(JS_TS_IMPORT_SPECIFIER_PATTERN)) {
-      const specifier = match[2] ?? match[3]; if (specifier === undefined) continue;
-      const targetPath = resolveLargeSyntaxModule(available, file.path, specifier); const target = targetPath === undefined ? undefined : modules.get(targetPath);
-      const start = match.index; addRelation(match[1] === "export" ? "export" : "import", moduleEntity, target, file.path, start, start + match[0].length, target === undefined ? "possible" : "confirmed");
-      if (targetPath !== undefined) {
-        const edges = directEdges.get(file.path);
-        if (edges === undefined) directEdges.set(file.path, new Set([targetPath]));
-        else edges.add(targetPath);
-      }
-      else if (specifier.startsWith(".") && !relativeAssetSpecifier(specifier)) incomplete.add(file.path);
-    }
-  }
+  scanBoundedDeclarations(sourceFiles, modules, entities, addRelation);
+  scanBoundedImports(sourceFiles, available, modules, directEdges, incomplete, addRelation);
   entities.sort((left, right) => left.id.localeCompare(right.id)); relations.sort((left, right) => left.id.localeCompare(right.id));
-  const dependencyClosures: Record<string, JsTsDependencyClosure> = {};
-  for (const file of sourceFiles) {
-    const visited = new Set<string>([file.path]); const stack = [file.path]; let complete = true;
-    while (stack.length > 0) { const current = stack.pop()!; if (incomplete.has(current)) complete = false; for (const next of directEdges.get(current) ?? []) if (!visited.has(next)) { visited.add(next); stack.push(next); } }
-    dependencyClosures[file.path] = { files: [...visited].sort(), complete };
-  }
-  return { language: rootNames.some((path) => languageForPath(path) === "javascript") && !rootNames.some((path) => languageForPath(path) === "typescript") ? "javascript" : "typescript", entities, relations, diagnostics: [], complete: true, dependency_closures: dependencyClosures };
+  const dependencyClosures = boundedDependencyClosures(sourceFiles, directEdges, incomplete);
+  return { language: analysisLanguage(rootNames), entities, relations, diagnostics: [], complete: true, dependency_closures: dependencyClosures };
 }
 
 /**
@@ -425,18 +527,10 @@ export function analyzeSyntaxProject(input: { readonly files: readonly AnalyzerF
   // thousand modest files can already make TypeScript's project graph
   // hundreds of megabytes before any useful stage-1 row is published.
   if (isLargeSyntaxCorpus(input)) return analyzeBoundedSyntaxProject(input);
-  const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].sort();
-  const sourceFiles = input.files.filter((candidate) => rootNames.includes(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
-  const virtualRoot = "/urdira-workspace";
+  const prepared = prepareSyntaxProject(input);
+  const { rootNames, sourceFiles, virtualRoot, configPath, virtualFiles } = prepared;
   const virtualPath = (path: string): string => `${virtualRoot}/${path}`;
   const relativePath = (path: string): string => path.startsWith(`${virtualRoot}/`) ? path.slice(virtualRoot.length + 1) : path;
-  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
-  const configPath = `${virtualRoot}/__urdira_project__.json`;
-  const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
-  const virtualFiles: Record<string, string> = Object.fromEntries([
-    ...sourceFiles.map((file) => [virtualPath(file.path), file.text] as const),
-    [configPath, JSON.stringify({ compilerOptions, files: rootNames })],
-  ]);
   const api = new API({ fs: createVirtualFileSystem(virtualFiles) });
   let project: TypescriptProject | undefined;
   try {
@@ -452,42 +546,16 @@ export function analyzeSyntaxProject(input: { readonly files: readonly AnalyzerF
     const directImportEdges = new Map<string, Set<string>>();
     const incompleteClosureFiles = new Set<string>();
     const nodeKey = (node: Node): string => `${relativePath(node.getSourceFile().fileName)}:${node.getStart(node.getSourceFile())}`;
-    const nameOf = (node: Node): string | undefined => {
-      // A `ConstructorDeclaration` has no `.name` node at all (`name?: never`
-      // in the TS AST) -- synthesize "constructor" as its name, matching the
-      // Rust syntax worker's `MethodDefinitionKind::Constructor` identity
-      // (`DeclKind::Constructor`'s name is the literal "constructor" text).
-      if (isConstructorDeclaration(node)) return "constructor";
-      const value = (node as Node & { readonly name?: Node }).name;
-      if (value === undefined) return undefined;
-      const candidate = value as Node & { readonly text?: string; readonly escapedText?: string | number };
-      if (typeof candidate.text === "string") return candidate.text;
-      if (typeof candidate.escapedText === "string" || typeof candidate.escapedText === "number") return String(candidate.escapedText);
-      return undefined;
-    };
     const addEntity = (node: Node, parent: JsTsEntity | undefined): JsTsEntity | undefined => {
-      const name = nameOf(node);
+      const name = nodeName(node);
       if (name === undefined || name.length === 0) return undefined;
       const source = node.getSourceFile();
       const path = relativePath(source.fileName);
       const start = node.getStart(source);
       const end = node.getEnd();
-      let kind: string;
-      let universalKind: string;
-      if (isFunctionDeclaration(node)) { kind = "function"; universalKind = "core:callable"; }
-      else if (isClassDeclaration(node)) { kind = "class"; universalKind = "core:type"; }
-      else if (isInterfaceDeclaration(node)) { kind = "interface"; universalKind = "core:type"; }
-      else if (isTypeAliasDeclaration(node)) { kind = "type"; universalKind = "core:type"; }
-      else if (isEnumDeclaration(node)) { kind = "enum"; universalKind = "core:type"; }
-      else if (isModuleDeclaration(node)) { kind = "namespace"; universalKind = "core:type"; }
-      else if (isVariableDeclaration(node)) { kind = "variable"; universalKind = "core:value"; }
-      else if (isParameterDeclaration(node)) { kind = "parameter"; universalKind = "core:parameter"; }
-      else if (isMethodDeclaration(node) || isMethodSignatureDeclaration(node)) { kind = "method"; universalKind = "core:callable"; }
-      else if (isConstructorDeclaration(node)) { kind = "constructor"; universalKind = "core:callable"; }
-      else if (isGetAccessorDeclaration(node)) { kind = "getter"; universalKind = "core:callable"; }
-      else if (isSetAccessorDeclaration(node)) { kind = "setter"; universalKind = "core:callable"; }
-      else if (isPropertyDeclaration(node)) { kind = "property"; universalKind = "core:value"; }
-      else return undefined;
+      const classification = classifyNode(node);
+      if (classification === undefined) return undefined;
+      const { kind, universalKind } = classification;
       // Identity uses the START OF THE NAME IDENTIFIER, not the declaration's
       // own start -- the same convention the Rust syntax worker uses
       // (`identifier.span.start`, crates/urdira-jsts-syntax-worker/src/lib.rs
@@ -512,24 +580,6 @@ export function analyzeSyntaxProject(input: { readonly files: readonly AnalyzerF
       const entity = addEntity(node, parent) ?? parent;
       node.forEachChild((child) => collect(child, entity));
     };
-    const moduleTarget = (node: Node): JsTsEntity | undefined => {
-      const specifier = (node as Node & { readonly text?: string }).text;
-      if (typeof specifier !== "string" || !specifier.startsWith(".")) return undefined;
-      const sourceParts = relativePath(node.getSourceFile().fileName).split("/");
-      sourceParts.pop();
-      for (const part of specifier.split("/")) {
-        if (part === "." || part === "") continue;
-        if (part === "..") sourceParts.pop();
-        else sourceParts.push(part);
-      }
-      const base = sourceParts.join("/");
-      const extensions = [...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS];
-      for (const candidate of [base, ...extensions.map((extension) => `${base}${extension}`), ...extensions.map((extension) => `${base}/index${extension}`)]) {
-        const target = moduleByPath.get(candidate);
-        if (target !== undefined) return target;
-      }
-      return undefined;
-    };
     const relate = (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, node: Node, classification: "confirmed" | "possible"): void => {
       const path = relativePath(node.getSourceFile().fileName);
       const start = node.getStart(node.getSourceFile());
@@ -553,42 +603,62 @@ export function analyzeSyntaxProject(input: { readonly files: readonly AnalyzerF
       moduleByPath.set(file.path, moduleEntity);
       collect(source, moduleEntity);
     }
-    for (const file of sourceFiles) {
-      const source = program.getSourceFile(virtualPath(file.path));
-      if (source === undefined) continue;
-      const walk = (node: Node): void => {
-        if (isImportDeclaration(node) || isExportDeclaration(node)) {
-          const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier;
-          const sourceModule = moduleByPath.get(file.path);
-          const targetModule = specifier === undefined ? undefined : moduleTarget(specifier);
-          if (sourceModule !== undefined && specifier !== undefined) {
-            relate(isImportDeclaration(node) ? "import" : "export", sourceModule, targetModule, node, targetModule === undefined ? "possible" : "confirmed");
-            const specifierText = (specifier as Node & { readonly text?: string }).text;
-            if (targetModule === undefined && typeof specifierText === "string" && specifierText.startsWith(".") && !relativeAssetSpecifier(specifierText)) incompleteClosureFiles.add(file.path);
-          }
-        }
-        node.forEachChild(walk);
-      };
-      walk(source);
-    }
+    collectSyntaxImports(sourceFiles, program, virtualPath, moduleByPath, relativePath, relate, incompleteClosureFiles);
     entities.sort((left, right) => left.id.localeCompare(right.id));
     relations.sort((left, right) => left.id.localeCompare(right.id));
-    const dependencyClosures: Record<string, JsTsDependencyClosure> = {};
-    for (const file of sourceFiles) {
-      const visited = new Set<string>([file.path]);
-      const stack = [file.path];
-      let complete = true;
-      while (stack.length > 0) {
-        const current = stack.pop()!;
-        if (incompleteClosureFiles.has(current)) complete = false;
-        for (const next of directImportEdges.get(current) ?? []) if (!visited.has(next)) { visited.add(next); stack.push(next); }
-      }
-      dependencyClosures[file.path] = { files: [...visited].sort(), complete };
-    }
-    return { language: rootNames.some((path) => languageForPath(path) === "javascript") && !rootNames.some((path) => languageForPath(path) === "typescript") ? "javascript" : "typescript", entities, relations, diagnostics: [], complete: true, dependency_closures: dependencyClosures };
+    const dependencyClosures = syntaxDependencyClosures(sourceFiles, directImportEdges, incompleteClosureFiles);
+    return { language: analysisLanguage(rootNames), entities, relations, diagnostics: [], complete: true, dependency_closures: dependencyClosures };
   } finally {
     api.close();
   }
+}
+
+function collectSyntaxImports(
+  sourceFiles: readonly AnalyzerFile[],
+  program: TypescriptProject["program"],
+  virtualPath: (path: string) => string,
+  moduleByPath: ReadonlyMap<string, JsTsEntity>,
+  relativePath: (path: string) => string,
+  relate: (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, node: Node, classification: "confirmed" | "possible") => void,
+  incompleteClosureFiles: Set<string>,
+): void {
+  for (const file of sourceFiles) {
+    const source = program.getSourceFile(virtualPath(file.path));
+    if (source === undefined) continue;
+    const walk = (node: Node): void => {
+      if (isImportDeclaration(node) || isExportDeclaration(node)) {
+        const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier;
+        const sourceModule = moduleByPath.get(file.path);
+        const targetModule = specifier === undefined ? undefined : syntaxModuleTarget(specifier, moduleByPath, relativePath);
+        if (sourceModule !== undefined && specifier !== undefined) {
+          relate(isImportDeclaration(node) ? "import" : "export", sourceModule, targetModule, node, targetModule === undefined ? "possible" : "confirmed");
+          const specifierText = (specifier as Node & { readonly text?: string }).text;
+          if (targetModule === undefined && typeof specifierText === "string" && specifierText.startsWith(".") && !relativeAssetSpecifier(specifierText)) incompleteClosureFiles.add(file.path);
+        }
+      }
+      node.forEachChild(walk);
+    };
+    walk(source);
+  }
+}
+
+function syntaxModuleTarget(node: Node, moduleByPath: ReadonlyMap<string, JsTsEntity>, relativePath: (path: string) => string): JsTsEntity | undefined {
+  const specifier = (node as Node & { readonly text?: string }).text;
+  if (typeof specifier !== "string" || !specifier.startsWith(".")) return undefined;
+  const sourceParts = relativePath(node.getSourceFile().fileName).split("/");
+  sourceParts.pop();
+  for (const part of specifier.split("/")) {
+    if (part === "." || part === "") continue;
+    if (part === "..") sourceParts.pop();
+    else sourceParts.push(part);
+  }
+  const base = sourceParts.join("/");
+  const extensions = [...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS];
+  for (const candidate of [base, ...extensions.map((extension) => `${base}${extension}`), ...extensions.map((extension) => `${base}/index${extension}`)]) {
+    const target = moduleByPath.get(candidate);
+    if (target !== undefined) return target;
+  }
+  return undefined;
 }
 
 function normalizedExtension(path: string): string {
@@ -637,6 +707,23 @@ function configCompilerOptions(config: Readonly<Record<string, unknown>>): Reado
     : {};
 }
 
+function fallbackProjectMembers(files: readonly AnalyzerFile[], config: Readonly<Record<string, unknown>>, configDirectory: string): string[] {
+  const filesFromConfig = stringArray(config["files"]);
+  const includes = stringArray(config["include"]);
+  return files.filter((file) => languageForPath(file.path) !== undefined && (
+    filesFromConfig.some((entry) => (configDirectory.length === 0 ? entry : `${configDirectory}/${entry}`) === file.path) || includes.length === 0 || includes.some((pattern) => {
+      const prefix = pattern.replace(/\*.*$/u, "");
+      return pattern === "**/*" || file.path.startsWith(configDirectory.length === 0 ? prefix : `${configDirectory}/${prefix}`);
+    })
+  )).map((file) => file.path).sort();
+}
+
+function referencedProjectPaths(config: Readonly<Record<string, unknown>>, normalizeRelative: (fromPath: string, target: string) => string, configPath: string): string[] {
+  return Array.isArray(config["references"])
+    ? config["references"].filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry)).map((entry) => typeof entry["path"] === "string" ? normalizeRelative(configPath, entry["path"]) : "").filter(Boolean).sort()
+    : [];
+}
+
 export function discoverProjects(files: readonly AnalyzerFile[]): readonly DiscoveredProject[] {
   const byPath = new Map(files.map((file) => [file.path, file]));
   const configs = files.filter((file) => /(^|\/)(?:tsconfig|jsconfig)\.json$/u.test(file.path));
@@ -680,18 +767,9 @@ export function discoverProjects(files: readonly AnalyzerFile[]): readonly Disco
         if (response !== undefined) compilerOptions = response.options;
       } catch {
         const configDirectory = config.path.includes("/") ? config.path.slice(0, config.path.lastIndexOf("/")) : "";
-        const filesFromConfig = stringArray(parsed?.["files"]);
-        const includes = stringArray(parsed?.["include"]);
-        members = files.filter((file) => languageForPath(file.path) !== undefined && (
-          filesFromConfig.some((entry) => (configDirectory.length === 0 ? entry : `${configDirectory}/${entry}`) === file.path) || includes.length === 0 || includes.some((pattern) => {
-            const prefix = pattern.replace(/\*.*$/u, "");
-            return pattern === "**/*" || file.path.startsWith(configDirectory.length === 0 ? prefix : `${configDirectory}/${prefix}`);
-          })
-        )).map((file) => file.path).sort();
+        members = fallbackProjectMembers(files, parsed ?? {}, configDirectory);
       }
-      const references = Array.isArray(parsed?.["references"])
-        ? parsed["references"].filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry)).map((entry) => typeof entry["path"] === "string" ? normalizeRelative(config.path, entry["path"]) : "").filter(Boolean).sort()
-        : [];
+      const references = referencedProjectPaths(parsed ?? {}, normalizeRelative, config.path);
       projects.push({ project_path: config.path, config_path: config.path, root_names: [...new Set(members)].sort(), referenced_projects: references, configuration_dependencies: configurationDependencies(config), workspace_manifests: manifests, compiler_options: compilerOptions, inferred: false });
     }
   } finally {
@@ -979,10 +1057,10 @@ function computeSemanticHashes(text: string, opaqueSpans: ReadonlyArray<readonly
       scanner.resetTokenState(span[1]);
       continue;
     }
-    if (token === SyntaxKind.WhitespaceTrivia || token === SyntaxKind.NewLineTrivia) continue;
+    if (isTriviaToken(token)) continue;
     if (token === SyntaxKind.SingleLineCommentTrivia || token === SyntaxKind.MultiLineCommentTrivia) {
       const commentText = scanner.getTokenText();
-      if (isJavascriptFamily || commentText.startsWith("///") || commentText.includes("@ts-") || commentText.includes("@jsx")) guardStream.push(commentText);
+      if (isGuardComment(commentText, isJavascriptFamily)) guardStream.push(commentText);
       continue;
     }
     semanticStream.push(`${token}\0${scanner.getTokenText()}`);
@@ -991,6 +1069,14 @@ function computeSemanticHashes(text: string, opaqueSpans: ReadonlyArray<readonly
     semantic_hash: createHash("sha256").update(semanticStream.join("\0")).digest("hex"),
     guard_hash: createHash("sha256").update(guardStream.join("\0")).digest("hex"),
   };
+}
+
+function isTriviaToken(token: SyntaxKind): boolean {
+  return token === SyntaxKind.WhitespaceTrivia || token === SyntaxKind.NewLineTrivia;
+}
+
+function isGuardComment(comment: string, isJavascriptFamily: boolean): boolean {
+  return isJavascriptFamily || comment.startsWith("///") || comment.includes("@ts-") || comment.includes("@jsx");
 }
 
 /**
@@ -1172,18 +1258,6 @@ function walkFiles(params: {
   let exportedDeclarations = new Set<Node>();
   const isExported = (node: Node): boolean => exportedDeclarations.has(node) || (node.parent !== undefined && exportedDeclarations.has(node.parent));
   const nodeKey = (node: Node): string => `${relativePath(node.getSourceFile().fileName)}:${node.getStart(node.getSourceFile())}`;
-  const nameOf = (node: Node): string | undefined => {
-    // A `ConstructorDeclaration` has no `.name` node at all (`name?: never`
-    // in the TS AST) -- synthesize "constructor" as its name, matching the
-    // Rust syntax worker's `MethodDefinitionKind::Constructor` identity.
-    if (isConstructorDeclaration(node)) return "constructor";
-    const value = (node as Node & { readonly name?: Node }).name;
-    if (value === undefined) return undefined;
-    const candidate = value as Node & { readonly text?: string; readonly escapedText?: string | number };
-    if (typeof candidate.text === "string") return candidate.text;
-    if (typeof candidate.escapedText === "string" || typeof candidate.escapedText === "number") return String(candidate.escapedText);
-    return undefined;
-  };
   const typeOf = (node: Node): string | undefined => {
     try {
       const type = checker.getTypeAtLocation(node);
@@ -1193,28 +1267,15 @@ function walkFiles(params: {
     }
   };
   const addEntity = (node: Node, parent: JsTsEntity | undefined): JsTsEntity | undefined => {
-    const name = nameOf(node);
+    const name = nodeName(node);
     if (name === undefined || name.length === 0) return undefined;
     const source = node.getSourceFile();
     const path = relativePath(source.fileName);
     const start = node.getStart(source);
     const end = node.getEnd();
-    let kind: string;
-    let universalKind: string;
-    if (isFunctionDeclaration(node)) { kind = "function"; universalKind = "core:callable"; }
-    else if (isClassDeclaration(node)) { kind = "class"; universalKind = "core:type"; }
-    else if (isInterfaceDeclaration(node)) { kind = "interface"; universalKind = "core:type"; }
-    else if (isTypeAliasDeclaration(node)) { kind = "type"; universalKind = "core:type"; }
-    else if (isEnumDeclaration(node)) { kind = "enum"; universalKind = "core:type"; }
-    else if (isModuleDeclaration(node)) { kind = "namespace"; universalKind = "core:type"; }
-    else if (isVariableDeclaration(node)) { kind = "variable"; universalKind = "core:value"; }
-    else if (isParameterDeclaration(node)) { kind = "parameter"; universalKind = "core:parameter"; }
-    else if (isMethodDeclaration(node) || isMethodSignatureDeclaration(node)) { kind = "method"; universalKind = "core:callable"; }
-    else if (isConstructorDeclaration(node)) { kind = "constructor"; universalKind = "core:callable"; }
-    else if (isGetAccessorDeclaration(node)) { kind = "getter"; universalKind = "core:callable"; }
-    else if (isSetAccessorDeclaration(node)) { kind = "setter"; universalKind = "core:callable"; }
-    else if (isPropertyDeclaration(node)) { kind = "property"; universalKind = "core:value"; }
-    else return undefined;
+    const classification = classifyNode(node);
+    if (classification === undefined) return undefined;
+    const { kind, universalKind } = classification;
     // Identity uses the START OF THE NAME IDENTIFIER, not the declaration's
     // own start -- see the matching comment in `analyzeSyntaxProject`'s own
     // `addEntity` above for the full rationale (Rust parity). The published
@@ -1239,38 +1300,14 @@ function walkFiles(params: {
     node.forEachChild((child) => collect(child, entity));
   };
   for (const file of filesToProcess) {
-    const source = program.getSourceFile(virtualPath(file.path));
-    if (source !== undefined) {
-      let isTestModule = false;
-      source.forEachChild((node) => {
-        if (!isImportDeclaration(node)) return;
-        const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier as Node & { readonly text?: string } | undefined;
-        if (specifier?.text === "node:test") isTestModule = true;
-      });
-      const moduleEntity: JsTsEntity = {
-        id: stableId("module", file.path, 0, file.path),
-        name: file.path,
-        kind: "module",
-        universal_kind: "core:container",
-        path: file.path,
-        start: 0,
-        end: source.getEnd(),
-        ...(isTestModule ? { is_test: true } : {}),
-      };
-      pushTo(entitiesByFile, file.path, moduleEntity);
-      entityById.set(moduleEntity.id, moduleEntity);
-      moduleByPath.set(file.path, moduleEntity);
-      try {
-        const moduleSymbol = checker.getSymbolAtLocation(source);
-        exportedDeclarations = new Set(moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol)
-          .flatMap((symbol) => symbol.declarations ?? [])
-          .map((handle) => handle.resolve(project))
-          .filter((resolved): resolved is Node => resolved !== undefined));
-      } catch {
-        exportedDeclarations = new Set();
-      }
-      collect(source, moduleEntity);
-    }
+    const initialized = initializeWalkFile(file, program, virtualPath, checker, project);
+    if (initialized === undefined) continue;
+    const { source, moduleEntity } = initialized;
+    exportedDeclarations = initialized.exportedDeclarations;
+    pushTo(entitiesByFile, file.path, moduleEntity);
+    entityById.set(moduleEntity.id, moduleEntity);
+    moduleByPath.set(file.path, moduleEntity);
+    collect(source, moduleEntity);
   }
   const targetForNode = (node: Node | undefined): JsTsEntity | undefined => {
     if (node === undefined) return undefined;
@@ -1309,33 +1346,7 @@ function walkFiles(params: {
     }
     return undefined;
   };
-  const moduleTarget = (node: Node): JsTsEntity | undefined => {
-    try {
-      const symbol = checker.getSymbolAtLocation(node);
-      for (const declaration of symbol?.declarations ?? []) {
-        const resolvedDeclaration = declaration.resolve(project);
-        if (resolvedDeclaration === undefined) continue;
-        const targetPath = relativePath(resolvedDeclaration.getSourceFile().fileName);
-        const target = moduleByPath.get(targetPath);
-        if (target !== undefined) return target;
-      }
-    } catch { /* Preserve the unresolved module relation below. */ }
-    const specifier = (node as Node & { readonly text?: string }).text;
-    if (typeof specifier !== "string" || !specifier.startsWith(".")) return undefined;
-    const sourceParts = relativePath(node.getSourceFile().fileName).split("/");
-    sourceParts.pop();
-    for (const part of specifier.split("/")) {
-      if (part === "." || part === "") continue;
-      if (part === "..") sourceParts.pop();
-      else sourceParts.push(part);
-    }
-    const base = sourceParts.join("/");
-    for (const candidate of [base, ...[...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS].map((extension) => `${base}${extension}`), ...[...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS].map((extension) => `${base}/index${extension}`)]) {
-      const target = moduleByPath.get(candidate);
-      if (target !== undefined) return target;
-    }
-    return undefined;
-  };
+  const moduleTarget = (node: Node): JsTsEntity | undefined => resolveWalkModuleTarget(node, checker, project, moduleByPath, relativePath);
   const relate = (kind: string, source: JsTsEntity, target: JsTsEntity | undefined, node: Node, classification: "confirmed" | "possible"): void => {
     const path = relativePath(node.getSourceFile().fileName);
     const start = node.getStart(node.getSourceFile());
@@ -1347,69 +1358,64 @@ function walkFiles(params: {
       directEdgesByFile.set(path, edges);
     }
   };
+  const walkImportExport = (node: Node): void => {
+    if (rustAuthoritativeScope || (!isImportDeclaration(node) && !isExportDeclaration(node))) return;
+    const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier;
+    if (specifier === undefined) return;
+    const sourceModule = moduleByPath.get(relativePath(node.getSourceFile().fileName));
+    const targetModule = moduleTarget(specifier);
+    if (sourceModule === undefined) return;
+    relate(isImportDeclaration(node) ? "import" : "export", sourceModule, targetModule, node, targetModule === undefined ? "possible" : "confirmed");
+    const specifierText = (specifier as Node & { readonly text?: string }).text;
+    if (targetModule === undefined && typeof specifierText === "string" && specifierText.startsWith(".") && !relativeAssetSpecifier(specifierText)) directIncompleteFiles.add(sourceModule.path);
+  };
+  const walkIdentifier = (node: Node, owner: JsTsEntity | undefined): void => {
+    if (!isIdentifier(node)) return;
+    const parent = node.parent;
+    const declared = parent === undefined ? undefined : entityByNode.get(nodeKey(parent));
+    const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
+    const isDeclarationName = declared !== undefined && parentName !== undefined && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
+    if (isDeclarationName) return;
+    const source = owner ?? moduleByPath.get(relativePath(node.getSourceFile().fileName));
+    const target = targetForNode(node);
+    if (source !== undefined && target !== undefined && source.id !== target.id) relate("references", source, target, node, "confirmed");
+  };
+  const walkCall = (node: Node, owner: JsTsEntity | undefined): void => {
+    if (!isCallExpression(node)) return;
+    const callOwner = owner ?? moduleByPath.get(relativePath(node.getSourceFile().fileName));
+    if (callOwner === undefined) return;
+    let target: JsTsEntity | undefined;
+    let declarationResolved = false;
+    try {
+      const signature = checker.getResolvedSignature(node);
+      const declaration = signature?.declaration?.resolve(project);
+      declarationResolved = declaration !== undefined;
+      target = declaration === undefined ? undefined : entityByNode.get(nodeKey(declaration));
+      if (target === undefined) {
+        const expression = (node as Node & { readonly expression?: Node }).expression;
+        target = targetForNode(expression);
+        if (target === undefined && !declarationResolved) declarationResolved = hasResolvedDeclaration(expression);
+      }
+    } catch { target = undefined; }
+    relate("call", callOwner, target, node, target === undefined ? "possible" : "confirmed");
+    if (target === undefined && !declarationResolved) pushTo(diagnosticsByFile, relativePath(node.getSourceFile().fileName), { code: "jsts:unresolved_call", message: "The TypeScript checker could not establish a unique call target.", path: relativePath(node.getSourceFile().fileName), start: node.getStart(node.getSourceFile()), end: node.getEnd() });
+  };
+  const walkHeritage = (node: Node): void => {
+    if (!isHeritageClause(node)) return;
+    const ownerEntity = entityByNode.get(nodeKey(node.parent));
+    if (ownerEntity === undefined) return;
+    for (const type of (node as Node & { readonly types?: readonly Node[] }).types ?? []) {
+      const target = targetForNode((type as Node & { readonly expression?: Node }).expression);
+      const clauseText = node.getText(node.getSourceFile()).trimStart();
+      relate(clauseText.startsWith("implements") ? "implements" : "inherits", ownerEntity, target, type, target === undefined ? "possible" : "confirmed");
+    }
+  };
   const walk = (node: Node): void => {
-    if (!rustAuthoritativeScope && (isImportDeclaration(node) || isExportDeclaration(node))) {
-      const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier;
-      if (specifier !== undefined) {
-        const sourceModule = moduleByPath.get(relativePath(node.getSourceFile().fileName));
-        const targetModule = moduleTarget(specifier);
-        if (sourceModule !== undefined) {
-          relate(isImportDeclaration(node) ? "import" : "export", sourceModule, targetModule, node, targetModule === undefined ? "possible" : "confirmed");
-          if (targetModule === undefined) {
-            // Same asset-specifier exemption as `analyzeProject`'s own walk
-            // (see the comment there) -- the two MUST stay in lockstep or the
-            // differential tests fail.
-            const specifierText = (specifier as Node & { readonly text?: string }).text;
-            if (typeof specifierText === "string" && specifierText.startsWith(".") && !relativeAssetSpecifier(specifierText)) directIncompleteFiles.add(sourceModule.path);
-          }
-        }
-      }
-    }
     const owner = ownerAt(node);
-    if (isIdentifier(node)) {
-      const parent = node.parent;
-      const declared = parent === undefined ? undefined : entityByNode.get(nodeKey(parent));
-      const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
-      const isDeclarationName = declared !== undefined && parentName !== undefined && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
-      if (!isDeclarationName) {
-        const source = owner ?? moduleByPath.get(relativePath(node.getSourceFile().fileName));
-        const target = targetForNode(node);
-        if (source !== undefined && target !== undefined && source.id !== target.id) relate("references", source, target, node, "confirmed");
-      }
-    }
-    if (isCallExpression(node)) {
-      // Same module-entity fallback as `analyzeProject`'s own walk, and for
-      // the same reason the sibling `core:references` handling above
-      // already falls back to `moduleByPath` -- see that walk's doc
-      // comment (Bug Group 4.1). The two walks MUST stay in lockstep or the
-      // differential tests fail.
-      const callOwner = owner ?? moduleByPath.get(relativePath(node.getSourceFile().fileName));
-      if (callOwner !== undefined) {
-        let target: JsTsEntity | undefined;
-        let declarationResolved = false;
-        try {
-          const signature = checker.getResolvedSignature(node);
-          const declaration = signature?.declaration?.resolve(project);
-          declarationResolved = declaration !== undefined;
-          target = declaration === undefined ? undefined : entityByNode.get(nodeKey(declaration));
-          if (target === undefined) {
-            const expression = (node as Node & { readonly expression?: Node }).expression;
-            target = targetForNode(expression);
-            if (target === undefined && !declarationResolved) declarationResolved = hasResolvedDeclaration(expression);
-          }
-        } catch { target = undefined; }
-        relate("call", callOwner, target, node, target === undefined ? "possible" : "confirmed");
-        if (target === undefined && !declarationResolved) pushTo(diagnosticsByFile, relativePath(node.getSourceFile().fileName), { code: "jsts:unresolved_call", message: "The TypeScript checker could not establish a unique call target.", path: relativePath(node.getSourceFile().fileName), start: node.getStart(node.getSourceFile()), end: node.getEnd() });
-      }
-    }
-    if (isHeritageClause(node)) {
-      const ownerEntity = entityByNode.get(nodeKey(node.parent));
-      if (ownerEntity !== undefined) for (const type of (node as Node & { readonly types?: readonly Node[] }).types ?? []) {
-        const target = targetForNode((type as Node & { readonly expression?: Node }).expression);
-        const clauseText = node.getText(node.getSourceFile()).trimStart();
-        relate(clauseText.startsWith("implements") ? "implements" : "inherits", ownerEntity, target, type, target === undefined ? "possible" : "confirmed");
-      }
-    }
+    walkImportExport(node);
+    walkIdentifier(node, owner);
+    walkCall(node, owner);
+    walkHeritage(node);
     node.forEachChild(walk);
   };
   for (const file of filesToProcess) {
@@ -1449,6 +1455,37 @@ function walkFiles(params: {
  * retained only when their inferred type is required by structural stage 3.
  */
 type RustSemanticDeclarationShape = { readonly kind: string; readonly universalKind: string };
+type RustSemanticFileReconciliation = {
+  readonly actuallyChangedPaths: Set<string>;
+  readonly createdPaths: Set<string>;
+  readonly deletedPaths: Set<string>;
+  readonly rootMembershipChanged: boolean;
+};
+type RustOwnerNodeCollection = {
+  readonly nodes: readonly Node[];
+  readonly declarationNodes: readonly Node[];
+  readonly identifierNodes: readonly Node[];
+  readonly hasSemanticNodes: boolean;
+  readonly pending: boolean;
+  readonly pendingCount: number;
+  readonly resolvedNodeCount: number;
+};
+type IncrementalMergedOutputs = {
+  readonly entitiesByFile: Map<string, readonly JsTsEntity[]>;
+  readonly relationsByFile: Map<string, readonly JsTsRelation[]>;
+  readonly diagnosticsByFile: Map<string, readonly JsTsDiagnostic[]>;
+  readonly finalDirectEdgesByFile: Map<string, readonly string[]>;
+};
+type RustGroupLookups = { readonly symbolByNode: Map<Node, TypescriptSymbol | undefined>; readonly inferredTypeByNode: Map<Node, string> };
+
+function assertRustSemanticGroupReady(api: API | undefined, project: TypescriptProject | undefined, snapshot: unknown, authoritative: boolean, active: boolean): void {
+  if (api === undefined || project === undefined || snapshot === undefined || !authoritative) throw new Error("Rust-authoritative semantic state has not been prepared.");
+  if (active) throw new Error("Rust-authoritative semantic owner groups cannot overlap.");
+}
+
+function validateRustSemanticOwnerPaths(ownerPaths: readonly string[], rootNames: readonly string[]): void {
+  if (ownerPaths.length === 0 || ownerPaths.length > 32 || ownerPaths.some((path) => !rootNames.includes(path))) throw new Error("Rust-authoritative semantic owner group paths are invalid.");
+}
 
 function rustSemanticDeclarationShape(node: Node): RustSemanticDeclarationShape | undefined {
   if (isFunctionDeclaration(node)) return { kind: "function", universalKind: "core:callable" };
@@ -1683,18 +1720,6 @@ function walkRustSemanticOwner(params: {
   const resolvedByNodeObject = new WeakMap<Node, Node | undefined>();
   const resolvedBySymbol = params.resolvedBySymbol ?? new WeakMap<object, Node | undefined>();
   const resolvedByDeclaration = params.resolvedByDeclaration ?? new WeakMap<Node, Node | undefined>();
-  const nameOf = (node: Node): string | undefined => {
-    // A `ConstructorDeclaration` has no `.name` node at all (`name?: never`
-    // in the TS AST) -- synthesize "constructor" as its name, matching the
-    // Rust syntax worker's `MethodDefinitionKind::Constructor` identity.
-    if (isConstructorDeclaration(node)) return "constructor";
-    const value = (node as Node & { readonly name?: Node }).name;
-    if (value === undefined) return undefined;
-    const candidate = value as Node & { readonly text?: string; readonly escapedText?: string | number };
-    if (typeof candidate.text === "string") return candidate.text;
-    if (typeof candidate.escapedText === "string" || typeof candidate.escapedText === "number") return String(candidate.escapedText);
-    return undefined;
-  };
   const kindOf = rustSemanticDeclarationShape;
   const moduleEntity = (file: TypescriptSourceFile): JsTsEntity => {
     const path = relativePath(file.fileName);
@@ -1785,21 +1810,13 @@ function walkRustSemanticOwner(params: {
       return cached;
     }
     const shape = kindOf(node);
-    const name = nameOf(node);
+    const name = nodeName(node);
     if (shape === undefined || name === undefined || name.length === 0) return undefined;
     const file = node.getSourceFile();
     const path = relativePath(file.fileName);
     const start = node.getStart(file);
-    let parentNode = node.parent;
-    let parent: JsTsEntity | undefined;
-    while (parentNode !== undefined && parentNode !== file) {
-      if (kindOf(parentNode) !== undefined && nameOf(parentNode) !== undefined) {
-        parent = entityForDeclaration(parentNode);
-        break;
-      }
-      parentNode = parentNode.parent;
-    }
-    parent ??= moduleEntity(file);
+    const parent = findRustDeclarationParent(node, file, kindOf, entityForDeclaration);
+    const owner = parent ?? moduleEntity(file);
     const inferredType = includeInferredTypes && path === owner.path ? inferredTypeByNode.get(node) : undefined;
     // Identity uses the START OF THE NAME IDENTIFIER, not the declaration's
     // own start -- see the matching comment in `analyzeSyntaxProject`'s own
@@ -1808,10 +1825,10 @@ function walkRustSemanticOwner(params: {
     // has no name node -- its identity instead anchors on the "constructor"
     // keyword (see `constructorKeywordStart`).
     const nameNode = (node as Node & { readonly name?: Node }).name;
-    const identityStart = nameNode !== undefined ? nameNode.getStart(file) : isConstructorDeclaration(node) ? constructorKeywordStart(node, file) : start;
+    const identityStart = declarationIdentityStart(node, nameNode, file, start);
     const entity: JsTsEntity = {
       id: stableId(shape.kind, path, identityStart, name), name, kind: shape.kind, universal_kind: shape.universalKind,
-      path, start, end: node.getEnd(), parent_id: parent.id, qualified_name: `${parent.qualified_name ?? parent.name}.${name}`,
+      path, start, end: node.getEnd(), parent_id: owner.id, qualified_name: `${owner.qualified_name ?? owner.name}.${name}`,
       ...(inferredType === undefined ? {} : { type: inferredType }),
     };
     entitiesByNode.set(nodeKey(node), entity);
@@ -1819,33 +1836,7 @@ function walkRustSemanticOwner(params: {
     entitiesById.set(entity.id, entity);
     return entity;
   };
-  const resolvedDeclaration = (node: Node | undefined): Node | undefined => {
-    if (node === undefined) return undefined;
-    if (resolvedByNodeObject.has(node)) return resolvedByNodeObject.get(node);
-    let symbol = symbolByNode.has(node) ? symbolByNode.get(node) : checker.getSymbolAtLocation(node);
-    if (symbol !== undefined && resolvedBySymbol.has(symbol)) {
-      const cached = resolvedBySymbol.get(symbol);
-      resolvedByNodeObject.set(node, cached);
-      return cached;
-    }
-    const originalSymbol = symbol;
-    if (symbol !== undefined && (symbol.flags & SymbolFlags.Alias) !== 0) {
-      try {
-        const aliased = checker.getAliasedSymbol(symbol);
-        if (!checker.isUnknownSymbol(aliased)) symbol = aliased;
-      } catch { /* The direct symbol remains authoritative. */ }
-    }
-    const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
-    const declarationNode = declaration as unknown as Node | undefined;
-    const resolved = declarationNode === undefined ? undefined : resolvedByDeclaration.has(declarationNode)
-      ? resolvedByDeclaration.get(declarationNode)
-      : (declaration as { resolve: (project?: TypescriptProject) => unknown }).resolve(project) as Node | undefined;
-    if (declarationNode !== undefined && !resolvedByDeclaration.has(declarationNode)) resolvedByDeclaration.set(declarationNode, resolved);
-    if (symbol !== undefined) resolvedBySymbol.set(symbol, resolved);
-    if (originalSymbol !== undefined && originalSymbol !== symbol) resolvedBySymbol.set(originalSymbol, resolved);
-    resolvedByNodeObject.set(node, resolved);
-    return resolved;
-  };
+  const resolvedDeclaration = (node: Node | undefined): Node | undefined => resolveRustDeclarationNode(node, symbolByNode, checker, project, resolvedByNodeObject, resolvedBySymbol, resolvedByDeclaration);
   /**
    * A direct, non-aliased identifier with exactly one declaration has no
    * overload or contextual-signature choice for the checker to make. Its
@@ -1889,94 +1880,66 @@ function walkRustSemanticOwner(params: {
     const end = node.getEnd();
     relations.push({ id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:${kind}:${path}:${start}:${end}:${relationSource.id}:${target?.id ?? "unresolved"}`, kind: `core:${kind}`, source_id: relationSource.id, ...(target === undefined ? {} : { target_id: target.id }), path, start, end, classification });
   };
+  const visitIdentifier = (node: Node): void => {
+    if (!isIdentifier(node)) return;
+    const parent = node.parent;
+    const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
+    const isDeclarationName = parent !== undefined && kindOf(parent) !== undefined && parentName !== undefined
+      && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
+    if (isDeclarationName) return;
+    const relationSource = ownerAt(node);
+    const targetDeclaration = resolvedDeclaration(node);
+    const target = targetDeclaration === undefined ? undefined : entityForDeclaration(targetDeclaration);
+    if (target !== undefined && relationSource.id !== target.id) relate("references", relationSource, target, node, "confirmed");
+  };
+  const resolveCallTarget = (node: Node): { readonly target?: JsTsEntity; readonly declarationResolved: boolean } => {
+    return resolveRustCallTarget(node, checker, project, directCallDeclaration, resolvedDeclaration, entityForDeclaration, resolvedByDeclaration);
+  };
+  const visitCall = (node: Node): void => {
+    if (!isCallExpression(node)) return;
+    const relationSource = ownerAt(node);
+    let target: JsTsEntity | undefined;
+    let declarationWasResolved = false;
+    try {
+      const resolved = resolveCallTarget(node);
+      target = resolved.target;
+      declarationWasResolved = resolved.declarationResolved;
+    } catch { target = undefined; }
+    relate("call", relationSource, target, node, target === undefined ? "possible" : "confirmed");
+    if (target === undefined && !declarationWasResolved) diagnostics.push({ code: "jsts:unresolved_call", message: "The TypeScript checker could not establish a unique call target.", path: owner.path, start: node.getStart(node.getSourceFile()), end: node.getEnd() });
+  };
+  const visitHeritage = (node: Node): void => {
+    if (!isHeritageClause(node)) return;
+    const relationSource = entityForDeclaration(node.parent);
+    if (relationSource === undefined) return;
+    for (const type of (node as Node & { readonly types?: readonly Node[] }).types ?? []) {
+      const declaration = resolvedDeclaration((type as Node & { readonly expression?: Node }).expression);
+      const target = declaration === undefined ? undefined : entityForDeclaration(declaration);
+      const clauseText = node.getText(node.getSourceFile()).trimStart();
+      relate(clauseText.startsWith("implements") ? "implements" : "inherits", relationSource, target, type, target === undefined ? "possible" : "confirmed");
+    }
+  };
   const visit = (node: Node, recurse = true): void => {
     // Only owner declarations whose checker-derived type can become a stage-3
     // record are retained. Rust remains the sole producer of their structural
     // declaration records.
     if (kindOf(node) !== undefined) entityForDeclaration(node);
-    if (isIdentifier(node)) {
-      const parent = node.parent;
-      const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
-      const isDeclarationName = parent !== undefined && kindOf(parent) !== undefined && parentName !== undefined
-        && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
-      if (!isDeclarationName) {
-        const relationSource = ownerAt(node);
-        const targetDeclaration = resolvedDeclaration(node);
-        const target = targetDeclaration === undefined ? undefined : entityForDeclaration(targetDeclaration);
-        if (target !== undefined && relationSource.id !== target.id) relate("references", relationSource, target, node, "confirmed");
-      }
-    }
-    if (isCallExpression(node)) {
-      const relationSource = ownerAt(node);
-      let target: JsTsEntity | undefined;
-      let declarationWasResolved = false;
-      try {
-        // `directCallDeclaration` already returns a FULLY RESOLVED node (its
-        // own `handle.resolve(project)` call), unlike
-        // `checker.getResolvedSignature(node)?.declaration`, which is still a
-        // raw checker declaration that this walk must `.resolve()` itself.
-        // Re-applying `.resolve()` to the already-resolved direct result
-        // would throw (`resolve` is not a function on a resolved `Node`), so
-        // the two sources are kept on their own branches instead of being
-        // funneled through one shared "needs resolving" cache lookup.
-        const directDeclaration = directCallDeclaration(node);
-        const declaration = directDeclaration !== undefined ? directDeclaration : (() => {
-          const signatureDeclaration = checker.getResolvedSignature(node)?.declaration;
-          const signatureNode = signatureDeclaration as unknown as Node | undefined;
-          const resolved = signatureNode === undefined ? undefined : resolvedByDeclaration.has(signatureNode)
-            ? resolvedByDeclaration.get(signatureNode)
-            : (signatureDeclaration as unknown as { resolve: (project?: TypescriptProject) => unknown }).resolve(project) as Node | undefined;
-          if (signatureNode !== undefined && !resolvedByDeclaration.has(signatureNode)) resolvedByDeclaration.set(signatureNode, resolved);
-          return resolved;
-        })();
-        declarationWasResolved = declaration !== undefined;
-        target = declaration === undefined ? undefined : entityForDeclaration(declaration);
-        if (target === undefined) {
-          const expression = (node as Node & { readonly expression?: Node }).expression;
-          const fallback = resolvedDeclaration(expression);
-          declarationWasResolved ||= fallback !== undefined;
-          target = fallback === undefined ? undefined : entityForDeclaration(fallback);
-        }
-      } catch { target = undefined; }
-      relate("call", relationSource, target, node, target === undefined ? "possible" : "confirmed");
-      if (target === undefined && !declarationWasResolved) diagnostics.push({ code: "jsts:unresolved_call", message: "The TypeScript checker could not establish a unique call target.", path: owner.path, start: node.getStart(node.getSourceFile()), end: node.getEnd() });
-    }
-    if (isHeritageClause(node)) {
-      const relationSource = entityForDeclaration(node.parent);
-      if (relationSource !== undefined) for (const type of (node as Node & { readonly types?: readonly Node[] }).types ?? []) {
-        const declaration = resolvedDeclaration((type as Node & { readonly expression?: Node }).expression);
-        const target = declaration === undefined ? undefined : entityForDeclaration(declaration);
-        const clauseText = node.getText(node.getSourceFile()).trimStart();
-        relate(clauseText.startsWith("implements") ? "implements" : "inherits", relationSource, target, type, target === undefined ? "possible" : "confirmed");
-      }
-    }
+    visitIdentifier(node);
+    visitCall(node);
+    visitHeritage(node);
     if (recurse) node.forEachChild((child) => visit(child));
   };
   const preparedNodes = groupLookups?.nodes_by_owner.get(owner.path) ?? localizedSites?.nodes;
-  if (preparedNodes === undefined) visit(source);
-  else for (const node of preparedNodes) visit(node, false);
+  walkRustPreparedNodes(source, preparedNodes, visit);
   const dynamicRuntimeCode = groupLookups === undefined
     ? /\b(?:eval|Function)\s*\(/u.test(source.getText())
     : groupLookups.dynamic_runtime_code_by_owner.get(owner.path) === true;
   if (dynamicRuntimeCode) diagnostics.push({ code: "jsts:dynamic_runtime_code", message: "Runtime code generation is not statically resolvable.", path: owner.path });
-  if (compilerDiagnostics === undefined) {
-    const diagnosticText = (message: unknown): string => typeof message === "string" ? message : message !== null && typeof message === "object" && "text" in message ? diagnosticText((message as { text: unknown }).text) : String(message);
-    for (const diagnostic of [...program.getSyntacticDiagnostics(virtualPath(owner.path)), ...program.getBindDiagnostics(virtualPath(owner.path)), ...program.getSemanticDiagnostics(virtualPath(owner.path))]) {
-      if (diagnostic.fileName === undefined || relativePath(diagnostic.fileName) !== owner.path) continue;
-      diagnostics.push({ code: "jsts:compiler_diagnostic", compiler_code: diagnostic.code, message: diagnosticText(diagnostic.text), path: owner.path, start: diagnostic.pos, end: diagnostic.end });
-    }
-  } else {
-    diagnostics.push(...compilerDiagnostics);
-  }
+  diagnostics.push(...ownerCompilerDiagnostics(program, virtualPath(owner.path), relativePath, owner.path, compilerDiagnostics));
   // Build per-file entity buckets linearly. Replacing a bucket with a spread
   // copy for every entity made a large owner with N declarations quadratic in
   // allocations even though the final order is already traversal order.
-  const entitiesByFile = new Map<string, JsTsEntity[]>();
-  for (const entity of entitiesById.values()) {
-    const entries = entitiesByFile.get(entity.path);
-    if (entries === undefined) entitiesByFile.set(entity.path, [entity]);
-    else entries.push(entity);
-  }
+  const entitiesByFile = groupRustEntitiesByFile(entitiesById);
   const relationsByFile = new Map<string, readonly JsTsRelation[]>([[owner.path, relations]]);
   const diagnosticsByFile = new Map<string, readonly JsTsDiagnostic[]>([[owner.path, diagnostics]]);
   // The Rust-authoritative walk only emits the owner plus declarations reached
@@ -1987,6 +1950,37 @@ function walkRustSemanticOwner(params: {
   const neededPaths = new Set<string>([owner.path, ...entitiesByFile.keys(), ...relationsByFile.keys(), ...diagnosticsByFile.keys()]);
   const outputFiles = files.filter((file) => neededPaths.has(file.path));
   return assembleAnalysis(outputFiles, languageRootNames, entitiesByFile, relationsByFile, diagnosticsByFile, new Map(), new Set(), entitiesById, true);
+}
+
+function walkRustPreparedNodes(source: Node, preparedNodes: readonly Node[] | undefined, visit: (node: Node, recurse?: boolean) => void): void {
+  if (preparedNodes === undefined) { visit(source); return; }
+  for (const node of preparedNodes) visit(node, false);
+}
+
+function groupRustEntitiesByFile(entitiesById: ReadonlyMap<string, JsTsEntity>): Map<string, JsTsEntity[]> {
+  const entitiesByFile = new Map<string, JsTsEntity[]>();
+  for (const entity of entitiesById.values()) {
+    const entries = entitiesByFile.get(entity.path);
+    if (entries === undefined) entitiesByFile.set(entity.path, [entity]); else entries.push(entity);
+  }
+  return entitiesByFile;
+}
+
+function ownerCompilerDiagnostics(
+  program: TypescriptProject["program"],
+  fileName: string,
+  relativePath: (path: string) => string,
+  ownerPath: string,
+  compilerDiagnostics: readonly JsTsDiagnostic[] | undefined,
+): JsTsDiagnostic[] {
+  if (compilerDiagnostics !== undefined) return [...compilerDiagnostics];
+  const diagnostics: JsTsDiagnostic[] = [];
+  const diagnosticText = (message: unknown): string => typeof message === "string" ? message : message !== null && typeof message === "object" && "text" in message ? diagnosticText((message as { text: unknown }).text) : String(message);
+  for (const diagnostic of [...program.getSyntacticDiagnostics(fileName), ...program.getBindDiagnostics(fileName), ...program.getSemanticDiagnostics(fileName)]) {
+    if (diagnostic.fileName === undefined || relativePath(diagnostic.fileName) !== ownerPath) continue;
+    diagnostics.push({ code: "jsts:compiler_diagnostic", compiler_code: diagnostic.code, message: diagnosticText(diagnostic.text), path: ownerPath, start: diagnostic.pos, end: diagnostic.end });
+  }
+  return diagnostics;
 }
 
 /**
@@ -2027,13 +2021,30 @@ function assembleAnalysis(
     }
     return undefined;
   };
+  appendCoverageRelations(relations, entityById, testContainerOf);
+  entities.sort((left, right) => left.id.localeCompare(right.id));
+  relations.sort((left, right) => left.id.localeCompare(right.id));
+  diagnostics.sort((left, right) => `${left.path}\0${left.start ?? -1}\0${left.code}`.localeCompare(`${right.path}\0${right.start ?? -1}\0${right.code}`));
+  const dependencyClosures = buildDependencyClosures(sourceFiles, directEdgesByFile, incompleteClosureFiles, rustAuthoritativeScope);
+  return {
+    language: rootNames.some((path) => languageForPath(path) === "javascript") && !rootNames.some((path) => languageForPath(path) === "typescript") ? "javascript" : "typescript",
+    entities,
+    relations,
+    diagnostics,
+    complete: diagnostics.length === 0,
+    dependency_closures: dependencyClosures,
+  };
+}
+
+function appendCoverageRelations(relations: JsTsRelation[], entityById: ReadonlyMap<string, JsTsEntity>, testContainerOf: (entity: JsTsEntity) => JsTsEntity | undefined): void {
   for (const reference of [...relations]) {
     if (reference.kind !== "core:references" || reference.target_id === undefined) continue;
     const source = entityById.get(reference.source_id);
     const target = entityById.get(reference.target_id);
     if (source === undefined || target === undefined || source.path === target.path) continue;
     const testContainer = testContainerOf(source);
-    if (testContainer !== undefined) relations.push({
+    if (testContainer === undefined) continue;
+    relations.push({
       id: `${JAVASCRIPT_TYPESCRIPT_NAMESPACE}:covers:${reference.path}:${reference.start}:${reference.end}:${testContainer.id}:${target.id}`,
       kind: "core:covers",
       source_id: testContainer.id,
@@ -2044,39 +2055,134 @@ function assembleAnalysis(
       classification: "confirmed",
     });
   }
-  entities.sort((left, right) => left.id.localeCompare(right.id));
-  relations.sort((left, right) => left.id.localeCompare(right.id));
-  diagnostics.sort((left, right) => `${left.path}\0${left.start ?? -1}\0${left.code}`.localeCompare(`${right.path}\0${right.start ?? -1}\0${right.code}`));
+}
+
+function buildDependencyClosures(sourceFiles: readonly AnalyzerFile[], directEdgesByFile: ReadonlyMap<string, readonly string[]>, incompleteClosureFiles: ReadonlySet<string>, rustAuthoritativeScope: boolean): Record<string, JsTsDependencyClosure> {
   const dependencyClosures: Record<string, JsTsDependencyClosure> = {};
-  for (const file of sourceFiles) {
-    if (rustAuthoritativeScope) {
-      // The host already retains the complete Rust graph and derives owner
-      // manifests from it. These keys preserve the analysis/cache shape; the
-      // deliberately incomplete singleton prevents accidental narrowing by a
-      // consumer that did not negotiate Rust authority.
-      dependencyClosures[file.path] = { files: [file.path], complete: false };
-      continue;
+  for (const file of sourceFiles) dependencyClosures[file.path] = rustAuthoritativeScope
+    ? { files: [file.path], complete: false }
+    : dependencyClosureForFile(file.path, directEdgesByFile, incompleteClosureFiles);
+  return dependencyClosures;
+}
+
+function dependencyClosureForFile(path: string, directEdgesByFile: ReadonlyMap<string, readonly string[]>, incompleteClosureFiles: ReadonlySet<string>): JsTsDependencyClosure {
+  const visited = new Set<string>([path]);
+  const stack = [path];
+  let complete = true;
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (incompleteClosureFiles.has(current)) complete = false;
+    for (const next of directEdgesByFile.get(current) ?? []) if (!visited.has(next)) {
+      visited.add(next);
+      stack.push(next);
     }
-    const visited = new Set<string>([file.path]);
-    const stack = [file.path];
-    let complete = true;
-    while (stack.length > 0) {
-      const current = stack.pop()!;
-      if (incompleteClosureFiles.has(current)) complete = false;
-      for (const next of directEdgesByFile.get(current) ?? []) {
-        if (!visited.has(next)) { visited.add(next); stack.push(next); }
-      }
-    }
-    dependencyClosures[file.path] = { files: [...visited].sort(), complete };
+  }
+  return { files: [...visited].sort(), complete };
+}
+
+function memoFromAnalysis(analysis: JsTsAnalysisResult, files: readonly AnalyzerFile[]): { readonly rootNames: readonly string[]; readonly memo: Map<string, JsTsFileMemo> } {
+  const rootNames = Object.keys(analysis.dependency_closures).sort();
+  const filesByPath = new Map(files.map((file) => [file.path, file]));
+  const { entitiesByPath, relationsByPath, diagnosticsByPath } = groupAnalysisByPath(analysis);
+  const entityById = new Map(analysis.entities.map((entity) => [entity.id, entity]));
+  const memo = new Map<string, JsTsFileMemo>();
+  for (const path of rootNames) {
+    const file = filesByPath.get(path);
+    if (file === undefined) continue;
+    memo.set(path, memoForAnalysisPath(path, file, analysis.dependency_closures[path], entitiesByPath, relationsByPath, diagnosticsByPath, entityById));
+  }
+  return { rootNames, memo };
+}
+
+function groupAnalysisByPath(analysis: JsTsAnalysisResult): {
+  readonly entitiesByPath: Map<string, JsTsEntity[]>;
+  readonly relationsByPath: Map<string, JsTsRelation[]>;
+  readonly diagnosticsByPath: Map<string, JsTsDiagnostic[]>;
+} {
+  const entitiesByPath = new Map<string, JsTsEntity[]>();
+  for (const entity of analysis.entities) appendPathValue(entitiesByPath, entity.path, entity);
+  const relationsByPath = new Map<string, JsTsRelation[]>();
+  for (const relation of analysis.relations) if (relation.kind !== "core:covers") appendPathValue(relationsByPath, relation.path, relation);
+  const diagnosticsByPath = new Map<string, JsTsDiagnostic[]>();
+  for (const diagnostic of analysis.diagnostics) appendPathValue(diagnosticsByPath, diagnostic.path, diagnostic);
+  return { entitiesByPath, relationsByPath, diagnosticsByPath };
+}
+
+function memoForAnalysisPath(path: string, file: AnalyzerFile, closure: JsTsDependencyClosure | undefined, entitiesByPath: ReadonlyMap<string, readonly JsTsEntity[]>, relationsByPath: ReadonlyMap<string, readonly JsTsRelation[]>, diagnosticsByPath: ReadonlyMap<string, readonly JsTsDiagnostic[]>, entityById: ReadonlyMap<string, JsTsEntity>): JsTsFileMemo {
+  const relations = relationsByPath.get(path) ?? [];
+  const directEdges = new Set<string>();
+  for (const relation of relations) {
+    if (relation.target_id === undefined) continue;
+    const target = entityById.get(relation.target_id);
+    if (target !== undefined && target.path !== path) directEdges.add(target.path);
   }
   return {
-    language: rootNames.some((path) => languageForPath(path) === "javascript") && !rootNames.some((path) => languageForPath(path) === "typescript") ? "javascript" : "typescript",
-    entities,
+    content_hash: fileContentDigest(file.text),
+    closure_files: closure?.files ?? [path],
+    closure_complete: closure?.complete ?? false,
+    entities: entitiesByPath.get(path) ?? [],
     relations,
-    diagnostics,
-    complete: diagnostics.length === 0,
-    dependency_closures: dependencyClosures,
+    diagnostics: diagnosticsByPath.get(path) ?? [],
+    direct_edges: [...directEdges].sort(),
   };
+}
+
+function appendPathValue<T>(valuesByPath: Map<string, T[]>, path: string, value: T): void {
+  const values = valuesByPath.get(path);
+  if (values === undefined) valuesByPath.set(path, [value]);
+  else values.push(value);
+}
+
+function memoFromFullAnalysis(sourceFiles: readonly AnalyzerFile[], analysis: JsTsAnalysisResult, walkOutput: JsTsWalkPassOutput, project: TypescriptProject, virtualRoot: string, rustScope: JsTsRustSemanticScope | undefined): Map<string, JsTsFileMemo> {
+  const memo = new Map<string, JsTsFileMemo>();
+  for (const file of sourceFiles) memo.set(file.path, memoForFullAnalysisPath(file, analysis, walkOutput, project, virtualRoot, rustScope));
+  return memo;
+}
+
+function memoForFullAnalysisPath(file: AnalyzerFile, analysis: JsTsAnalysisResult, walkOutput: JsTsWalkPassOutput, project: TypescriptProject, virtualRoot: string, rustScope: JsTsRustSemanticScope | undefined): JsTsFileMemo {
+  const source = rustScope === undefined ? project.program.getSourceFile(`${virtualRoot}/${file.path}`) : undefined;
+  const hashes = rustScope === undefined
+    ? computeSemanticHashes(file.text, source === undefined ? [] : collectOpaqueSpans(file.text, source), languageForPath(file.path) === "javascript")
+    : undefined;
+  return {
+    content_hash: fileContentDigest(file.text),
+    closure_files: analysis.dependency_closures[file.path]?.files ?? [file.path],
+    closure_complete: analysis.dependency_closures[file.path]?.complete ?? false,
+    entities: walkOutput.entitiesByFile.get(file.path) ?? [],
+    relations: walkOutput.relationsByFile.get(file.path) ?? [],
+    diagnostics: walkOutput.diagnosticsByFile.get(file.path) ?? [],
+    direct_edges: rustScope === undefined ? walkOutput.directEdgesByFile.get(file.path) ?? [] : [],
+    ...(hashes === undefined ? {} : hashes),
+  };
+}
+
+function selectIncrementalPhase1(sourceFiles: readonly AnalyzerFile[], memoByPath: ReadonlyMap<string, JsTsFileMemo>, changedPaths: ReadonlySet<string>, rustScope: JsTsRustSemanticScope | undefined): Set<string> {
+  const phase1Set = new Set<string>();
+  for (const file of sourceFiles) {
+    const memo = memoByPath.get(file.path);
+    if (memo === undefined || (rustScope === undefined && !memo.closure_complete) || changedPaths.has(file.path)) phase1Set.add(file.path);
+  }
+  return phase1Set;
+}
+
+function computeImpactfulChangedPaths(changedPaths: ReadonlySet<string>, filesByPath: ReadonlyMap<string, AnalyzerFile>, project: TypescriptProject, virtualRoot: string, memoByPath: ReadonlyMap<string, JsTsFileMemo>, phase1Output: JsTsWalkPassOutput): { readonly impactful: Set<string>; readonly freshHashesByPath: Map<string, { readonly semantic_hash: string; readonly guard_hash: string }> } {
+  const impactful = new Set<string>();
+  const freshHashesByPath = new Map<string, { readonly semantic_hash: string; readonly guard_hash: string }>();
+  for (const path of changedPaths) {
+    const file = filesByPath.get(path);
+    if (file === undefined) continue;
+    const source = project.program.getSourceFile(`${virtualRoot}/${path}`);
+    const fresh = computeSemanticHashes(file.text, source === undefined ? [] : collectOpaqueSpans(file.text, source), languageForPath(path) === "javascript");
+    freshHashesByPath.set(path, fresh);
+    const memo = memoByPath.get(path);
+    const gatePasses = memo !== undefined
+      && memo.semantic_hash !== undefined && memo.semantic_hash === fresh.semantic_hash
+      && memo.guard_hash !== undefined && memo.guard_hash === fresh.guard_hash
+      && entityProjection(memo.entities) === entityProjection(phase1Output.entitiesByFile.get(path) ?? [])
+      && sameStringArray(memo.direct_edges, phase1Output.directEdgesByFile.get(path) ?? []);
+    if (!gatePasses) impactful.add(path);
+  }
+  return { impactful, freshHashesByPath };
 }
 
 /**
@@ -2143,23 +2249,22 @@ export class JsTsAnalysisSession {
     // measured by the admission harness; an OOM remains a hard failure, while
     // an observed overage is retained as advisory evidence when the time and
     // digest gates pass.
-    const configuredWindow = Number(process.env["URDIRA_RUST_SEMANTIC_WINDOW_SIZE"] ?? "512");
-    const windowSize = Number.isSafeInteger(configuredWindow) && configuredWindow >= 512 && configuredWindow <= 4096 && configuredWindow % 32 === 0
-      ? configuredWindow
-      : 512;
+    const windowSize = rustSemanticWindowSize();
     const first = this.rootNames.indexOf(requested[0]!);
     const windowStart = Math.floor(first / windowSize) * windowSize;
     const roots = [...new Set([...this.rootNames.slice(windowStart, windowStart + windowSize), ...requested])].sort();
+    this.refreshRustSemanticProject(roots);
+  }
+
+  private refreshRustSemanticProject(roots: readonly string[]): void {
+    const configPath = this.rustSemanticConfigPath!;
     const config = JSON.stringify({ compilerOptions: this.rustSemanticCompilerOptions, files: roots });
-    if (this.fileMap.get(this.rustSemanticConfigPath) === config && this.rustSemanticProject !== undefined && this.rustSemanticSnapshot !== undefined) return;
-    this.fileMap.set(this.rustSemanticConfigPath, config);
+    if (this.fileMap!.get(configPath) === config && this.rustSemanticProject !== undefined && this.rustSemanticSnapshot !== undefined) return;
+    this.fileMap!.set(configPath, config);
     this.rustSemanticSnapshot?.dispose();
-    const snapshot = this.api.updateSnapshot({ openProjects: [this.rustSemanticConfigPath], fileChanges: { changed: [this.rustSemanticConfigPath] } });
-    const project = snapshot.getProjects().find((candidate) => candidate.configFileName === this.rustSemanticConfigPath);
-    if (project === undefined) {
-      snapshot.dispose();
-      throw new Error("TypeScript did not create a project for the Rust semantic owner window.");
-    }
+    const snapshot = this.api!.updateSnapshot({ openProjects: [configPath], fileChanges: { changed: [configPath] } });
+    const project = snapshot.getProjects().find((candidate) => candidate.configFileName === configPath);
+    if (project === undefined) { snapshot.dispose(); throw new Error("TypeScript did not create a project for the Rust semantic owner window."); }
     this.rustSemanticSnapshot = snapshot;
     this.rustSemanticProject = project;
     this.resetRustSemanticResolutionCaches();
@@ -2177,31 +2282,15 @@ export class JsTsAnalysisSession {
    * `compiler_options` change, or the bailout ratio).
    */
   analyze(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[]; readonly compiler_options?: Readonly<Record<string, unknown>>; readonly rust_semantic_scope?: JsTsRustSemanticScope }): JsTsSessionAnalyzeResult {
-    const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].sort();
-    const sourceFiles = input.files.filter((candidate) => rootNames.includes(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
-    const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
-    const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
-    const rustScope = input.rust_semantic_scope;
-    if (rustScope !== undefined) {
-      const roots = new Set(rootNames);
-      const changed = new Set(rustScope.changed_paths);
-      const affected = new Set(rustScope.affected_paths);
-      if ([...changed, ...affected].some((path) => !roots.has(path))) throw new TypeError("Rust semantic scope contains a path outside root_names.");
-      if ([...changed].some((path) => !affected.has(path))) throw new TypeError("Rust semantic scope must include every changed path in affected_paths.");
-    }
+    const prepared = prepareSessionAnalysisInput(input);
+    const { rootNames, sourceFiles, compilerOptions, rustScope } = prepared;
 
     if (!this.everBuilt) return this.fullBuildResult(sourceFiles, rootNames, compilerOptions, rustScope);
     if (this.rustAuthoritativeScope !== (rustScope !== undefined)) return this.fullBuildResult(sourceFiles, rootNames, compilerOptions, rustScope);
     if (!sameStringArray(this.rootNames, rootNames)) return this.fullBuildResult(sourceFiles, rootNames, compilerOptions, rustScope);
     if (stableOptionsJson(this.compilerOptionsSnapshot) !== stableOptionsJson(compilerOptions)) return this.fullBuildResult(sourceFiles, rootNames, compilerOptions, rustScope);
 
-    const changedPaths = new Set<string>(rustScope?.changed_paths ?? []);
-    if (rustScope === undefined) {
-      for (const file of sourceFiles) {
-        const memo = this.memo.get(file.path);
-        if (memo === undefined || memo.content_hash !== fileContentDigest(file.text)) changedPaths.add(file.path);
-      }
-    }
+    const changedPaths = changedPathsForSession(sourceFiles, rustScope, this.memo);
     if (rootNames.length > 0 && changedPaths.size / rootNames.length > INCREMENTAL_CHANGE_RATIO_BAILOUT) return this.fullBuildResult(sourceFiles, rootNames, compilerOptions, rustScope);
 
     return this.buildIncremental(sourceFiles, rootNames, compilerOptions, changedPaths, rustScope);
@@ -2219,15 +2308,8 @@ export class JsTsAnalysisSession {
     readonly compiler_options?: Readonly<Record<string, unknown>>;
     readonly rust_semantic_scope: JsTsRustSemanticScope;
   }): "full" | "incremental" {
-    const rootNames = [...input.root_names].sort();
-    const roots = new Set(rootNames);
-    const sourceFiles = input.files.filter((candidate) => roots.has(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
-    const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
-    const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
-    const changedPaths = new Set(input.rust_semantic_scope.changed_paths);
-    const affectedPaths = new Set(input.rust_semantic_scope.affected_paths);
-    if ([...changedPaths, ...affectedPaths].some((path) => !roots.has(path))) throw new TypeError("Rust semantic scope contains a path outside root_names.");
-    if ([...changedPaths].some((path) => !affectedPaths.has(path))) throw new TypeError("Rust semantic scope must include every changed path in affected_paths.");
+    const prepared = prepareRustSemanticInput(input);
+    const { rootNames, roots, sourceFiles, compilerOptions, changedPaths } = prepared;
 
     // T2 (docs/evidence/2026-09-02-file-creation-diagnosis.md): a root-set
     // change on its own no longer disqualifies the live API/project from
@@ -2244,6 +2326,47 @@ export class JsTsAnalysisSession {
       && stableOptionsJson(this.compilerOptionsSnapshot) === stableOptionsJson(compilerOptions);
     const virtualRoot = SESSION_VIRTUAL_ROOT;
     const configPath = `${virtualRoot}/${SESSION_CONFIG_FILE}`;
+    const reconciliation = this.reconcileRustSemanticFiles(sourceFiles, rootNames, compilerOptions, changedPaths, roots, virtualRoot, configPath, canUpdate);
+    const { actuallyChangedPaths, createdPaths, deletedPaths, rootMembershipChanged } = reconciliation;
+    const api = this.api!;
+    this.rustSemanticConfigPath = configPath;
+    this.rustSemanticCompilerOptions = compilerOptions;
+    this.rustSemanticWindowed = rootNames.length > 1_200 && process.env["URDIRA_RUST_SEMANTIC_WINDOWED"] !== "0";
+    if (this.rustSemanticWindowed) {
+      // A root-free configured project supplies the compiler options while
+      // keeping project activation cheap; beginRustSemanticOwnerGroup swaps
+      // in each bounded root window immediately before its checker walk.
+      this.fileMap!.set(configPath, JSON.stringify({ compilerOptions, files: [] }));
+    }
+    this.refreshPreparedRustSnapshot(api, configPath, virtualRoot, canUpdate, actuallyChangedPaths, createdPaths, deletedPaths, rootMembershipChanged);
+    this.memo = new Map();
+    this.rootNames = rootNames;
+    this.compilerOptionsSnapshot = compilerOptions;
+    this.everBuilt = true;
+    this.rustAuthoritativeScope = true;
+    return canUpdate ? "incremental" : "full";
+  }
+
+  private refreshPreparedRustSnapshot(api: API, configPath: string, virtualRoot: string, canUpdate: boolean, actuallyChangedPaths: ReadonlySet<string>, createdPaths: ReadonlySet<string>, deletedPaths: ReadonlySet<string>, rootMembershipChanged: boolean): void {
+    if (canUpdate && actuallyChangedPaths.size === 0 && !rootMembershipChanged && this.rustSemanticSnapshot !== undefined && this.rustSemanticProject !== undefined) return;
+    this.rustSemanticSnapshot?.dispose();
+    const snapshot = api.updateSnapshot(!canUpdate
+      ? { openProjects: [configPath] }
+      : rootMembershipChanged
+        ? { openProjects: [configPath], fileChanges: { changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`).concat(configPath), ...(createdPaths.size > 0 ? { created: [...createdPaths].map((path) => `${virtualRoot}/${path}`) } : {}), ...(deletedPaths.size > 0 ? { deleted: [...deletedPaths].map((path) => `${virtualRoot}/${path}`) } : {}) } }
+        : { fileChanges: { changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`) } });
+    const project = snapshot.getProjects().find((candidate) => candidate.configFileName === configPath);
+    if (project === undefined) { snapshot.dispose(); throw new Error("TypeScript did not create a project for the Rust-authoritative semantic state."); }
+    this.rustSemanticSnapshot = snapshot;
+    this.rustSemanticProject = project;
+    this.resetRustSemanticResolutionCaches();
+    this.rustSemanticOwnerGroupActive = false;
+    this.rustSemanticGroupLookups = undefined;
+    this.rustSemanticCompilerDiagnosticsByPath = undefined;
+    api.clearSourceFileCache();
+  }
+
+  private reconcileRustSemanticFiles(sourceFiles: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>>, changedPaths: ReadonlySet<string>, roots: ReadonlySet<string>, virtualRoot: string, configPath: string, canUpdate: boolean): RustSemanticFileReconciliation {
     const actuallyChangedPaths = new Set<string>();
     const createdPaths = new Set<string>();
     const deletedPaths = new Set<string>();
@@ -2258,87 +2381,29 @@ export class JsTsAnalysisSession {
       store.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
       this.fileMap = store;
       this.api = new API({ fs: createMutableFileSystem(store), ...(process.env["URDIRA_DEBUG_TIMING"] === "1" ? { collectTiming: true } : {}) });
-    } else {
-      const filesByPath = new Map(sourceFiles.map((file) => [file.path, file]));
-      const priorRoots = new Set(this.rootNames);
-      // Removed roots first: drop their text from the live store so a
-      // later re-creation of the same path is correctly seen as `created`
-      // (fresh text, not a no-op `changed` against stale leftovers) rather
-      // than silently resurrecting whatever this store still held for it.
-      for (const path of this.rootNames) {
-        if (roots.has(path)) continue;
-        this.fileMap!.delete(`${virtualRoot}/${path}`);
-        deletedPaths.add(path);
-        rootMembershipChanged = true;
-      }
-      for (const path of changedPaths) {
-        const file = filesByPath.get(path);
-        if (file === undefined) continue;
-        const virtualPath = `${virtualRoot}/${path}`;
-        const isNewRoot = !priorRoots.has(path);
-        if (isNewRoot) rootMembershipChanged = true;
-        if (this.fileMap!.get(virtualPath) !== file.text) {
-          this.fileMap!.set(virtualPath, file.text);
-          if (isNewRoot) createdPaths.add(path); else actuallyChangedPaths.add(path);
-        } else if (isNewRoot) {
-          // Text already present in the store (defensive: Rust always lists
-          // an added root in `changed_paths`, so this should not happen) --
-          // still needs to count as `created` so the project reopen below
-          // actually picks the path up as a root.
-          createdPaths.add(path);
-        }
-      }
-      if (rootMembershipChanged) this.fileMap!.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
+      return { actuallyChangedPaths, createdPaths, deletedPaths, rootMembershipChanged };
     }
-    const api = this.api!;
-    this.rustSemanticConfigPath = configPath;
-    this.rustSemanticCompilerOptions = compilerOptions;
-    this.rustSemanticWindowed = rootNames.length > 1_200 && process.env["URDIRA_RUST_SEMANTIC_WINDOWED"] !== "0";
-    if (this.rustSemanticWindowed) {
-      // A root-free configured project supplies the compiler options while
-      // keeping project activation cheap; beginRustSemanticOwnerGroup swaps
-      // in each bounded root window immediately before its checker walk.
-      this.fileMap!.set(configPath, JSON.stringify({ compilerOptions, files: [] }));
+    const filesByPath = new Map(sourceFiles.map((file) => [file.path, file]));
+    const priorRoots = new Set(this.rootNames);
+    for (const path of this.rootNames) {
+      if (roots.has(path)) continue;
+      this.fileMap!.delete(`${virtualRoot}/${path}`);
+      deletedPaths.add(path);
+      rootMembershipChanged = true;
     }
-    if (!canUpdate || actuallyChangedPaths.size > 0 || rootMembershipChanged || this.rustSemanticSnapshot === undefined || this.rustSemanticProject === undefined) {
-      this.rustSemanticSnapshot?.dispose();
-      const snapshot = api.updateSnapshot(!canUpdate
-        ? { openProjects: [configPath] }
-        : rootMembershipChanged
-          // A root add/remove reopens `configPath` (already ref-counted
-          // open, so this is a cheap reconfigure, not the full API/Program
-          // teardown the `!canUpdate` branch above performs) -- the same
-          // `openProjects` + `fileChanges.changed:[configPath]` pairing
-          // `activateRustSemanticWindow` already relies on to pick up a
-          // changed root list without a full rebuild. `created`/`deleted`
-          // are included for the source paths themselves, on top of
-          // whatever OTHER retained path's content also changed in this
-          // same call.
-          ? { openProjects: [configPath], fileChanges: {
-              changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`).concat(configPath),
-              ...(createdPaths.size > 0 ? { created: [...createdPaths].map((path) => `${virtualRoot}/${path}`) } : {}),
-              ...(deletedPaths.size > 0 ? { deleted: [...deletedPaths].map((path) => `${virtualRoot}/${path}`) } : {}),
-            } }
-          : { fileChanges: { changed: [...actuallyChangedPaths].map((path) => `${virtualRoot}/${path}`) } });
-      const project = snapshot.getProjects().find((candidate) => candidate.configFileName === configPath);
-      if (project === undefined) {
-        snapshot.dispose();
-        throw new Error("TypeScript did not create a project for the Rust-authoritative semantic state.");
-      }
-      this.rustSemanticSnapshot = snapshot;
-      this.rustSemanticProject = project;
-      this.resetRustSemanticResolutionCaches();
-      this.rustSemanticOwnerGroupActive = false;
-      this.rustSemanticGroupLookups = undefined;
-      this.rustSemanticCompilerDiagnosticsByPath = undefined;
-      api.clearSourceFileCache();
+    for (const path of changedPaths) {
+      const file = filesByPath.get(path);
+      if (file === undefined) continue;
+      const virtualPath = `${virtualRoot}/${path}`;
+      const isNewRoot = !priorRoots.has(path);
+      if (isNewRoot) rootMembershipChanged = true;
+      if (this.fileMap!.get(virtualPath) !== file.text) {
+        this.fileMap!.set(virtualPath, file.text);
+        if (isNewRoot) createdPaths.add(path); else actuallyChangedPaths.add(path);
+      } else if (isNewRoot) createdPaths.add(path);
     }
-    this.memo = new Map();
-    this.rootNames = rootNames;
-    this.compilerOptionsSnapshot = compilerOptions;
-    this.everBuilt = true;
-    this.rustAuthoritativeScope = true;
-    return canUpdate ? "incremental" : "full";
+    if (rootMembershipChanged) this.fileMap!.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
+    return { actuallyChangedPaths, createdPaths, deletedPaths, rootMembershipChanged };
   }
 
   /** Analyze exactly one owner against the already-prepared full checker. */
@@ -2348,7 +2413,7 @@ export class JsTsAnalysisSession {
     if (owner === undefined) throw new TypeError("Rust-authoritative semantic owner is absent from the accepted input manifest.");
     if (!this.rootNames.includes(owner.path)) throw new TypeError("Rust-authoritative semantic owner is outside the prepared project.");
     const api = this.api;
-    const project = this.rustSemanticProject;
+    const project = this.rustSemanticProject!;
     if (project === undefined || this.rustSemanticSnapshot === undefined) throw new Error("Rust-authoritative semantic snapshot has not been prepared.");
     let result: JsTsAnalysisResult;
     try {
@@ -2375,16 +2440,11 @@ export class JsTsAnalysisSession {
    * handles once when the group closes. The program is never reconstructed
    * merely because an owner counter crossed a threshold. */
   beginRustSemanticOwnerGroup(ownerPaths: readonly string[], includeInferredTypes = true, pendingSitesByOwner?: ReadonlyMap<string, readonly RustHybridPendingSite[]>): void {
-    if (this.api === undefined || this.rustSemanticProject === undefined || this.rustSemanticSnapshot === undefined || !this.rustAuthoritativeScope) {
-      throw new Error("Rust-authoritative semantic state has not been prepared.");
-    }
-    if (this.rustSemanticOwnerGroupActive) throw new Error("Rust-authoritative semantic owner groups cannot overlap.");
+    assertRustSemanticGroupReady(this.api, this.rustSemanticProject, this.rustSemanticSnapshot, this.rustAuthoritativeScope, this.rustSemanticOwnerGroupActive);
     const uniqueOwnerPaths = [...new Set(ownerPaths)];
-    if (uniqueOwnerPaths.length === 0 || uniqueOwnerPaths.length > 32 || uniqueOwnerPaths.some((path) => !this.rootNames.includes(path))) {
-      throw new Error("Rust-authoritative semantic owner group paths are invalid.");
-    }
+    validateRustSemanticOwnerPaths(uniqueOwnerPaths, this.rootNames);
     this.activateRustSemanticWindow(ownerPaths);
-    const project = this.rustSemanticProject;
+    const project = this.rustSemanticProject!;
     const checker = project.checker;
     const identifierNodes: Node[] = [];
     const declarationNodes: Node[] = [];
@@ -2422,110 +2482,22 @@ export class JsTsAnalysisSession {
       const hasExportSyntax = /\bexport\b|\bexports?\s*(?:\.|\[)|\bmodule\s*(?:\.|\[)\s*["']?exports\b|\bObject\.defineProperty\s*\(\s*exports\b/u.test(sourceText);
       dynamicRuntimeCodeByOwner.set(path, /\b(?:eval|Function)\s*\(/u.test(sourceText));
       const pendingSites = pendingSitesByOwner?.get(path);
-      if (pendingSites !== undefined) {
-        // E1c cutover (design doc E1, step 1 of the handoff): Rust already
-        // enumerated every site the checker still needs to look at for this
-        // owner (`rust_hybrid_pending_sites`); descend straight to each
-        // instead of re-walking the whole file with `collectAll`. Site
-        // resolution/dedup semantics: `resolveOwnerPendingSites`'s own
-        // doc comment. A pending site is never itself a declaration-name
-        // identifier (Rust's `IdentifierReference`/`BindingIdentifier`
-        // split already excludes those at the source, unlike `collectAll`'s
-        // own explicit `isDeclarationName` guard above), so no equivalent
-        // guard is needed here.
-        const resolved = resolveOwnerPendingSites(source, pendingSites);
-        nodes = resolved.nodes;
-        ownerDeclarationNodes = includeInferredTypes ? resolved.declarationNodes : [];
-        if (includeInferredTypes) declarationNodes.push(...resolved.declarationNodes);
-        identifierNodes.push(...resolved.identifierNodes);
-        // Matches `hybrid_owner_can_skip_checker`'s own predicate in
-        // urdira-indexing-worker/src/main.rs: nothing pending means Rust
-        // proved there is nothing left here for the checker to do.
-        hasSemanticNodes = pendingSites.length > 0;
-        pendingSiteOwners += 1;
-        pendingSiteCount += pendingSites.length;
-        resolvedSiteNodeCount += resolved.nodes.length;
-      } else {
-        const collected: Node[] = [];
-        const collectedDeclarations: Node[] = [];
-        let collectedHasSemanticNodes = false;
-        const collectAll = (node: Node): void => {
-          collected.push(node);
-          if (isIdentifier(node)) {
-            // The owner walk deliberately skips declaration-name identifiers;
-            // resolving their symbols only adds checker work and retains
-            // entries that can never be consumed.
-            const parent = node.parent;
-            const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
-            const isDeclarationName = parent !== undefined && rustSemanticDeclarationShape(parent) !== undefined && parentName !== undefined
-              && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
-            if (!isDeclarationName) {
-              identifierNodes.push(node);
-              collectedHasSemanticNodes = true;
-            }
-          }
-          const declarationShape = rustSemanticDeclarationShape(node);
-          if (includeInferredTypes && declarationShape !== undefined) {
-            declarationNodes.push(node);
-            collectedDeclarations.push(node);
-          }
-          // `super()` has no identifier child but still emits a call relation;
-          // heritage clauses can likewise be represented without an identifier.
-          if (isCallExpression(node) || isHeritageClause(node)) collectedHasSemanticNodes = true;
-          node.forEachChild(collectAll);
-        };
-        collectAll(source);
-        nodes = collected;
-        ownerDeclarationNodes = collectedDeclarations;
-        hasSemanticNodes = collectedHasSemanticNodes;
-        legacyOwners += 1;
-        legacyCollectAllNodeCount += collected.length;
-      }
+      const collected = collectRustOwnerNodes(source, pendingSites, includeInferredTypes);
+      nodes = collected.nodes;
+      ownerDeclarationNodes = collected.declarationNodes;
+      hasSemanticNodes = collected.hasSemanticNodes;
+      identifierNodes.push(...collected.identifierNodes);
+      if (includeInferredTypes) declarationNodes.push(...collected.declarationNodes);
+      pendingSiteOwners += collected.pending ? 1 : 0;
+      pendingSiteCount += collected.pendingCount;
+      resolvedSiteNodeCount += collected.resolvedNodeCount;
+      legacyOwners += collected.pending ? 0 : 1;
+      legacyCollectAllNodeCount += collected.pending ? 0 : collected.nodes.length;
       nodesByOwner.set(path, Object.freeze([...nodes]));
-      if (hasExportSyntax && ownerDeclarationNodes.some((node) => rustSemanticDeclarationShape(node)?.kind !== "parameter")) {
-        try {
-          const moduleSymbol = checker.getSymbolAtLocation(source);
-          for (const declaration of checker.getExportsOfModule(moduleSymbol!).flatMap((symbol) => symbol.declarations ?? [])) {
-            const resolved = declaration.resolve(project);
-            if (resolved !== undefined) exportedDeclarations.add(resolved);
-          }
-        } catch { /* A script without a module symbol has no exported type facts. */ }
-      }
-      // An unexported declaration with an empty body contributes no semantic
-      // row: structural declaration records are already owned by Rust, and
-      // inferred types are emitted only for exported declarations. Keep the
-      // checker-free fast path for this common private-helper shape while
-      // retaining files with references, calls or heritage clauses above.
-      if (includeInferredTypes && !hasSemanticNodes && declarationNodes.some((node) => {
-        const shape = rustSemanticDeclarationShape(node);
-        return shape !== undefined && shape.kind !== "parameter"
-          && (exportedDeclarations.has(node) || (node.parent !== undefined && exportedDeclarations.has(node.parent)));
-      })) hasSemanticNodes = true;
+      hasSemanticNodes = augmentRustOwnerSemanticState(source, ownerDeclarationNodes, hasSemanticNodes, hasExportSyntax, includeInferredTypes, checker, project, exportedDeclarations, declarationNodes);
       semanticOwnerHasNodes.set(path, hasSemanticNodes);
     }
-    const symbolByNode = new Map<Node, TypescriptSymbol | undefined>();
-    // Avoid crossing the checker boundary for an empty lookup batch.  The
-    // checker API still allocates a remote request for `[]`, which is common
-    // for declaration-only owners and needlessly repeats once per bounded
-    // Rust semantic group.
-    if (identifierNodes.length > 0) {
-      const symbols = checker.getSymbolAtLocation(identifierNodes);
-      for (let index = 0; index < identifierNodes.length; index += 1) symbolByNode.set(identifierNodes[index]!, symbols[index]);
-    }
-    const typedDeclarations = declarationNodes.filter((node) => {
-      const shape = rustSemanticDeclarationShape(node);
-      return shape !== undefined && shape.kind !== "parameter" && (exportedDeclarations.has(node) || (node.parent !== undefined && exportedDeclarations.has(node.parent)));
-    });
-    const inferredTypeByNode = new Map<Node, string>();
-    if (includeInferredTypes && typedDeclarations.length > 0) {
-      const types = checker.getTypeAtLocation(typedDeclarations);
-      for (let index = 0; index < typedDeclarations.length; index += 1) {
-        const type = types[index];
-        if (type === undefined) continue;
-        try { inferredTypeByNode.set(typedDeclarations[index]!, checker.typeToString(type, typedDeclarations[index])); }
-        catch { /* An unavailable type remains absent, matching the owner walk. */ }
-      }
-    }
+    const { symbolByNode, inferredTypeByNode } = prepareRustGroupLookups(checker, identifierNodes, declarationNodes, exportedDeclarations, includeInferredTypes);
     this.rustSemanticGroupLookups = {
       symbol_by_node: symbolByNode,
       inferred_type_by_node: inferredTypeByNode,
@@ -2541,36 +2513,12 @@ export class JsTsAnalysisSession {
     // activation.  Query the checker per owner instead and retain the results
     // across later groups in the same snapshot; this keeps the Rust bridge
     // bounded without rebuilding a corpus-sized diagnostic array.
-    const diagnosticsByPath = new Map<string, JsTsDiagnostic[]>();
-    for (const [path, diagnostics] of this.rustSemanticCompilerDiagnosticsByPath ?? []) diagnosticsByPath.set(path, [...diagnostics]);
-    {
-      const diagnosticText = (message: unknown): string => typeof message === "string" ? message : message !== null && typeof message === "object" && "text" in message ? diagnosticText((message as { text: unknown }).text) : String(message);
-      const append = (diagnostic: { readonly fileName?: string | undefined; readonly code: number; readonly text: unknown; readonly pos?: number | undefined; readonly end?: number | undefined }): void => {
-        if (diagnostic.fileName === undefined || !diagnostic.fileName.startsWith(`${SESSION_VIRTUAL_ROOT}/`)) return;
-        const path = diagnostic.fileName.slice(SESSION_VIRTUAL_ROOT.length + 1);
-        if (!this.rootNames.includes(path)) return;
-        const converted: JsTsDiagnostic = {
-          code: "jsts:compiler_diagnostic",
-          compiler_code: diagnostic.code,
-          message: diagnosticText(diagnostic.text),
-          path,
-          ...(diagnostic.pos === undefined ? {} : { start: diagnostic.pos }),
-          ...(diagnostic.end === undefined ? {} : { end: diagnostic.end }),
-        };
-        const entries = diagnosticsByPath.get(path);
-        if (entries === undefined) diagnosticsByPath.set(path, [converted]);
-        else entries.push(converted);
-      };
-      for (const path of uniqueOwnerPaths) {
-        if (diagnosticsByPath.has(path)) continue;
-        const fileName = `${SESSION_VIRTUAL_ROOT}/${path}`;
-        for (const diagnostic of this.rustSemanticProject.program.getSyntacticDiagnostics(fileName)) append(diagnostic);
-        for (const diagnostic of this.rustSemanticProject.program.getBindDiagnostics(fileName)) append(diagnostic);
-        for (const diagnostic of this.rustSemanticProject.program.getSemanticDiagnostics(fileName)) append(diagnostic);
-        if (!diagnosticsByPath.has(path)) diagnosticsByPath.set(path, []);
-      }
-      this.rustSemanticCompilerDiagnosticsByPath = diagnosticsByPath;
-    }
+    this.rustSemanticCompilerDiagnosticsByPath = collectRustSemanticDiagnostics(
+      project.program,
+      this.rootNames,
+      uniqueOwnerPaths,
+      this.rustSemanticCompilerDiagnosticsByPath,
+    );
     this.rustSemanticOwnerGroupActive = true;
     if (debugTiming) {
       console.error(`[urdira] jsts site descent owners=${uniqueOwnerPaths.length} cutover_owners=${pendingSiteOwners} pending_sites=${pendingSiteCount} resolved_nodes=${resolvedSiteNodeCount} legacy_owners=${legacyOwners} legacy_ast_nodes=${legacyCollectAllNodeCount} elapsed_ms=${Math.round(performance.now() - descentStarted)}`);
@@ -2644,48 +2592,7 @@ export class JsTsAnalysisSession {
     this.api = undefined;
     this.fileMap = undefined;
 
-    const rootNames = Object.keys(analysis.dependency_closures).sort();
-    const filesByPath = new Map(files.map((file) => [file.path, file]));
-    const entitiesByPath = new Map<string, JsTsEntity[]>();
-    for (const entity of analysis.entities) {
-      const list = entitiesByPath.get(entity.path);
-      if (list === undefined) entitiesByPath.set(entity.path, [entity]); else list.push(entity);
-    }
-    const relationsByPath = new Map<string, JsTsRelation[]>();
-    for (const relation of analysis.relations) {
-      if (relation.kind === "core:covers") continue;
-      const list = relationsByPath.get(relation.path);
-      if (list === undefined) relationsByPath.set(relation.path, [relation]); else list.push(relation);
-    }
-    const diagnosticsByPath = new Map<string, JsTsDiagnostic[]>();
-    for (const diagnostic of analysis.diagnostics) {
-      const list = diagnosticsByPath.get(diagnostic.path);
-      if (list === undefined) diagnosticsByPath.set(diagnostic.path, [diagnostic]); else list.push(diagnostic);
-    }
-    const entityById = new Map(analysis.entities.map((entity) => [entity.id, entity]));
-
-    const memo = new Map<string, JsTsFileMemo>();
-    for (const path of rootNames) {
-      const file = filesByPath.get(path);
-      if (file === undefined) continue;
-      const relations = relationsByPath.get(path) ?? [];
-      const directEdges = new Set<string>();
-      for (const relation of relations) {
-        if (relation.target_id === undefined) continue;
-        const target = entityById.get(relation.target_id);
-        if (target !== undefined && target.path !== path) directEdges.add(target.path);
-      }
-      const closure = analysis.dependency_closures[path];
-      memo.set(path, {
-        content_hash: fileContentDigest(file.text),
-        closure_files: closure?.files ?? [path],
-        closure_complete: closure?.complete ?? false,
-        entities: entitiesByPath.get(path) ?? [],
-        relations,
-        diagnostics: diagnosticsByPath.get(path) ?? [],
-        direct_edges: [...directEdges].sort(),
-      });
-    }
+    const { rootNames, memo } = memoFromAnalysis(analysis, files);
     this.memo = memo;
     this.rootNames = rootNames;
     this.compilerOptionsSnapshot = compilerOptions ?? {};
@@ -2751,27 +2658,9 @@ export class JsTsAnalysisSession {
       const moduleByPath = new Map<string, JsTsEntity>();
       const walkOutput = walkFiles({ project, virtualRoot, filesToProcess: sourceFiles, entityByNode, entityById, moduleByPath, ...(rustScope === undefined ? {} : { rust_authoritative_scope: true }) });
       const analysis = assembleAnalysis(sourceFiles, rootNames, walkOutput.entitiesByFile, walkOutput.relationsByFile, walkOutput.diagnosticsByFile, walkOutput.directEdgesByFile, walkOutput.directIncompleteFiles, entityById, rustScope !== undefined);
-      const memo = new Map<string, JsTsFileMemo>();
-      for (const file of sourceFiles) {
-        // Hash warm-up: the program/AST is right here, so pay this cost once
-        // per file now rather than leaving it to the first future edit. This
-        // is what lets THAT edit's `buildIncremental` gate be capable from
-        // the very first post-full-scan call.
-        const source = rustScope === undefined ? project.program.getSourceFile(`${virtualRoot}/${file.path}`) : undefined;
-        const hashes = rustScope === undefined
-          ? computeSemanticHashes(file.text, source === undefined ? [] : collectOpaqueSpans(file.text, source), languageForPath(file.path) === "javascript")
-          : undefined;
-        memo.set(file.path, {
-          content_hash: fileContentDigest(file.text),
-          closure_files: analysis.dependency_closures[file.path]?.files ?? [file.path],
-          closure_complete: analysis.dependency_closures[file.path]?.complete ?? false,
-          entities: walkOutput.entitiesByFile.get(file.path) ?? [],
-          relations: walkOutput.relationsByFile.get(file.path) ?? [],
-          diagnostics: walkOutput.diagnosticsByFile.get(file.path) ?? [],
-          direct_edges: rustScope === undefined ? walkOutput.directEdgesByFile.get(file.path) ?? [] : [],
-          ...(hashes === undefined ? {} : hashes),
-        });
-      }
+      // Hash warm-up happens while the program/AST is available so the first
+      // future incremental edit can use the semantic gate immediately.
+      const memo = memoFromFullAnalysis(sourceFiles, analysis, walkOutput, project, virtualRoot, rustScope);
       this.memo = memo;
       this.api = api;
       this.fileMap = map;
@@ -2829,25 +2718,8 @@ export class JsTsAnalysisSession {
   private buildIncremental(sourceFiles: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>>, changedPaths: ReadonlySet<string>, rustScope?: JsTsRustSemanticScope): JsTsSessionAnalyzeResult {
     const virtualRoot = SESSION_VIRTUAL_ROOT;
     const configPath = `${virtualRoot}/${SESSION_CONFIG_FILE}`;
-    const virtualPath = (path: string): string => `${virtualRoot}/${path}`;
     const filesByPath = new Map(sourceFiles.map((file) => [file.path, file]));
-    let freshApi = false;
-    if (this.api === undefined || this.fileMap === undefined) {
-      const map = new MutableVirtualFileSystemStore(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const));
-      map.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
-      this.fileMap = map;
-      this.api = new API({ fs: createMutableFileSystem(map) });
-      freshApi = true;
-    } else {
-      for (const path of changedPaths) {
-        const file = filesByPath.get(path);
-        if (file !== undefined) this.fileMap.set(`${virtualRoot}/${path}`, file.text);
-      }
-    }
-    const api = this.api;
-    const snapshot = freshApi
-      ? api.updateSnapshot({ openProjects: [configPath] })
-      : api.updateSnapshot({ fileChanges: { changed: [...changedPaths].map((path) => `${virtualRoot}/${path}`) } });
+    const { api, snapshot } = this.openIncrementalSnapshot(sourceFiles, rootNames, compilerOptions, changedPaths, virtualRoot, configPath, filesByPath);
     let project: TypescriptProject | undefined;
     try {
       project = snapshot.getProjects().find((candidate) => candidate.configFileName === configPath);
@@ -2857,11 +2729,7 @@ export class JsTsAnalysisSession {
       // files in HERE can widen phase 2 -- a file forced in by an
       // incomplete closure but whose own content didn't change is never
       // itself gated (the gate only runs over `changedPaths`, below).
-      const phase1Set = new Set<string>();
-      for (const file of sourceFiles) {
-        const memo = this.memo.get(file.path);
-        if (memo === undefined || (rustScope === undefined && !memo.closure_complete) || changedPaths.has(file.path)) phase1Set.add(file.path);
-      }
+      const phase1Set = selectIncrementalPhase1(sourceFiles, this.memo, changedPaths, rustScope);
       const phase1Files = [...phase1Set]
         .map((path) => filesByPath.get(path))
         .filter((file): file is AnalyzerFile => file !== undefined)
@@ -2885,93 +2753,31 @@ export class JsTsAnalysisSession {
       // Gate: only `changedPaths` files can be impactful -- the other
       // phase-1 members (incomplete-closure files) never themselves widen
       // the rewalk, they just always re-walk their OWN output.
-      const impactful = new Set<string>();
-      const freshHashesByPath = new Map<string, { readonly semantic_hash: string; readonly guard_hash: string }>();
-      for (const path of rustScope === undefined ? changedPaths : []) {
-        const file = filesByPath.get(path);
-        if (file === undefined) continue;
-        const source = project.program.getSourceFile(virtualPath(path));
-        const opaqueSpans = source === undefined ? [] : collectOpaqueSpans(file.text, source);
-        const fresh = computeSemanticHashes(file.text, opaqueSpans, languageForPath(path) === "javascript");
-        freshHashesByPath.set(path, fresh);
-        const memo = this.memo.get(path);
-        const gatePasses = memo !== undefined
-          && memo.semantic_hash !== undefined && memo.semantic_hash === fresh.semantic_hash
-          && memo.guard_hash !== undefined && memo.guard_hash === fresh.guard_hash
-          && entityProjection(memo.entities) === entityProjection(phase1Output.entitiesByFile.get(path) ?? [])
-          && sameStringArray(memo.direct_edges, phase1Output.directEdgesByFile.get(path) ?? []);
-        if (!gatePasses) impactful.add(path);
-      }
+      const { impactful, freshHashesByPath } = computeImpactfulChangedPaths(
+        rustScope === undefined ? changedPaths : new Set(),
+        filesByPath,
+        project,
+        virtualRoot,
+        this.memo,
+        phase1Output,
+      );
 
       // Phase 2 set D: dependents (direct or transitive -- `closure_files`
       // is already the full transitive closure) of an impactful file, drawn
       // only from files phase 1 left untouched. Empty whenever the gate
       // passed for every changed file.
-      const D = new Set<string>();
-      if (rustScope !== undefined) {
-        for (const path of rustScope.affected_paths) if (!phase1Set.has(path)) D.add(path);
-      } else if (impactful.size > 0) {
-        for (const file of sourceFiles) {
-          if (phase1Set.has(file.path)) continue;
-          const memo = this.memo.get(file.path)!;
-          if (memo.closure_files.some((path) => impactful.has(path))) D.add(file.path);
-        }
-      }
+      const D = incrementalPhase2Paths(sourceFiles, phase1Set, impactful, rustScope, this.memo);
 
       let phase2Output: JsTsWalkPassOutput | undefined;
       let entityByIdFinal = entityById1;
       if (D.size > 0) {
-        const entityByNode2 = new Map<string, JsTsEntity>();
-        const entityById2 = new Map<string, JsTsEntity>();
-        const moduleByPath2 = new Map<string, JsTsEntity>();
-        for (const file of sourceFiles) {
-          if (D.has(file.path)) continue;
-          if (phase1Set.has(file.path)) {
-            for (const entity of phase1Output.entitiesByFile.get(file.path) ?? []) {
-              entityById2.set(entity.id, entity);
-              if (entity.kind === "module") moduleByPath2.set(entity.path, entity);
-              else entityByNode2.set(`${entity.path}:${entity.start}`, entity);
-            }
-            continue;
-          }
-          const memo = this.memo.get(file.path)!;
-          for (const entity of memo.entities) {
-            entityById2.set(entity.id, entity);
-            if (entity.kind === "module") moduleByPath2.set(entity.path, entity);
-            else entityByNode2.set(`${entity.path}:${entity.start}`, entity);
-          }
-        }
-        const dFiles = [...D]
-          .map((path) => filesByPath.get(path))
-          .filter((file): file is AnalyzerFile => file !== undefined)
-          .sort((left, right) => left.path.localeCompare(right.path));
-        phase2Output = walkFiles({ project, virtualRoot, filesToProcess: dFiles, entityByNode: entityByNode2, entityById: entityById2, moduleByPath: moduleByPath2, ...(rustScope === undefined ? {} : { rust_authoritative_scope: true }) });
-        entityByIdFinal = entityById2;
+        const phase2 = this.walkIncrementalPhase2(project, virtualRoot, sourceFiles, D, phase1Set, phase1Output, rustScope, this.memo, filesByPath);
+        phase2Output = phase2.output;
+        entityByIdFinal = phase2.entityById;
       }
 
-      const entitiesByFile = new Map<string, readonly JsTsEntity[]>();
-      const relationsByFile = new Map<string, readonly JsTsRelation[]>();
-      const diagnosticsByFile = new Map<string, readonly JsTsDiagnostic[]>();
-      const finalDirectEdgesByFile = new Map<string, readonly string[]>();
-      for (const file of sourceFiles) {
-        if (phase1Set.has(file.path)) {
-          entitiesByFile.set(file.path, phase1Output.entitiesByFile.get(file.path) ?? []);
-          relationsByFile.set(file.path, phase1Output.relationsByFile.get(file.path) ?? []);
-          diagnosticsByFile.set(file.path, phase1Output.diagnosticsByFile.get(file.path) ?? []);
-          finalDirectEdgesByFile.set(file.path, phase1Output.directEdgesByFile.get(file.path) ?? []);
-        } else if (D.has(file.path)) {
-          entitiesByFile.set(file.path, phase2Output!.entitiesByFile.get(file.path) ?? []);
-          relationsByFile.set(file.path, phase2Output!.relationsByFile.get(file.path) ?? []);
-          diagnosticsByFile.set(file.path, phase2Output!.diagnosticsByFile.get(file.path) ?? []);
-          finalDirectEdgesByFile.set(file.path, phase2Output!.directEdgesByFile.get(file.path) ?? []);
-        } else {
-          const memo = this.memo.get(file.path)!;
-          entitiesByFile.set(file.path, memo.entities);
-          relationsByFile.set(file.path, memo.relations);
-          diagnosticsByFile.set(file.path, memo.diagnostics);
-          finalDirectEdgesByFile.set(file.path, memo.direct_edges);
-        }
-      }
+      const merged = mergeIncrementalFileOutputs(sourceFiles, phase1Set, D, phase1Output, phase2Output, this.memo);
+      const { entitiesByFile, relationsByFile, diagnosticsByFile, finalDirectEdgesByFile } = merged;
 
       // Files left untouched by BOTH phases provably never need a direct-
       // incomplete entry: if any file reachable from such a file G had one,
@@ -2993,34 +2799,430 @@ export class JsTsAnalysisSession {
       // memo entry -- including a phase-1 member forced in only by an
       // incomplete closure, whose own text never changed this round -- is
       // carried forward completely unchanged.
-      const newMemo = new Map<string, JsTsFileMemo>();
-      for (const file of sourceFiles) {
-        if (phase1Set.has(file.path) || D.has(file.path)) {
-          const walkOutput = phase1Set.has(file.path) ? phase1Output : phase2Output!;
-          const hashes = freshHashesByPath.get(file.path);
-          newMemo.set(file.path, {
-            content_hash: fileContentDigest(file.text),
-            closure_files: analysis.dependency_closures[file.path]?.files ?? [file.path],
-            closure_complete: analysis.dependency_closures[file.path]?.complete ?? false,
-            entities: walkOutput.entitiesByFile.get(file.path) ?? [],
-            relations: walkOutput.relationsByFile.get(file.path) ?? [],
-            diagnostics: walkOutput.diagnosticsByFile.get(file.path) ?? [],
-            direct_edges: rustScope === undefined ? walkOutput.directEdgesByFile.get(file.path) ?? [] : [],
-            ...(hashes === undefined ? {} : hashes),
-          });
-        } else {
-          newMemo.set(file.path, this.memo.get(file.path)!);
-        }
-      }
-      this.memo = newMemo;
-      this.rootNames = rootNames;
-      this.compilerOptionsSnapshot = compilerOptions;
-      this.everBuilt = true;
-      this.rustAuthoritativeScope = rustScope !== undefined;
-      const rewalked = [...phase1Set, ...D].sort((left, right) => left.localeCompare(right));
-      return { result: analysis, build: "incremental", rewalked, ...(rustScope === undefined ? { impactful_changed_paths: [...impactful].sort((left, right) => left.localeCompare(right)) } : {}) };
+      const newMemo = rebuildIncrementalMemo(sourceFiles, phase1Set, D, phase1Output, phase2Output, freshHashesByPath, analysis, rustScope, this.memo);
+      return this.commitIncrementalAnalysis(newMemo, rootNames, compilerOptions, rustScope, analysis, phase1Set, D, impactful);
     } finally {
       project?.checker.dispose();
     }
   }
+
+  private walkIncrementalPhase2(project: TypescriptProject, virtualRoot: string, sourceFiles: readonly AnalyzerFile[], phase2Set: ReadonlySet<string>, phase1Set: ReadonlySet<string>, phase1Output: JsTsWalkPassOutput, rustScope: JsTsRustSemanticScope | undefined, memo: ReadonlyMap<string, JsTsFileMemo>, filesByPath: ReadonlyMap<string, AnalyzerFile>): { readonly output: JsTsWalkPassOutput; readonly entityById: Map<string, JsTsEntity> } {
+    const entityByNode = new Map<string, JsTsEntity>();
+    const entityById = new Map<string, JsTsEntity>();
+    const moduleByPath = new Map<string, JsTsEntity>();
+    for (const file of sourceFiles) {
+      if (phase2Set.has(file.path)) continue;
+      const entities = phase1Set.has(file.path) ? phase1Output.entitiesByFile.get(file.path) ?? [] : memo.get(file.path)!.entities;
+      for (const entity of entities) {
+        entityById.set(entity.id, entity);
+        if (entity.kind === "module") moduleByPath.set(entity.path, entity); else entityByNode.set(`${entity.path}:${entity.start}`, entity);
+      }
+    }
+    const files = [...phase2Set].map((path) => filesByPath.get(path)).filter((file): file is AnalyzerFile => file !== undefined).sort((left, right) => left.path.localeCompare(right.path));
+    const output = walkFiles({ project, virtualRoot, filesToProcess: files, entityByNode, entityById, moduleByPath, ...(rustScope === undefined ? {} : { rust_authoritative_scope: true }) });
+    return { output, entityById };
+  }
+
+  private commitIncrementalAnalysis(newMemo: Map<string, JsTsFileMemo>, rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>>, rustScope: JsTsRustSemanticScope | undefined, analysis: JsTsAnalysisResult, phase1Set: ReadonlySet<string>, phase2Set: ReadonlySet<string>, impactful: ReadonlySet<string>): JsTsSessionAnalyzeResult {
+    this.memo = newMemo;
+    this.rootNames = rootNames;
+    this.compilerOptionsSnapshot = compilerOptions;
+    this.everBuilt = true;
+    this.rustAuthoritativeScope = rustScope !== undefined;
+    const rewalked = [...phase1Set, ...phase2Set].sort((left, right) => left.localeCompare(right));
+    return { result: analysis, build: "incremental", rewalked, ...(rustScope === undefined ? { impactful_changed_paths: [...impactful].sort((left, right) => left.localeCompare(right)) } : {}) };
+  }
+
+  private openIncrementalSnapshot(sourceFiles: readonly AnalyzerFile[], rootNames: readonly string[], compilerOptions: Readonly<Record<string, unknown>>, changedPaths: ReadonlySet<string>, virtualRoot: string, configPath: string, filesByPath: ReadonlyMap<string, AnalyzerFile>): { readonly api: API; readonly snapshot: ReturnType<API["updateSnapshot"]> } {
+    const freshApi = this.api === undefined || this.fileMap === undefined;
+    if (freshApi) {
+      const map = new MutableVirtualFileSystemStore(sourceFiles.map((file) => [`${virtualRoot}/${file.path}`, file.text] as const));
+      map.set(configPath, JSON.stringify({ compilerOptions, files: rootNames }));
+      this.fileMap = map;
+      this.api = new API({ fs: createMutableFileSystem(map) });
+    } else {
+      for (const path of changedPaths) {
+        const file = filesByPath.get(path);
+        if (file !== undefined) this.fileMap!.set(`${virtualRoot}/${path}`, file.text);
+      }
+    }
+    const api = this.api!;
+    const snapshot = freshApi
+      ? api.updateSnapshot({ openProjects: [configPath] })
+      : api.updateSnapshot({ fileChanges: { changed: [...changedPaths].map((path) => `${virtualRoot}/${path}`) } });
+    return { api, snapshot };
+  }
+}
+
+function mergeIncrementalFileOutputs(sourceFiles: readonly AnalyzerFile[], phase1Set: ReadonlySet<string>, phase2Set: ReadonlySet<string>, phase1: JsTsWalkPassOutput, phase2: JsTsWalkPassOutput | undefined, memo: ReadonlyMap<string, JsTsFileMemo>): IncrementalMergedOutputs {
+  const entitiesByFile = new Map<string, readonly JsTsEntity[]>();
+  const relationsByFile = new Map<string, readonly JsTsRelation[]>();
+  const diagnosticsByFile = new Map<string, readonly JsTsDiagnostic[]>();
+  const finalDirectEdgesByFile = new Map<string, readonly string[]>();
+  for (const file of sourceFiles) {
+    const output = phase1Set.has(file.path) ? phase1 : phase2Set.has(file.path) ? phase2 : undefined;
+    if (output !== undefined) {
+      entitiesByFile.set(file.path, output.entitiesByFile.get(file.path) ?? []);
+      relationsByFile.set(file.path, output.relationsByFile.get(file.path) ?? []);
+      diagnosticsByFile.set(file.path, output.diagnosticsByFile.get(file.path) ?? []);
+      finalDirectEdgesByFile.set(file.path, output.directEdgesByFile.get(file.path) ?? []);
+      continue;
+    }
+    const retained = memo.get(file.path)!;
+    entitiesByFile.set(file.path, retained.entities);
+    relationsByFile.set(file.path, retained.relations);
+    diagnosticsByFile.set(file.path, retained.diagnostics);
+    finalDirectEdgesByFile.set(file.path, retained.direct_edges);
+  }
+  return { entitiesByFile, relationsByFile, diagnosticsByFile, finalDirectEdgesByFile };
+}
+
+function rebuildIncrementalMemo(sourceFiles: readonly AnalyzerFile[], phase1Set: ReadonlySet<string>, phase2Set: ReadonlySet<string>, phase1: JsTsWalkPassOutput, phase2: JsTsWalkPassOutput | undefined, freshHashesByPath: ReadonlyMap<string, { readonly semantic_hash: string; readonly guard_hash: string }>, analysis: JsTsAnalysisResult, rustScope: JsTsRustSemanticScope | undefined, previous: ReadonlyMap<string, JsTsFileMemo>): Map<string, JsTsFileMemo> {
+  const newMemo = new Map<string, JsTsFileMemo>();
+  for (const file of sourceFiles) {
+    if (!phase1Set.has(file.path) && !phase2Set.has(file.path)) {
+      newMemo.set(file.path, previous.get(file.path)!);
+      continue;
+    }
+    const output = phase1Set.has(file.path) ? phase1 : phase2!;
+    const hashes = freshHashesByPath.get(file.path);
+    newMemo.set(file.path, {
+      content_hash: fileContentDigest(file.text),
+      closure_files: analysis.dependency_closures[file.path]?.files ?? [file.path],
+      closure_complete: analysis.dependency_closures[file.path]?.complete ?? false,
+      entities: output.entitiesByFile.get(file.path) ?? [],
+      relations: output.relationsByFile.get(file.path) ?? [],
+      diagnostics: output.diagnosticsByFile.get(file.path) ?? [],
+      direct_edges: rustScope === undefined ? output.directEdgesByFile.get(file.path) ?? [] : [],
+      ...(hashes === undefined ? {} : hashes),
+    });
+  }
+  return newMemo;
+}
+
+function incrementalPhase2Paths(
+  sourceFiles: readonly AnalyzerFile[],
+  phase1Set: ReadonlySet<string>,
+  impactful: ReadonlySet<string>,
+  rustScope: JsTsRustSemanticScope | undefined,
+  memo: ReadonlyMap<string, JsTsFileMemo>,
+): Set<string> {
+  const phase2 = new Set<string>();
+  if (rustScope !== undefined) {
+    for (const path of rustScope.affected_paths) if (!phase1Set.has(path)) phase2.add(path);
+    return phase2;
+  }
+  if (impactful.size === 0) return phase2;
+  for (const file of sourceFiles) {
+    if (phase1Set.has(file.path)) continue;
+    const entry = memo.get(file.path);
+    if (entry?.closure_files.some((path) => impactful.has(path))) phase2.add(file.path);
+  }
+  return phase2;
+}
+
+function prepareRustSemanticInput(input: {
+  readonly files: readonly AnalyzerFile[];
+  readonly root_names: readonly string[];
+  readonly compiler_options?: Readonly<Record<string, unknown>>;
+  readonly rust_semantic_scope: JsTsRustSemanticScope;
+}): { readonly rootNames: readonly string[]; readonly roots: ReadonlySet<string>; readonly sourceFiles: readonly AnalyzerFile[]; readonly compilerOptions: Readonly<Record<string, unknown>>; readonly changedPaths: Set<string> } {
+  const rootNames = [...input.root_names].sort();
+  const roots = new Set(rootNames);
+  const sourceFiles = input.files.filter((candidate) => roots.has(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
+  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
+  const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
+  const changedPaths = new Set(input.rust_semantic_scope.changed_paths);
+  const affectedPaths = new Set(input.rust_semantic_scope.affected_paths);
+  if ([...changedPaths, ...affectedPaths].some((path) => !roots.has(path))) throw new TypeError("Rust semantic scope contains a path outside root_names.");
+  if ([...changedPaths].some((path) => !affectedPaths.has(path))) throw new TypeError("Rust semantic scope must include every changed path in affected_paths.");
+  return { rootNames, roots, sourceFiles, compilerOptions, changedPaths };
+}
+
+function findRustDeclarationParent(node: Node, file: TypescriptSourceFile, kindOf: (node: Node) => RustSemanticDeclarationShape | undefined, resolve: (node: Node) => JsTsEntity | undefined): JsTsEntity | undefined {
+  let parentNode = node.parent;
+  while (parentNode !== undefined && parentNode !== file) {
+    if (kindOf(parentNode) !== undefined && nodeName(parentNode) !== undefined) return resolve(parentNode);
+    parentNode = parentNode.parent;
+  }
+  return undefined;
+}
+
+function declarationIdentityStart(node: Node, nameNode: Node | undefined, file: TypescriptSourceFile, start: number): number {
+  if (nameNode !== undefined) return nameNode.getStart(file);
+  return isConstructorDeclaration(node) ? constructorKeywordStart(node, file) : start;
+}
+
+function resolveRustDeclarationNode(
+  node: Node | undefined,
+  symbolByNode: ReadonlyMap<Node, TypescriptSymbol | undefined>,
+  checker: TypescriptProject["checker"],
+  project: TypescriptProject,
+  resolvedByNodeObject: WeakMap<Node, Node | undefined>,
+  resolvedBySymbol: WeakMap<object, Node | undefined>,
+  resolvedByDeclaration: WeakMap<Node, Node | undefined>,
+): Node | undefined {
+  if (node === undefined) return undefined;
+  if (resolvedByNodeObject.has(node)) return resolvedByNodeObject.get(node);
+  let symbol = symbolByNode.has(node) ? symbolByNode.get(node) : checker.getSymbolAtLocation(node);
+  if (symbol !== undefined && resolvedBySymbol.has(symbol)) {
+    const cached = resolvedBySymbol.get(symbol);
+    resolvedByNodeObject.set(node, cached);
+    return cached;
+  }
+  const originalSymbol = symbol;
+  symbol = normalizeRustSymbol(symbol, checker);
+  const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
+  const declarationNode = declaration as unknown as Node | undefined;
+  const resolved = resolveRustDeclaration(declaration, declarationNode, project, resolvedByDeclaration);
+  if (symbol !== undefined) resolvedBySymbol.set(symbol, resolved);
+  if (originalSymbol !== undefined && originalSymbol !== symbol) resolvedBySymbol.set(originalSymbol, resolved);
+  resolvedByNodeObject.set(node, resolved);
+  return resolved;
+}
+
+function normalizeRustSymbol(symbol: TypescriptSymbol | undefined, checker: TypescriptProject["checker"]): TypescriptSymbol | undefined {
+  if (symbol === undefined || (symbol.flags & SymbolFlags.Alias) === 0) return symbol;
+  try {
+    const aliased = checker.getAliasedSymbol(symbol);
+    return checker.isUnknownSymbol(aliased) ? symbol : aliased;
+  } catch { /* The direct symbol remains authoritative. */ return symbol; }
+}
+
+function resolveRustDeclaration(declaration: unknown, declarationNode: Node | undefined, project: TypescriptProject, cache: WeakMap<Node, Node | undefined>): Node | undefined {
+  if (declarationNode === undefined) return undefined;
+  if (cache.has(declarationNode)) return cache.get(declarationNode);
+  const resolved = (declaration as { resolve: (project?: TypescriptProject) => unknown }).resolve(project) as Node | undefined;
+  cache.set(declarationNode, resolved);
+  return resolved;
+}
+
+function resolveRustCallTarget(
+  node: Node,
+  checker: TypescriptProject["checker"],
+  project: TypescriptProject,
+  directCallDeclaration: (node: Node) => Node | undefined,
+  resolvedDeclaration: (node: Node | undefined) => Node | undefined,
+  entityForDeclaration: (node: Node) => JsTsEntity | undefined,
+  resolvedByDeclaration: WeakMap<Node, Node | undefined>,
+): { readonly target?: JsTsEntity; readonly declarationResolved: boolean } {
+  const directDeclaration = directCallDeclaration(node);
+  const declaration = directDeclaration ?? resolveCallSignatureDeclaration(node, checker, project, resolvedByDeclaration);
+  let declarationResolved = declaration !== undefined;
+  let target = declaration === undefined ? undefined : entityForDeclaration(declaration);
+  if (target === undefined) {
+    const expression = (node as Node & { readonly expression?: Node }).expression;
+    const fallback = resolvedDeclaration(expression);
+    declarationResolved ||= fallback !== undefined;
+    target = fallback === undefined ? undefined : entityForDeclaration(fallback);
+  }
+  return { ...(target === undefined ? {} : { target }), declarationResolved };
+}
+
+function resolveCallSignatureDeclaration(node: Node, checker: TypescriptProject["checker"], project: TypescriptProject, cache: WeakMap<Node, Node | undefined>): Node | undefined {
+  const signatureDeclaration = checker.getResolvedSignature(node)?.declaration;
+  const signatureNode = signatureDeclaration as unknown as Node | undefined;
+  if (signatureNode === undefined) return undefined;
+  if (cache.has(signatureNode)) return cache.get(signatureNode);
+  const resolved = (signatureDeclaration as unknown as { resolve: (project?: TypescriptProject) => unknown }).resolve(project) as Node | undefined;
+  cache.set(signatureNode, resolved);
+  return resolved;
+}
+
+function collectRustSemanticDiagnostics(
+  program: TypescriptProject["program"],
+  rootNames: readonly string[],
+  ownerPaths: readonly string[],
+  previous: ReadonlyMap<string, readonly JsTsDiagnostic[]> | undefined,
+): ReadonlyMap<string, readonly JsTsDiagnostic[]> {
+  const diagnosticsByPath = new Map<string, JsTsDiagnostic[]>();
+  for (const [path, diagnostics] of previous ?? []) diagnosticsByPath.set(path, [...diagnostics]);
+  const diagnosticText = (message: unknown): string => typeof message === "string" ? message : message !== null && typeof message === "object" && "text" in message ? diagnosticText((message as { text: unknown }).text) : String(message);
+  const append = (diagnostic: { readonly fileName?: string | undefined; readonly code: number; readonly text: unknown; readonly pos?: number | undefined; readonly end?: number | undefined }): void => {
+    if (diagnostic.fileName === undefined || !diagnostic.fileName.startsWith(`${SESSION_VIRTUAL_ROOT}/`)) return;
+    const path = diagnostic.fileName.slice(SESSION_VIRTUAL_ROOT.length + 1);
+    if (!rootNames.includes(path)) return;
+    const converted: JsTsDiagnostic = { code: "jsts:compiler_diagnostic", compiler_code: diagnostic.code, message: diagnosticText(diagnostic.text), path, ...(diagnostic.pos === undefined ? {} : { start: diagnostic.pos }), ...(diagnostic.end === undefined ? {} : { end: diagnostic.end }) };
+    const entries = diagnosticsByPath.get(path);
+    if (entries === undefined) diagnosticsByPath.set(path, [converted]); else entries.push(converted);
+  };
+  for (const path of ownerPaths) {
+    if (diagnosticsByPath.has(path)) continue;
+    const fileName = `${SESSION_VIRTUAL_ROOT}/${path}`;
+    for (const diagnostic of program.getSyntacticDiagnostics(fileName)) append(diagnostic);
+    for (const diagnostic of program.getBindDiagnostics(fileName)) append(diagnostic);
+    for (const diagnostic of program.getSemanticDiagnostics(fileName)) append(diagnostic);
+    if (!diagnosticsByPath.has(path)) diagnosticsByPath.set(path, []);
+  }
+  return diagnosticsByPath;
+}
+
+function resolveWalkModuleTarget(node: Node, checker: TypescriptProject["checker"], project: TypescriptProject, moduleByPath: ReadonlyMap<string, JsTsEntity>, relativePath: (path: string) => string): JsTsEntity | undefined {
+  try {
+    const symbol = checker.getSymbolAtLocation(node);
+    for (const declaration of symbol?.declarations ?? []) {
+      const resolved = declaration.resolve(project);
+      if (resolved === undefined) continue;
+      const target = moduleByPath.get(relativePath(resolved.getSourceFile().fileName));
+      if (target !== undefined) return target;
+    }
+  } catch { /* Preserve the unresolved module relation below. */ }
+  const specifier = (node as Node & { readonly text?: string }).text;
+  if (typeof specifier !== "string" || !specifier.startsWith(".")) return undefined;
+  const sourceParts = relativePath(node.getSourceFile().fileName).split("/");
+  sourceParts.pop();
+  for (const part of specifier.split("/")) {
+    if (part === "." || part === "") continue;
+    if (part === "..") sourceParts.pop(); else sourceParts.push(part);
+  }
+  const base = sourceParts.join("/");
+  const candidates = [base, ...[...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS].map((extension) => `${base}${extension}`), ...[...JAVASCRIPT_EXTENSIONS, ...TYPESCRIPT_EXTENSIONS].map((extension) => `${base}/index${extension}`)];
+  for (const candidate of candidates) {
+    const target = moduleByPath.get(candidate);
+    if (target !== undefined) return target;
+  }
+  return undefined;
+}
+
+function initializeWalkFile(file: AnalyzerFile, program: TypescriptProject["program"], virtualPath: (path: string) => string, checker: TypescriptProject["checker"], project: TypescriptProject): { readonly source: TypescriptSourceFile; readonly moduleEntity: JsTsEntity; readonly exportedDeclarations: Set<Node> } | undefined {
+  const source = program.getSourceFile(virtualPath(file.path));
+  if (source === undefined) return undefined;
+  let isTestModule = false;
+  source.forEachChild((node) => {
+    if (!isImportDeclaration(node)) return;
+    const specifier = (node as Node & { readonly moduleSpecifier?: Node }).moduleSpecifier as Node & { readonly text?: string } | undefined;
+    if (specifier?.text === "node:test") isTestModule = true;
+  });
+  const moduleEntity: JsTsEntity = { id: stableId("module", file.path, 0, file.path), name: file.path, kind: "module", universal_kind: "core:container", path: file.path, start: 0, end: source.getEnd(), ...(isTestModule ? { is_test: true } : {}) };
+  let exportedDeclarations = new Set<Node>();
+  try {
+    const moduleSymbol = checker.getSymbolAtLocation(source);
+    exportedDeclarations = new Set(moduleSymbol === undefined ? [] : checker.getExportsOfModule(moduleSymbol).flatMap((symbol) => symbol.declarations ?? []).map((handle) => handle.resolve(project)).filter((resolved): resolved is Node => resolved !== undefined));
+  } catch { /* A script without a module symbol has no exported declarations. */ }
+  return { source, moduleEntity, exportedDeclarations };
+}
+
+function collectRustOwnerNodes(source: TypescriptSourceFile, pendingSites: readonly RustHybridPendingSite[] | undefined, includeInferredTypes: boolean): RustOwnerNodeCollection {
+  if (pendingSites !== undefined) {
+    const resolved = resolveOwnerPendingSites(source, pendingSites);
+    return {
+      nodes: resolved.nodes,
+      declarationNodes: includeInferredTypes ? resolved.declarationNodes : [],
+      identifierNodes: resolved.identifierNodes,
+      hasSemanticNodes: pendingSites.length > 0,
+      pending: true,
+      pendingCount: pendingSites.length,
+      resolvedNodeCount: resolved.nodes.length,
+    };
+  }
+  const collected: Node[] = [];
+  const declarations: Node[] = [];
+  let hasSemanticNodes = false;
+  const collectAll = (node: Node): void => {
+    collected.push(node);
+    if (isIdentifier(node) && !isRustDeclarationName(node)) hasSemanticNodes = true;
+    const shape = rustSemanticDeclarationShape(node);
+    if (includeInferredTypes && shape !== undefined) declarations.push(node);
+    if (isCallExpression(node) || isHeritageClause(node)) hasSemanticNodes = true;
+    node.forEachChild(collectAll);
+  };
+  collectAll(source);
+  return { nodes: collected, declarationNodes: declarations, identifierNodes: collected.filter((node) => isIdentifier(node) && !isRustDeclarationName(node)), hasSemanticNodes, pending: false, pendingCount: 0, resolvedNodeCount: 0 };
+}
+
+function isRustDeclarationName(node: Node): boolean {
+  const parent = node.parent;
+  const parentName = parent === undefined ? undefined : (parent as Node & { readonly name?: Node }).name;
+  return parent !== undefined && rustSemanticDeclarationShape(parent) !== undefined && parentName !== undefined
+    && parentName.getStart(parentName.getSourceFile()) === node.getStart(node.getSourceFile()) && parentName.getEnd() === node.getEnd();
+}
+
+function augmentRustOwnerSemanticState(
+  source: TypescriptSourceFile,
+  ownerDeclarationNodes: readonly Node[],
+  hasSemanticNodes: boolean,
+  hasExportSyntax: boolean,
+  includeInferredTypes: boolean,
+  checker: TypescriptProject["checker"],
+  project: TypescriptProject,
+  exportedDeclarations: Set<Node>,
+  declarationNodes: readonly Node[],
+): boolean {
+  if (hasExportSyntax && ownerDeclarationNodes.some((node) => rustSemanticDeclarationShape(node)?.kind !== "parameter")) {
+    try {
+      const moduleSymbol = checker.getSymbolAtLocation(source);
+      for (const declaration of checker.getExportsOfModule(moduleSymbol!).flatMap((symbol) => symbol.declarations ?? [])) {
+        const resolved = declaration.resolve(project);
+        if (resolved !== undefined) exportedDeclarations.add(resolved);
+      }
+    } catch { /* A script without a module symbol has no exported type facts. */ }
+  }
+  if (includeInferredTypes && !hasSemanticNodes && declarationNodes.some((node) => {
+    const shape = rustSemanticDeclarationShape(node);
+    return shape !== undefined && shape.kind !== "parameter" && (exportedDeclarations.has(node) || (node.parent !== undefined && exportedDeclarations.has(node.parent)));
+  })) return true;
+  return hasSemanticNodes;
+}
+
+function prepareRustGroupLookups(
+  checker: TypescriptProject["checker"],
+  identifierNodes: readonly Node[],
+  declarationNodes: readonly Node[],
+  exportedDeclarations: ReadonlySet<Node>,
+  includeInferredTypes: boolean,
+): RustGroupLookups {
+  const symbolByNode = new Map<Node, TypescriptSymbol | undefined>();
+  if (identifierNodes.length > 0) {
+    const symbols = checker.getSymbolAtLocation(identifierNodes);
+    for (let index = 0; index < identifierNodes.length; index += 1) symbolByNode.set(identifierNodes[index]!, symbols[index]);
+  }
+  const typedDeclarations = declarationNodes.filter((node) => {
+    const shape = rustSemanticDeclarationShape(node);
+    return shape !== undefined && shape.kind !== "parameter" && (exportedDeclarations.has(node) || (node.parent !== undefined && exportedDeclarations.has(node.parent)));
+  });
+  const inferredTypeByNode = new Map<Node, string>();
+  if (includeInferredTypes && typedDeclarations.length > 0) {
+    const types = checker.getTypeAtLocation(typedDeclarations);
+    for (let index = 0; index < typedDeclarations.length; index += 1) {
+      const type = types[index];
+      if (type === undefined) continue;
+      try { inferredTypeByNode.set(typedDeclarations[index]!, checker.typeToString(type, typedDeclarations[index])); }
+      catch { /* An unavailable type remains absent, matching the owner walk. */ }
+    }
+  }
+  return { symbolByNode, inferredTypeByNode };
+}
+
+function prepareSessionAnalysisInput(input: { readonly files: readonly AnalyzerFile[]; readonly root_names?: readonly string[]; readonly compiler_options?: Readonly<Record<string, unknown>>; readonly rust_semantic_scope?: JsTsRustSemanticScope }): { readonly rootNames: readonly string[]; readonly sourceFiles: readonly AnalyzerFile[]; readonly compilerOptions: Readonly<Record<string, unknown>>; readonly rustScope: JsTsRustSemanticScope | undefined } {
+  const rootNames = [...(input.root_names ?? input.files.map((file) => file.path).filter((path) => languageForPath(path) !== undefined))].sort();
+  const sourceFiles = input.files.filter((candidate) => rootNames.includes(candidate.path)).sort((left, right) => left.path.localeCompare(right.path));
+  const hasJavaScript = rootNames.some((path) => languageForPath(path) === "javascript");
+  const compilerOptions = { ...(hasJavaScript ? { allowJs: true, checkJs: true } : {}), ...(input.compiler_options ?? {}) };
+  const rustScope = input.rust_semantic_scope;
+  validateRustSemanticScope(rootNames, rustScope);
+  return { rootNames, sourceFiles, compilerOptions, rustScope };
+}
+
+function validateRustSemanticScope(rootNames: readonly string[], rustScope: JsTsRustSemanticScope | undefined): void {
+  if (rustScope === undefined) return;
+  const roots = new Set(rootNames);
+  const changed = new Set(rustScope.changed_paths);
+  const affected = new Set(rustScope.affected_paths);
+  if ([...changed, ...affected].some((path) => !roots.has(path))) throw new TypeError("Rust semantic scope contains a path outside root_names.");
+  if ([...changed].some((path) => !affected.has(path))) throw new TypeError("Rust semantic scope must include every changed path in affected_paths.");
+}
+
+function changedPathsForSession(sourceFiles: readonly AnalyzerFile[], rustScope: JsTsRustSemanticScope | undefined, memo: ReadonlyMap<string, JsTsFileMemo>): Set<string> {
+  const changedPaths = new Set<string>(rustScope?.changed_paths ?? []);
+  if (rustScope !== undefined) return changedPaths;
+  for (const file of sourceFiles) {
+    const existing = memo.get(file.path);
+    if (existing === undefined || existing.content_hash !== fileContentDigest(file.text)) changedPaths.add(file.path);
+  }
+  return changedPaths;
+}
+
+function rustSemanticWindowSize(): number {
+  const configured = Number(process.env["URDIRA_RUST_SEMANTIC_WINDOW_SIZE"] ?? "512");
+  return Number.isSafeInteger(configured) && configured >= 512 && configured <= 4096 && configured % 32 === 0 ? configured : 512;
 }

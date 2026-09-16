@@ -93,6 +93,8 @@ TypeScript packages in `architecture/manifest.json`.
       changed.
 - [ ] `pnpm verify` passes.
 - [ ] The final summary includes tests, documentation, and known limitations.
+- [ ] `pnpm check:maintainability` passes and no readability baseline entry was
+      added without a local explanation.
 
 ## Reporting conflicts and security issues
 

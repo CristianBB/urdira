@@ -42,31 +42,43 @@ export async function checkArchitecture(repositoryRoot, manifest) {
   }
 
   const rawEntries = Array.isArray(manifest.packages) ? manifest.packages : [];
+  const { entries, entriesByName, entriesByPath } = indexManifestEntries(rawEntries, errors);
+
+  const workspacePackages = await discoverWorkspacePackages(repositoryRoot);
+  const checkedPackages = workspacePackages.map((workspacePackage) => workspacePackage.name);
+
+  errors.push(...(await checkWorkspacePackages(repositoryRoot, workspacePackages, entriesByPath, entriesByName)));
+  errors.push(...checkManifestEntries(repositoryRoot, entries, entriesByName));
+
+  errors.push(...checkCoverage(manifest.coverage, entriesByName));
+  errors.push(...(await checkSourceProviderCommandIsolation(repositoryRoot)));
+  errors.push(...(await checkPluginPhaseBoundaries(repositoryRoot, workspacePackages)));
+  errors.push(...(await checkNativePipelineContracts(repositoryRoot, workspacePackages)));
+
+  return { errors, checkedPackages };
+}
+
+function indexManifestEntries(rawEntries, errors) {
   const entries = [];
   const entriesByName = new Map();
   const entriesByPath = new Map();
-
   for (const entry of rawEntries) {
     if (!isPackageEntry(entry)) {
       errors.push("Architecture manifest contains an invalid package entry");
       continue;
     }
-
     entries.push(entry);
-    if (entriesByName.has(entry.name)) {
-      errors.push(`Architecture manifest contains duplicate package ${entry.name}`);
-    }
+    if (entriesByName.has(entry.name)) errors.push(`Architecture manifest contains duplicate package ${entry.name}`);
     const normalizedEntryPath = normalizeArchitecturePath(entry.path);
-    if (entriesByPath.has(normalizedEntryPath)) {
-      errors.push(`Architecture manifest contains duplicate path ${entry.path}`);
-    }
+    if (entriesByPath.has(normalizedEntryPath)) errors.push(`Architecture manifest contains duplicate path ${entry.path}`);
     entriesByName.set(entry.name, entry);
     entriesByPath.set(normalizedEntryPath, entry);
   }
+  return { entries, entriesByName, entriesByPath };
+}
 
-  const workspacePackages = await discoverWorkspacePackages(repositoryRoot);
-  const checkedPackages = workspacePackages.map((workspacePackage) => workspacePackage.name);
-
+async function checkWorkspacePackages(repositoryRoot, workspacePackages, entriesByPath, entriesByName) {
+  const errors = [];
   for (const workspacePackage of workspacePackages) {
     const relativePath = normalizeArchitecturePath(relative(repositoryRoot, workspacePackage.path));
     const entry = entriesByPath.get(relativePath);
@@ -75,45 +87,26 @@ export async function checkArchitecture(repositoryRoot, manifest) {
       continue;
     }
     if (entry.name !== workspacePackage.name) {
-      errors.push(
-        `Manifest path ${entry.path} names ${entry.name}, but package.json declares ${workspacePackage.name}`,
-      );
+      errors.push(`Manifest path ${entry.path} names ${entry.name}, but package.json declares ${workspacePackage.name}`);
     }
     errors.push(...checkDependencies(workspacePackage, entry));
-    errors.push(
-      ...(await checkSourceImports(
-        repositoryRoot,
-        workspacePackage,
-        entry,
-        entriesByName,
-        workspacePackages,
-      )),
-    );
+    errors.push(...(await checkSourceImports(repositoryRoot, workspacePackage, entry, entriesByName, workspacePackages)));
   }
+  return errors;
+}
 
+function checkManifestEntries(repositoryRoot, entries, entriesByName) {
+  const errors = [];
   for (const entry of entries) {
     const packageJsonPath = join(repositoryRoot, entry.path, "package.json");
-    if (!existsSync(packageJsonPath)) {
-      errors.push(`Manifest package ${entry.name} is missing ${entry.path}/package.json`);
-    }
+    if (!existsSync(packageJsonPath)) errors.push(`Manifest package ${entry.name} is missing ${entry.path}/package.json`);
     for (const dependencyName of entry.dependencies) {
       const dependency = entriesByName.get(dependencyName);
-      if (!dependency) {
-        errors.push(`${entry.name} allows dependency ${dependencyName}, which is not in the manifest`);
-      } else if (dependency.layer >= entry.layer) {
-        errors.push(
-          `${entry.name} depends on ${dependencyName} without moving toward a lower architecture layer`,
-        );
-      }
+      if (!dependency) errors.push(`${entry.name} allows dependency ${dependencyName}, which is not in the manifest`);
+      else if (dependency.layer >= entry.layer) errors.push(`${entry.name} depends on ${dependencyName} without moving toward a lower architecture layer`);
     }
   }
-
-  errors.push(...checkCoverage(manifest.coverage, entriesByName));
-  errors.push(...(await checkSourceProviderCommandIsolation(repositoryRoot)));
-  errors.push(...(await checkPluginPhaseBoundaries(repositoryRoot, workspacePackages)));
-  errors.push(...(await checkNativePipelineContracts(repositoryRoot, workspacePackages)));
-
-  return { errors, checkedPackages };
+  return errors;
 }
 
 async function checkNativePipelineContracts(repositoryRoot, workspacePackages) {
@@ -946,43 +939,44 @@ async function checkSourceImports(
 
   for (const sourceFile of sourceFiles) {
     const source = await readFile(sourceFile, "utf8");
+    const sourcePath = normalizeArchitecturePath(relative(repositoryRoot, sourceFile));
     for (const specifier of findImportSpecifiers(source)) {
-      const sourcePath = normalizeArchitecturePath(relative(repositoryRoot, sourceFile));
-      if (specifier.startsWith(".")) {
-        const targetPackage = findOwningPackage(
-          resolve(dirname(sourceFile), specifier),
-          workspacePackages,
-        );
-        if (targetPackage && targetPackage.name !== workspacePackage.name) {
-          if (!allowedDependencies.has(targetPackage.name)) {
-            errors.push(
-              `${sourcePath} relative import ${specifier} resolves to ${targetPackage.name}, which is not an allowed dependency`,
-            );
-          } else if (!declaredDependencies.has(targetPackage.name)) {
-            errors.push(
-              `${sourcePath} relative import ${specifier} resolves to ${targetPackage.name} without declaring the workspace dependency`,
-            );
-          }
-        }
-        continue;
-      }
-
-      const importName = resolveInternalPackageName(specifier, entriesByName);
-      if (!importName) {
-        continue;
-      }
-      if (!entriesByName.has(importName) || !allowedDependencies.has(importName)) {
-        errors.push(
-          `${sourcePath} imports ${importName}, which is not an allowed dependency`,
-        );
-      } else if (importName !== workspacePackage.name && !declaredDependencies.has(importName)) {
-        errors.push(
-          `${sourcePath} imports ${importName} without declaring the workspace dependency`,
-        );
-      }
+      errors.push(...checkImportSpecifier(
+        sourceFile,
+        sourcePath,
+        specifier,
+        workspacePackage,
+        entriesByName,
+        workspacePackages,
+        allowedDependencies,
+        declaredDependencies,
+      ));
     }
   }
   return errors;
+}
+
+function checkImportSpecifier(sourceFile, sourcePath, specifier, workspacePackage, entriesByName, workspacePackages, allowedDependencies, declaredDependencies) {
+  if (specifier.startsWith(".")) {
+    const targetPackage = findOwningPackage(resolve(dirname(sourceFile), specifier), workspacePackages);
+    if (!targetPackage || targetPackage.name === workspacePackage.name) return [];
+    if (!allowedDependencies.has(targetPackage.name)) {
+      return [`${sourcePath} relative import ${specifier} resolves to ${targetPackage.name}, which is not an allowed dependency`];
+    }
+    if (!declaredDependencies.has(targetPackage.name)) {
+      return [`${sourcePath} relative import ${specifier} resolves to ${targetPackage.name} without declaring the workspace dependency`];
+    }
+    return [];
+  }
+  const importName = resolveInternalPackageName(specifier, entriesByName);
+  if (!importName) return [];
+  if (!entriesByName.has(importName) || !allowedDependencies.has(importName)) {
+    return [`${sourcePath} imports ${importName}, which is not an allowed dependency`];
+  }
+  if (importName !== workspacePackage.name && !declaredDependencies.has(importName)) {
+    return [`${sourcePath} imports ${importName} without declaring the workspace dependency`];
+  }
+  return [];
 }
 
 async function findSourceFiles(directory) {

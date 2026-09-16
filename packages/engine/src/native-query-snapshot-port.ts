@@ -23,7 +23,7 @@
  * first two), and the test matrix comparing this port's answers against
  * `SqliteCanonicalQuerySnapshotPort` for the same seeded fixtures.
  */
-import { isTestArtifactPath, matchesArtifactGlob, matchesWordMode } from "./canonical-query-data-port.js";
+import { isTestArtifactPath, matchesArtifactGlob, matchesWordMode } from "./source-matching.js";
 import type { QueryScope, StructuralFilter } from "@urdira/contracts";
 import type { SqliteDatabase } from "@urdira/storage";
 import type {

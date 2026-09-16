@@ -77,27 +77,67 @@ function encodeProcessByteChunk(chunk: ProcessByteChunk): Uint8Array {
   return writer.finish();
 }
 
-function decodeProcessByteChunkBody(body: Uint8Array): ProcessByteChunk {
+interface DecodedProcessByteChunkFields {
+  readonly protocolVersion?: number;
+  readonly streamId?: string;
+  readonly sequence?: number;
+  readonly offset?: bigint;
+  readonly payload?: Uint8Array;
+  readonly final?: boolean;
+  readonly cancellationId?: string;
+  readonly maxBytes?: bigint;
+  readonly maxInFlight?: number;
+  readonly chunkKind?: ProcessByteChunk["chunk_kind"];
+  readonly maxInFlightBytes?: bigint;
+}
+
+function readChunkUint64(reader: BinaryReader): bigint {
+  const value = reader.uint64();
+  return typeof value === "bigint" ? value : BigInt(value);
+}
+
+function requireChunkWireType(actual: WireType, expected: WireType, field: number): void {
+  if (actual !== expected) throw new DaemonError("core:ipc_chunk_invalid", `Unknown or invalid protobuf chunk field ${field}.`);
+}
+
+function registerChunkField(seen: Set<number>, field: number): void {
+  if (seen.has(field)) throw new DaemonError("core:ipc_chunk_invalid", `Duplicate protobuf chunk field ${field}.`);
+  seen.add(field);
+}
+
+function decodeProcessByteChunkFields(body: Uint8Array): DecodedProcessByteChunkFields {
   const reader = new BinaryReader(body);
-  let protocolVersion: number | undefined; let streamId: string | undefined; let sequence: number | undefined; let offset: bigint | undefined; let payload: Uint8Array | undefined; let final: boolean | undefined; let cancellationId: string | undefined; let maxBytes: bigint | undefined; let maxInFlight: number | undefined; let chunkKind: ProcessByteChunk["chunk_kind"] | undefined; let maxInFlightBytes: bigint | undefined;
+  const fields: { -readonly [K in keyof DecodedProcessByteChunkFields]?: DecodedProcessByteChunkFields[K] } = {};
   const seen = new Set<number>();
   while (reader.pos < reader.len) {
     const [field, wireType] = reader.tag();
-    if (seen.has(field)) throw new DaemonError("core:ipc_chunk_invalid", `Duplicate protobuf chunk field ${field}.`);
-    seen.add(field);
-    if (field === 1 && wireType === WireType.Varint) protocolVersion = reader.uint32();
-    else if (field === 2 && wireType === WireType.LengthDelimited) streamId = reader.string();
-    else if (field === 3 && wireType === WireType.Varint) sequence = reader.uint32();
-    else if (field === 4 && wireType === WireType.Varint) { const value = reader.uint64(); offset = typeof value === "bigint" ? value : BigInt(value); }
-    else if (field === 5 && wireType === WireType.LengthDelimited) payload = new Uint8Array(reader.bytes());
-    else if (field === 6 && wireType === WireType.Varint) final = reader.bool();
-    else if (field === 7 && wireType === WireType.LengthDelimited) cancellationId = reader.string();
-    else if (field === 8 && wireType === WireType.Varint) { const value = reader.uint64(); maxBytes = typeof value === "bigint" ? value : BigInt(value); }
-    else if (field === 9 && wireType === WireType.Varint) maxInFlight = reader.uint32();
-    else if (field === 10 && wireType === WireType.LengthDelimited) { const value = reader.string(); if (value !== "source_bytes" && value !== "fact_delta") throw new DaemonError("core:ipc_chunk_invalid", "Chunk kind is not registered."); chunkKind = value; }
-    else if (field === 11 && wireType === WireType.Varint) { const value = reader.uint64(); maxInFlightBytes = typeof value === "bigint" ? value : BigInt(value); }
-    else throw new DaemonError("core:ipc_chunk_invalid", `Unknown or invalid protobuf chunk field ${field}.`);
+    registerChunkField(seen, field);
+    switch (field) {
+      case 1: requireChunkWireType(wireType, WireType.Varint, field); fields.protocolVersion = reader.uint32(); break;
+      case 2: requireChunkWireType(wireType, WireType.LengthDelimited, field); fields.streamId = reader.string(); break;
+      case 3: requireChunkWireType(wireType, WireType.Varint, field); fields.sequence = reader.uint32(); break;
+      case 4: requireChunkWireType(wireType, WireType.Varint, field); fields.offset = readChunkUint64(reader); break;
+      case 5: requireChunkWireType(wireType, WireType.LengthDelimited, field); fields.payload = new Uint8Array(reader.bytes()); break;
+      case 6: requireChunkWireType(wireType, WireType.Varint, field); fields.final = reader.bool(); break;
+      case 7: requireChunkWireType(wireType, WireType.LengthDelimited, field); fields.cancellationId = reader.string(); break;
+      case 8: requireChunkWireType(wireType, WireType.Varint, field); fields.maxBytes = readChunkUint64(reader); break;
+      case 9: requireChunkWireType(wireType, WireType.Varint, field); fields.maxInFlight = reader.uint32(); break;
+      case 10: {
+        requireChunkWireType(wireType, WireType.LengthDelimited, field);
+        const value = reader.string();
+        if (value !== "source_bytes" && value !== "fact_delta") throw new DaemonError("core:ipc_chunk_invalid", "Chunk kind is not registered.");
+        fields.chunkKind = value;
+        break;
+      }
+      case 11: requireChunkWireType(wireType, WireType.Varint, field); fields.maxInFlightBytes = readChunkUint64(reader); break;
+      default: throw new DaemonError("core:ipc_chunk_invalid", `Unknown or invalid protobuf chunk field ${field}.`);
+    }
   }
+  return fields;
+}
+
+function decodeProcessByteChunkBody(body: Uint8Array): ProcessByteChunk {
+  const { protocolVersion, streamId, sequence, offset, payload, final, cancellationId, maxBytes, maxInFlight, maxInFlightBytes, chunkKind } = decodeProcessByteChunkFields(body);
   if (protocolVersion === undefined || streamId === undefined || sequence === undefined || offset === undefined || payload === undefined || final === undefined || cancellationId === undefined || maxBytes === undefined || maxInFlight === undefined || maxInFlightBytes === undefined || chunkKind === undefined) throw new DaemonError("core:ipc_chunk_invalid", "Protobuf chunk is missing a required field.");
   const result = { protocol_version: protocolVersion, stream_id: streamId, sequence, offset, payload, final, cancellation_id: cancellationId, max_bytes: maxBytes, max_in_flight: maxInFlight, max_in_flight_bytes: maxInFlightBytes, chunk_kind: chunkKind } as ProcessByteChunk;
   validateProcessByteChunk(result);
@@ -154,42 +194,78 @@ function encodeValue(value: unknown): Uint8Array {
   return writer.finish();
 }
 
-function decodeValue(body: Uint8Array): unknown {
+type DecodedValueKind = "null" | "boolean" | "number" | "string" | "bytes" | "array" | "object";
+interface DecodedValueState { kind?: DecodedValueKind; scalar?: unknown; readonly array: unknown[]; readonly object: Record<string, unknown>; }
+
+function setDecodedScalarKind(state: DecodedValueState, kind: Exclude<DecodedValueKind, "array" | "object">): void {
+  if (state.kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds.");
+  state.kind = kind;
+}
+
+function setDecodedCollectionKind(state: DecodedValueState, kind: "array" | "object"): void {
+  if (state.kind !== undefined && state.kind !== kind) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds.");
+  state.kind = kind;
+}
+
+function requireValueWireType(actual: WireType, expected: WireType, field: number): void {
+  if (actual !== expected) throw new DaemonError("core:ipc_frame_invalid", `Unknown closed protobuf value field ${field}.`);
+}
+
+function decodeObjectEntry(body: Uint8Array): { readonly key: string; readonly value: unknown } {
   const reader = new BinaryReader(body);
-  let kind: "null" | "boolean" | "number" | "string" | "bytes" | "array" | "object" | undefined;
-  let scalar: unknown;
-  const array: unknown[] = [];
-  const object: Record<string, unknown> = {};
+  let key: string | undefined;
+  let value: unknown;
   while (reader.pos < reader.len) {
     const [field, wireType] = reader.tag();
-    if (field === 1 && wireType === WireType.Varint) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "null"; reader.bool(); }
-    else if (field === 2 && wireType === WireType.Varint) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "boolean"; scalar = reader.bool(); }
-    else if (field === 3 && wireType === WireType.Bit64) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "number"; scalar = reader.double(); }
-    else if (field === 4 && wireType === WireType.LengthDelimited) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "string"; scalar = reader.string(); }
-    else if (field === 5 && wireType === WireType.LengthDelimited) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "bytes"; scalar = reader.bytes(); }
-    else if (field === 6 && wireType === WireType.LengthDelimited) { if (kind !== undefined && kind !== "array") throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "array"; array.push(decodeValue(reader.bytes())); }
-    else if (field === 7 && wireType === WireType.LengthDelimited) {
-      if (kind !== undefined && kind !== "object") throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds.");
-      kind = "object";
-      const entryReader = new BinaryReader(reader.bytes());
-      let key: string | undefined;
-      let entryValue: unknown;
-      while (entryReader.pos < entryReader.len) {
-        const [entryField, entryWireType] = entryReader.tag();
-        if (entryField === 1 && entryWireType === WireType.LengthDelimited && key === undefined) key = entryReader.string();
-        else if (entryField === 2 && entryWireType === WireType.LengthDelimited && entryValue === undefined) entryValue = decodeValue(entryReader.bytes());
-        else throw new DaemonError("core:ipc_frame_invalid", "IPC object entry is invalid or contains an unknown field.");
-      }
-      if (key === undefined || entryValue === undefined || Object.hasOwn(object, key)) throw new DaemonError("core:ipc_frame_invalid", "IPC object entry is incomplete or duplicated.");
-      object[key] = entryValue;
-    } else if (field === 8 && wireType === WireType.Varint) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "array"; reader.bool(); }
-    else if (field === 9 && wireType === WireType.Varint) { if (kind !== undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC value has multiple protobuf kinds."); kind = "object"; reader.bool(); }
-    else throw new DaemonError("core:ipc_frame_invalid", `Unknown closed protobuf value field ${field}.`);
+    if (field === 1 && wireType === WireType.LengthDelimited && key === undefined) key = reader.string();
+    else if (field === 2 && wireType === WireType.LengthDelimited && value === undefined) value = decodeValue(reader.bytes());
+    else throw new DaemonError("core:ipc_frame_invalid", "IPC object entry is invalid or contains an unknown field.");
   }
-  if (kind === "null") return null;
-  if (kind === "boolean" || kind === "number" || kind === "string" || kind === "bytes") return scalar;
-  if (kind === "array") return array;
-  if (kind === "object") return object;
+  if (key === undefined || value === undefined) throw new DaemonError("core:ipc_frame_invalid", "IPC object entry is incomplete or duplicated.");
+  return { key, value };
+}
+
+function decodeScalarValueField(reader: BinaryReader, field: number, wireType: WireType, state: DecodedValueState): boolean {
+  switch (field) {
+    case 1: requireValueWireType(wireType, WireType.Varint, field); setDecodedScalarKind(state, "null"); reader.bool(); return true;
+    case 2: requireValueWireType(wireType, WireType.Varint, field); setDecodedScalarKind(state, "boolean"); state.scalar = reader.bool(); return true;
+    case 3: requireValueWireType(wireType, WireType.Bit64, field); setDecodedScalarKind(state, "number"); state.scalar = reader.double(); return true;
+    case 4: requireValueWireType(wireType, WireType.LengthDelimited, field); setDecodedScalarKind(state, "string"); state.scalar = reader.string(); return true;
+    case 5: requireValueWireType(wireType, WireType.LengthDelimited, field); setDecodedScalarKind(state, "bytes"); state.scalar = reader.bytes(); return true;
+    case 8: requireValueWireType(wireType, WireType.Varint, field); setDecodedCollectionKind(state, "array"); reader.bool(); return true;
+    case 9: requireValueWireType(wireType, WireType.Varint, field); setDecodedCollectionKind(state, "object"); reader.bool(); return true;
+    default: return false;
+  }
+}
+
+function decodeCollectionValueField(reader: BinaryReader, field: number, wireType: WireType, state: DecodedValueState): boolean {
+  if (field === 6) {
+    requireValueWireType(wireType, WireType.LengthDelimited, field);
+    setDecodedCollectionKind(state, "array");
+    state.array.push(decodeValue(reader.bytes()));
+    return true;
+  }
+  if (field !== 7) return false;
+  requireValueWireType(wireType, WireType.LengthDelimited, field);
+  setDecodedCollectionKind(state, "object");
+  const entry = decodeObjectEntry(reader.bytes());
+  if (Object.hasOwn(state.object, entry.key)) throw new DaemonError("core:ipc_frame_invalid", "IPC object entry is incomplete or duplicated.");
+  state.object[entry.key] = entry.value;
+  return true;
+}
+
+function decodeValue(body: Uint8Array): unknown {
+  const reader = new BinaryReader(body);
+  const state: DecodedValueState = { array: [], object: {} };
+  while (reader.pos < reader.len) {
+    const [field, wireType] = reader.tag();
+    if (decodeScalarValueField(reader, field, wireType, state) || decodeCollectionValueField(reader, field, wireType, state)) continue;
+    throw new DaemonError("core:ipc_frame_invalid", `Unknown closed protobuf value field ${field}.`);
+  }
+  if (state.kind === "null") return null;
+  if (state.kind === "boolean" || state.kind === "number" || state.kind === "string" || state.kind === "bytes") return state.scalar;
+  if (state.kind === "array") return state.array;
+  if (state.kind === "object") return state.object;
   throw new DaemonError("core:ipc_frame_invalid", "IPC value is empty.");
 }
 
@@ -220,40 +296,68 @@ function encodeProtoFrame(frame: IpcFrame): Uint8Array {
   return writer.finish();
 }
 
-function decodeProtoFrame(body: Uint8Array): IpcFrame {
+interface DecodedProtoFrameFields {
+  readonly protocolVersion?: number;
+  readonly requestId?: string;
+  readonly kind?: string;
+  readonly call?: string;
+  readonly deadline?: string;
+  readonly cancellation?: string;
+  readonly payload?: unknown;
+  readonly outcome?: IpcResponse["outcome"];
+  readonly error?: IpcResponse["error"];
+  readonly progress?: IpcProgress["progress"];
+}
+
+function decodeProtoFrameFields(body: Uint8Array): DecodedProtoFrameFields {
   const reader = new BinaryReader(body);
-  let protocolVersion: number | undefined;
-  let requestId: string | undefined;
-  let kind: string | undefined;
-  let call: string | undefined;
-  let deadline: string | undefined;
-  let cancellation: string | undefined;
-  let payload: unknown;
-  let outcome: IpcResponse["outcome"] | undefined;
-  let error: IpcResponse["error"] | undefined;
-  let progress: IpcProgress["progress"] | undefined;
+  const fields: { -readonly [K in keyof DecodedProtoFrameFields]?: DecodedProtoFrameFields[K] } = {};
   while (reader.pos < reader.len) {
     const [field, wireType] = reader.tag();
     if (wireType !== WireType.Varint && wireType !== WireType.LengthDelimited) throw new DaemonError("core:ipc_frame_invalid", "Protobuf frame uses an unsupported wire type.");
     switch (field) {
-      case 1: protocolVersion = reader.uint32(); break;
-      case 2: requestId = reader.string(); break;
-      case 3: kind = reader.string(); break;
-      case 4: call = reader.string(); break;
-      case 5: deadline = reader.string(); break;
-      case 6: cancellation = reader.string(); break;
-      case 7: payload = decodeValue(reader.bytes()); break;
-      case 8: outcome = reader.string() as IpcResponse["outcome"]; break;
-      case 9: error = decodeValue(reader.bytes()) as IpcResponse["error"]; break;
-      case 10: progress = decodeValue(reader.bytes()) as IpcProgress["progress"]; break;
+      case 1: fields.protocolVersion = reader.uint32(); break;
+      case 2: fields.requestId = reader.string(); break;
+      case 3: fields.kind = reader.string(); break;
+      case 4: fields.call = reader.string(); break;
+      case 5: fields.deadline = reader.string(); break;
+      case 6: fields.cancellation = reader.string(); break;
+      case 7: fields.payload = decodeValue(reader.bytes()); break;
+      case 8: fields.outcome = reader.string() as IpcResponse["outcome"]; break;
+      case 9: fields.error = decodeValue(reader.bytes()) as IpcResponse["error"]; break;
+      case 10: fields.progress = decodeValue(reader.bytes()) as IpcProgress["progress"]; break;
       default: throw new DaemonError("core:ipc_frame_invalid", `Unknown closed protobuf frame field ${field}.`);
     }
   }
+  return fields;
+}
+
+function decodedRequest(fields: DecodedProtoFrameFields, protocolVersion: number, requestId: string): IpcRequest | undefined {
+  if (fields.call === undefined || fields.deadline === undefined || fields.cancellation === undefined || fields.payload === undefined) return undefined;
+  return validateFrame({ protocol_version: protocolVersion, request_id: requestId, call: fields.call, deadline_at: fields.deadline, cancellation_id: fields.cancellation, payload: fields.payload }) as IpcRequest;
+}
+
+function decodedResponse(fields: DecodedProtoFrameFields, protocolVersion: number, requestId: string): IpcResponse | undefined {
+  if (fields.outcome === undefined) return undefined;
+  return validateFrame({ protocol_version: protocolVersion, request_id: requestId, outcome: fields.outcome, ...(fields.payload === undefined ? {} : { payload: fields.payload }), ...(fields.error === undefined ? {} : { error: fields.error }) }) as IpcResponse;
+}
+
+function decodedProgress(fields: DecodedProtoFrameFields, protocolVersion: number, requestId: string): IpcProgress | undefined {
+  if (fields.progress === undefined) return undefined;
+  return validateFrame({ protocol_version: protocolVersion, request_id: requestId, event: "progress", progress: fields.progress }) as IpcProgress;
+}
+
+function validateDecodedProtoFrame(fields: DecodedProtoFrameFields): IpcFrame {
+  const { protocolVersion, requestId, kind } = fields;
   if (protocolVersion !== IPC_PROTOCOL_VERSION || requestId === undefined || requestId.length === 0 || kind === undefined) throw new DaemonError("core:ipc_frame_invalid", "Protobuf frame is missing required control fields.");
-  if (kind === "request" && call !== undefined && deadline !== undefined && cancellation !== undefined && payload !== undefined) return validateFrame({ protocol_version: protocolVersion, request_id: requestId, call, deadline_at: deadline, cancellation_id: cancellation, payload });
-  if (kind === "response" && outcome !== undefined) return validateFrame({ protocol_version: protocolVersion, request_id: requestId, outcome, ...(payload === undefined ? {} : { payload }), ...(error === undefined ? {} : { error }) });
-  if (kind === "progress" && progress !== undefined) return validateFrame({ protocol_version: protocolVersion, request_id: requestId, event: "progress", progress });
+  if (kind === "request") { const request = decodedRequest(fields, protocolVersion, requestId); if (request !== undefined) return request; }
+  if (kind === "response") { const response = decodedResponse(fields, protocolVersion, requestId); if (response !== undefined) return response; }
+  if (kind === "progress") { const progress = decodedProgress(fields, protocolVersion, requestId); if (progress !== undefined) return progress; }
   throw new DaemonError("core:ipc_frame_invalid", "Protobuf frame does not match its closed message kind.");
+}
+
+function decodeProtoFrame(body: Uint8Array): IpcFrame {
+  return validateDecodedProtoFrame(decodeProtoFrameFields(body));
 }
 
 function record(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -277,6 +381,17 @@ function foreignWireError(error: unknown): { readonly code: string; readonly mes
   return { code, message: error.message, details: record(details) ? details : {} };
 }
 
+function validateRequestDeadline(request: IpcRequest, deadline: number, startedAt: number): void {
+  if (!Number.isFinite(deadline)) throw new DaemonError("core:ipc_request_invalid", "IPC request deadline is not a valid timestamp.");
+  if (deadline <= Date.now()) throw new DaemonError("core:ipc_timeout", "IPC request deadline has expired.", { deadline_at: request.deadline_at, elapsed_ms: Math.max(0, Date.now() - startedAt), phase: "daemon_admission" });
+}
+
+function requestWireError(error: unknown, timedOut: boolean, request: IpcRequest, startedAt: number): { readonly code: string; readonly message: string; readonly details: Readonly<Record<string, unknown>> } {
+  if (timedOut) return { code: "core:ipc_timeout", message: "IPC request exceeded its deadline.", details: { deadline_at: request.deadline_at, elapsed_ms: Math.max(0, Date.now() - startedAt), phase: "daemon_execution" } };
+  if (error instanceof DaemonError) return { code: error.code, message: error.message, details: error.details };
+  return foreignWireError(error) ?? { code: "core:execution_failed", message: error instanceof Error ? error.message : "IPC request failed.", details: {} };
+}
+
 function scheduleAt(deadline: number, callback: () => void): () => void {
   let timer: NodeJS.Timeout | undefined;
   let cancelled = false;
@@ -290,13 +405,19 @@ function scheduleAt(deadline: number, callback: () => void): () => void {
   return () => { cancelled = true; if (timer !== undefined) clearTimeout(timer); };
 }
 
-function validateFrame(value: unknown): IpcFrame {
+function validateFrameControl(value: unknown): asserts value is Record<string, unknown> {
   if (!record(value) || value["protocol_version"] !== IPC_PROTOCOL_VERSION || typeof value["request_id"] !== "string" || value["request_id"].length === 0) throw new DaemonError("core:ipc_frame_invalid", "IPC frame has invalid protocol or correlation claims.");
-  if (value["event"] === "progress") {
-    const progress = value["progress"];
-    if (!record(progress) || typeof progress["phase"] !== "string" || typeof progress["completed"] !== "number") throw new DaemonError("core:ipc_frame_invalid", "IPC progress frame is incomplete.");
-    return value as unknown as IpcProgress;
-  }
+}
+
+function validateProgressFrame(value: Record<string, unknown>): IpcProgress {
+  const progress = value["progress"];
+  if (!record(progress) || typeof progress["phase"] !== "string" || typeof progress["completed"] !== "number") throw new DaemonError("core:ipc_frame_invalid", "IPC progress frame is incomplete.");
+  return value as unknown as IpcProgress;
+}
+
+function validateFrame(value: unknown): IpcFrame {
+  validateFrameControl(value);
+  if (value["event"] === "progress") return validateProgressFrame(value);
   if (typeof value["call"] === "string" && typeof value["deadline_at"] === "string" && typeof value["cancellation_id"] === "string" && "payload" in value) return value as unknown as IpcRequest;
   if (value["outcome"] === "success" || value["outcome"] === "error" || value["outcome"] === "cancelled") return value as unknown as IpcResponse;
   throw new DaemonError("core:ipc_frame_invalid", "IPC frame kind is not registered.");
@@ -370,33 +491,46 @@ export class LocalIpcServer {
       catch (error) { socket.destroy(error instanceof Error ? error : undefined); }
     });
   }
-  private async handleFrame(socket: Socket, frame: IpcFrame, seenRequestIds: Set<string>): Promise<void> {
-    if (!("call" in frame)) return;
-    const request = frame;
-    if (seenRequestIds.has(request.request_id)) { this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, outcome: "error", error: { code: "core:ipc_request_invalid", message: "IPC request id was already used on this connection." } }); return; }
-    seenRequestIds.add(request.request_id);
+
+  private rejectDuplicateRequest(socket: Socket, request: IpcRequest, seenRequestIds: Set<string>): boolean {
+    if (!seenRequestIds.has(request.request_id)) { seenRequestIds.add(request.request_id); return false; }
+    this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, outcome: "error", error: { code: "core:ipc_request_invalid", message: "IPC request id was already used on this connection." } });
+    return true;
+  }
+
+  private handleCancellation(socket: Socket, request: IpcRequest): boolean {
     const cancelId = request.call === "core:cancel" && record(request.payload) && typeof request.payload["cancellation_id"] === "string" ? request.payload["cancellation_id"] : undefined;
-    if (cancelId) { this.controllers.get(cancelId)?.abort(); this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, outcome: "success", payload: { cancelled: true } }, request.call); return; }
+    if (cancelId === undefined) return false;
+    this.controllers.get(cancelId)?.abort();
+    this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, outcome: "success", payload: { cancelled: true } }, request.call);
+    return true;
+  }
+
+  private async executeRequest(socket: Socket, request: IpcRequest): Promise<void> {
     const controller = new AbortController();
     const startedAt = Date.now();
     this.controllers.set(request.cancellation_id, controller);
     const reportProgress = (progress: IpcProgress["progress"]): void => this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, event: "progress", progress }, request.call);
-    const deadline = Date.parse(request.deadline_at); let timedOut = false;
+    const deadline = Date.parse(request.deadline_at);
+    let timedOut = false;
     const cancelTimeout = Number.isFinite(deadline) && deadline > Date.now() ? scheduleAt(deadline, () => { timedOut = true; controller.abort(); }) : undefined;
     try {
-      if (!Number.isFinite(deadline)) throw new DaemonError("core:ipc_request_invalid", "IPC request deadline is not a valid timestamp.");
-      if (deadline <= Date.now()) throw new DaemonError("core:ipc_timeout", "IPC request deadline has expired.", { deadline_at: request.deadline_at, elapsed_ms: Math.max(0, Date.now() - startedAt), phase: "daemon_admission" });
+      validateRequestDeadline(request, deadline, startedAt);
       const payload = await this.options.handler(request, { signal: controller.signal, deadline_at: request.deadline_at, reportProgress });
       if (timedOut) throw new DaemonError("core:ipc_timeout", "IPC request exceeded its deadline.");
       this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, outcome: controller.signal.aborted ? "cancelled" : "success", ...(controller.signal.aborted ? {} : { payload }) }, request.call);
     } catch (error) {
-      const wireError = timedOut
-        ? { code: "core:ipc_timeout", message: "IPC request exceeded its deadline.", details: { deadline_at: request.deadline_at, elapsed_ms: Math.max(0, Date.now() - startedAt), phase: "daemon_execution" } }
-        : error instanceof DaemonError
-        ? { code: error.code, message: error.message, details: error.details }
-        : foreignWireError(error) ?? { code: "core:execution_failed", message: error instanceof Error ? error.message : "IPC request failed.", details: {} };
+      const wireError = requestWireError(error, timedOut, request, startedAt);
       this.write(socket, { protocol_version: IPC_PROTOCOL_VERSION, request_id: request.request_id, outcome: timedOut ? "error" : controller.signal.aborted ? "cancelled" : "error", error: wireError }, request.call);
     } finally { cancelTimeout?.(); this.controllers.delete(request.cancellation_id); }
+  }
+
+  private async handleFrame(socket: Socket, frame: IpcFrame, seenRequestIds: Set<string>): Promise<void> {
+    if (!("call" in frame)) return;
+    const request = frame;
+    if (this.rejectDuplicateRequest(socket, request, seenRequestIds)) return;
+    if (this.handleCancellation(socket, request)) return;
+    await this.executeRequest(socket, request);
   }
   /**
    * `encodeIpcFrame` throws `core:ipc_frame_too_large` (a registered

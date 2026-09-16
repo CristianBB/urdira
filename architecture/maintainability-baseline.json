@@ -1,0 +1,693 @@
+{
+  "version": 1,
+  "rules": {
+    "complexity": 313,
+    "max-depth": 72,
+    "max-lines-per-function": 213
+  },
+  "exclusions": [
+    "generated artifacts and fixture trees are excluded; see scripts/check-maintainability.mjs"
+  ],
+  "files": {
+    "apps/bootstrap/src/runtime-bootstrap.ts": {
+      "complexity": 2
+    },
+    "apps/urdira/src/index.ts": {
+      "complexity": 12,
+      "max-lines-per-function": 3
+    },
+    "packages/canonical/src/digest-payload-schemas.ts": {
+      "complexity": 2
+    },
+    "packages/canonical/src/digests.ts": {
+      "complexity": 5
+    },
+    "packages/canonical/src/logical-encoding.ts": {
+      "complexity": 1
+    },
+    "packages/canonical/src/typed.ts": {
+      "complexity": 3
+    },
+    "packages/cli/src/agent-integration.ts": {
+      "complexity": 14,
+      "max-lines-per-function": 1,
+      "max-depth": 3
+    },
+    "packages/cli/src/index.ts": {
+      "complexity": 4
+    },
+    "packages/contracts/scripts/generate-model-field-authority.mjs": {
+      "max-depth": 1
+    },
+    "packages/contracts/scripts/generate-registry-descriptions.mjs": {
+      "complexity": 1,
+      "max-depth": 2
+    },
+    "packages/contracts/scripts/generate-registry-payload-authority.mjs": {
+      "max-depth": 1
+    },
+    "packages/contracts/src/fact-delta-batch.ts": {
+      "complexity": 1
+    },
+    "packages/contracts/src/schema-ir.ts": {
+      "complexity": 1,
+      "max-lines-per-function": 1,
+      "max-depth": 3
+    },
+    "packages/daemon/src/runtime.ts": {
+      "complexity": 6,
+      "max-lines-per-function": 4,
+      "max-depth": 7
+    },
+    "packages/daemon/src/semantic-process.ts": {
+      "max-lines-per-function": 1
+    },
+    "packages/engine/src/candidate-execution.ts": {
+      "complexity": 3
+    },
+    "packages/engine/src/candidate-indexer.ts": {
+      "complexity": 2
+    },
+    "packages/engine/src/candidate-materialization.ts": {
+      "max-lines-per-function": 2,
+      "complexity": 5
+    },
+    "packages/engine/src/candidate-planning.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 2
+    },
+    "packages/engine/src/canonical-query-data-port.ts": {
+      "complexity": 7,
+      "max-depth": 5,
+      "max-lines-per-function": 5
+    },
+    "packages/engine/src/cursor-cache.ts": {
+      "complexity": 2
+    },
+    "packages/engine/src/directory-provider.ts": {
+      "complexity": 3
+    },
+    "packages/engine/src/fact-delta.ts": {
+      "complexity": 10,
+      "max-lines-per-function": 1
+    },
+    "packages/engine/src/index-pack-verify-worker.ts": {
+      "max-depth": 5
+    },
+    "packages/engine/src/index-pack.ts": {
+      "max-lines-per-function": 2,
+      "complexity": 5
+    },
+    "packages/engine/src/native-query-snapshot-port.ts": {
+      "complexity": 2
+    },
+    "packages/engine/src/native-store-convert.ts": {
+      "max-lines-per-function": 1
+    },
+    "packages/engine/src/pipeline-executor.ts": {
+      "complexity": 5,
+      "max-depth": 1
+    },
+    "packages/engine/src/query-comparison.ts": {
+      "complexity": 1
+    },
+    "packages/engine/src/query-execution.ts": {
+      "complexity": 2
+    },
+    "packages/engine/src/query-operators.ts": {
+      "complexity": 1
+    },
+    "packages/engine/src/query-plan.ts": {
+      "complexity": 6
+    },
+    "packages/engine/src/recipe-executor.ts": {
+      "complexity": 3
+    },
+    "packages/engine/src/reconciliation.ts": {
+      "complexity": 1
+    },
+    "packages/engine/src/semantic-provider.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "packages/engine/src/semantic-reconciler.ts": {
+      "max-lines-per-function": 2,
+      "complexity": 2
+    },
+    "packages/engine/src/source-candidate-planning.ts": {
+      "complexity": 1
+    },
+    "packages/engine/src/source-indexer.ts": {
+      "complexity": 8,
+      "max-lines-per-function": 1
+    },
+    "packages/engine/src/source-snippet.ts": {
+      "complexity": 1
+    },
+    "packages/engine/src/stage-handle-materialization.ts": {
+      "complexity": 1
+    },
+    "packages/engine/src/v4-verify.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "packages/engine/src/workspace-fork.ts": {
+      "complexity": 3
+    },
+    "packages/engine/src/workspace-indexing-session.ts": {
+      "complexity": 7,
+      "max-lines-per-function": 3
+    },
+    "packages/engine/src/workspaces.ts": {
+      "complexity": 4
+    },
+    "packages/native/src/loader.ts": {
+      "complexity": 2
+    },
+    "packages/plugin-javascript-typescript/src/analyzer.ts": {
+      "max-lines-per-function": 4,
+      "max-depth": 4,
+      "complexity": 13
+    },
+    "packages/plugin-javascript-typescript/src/fact-delta.ts": {
+      "complexity": 1
+    },
+    "packages/plugin-javascript-typescript/src/indexing-core-process-transport.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "packages/plugin-javascript-typescript/src/process-transport.ts": {
+      "max-lines-per-function": 1
+    },
+    "packages/plugin-javascript-typescript/src/registry-contribution.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "packages/plugin-javascript-typescript/src/rust-protocol.ts": {
+      "complexity": 1
+    },
+    "packages/plugin-javascript-typescript/src/rust-semantic-worker.ts": {
+      "complexity": 1
+    },
+    "packages/plugin-javascript-typescript/src/semantic-process-transport.ts": {
+      "complexity": 3,
+      "max-lines-per-function": 1
+    },
+    "packages/plugin-javascript-typescript/src/semantic-process-worker.ts": {
+      "complexity": 2,
+      "max-lines-per-function": 1,
+      "max-depth": 5
+    },
+    "packages/plugin-javascript-typescript/src/syntax-protocol.ts": {
+      "complexity": 1
+    },
+    "packages/plugin-javascript-typescript/src/worker.ts": {
+      "complexity": 9,
+      "max-lines-per-function": 3,
+      "max-depth": 2
+    },
+    "packages/plugin-sdk/src/access-manifest.ts": {
+      "max-lines-per-function": 1
+    },
+    "packages/plugin-sdk/src/analysis-context.ts": {
+      "complexity": 1,
+      "max-lines-per-function": 1
+    },
+    "packages/plugin-sdk/src/invalidation.ts": {
+      "complexity": 1
+    },
+    "packages/plugin-sdk/src/packages.ts": {
+      "complexity": 4,
+      "max-lines-per-function": 1
+    },
+    "packages/plugin-sdk/src/port-boundary.ts": {
+      "complexity": 1
+    },
+    "packages/plugin-sdk/src/protocol.ts": {
+      "complexity": 3
+    },
+    "packages/plugin-sdk/src/registry.ts": {
+      "complexity": 2,
+      "max-lines-per-function": 1,
+      "max-depth": 2
+    },
+    "packages/plugin-sdk/src/resolution.ts": {
+      "complexity": 6
+    },
+    "packages/plugin-sdk/src/semver.ts": {
+      "complexity": 3
+    },
+    "packages/plugin-sdk/src/supervisor.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "packages/security/src/configuration.ts": {
+      "complexity": 1
+    },
+    "packages/security/src/download.ts": {
+      "complexity": 1
+    },
+    "packages/security/src/inclusion.ts": {
+      "complexity": 1
+    },
+    "packages/security/src/logging.ts": {
+      "max-depth": 1
+    },
+    "packages/security/src/model-packs.ts": {
+      "complexity": 6,
+      "max-lines-per-function": 2,
+      "max-depth": 2
+    },
+    "packages/security/src/packages.ts": {
+      "complexity": 3
+    },
+    "packages/security/src/secrets.ts": {
+      "complexity": 1
+    },
+    "packages/storage/src/candidates.ts": {
+      "complexity": 1
+    },
+    "packages/storage/src/cas.ts": {
+      "complexity": 1
+    },
+    "packages/storage/src/lifecycle.ts": {
+      "complexity": 11,
+      "max-lines-per-function": 2,
+      "max-depth": 3
+    },
+    "packages/storage/src/projections.ts": {
+      "complexity": 2
+    },
+    "packages/storage/src/publication-authority.ts": {
+      "max-lines-per-function": 5,
+      "complexity": 9,
+      "max-depth": 2
+    },
+    "packages/storage/src/publication-compaction.ts": {
+      "complexity": 1,
+      "max-depth": 3
+    },
+    "packages/storage/src/repositories.ts": {
+      "complexity": 5
+    },
+    "packages/storage/src/schema.ts": {
+      "complexity": 2
+    },
+    "packages/storage/src/sqlite.ts": {
+      "complexity": 1
+    },
+    "packages/storage/src/storage.ts": {
+      "complexity": 6,
+      "max-depth": 2,
+      "max-lines-per-function": 1
+    },
+    "packages/testkit/src/synthetic-workers.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "packages/web/src/client/graph-data.ts": {
+      "complexity": 1,
+      "max-depth": 2
+    },
+    "packages/web/src/client/main.tsx": {
+      "complexity": 6
+    },
+    "packages/web/src/client/mcp-request-builder.tsx": {
+      "complexity": 1
+    },
+    "packages/web/src/client/mcp-request-schema.ts": {
+      "complexity": 1,
+      "max-depth": 2
+    },
+    "packages/web/src/client/query-choices.ts": {
+      "complexity": 1,
+      "max-depth": 2
+    },
+    "packages/web/src/client/renderers.tsx": {
+      "complexity": 1
+    },
+    "packages/web/src/client/result-presentation.ts": {
+      "complexity": 1
+    },
+    "packages/web/src/client/searchable-select.tsx": {
+      "complexity": 1
+    },
+    "packages/web/src/server/index.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "scripts/check-architecture.mjs": {
+      "complexity": 6,
+      "max-depth": 15,
+      "max-lines-per-function": 2
+    },
+    "scripts/check-coverage-gate.mjs": {
+      "complexity": 1
+    },
+    "scripts/exact-vector-top-k-benchmark.mjs": {
+      "complexity": 5,
+      "max-lines-per-function": 1
+    },
+    "scripts/n8n-incremental-preflight.mjs": {
+      "complexity": 1
+    },
+    "scripts/native-acceleration-controller.mjs": {
+      "complexity": 2
+    },
+    "scripts/native-acceleration-gate.mjs": {
+      "complexity": 8
+    },
+    "scripts/package-npm.mjs": {
+      "complexity": 2
+    },
+    "scripts/package-release.mjs": {
+      "complexity": 2
+    },
+    "scripts/prepare-native-acceleration-trace.mjs": {
+      "complexity": 2
+    },
+    "scripts/release-contract.mjs": {
+      "complexity": 1
+    },
+    "scripts/release-suite.mjs": {
+      "complexity": 2
+    },
+    "scripts/run-native-acceleration-campaign.mjs": {
+      "complexity": 4,
+      "max-lines-per-function": 1
+    },
+    "scripts/semantic-window-histogram.mjs": {
+      "max-lines-per-function": 1,
+      "complexity": 1,
+      "max-depth": 1
+    },
+    "scripts/sqlite-publication-microgate.mjs": {
+      "complexity": 1
+    },
+    "scripts/v4-mutation-harness.mjs": {
+      "complexity": 5,
+      "max-lines-per-function": 1
+    },
+    "scripts/v4-reconcile-threshold.mjs": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "scripts/v4-references-parity-diff.mjs": {
+      "complexity": 1
+    },
+    "scripts/v4-scan.mjs": {
+      "complexity": 1
+    },
+    "scripts/watch-latency-probe.mjs": {
+      "complexity": 2
+    },
+    "tests/agent-integration.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/agent-page-fitting.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/agent-validation-environment.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/analysis-worker-pool.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/app-native-runtime-binding.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/app-runtime.test.ts": {
+      "complexity": 1,
+      "max-lines-per-function": 2
+    },
+    "tests/architecture-guardrails.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/canonical.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/cas-stream.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/codebase-fixtures.test.ts": {
+      "complexity": 1
+    },
+    "tests/contracts.test.ts": {
+      "max-lines-per-function": 2,
+      "complexity": 2
+    },
+    "tests/definitive-agent-campaign.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/documentation-current-state.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/embedding-local.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/exact-vector-top-k-benchmark.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/expanded-agent-report.test.ts": {
+      "max-lines-per-function": 2,
+      "complexity": 1,
+      "max-depth": 2
+    },
+    "tests/expanded-agent-transcript-metrics.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/expanded-benchmark-smoke.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/fact-delta-batch.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/fact-delta-stream.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/index-pack-v4.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/javascript-typescript-direct-stream.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/javascript-typescript-incremental-analysis.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/javascript-typescript-plugin.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/javascript-typescript-production-e2e.test.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "tests/javascript-typescript-rust-process-transport.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/javascript-typescript-rust-protocol.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/javascript-typescript-semantic-process-transport.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/lexical-maintenance.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/mcp-response-deduplication.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/merkle-bucket.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/native-acceleration-campaign.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/native-acceleration-controller.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/native-api.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/native-loader.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/native-query-snapshot-port.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/phase-canonical-query-data-port.test.ts": {
+      "max-lines-per-function": 11
+    },
+    "tests/phase-daemon-admin-integration.test.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "tests/phase-daemon-indexing-integration.test.ts": {
+      "max-lines-per-function": 3,
+      "max-depth": 1
+    },
+    "tests/phase-daemon-orphan-sweep.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase-daemon-recreate-outdated.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/phase-daemon-v4-index-pack.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase-daemon-v4-scan.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase-daemon-v4-semantic.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase-durable-analysis-cache.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase-index-pack.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/phase-worker-analysis-cache.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase-workspace-fork.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/phase-workspace-indexing-session.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/phase10-semantic.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase11-cursor-cache.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase11-query-plan.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase11-recipe-executor.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase12-cli.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase12-daemon-protocol.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase13-mcp.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase15-workspace-control.test.ts": {
+      "max-lines-per-function": 2
+    },
+    "tests/phase17-pipeline-executor.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase24-web.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase5-review-fixes.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase5.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase6-review-fixes.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase6-security.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase7-indexing.test.ts": {
+      "max-lines-per-function": 1,
+      "complexity": 1
+    },
+    "tests/phase7-providers.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/phase7-reconciliation.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/phase7-workspaces.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase8-conformance.test.ts": {
+      "max-lines-per-function": 3,
+      "complexity": 6
+    },
+    "tests/phase8-context.test.ts": {
+      "max-lines-per-function": 5
+    },
+    "tests/phase8-registry.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/phase8-runtime.test.ts": {
+      "complexity": 1,
+      "max-lines-per-function": 3
+    },
+    "tests/phase9-deltas.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase9-execution.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase9-indexing.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase9-materialization.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase9-planning.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/phase9-publication.test.ts": {
+      "max-lines-per-function": 4,
+      "complexity": 1
+    },
+    "tests/plugin-stream-runtime-bindings.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/query-operation-telemetry.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/query-pushdown-catalog.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/runtime-bootstrap.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/rust-acceleration-gate.test.ts": {
+      "max-lines-per-function": 4
+    },
+    "tests/rust-protocol-v4.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/semantic-maintenance.test.ts": {
+      "max-lines-per-function": 5
+    },
+    "tests/semantic-provider.test.ts": {
+      "max-lines-per-function": 3
+    },
+    "tests/storage.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/v4-daemon-e2e.test.ts": {
+      "max-lines-per-function": 2,
+      "complexity": 2
+    },
+    "tests/v4-mutation-harness.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/v4-pending-sites-query.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/v4-scan.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/v4-verify.test.ts": {
+      "max-lines-per-function": 1
+    },
+    "tests/workspace-fork-v4.test.ts": {
+      "max-lines-per-function": 1
+    }
+  }
+}

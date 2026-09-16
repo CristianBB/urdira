@@ -28,7 +28,8 @@ export {
 } from "./protocol.js";
 export { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, type DaemonPaths, type EndpointDescriptor, type LastKnownGood, type ProcessLockOwner } from "./ownership.js";
 export { DaemonScheduler, PersistentCursorRecovery, WORK_POOL_KINDS, type ClientQuota, type JobHandle, type PersistedCursorState, type ProgressEvent, type ReadOnlySourcePort, type RestartLease, type SchedulerJobRequest, type SchedulerOptions, type WorkPoolKind } from "./scheduler.js";
-export { DaemonClient, DaemonRuntime, type DaemonPluginCatalogEntry, type DaemonRuntimeOptions, type DaemonStartupPhase, type DaemonStatus } from "./runtime.js";
+export { DaemonRuntime, type DaemonPluginCatalogEntry, type DaemonRuntimeOptions, type DaemonStartupPhase, type DaemonStatus } from "./runtime.js";
+export { DaemonClient } from "./client.js";
 export { createPersistentWorkspaceRegistry, WorkspaceRegistry, type WorkspaceRegistryState } from "./workspace-registry.js";
 export { runLexicalReconcileInThread, type LexicalThreadJob, type LexicalThreadRun } from "./lexical-thread.js";
 export { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";

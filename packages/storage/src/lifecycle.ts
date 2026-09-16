@@ -391,13 +391,32 @@ export async function projectionSetDigestRowsByKind(database: SqliteDatabase, wo
   return { graph, dependency, metric };
 }
 
-function collectContentHashes(value: unknown, hashes: Set<string>): void {
-  if (isContentHash(value)) { hashes.add(value); return; }
-  if (Array.isArray(value)) { for (const item of value) collectContentHashes(item, hashes); return; }
-  if (value && typeof value === "object") for (const [key, item] of Object.entries(value)) {
-    if (key === "content_hash" || key === "content_digest" || key === "payload_cas_digest" || key === "manifest_digest" || key === "contribution_digest" || key === "root_digest" || key === "storage_reference") collectContentHashes(item, hashes);
-    else if (item && typeof item === "object") collectContentHashes(item, hashes);
+const CONTENT_HASH_FIELDS = new Set([
+  "content_hash",
+  "content_digest",
+  "payload_cas_digest",
+  "manifest_digest",
+  "contribution_digest",
+  "root_digest",
+  "storage_reference",
+]);
+
+function collectContentHashesFromObject(value: Record<string, unknown>, hashes: Set<string>): void {
+  for (const [key, item] of Object.entries(value)) {
+    if (CONTENT_HASH_FIELDS.has(key) || (item !== null && typeof item === "object")) collectContentHashes(item, hashes);
   }
+}
+
+function collectContentHashes(value: unknown, hashes: Set<string>): void {
+  if (isContentHash(value)) {
+    hashes.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectContentHashes(item, hashes);
+    return;
+  }
+  if (value !== null && typeof value === "object") collectContentHashesFromObject(value as Record<string, unknown>, hashes);
 }
 async function statPath(path: string): Promise<void> { await import("node:fs/promises").then(({ stat }) => stat(path)).then(() => undefined); }
 async function pathExists(path: string): Promise<boolean> { try { await statPath(path); return true; } catch { return false; } }

@@ -211,21 +211,59 @@ export function generateJsonSchema(schema: CanonicalSchemaDefinition): JsonSchem
   return generated;
 }
 
-function typeToJsonSchema(type: CanonicalTypeExpression, definitions: Record<string, JsonSchema>): JsonSchema {
+/** Converts scalar schema expressions; collection/composite handling stays in the caller. */
+function scalarTypeSchema(type: CanonicalTypeExpression): JsonSchema | undefined {
   switch (type.type_kind) {
     case "null": return { type: "null" };
     case "boolean": return { type: "boolean" };
     case "safe_integer": return withBounds({ type: "integer" }, type.minimum, type.maximum);
-    case "big_integer": return { type: "string", pattern: BIG_INTEGER_PATTERN.source, ...(type.minimum === undefined ? {} : { "x-urdira-big-integer-minimum": type.minimum }), ...(type.maximum === undefined ? {} : { "x-urdira-big-integer-maximum": type.maximum }) };
+    case "big_integer": return bigIntegerSchema(type);
     case "float64": return withBounds({ type: "number" }, type.minimum, type.maximum);
-    case "exact_decimal": return { type: "string", pattern: EXACT_DECIMAL_PATTERN.source, "x-urdira-exact-decimal-scale-policy": type.scale_policy, ...(type.minimum === undefined ? {} : { "x-urdira-exact-decimal-minimum": type.minimum }), ...(type.maximum === undefined ? {} : { "x-urdira-exact-decimal-maximum": type.maximum }) };
-    case "text": return withBounds({ type: "string", ...(type.identifier_kind === "identifier" ? { pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$" } : {}), ...(type.identifier_kind === "namespaced_identifier" ? { pattern: "^[a-z][a-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9._-]*$" } : {}), ...(type.identifier_kind === "semver" ? { pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" } : {}) }, type.minimum_code_point_count, type.maximum_code_point_count, "length");
-    case "bytes": {
-      return { type: "object", properties: { digest: { type: "string" }, byte_length: { type: "integer", minimum: 0 }, media_type: { type: "string" } }, required: ["digest", "byte_length", "media_type"], additionalProperties: false, ...(type.minimum_byte_length === undefined ? {} : { "x-urdira-minimum-byte-length": type.minimum_byte_length }), ...(type.maximum_byte_length === undefined ? {} : { "x-urdira-maximum-byte-length": type.maximum_byte_length }), ...(type.bound_schema_id_field === undefined ? {} : { "x-urdira-schema-bound-bytes": { schema_id_field: type.bound_schema_id_field, schema_version_field: type.bound_schema_version_field } }) };
-    }
-    case "timestamp": return { type: "string", pattern: TIMESTAMP_PATTERN.source, ...(type.earliest === undefined ? {} : { "x-urdira-timestamp-earliest": type.earliest }), ...(type.latest === undefined ? {} : { "x-urdira-timestamp-latest": type.latest }) };
-    case "digest": return { type: "string", pattern: digestPattern(type.allowed_hash_algorithms).source };
+    case "exact_decimal": return exactDecimalSchema(type);
+    case "text": return textSchema(type);
+    case "bytes": return bytesSchema(type);
+    case "timestamp": return timestampSchema(type);
+    case "digest": return digestSchema(type);
     case "enum": return { type: "string", enum: [...type.values] };
+    default: return undefined;
+  }
+}
+
+function bigIntegerSchema(type: BigIntegerTypeExpression): JsonSchema {
+  return { type: "string", pattern: BIG_INTEGER_PATTERN.source, ...(type.minimum === undefined ? {} : { "x-urdira-big-integer-minimum": type.minimum }), ...(type.maximum === undefined ? {} : { "x-urdira-big-integer-maximum": type.maximum }) };
+}
+
+function exactDecimalSchema(type: ExactDecimalTypeExpression): JsonSchema {
+  return { type: "string", pattern: EXACT_DECIMAL_PATTERN.source, "x-urdira-exact-decimal-scale-policy": type.scale_policy, ...(type.minimum === undefined ? {} : { "x-urdira-exact-decimal-minimum": type.minimum }), ...(type.maximum === undefined ? {} : { "x-urdira-exact-decimal-maximum": type.maximum }) };
+}
+
+function textSchema(type: TextTypeExpression): JsonSchema {
+  const pattern = type.identifier_kind === "identifier"
+    ? "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    : type.identifier_kind === "namespaced_identifier"
+      ? "^[a-z][a-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9._-]*$"
+      : type.identifier_kind === "semver"
+        ? "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+        : undefined;
+  return withBounds({ type: "string", ...(pattern === undefined ? {} : { pattern }) }, type.minimum_code_point_count, type.maximum_code_point_count, "length");
+}
+
+function bytesSchema(type: BytesTypeExpression): JsonSchema {
+  return { type: "object", properties: { digest: { type: "string" }, byte_length: { type: "integer", minimum: 0 }, media_type: { type: "string" } }, required: ["digest", "byte_length", "media_type"], additionalProperties: false, ...(type.minimum_byte_length === undefined ? {} : { "x-urdira-minimum-byte-length": type.minimum_byte_length }), ...(type.maximum_byte_length === undefined ? {} : { "x-urdira-maximum-byte-length": type.maximum_byte_length }), ...(type.bound_schema_id_field === undefined ? {} : { "x-urdira-schema-bound-bytes": { schema_id_field: type.bound_schema_id_field, schema_version_field: type.bound_schema_version_field } }) };
+}
+
+function timestampSchema(type: TimestampTypeExpression): JsonSchema {
+  return { type: "string", pattern: TIMESTAMP_PATTERN.source, ...(type.earliest === undefined ? {} : { "x-urdira-timestamp-earliest": type.earliest }), ...(type.latest === undefined ? {} : { "x-urdira-timestamp-latest": type.latest }) };
+}
+
+function digestSchema(type: DigestTypeExpression): JsonSchema {
+  return { type: "string", pattern: digestPattern(type.allowed_hash_algorithms).source };
+}
+
+function typeToJsonSchema(type: CanonicalTypeExpression, definitions: Record<string, JsonSchema>): JsonSchema {
+  const scalar = scalarTypeSchema(type);
+  if (scalar !== undefined) return scalar;
+  switch (type.type_kind) {
     case "sequence": return collectionSchema(type, definitions);
     case "set": return collectionSchema(type, definitions);
     case "ordered_set": return collectionSchema(type, definitions);
@@ -242,6 +280,7 @@ function typeToJsonSchema(type: CanonicalTypeExpression, definitions: Record<str
       if (type.type_name === "JsonValue" && type.schema_id === "core:JsonValue" && type.schema_version === 1) return jsonValueSchema();
       return { $ref: type.reference_scope === "local" || isAuthoritativeModelReference(type) ? `#/$defs/${type.type_name}` : `${type.schema_id ?? ""}#/$defs/${type.type_name}` };
   }
+  throw new Error(`Unsupported canonical type kind: ${type.type_kind}`);
 }
 
 function jsonValueSchema(): JsonSchema {
@@ -311,8 +350,15 @@ export function validateSchemaDefinition(schema: CanonicalSchemaDefinition, cont
   if (!schema.schema_id || !schema.description) fail("schema", "requires an identifier and description");
   if (!Number.isSafeInteger(schema.definition_revision) || schema.definition_revision < 1) fail("schema.definition_revision", "must be a positive safe integer");
   if (!Number.isSafeInteger(schema.schema_version) || schema.schema_version < 1) fail("schema.schema_version", "must be a positive safe integer");
+  validateNamedTypeDefinitions(schema.type_definitions, context);
+  validateTypeDefinition(schema.root_type, "schema.root_type", context);
+  validateLocalReferences(schema, context);
+  validateSchemaLifecycle(schema);
+}
+
+function validateNamedTypeDefinitions(definitions: ReadonlyArray<CanonicalNamedTypeDefinition>, context: SchemaValidationContext): void {
   const names = new Set<string>();
-  for (const definition of schema.type_definitions) {
+  for (const definition of definitions) {
     assertClosedObject(definition as unknown as Record<string, unknown>, ["type_name", "description", "type_expression"], `schema.type_definitions.${definition.type_name || "<unnamed>"}`);
     if (!definition.description) fail(`schema.type_definitions.${definition.type_name}`, "requires a description");
     if (!/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(definition.type_name)) fail(`schema.type_definitions.${definition.type_name}`, "must be ASCII snake_case");
@@ -320,11 +366,22 @@ export function validateSchemaDefinition(schema: CanonicalSchemaDefinition, cont
     names.add(definition.type_name);
     validateTypeDefinition(definition.type_expression, `schema.type_definitions.${definition.type_name}`, context);
   }
-  validateTypeDefinition(schema.root_type, "schema.root_type", context);
-  validateLocalReferences(schema, context);
+}
+
+function validateSchemaLifecycle(schema: CanonicalSchemaDefinition): void {
   if (schema.lifecycle_state === "active" && (schema.deprecated_since !== undefined || schema.retired_since !== undefined)) fail("schema.lifecycle_state", "active schema cannot have lifecycle markers");
   if (schema.lifecycle_state !== "active" && schema.deprecated_since === undefined) fail("schema.deprecated_since", "is required for deprecated or retired schemas");
   if (schema.lifecycle_state === "retired" && schema.retired_since === undefined) fail("schema.retired_since", "is required for retired schemas");
+}
+
+type ScalarTypeExpression = NullTypeExpression | BooleanTypeExpression | SafeIntegerTypeExpression | BigIntegerTypeExpression | Float64TypeExpression | ExactDecimalTypeExpression | TextTypeExpression | BytesTypeExpression | TimestampTypeExpression | DigestTypeExpression | EnumTypeExpression;
+
+function isScalarTypeExpression(type: CanonicalTypeExpression): type is ScalarTypeExpression {
+  return ["null", "boolean", "safe_integer", "big_integer", "float64", "exact_decimal", "text", "bytes", "timestamp", "digest", "enum"].includes(type.type_kind);
+}
+
+function isCollectionTypeExpression(type: CanonicalTypeExpression): type is SequenceTypeExpression | SetTypeExpression | OrderedSetTypeExpression {
+  return ["sequence", "set", "ordered_set"].includes(type.type_kind);
 }
 
 function validateTypeDefinition(type: CanonicalTypeExpression, path: string, context: SchemaValidationContext = {}): void {
@@ -338,55 +395,98 @@ function validateTypeDefinition(type: CanonicalTypeExpression, path: string, con
     record: ["type_kind", "fields"], union: ["type_kind", "discriminator_field", "discriminator_description", "variants"], schema_reference: ["type_kind", "reference_scope", "type_name", "schema_id", "schema_version"],
   };
   assertClosedObject(type as unknown as Record<string, unknown>, allowedByKind[type.type_kind], path);
-  switch (type.type_kind) {
-    case "safe_integer": checkOptionalNumericBounds(type.minimum, type.maximum, path); return;
-    case "float64": if (type.minimum !== undefined && !Number.isFinite(type.minimum) || type.maximum !== undefined && !Number.isFinite(type.maximum)) fail(path, "bounds must be finite"); checkOptionalValueBounds(type.minimum, type.maximum, path); return;
-    case "big_integer": validateBigIntegerDefinitionBounds(type.minimum, type.maximum, path); return;
-    case "exact_decimal":
-      if (type.scale_policy !== "significant" && type.scale_policy !== "insignificant") fail(path, "scale_policy must be significant or insignificant");
-      validateDecimalDefinitionBounds(type.minimum, type.maximum, path); return;
-    case "text": if (type.identifier_kind !== undefined && !["identifier", "namespaced_identifier", "semver", "uri"].includes(type.identifier_kind)) fail(path, "identifier_kind is not registered"); checkOptionalBounds(type.minimum_code_point_count, type.maximum_code_point_count, path); return;
-    case "bytes":
-      checkOptionalBounds(type.minimum_byte_length, type.maximum_byte_length, path);
-      if ((type.bound_schema_id_field === undefined) !== (type.bound_schema_version_field === undefined)) fail(path, "schema-bound bytes requires both coordinate fields");
-      if (type.bound_schema_id_field !== undefined && !/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(type.bound_schema_id_field)) fail(path, "bound schema id field must be snake_case");
-      if (type.bound_schema_version_field !== undefined && !/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(type.bound_schema_version_field)) fail(path, "bound schema version field must be snake_case");
-      return;
-    case "timestamp": if (type.earliest !== undefined) validateTimestamp(type.earliest, path); if (type.latest !== undefined) validateTimestamp(type.latest, path); if (type.earliest !== undefined && type.latest !== undefined && type.earliest > type.latest) fail(path, "earliest exceeds latest"); return;
-    case "digest": if (new Set(type.allowed_hash_algorithms).size !== type.allowed_hash_algorithms.length || type.allowed_hash_algorithms.length === 0 || type.allowed_hash_algorithms.some((algorithm) => !DIGEST_LENGTHS[algorithm])) fail(path, "requires allowed registered hash algorithms"); return;
-    case "enum": if (new Set(type.values).size !== type.values.length || type.values.length === 0) fail(path, "requires a non-empty unique enum set"); return;
-    case "sequence": case "set": case "ordered_set":
-      checkOptionalBounds(type.minimum_item_count, type.maximum_item_count, path);
-      if (type.type_kind === "ordered_set" && (!type.comparator_id || type.comparator_version < 1)) fail(path, "requires a comparator identifier and positive version");
-      if (type.type_kind === "ordered_set") {
-        const comparator = findComparator(type.comparator_id, type.comparator_version, context);
-        if (!comparator) fail(path, `references unknown comparator ${type.comparator_id}@${type.comparator_version}`);
-        validateComparatorCompatibility(type.element_type, comparator.sort_keys ?? [], path, context);
-      }
-      validateTypeDefinition(type.element_type, `${path}.element_type`, context); return;
-    case "map": checkOptionalBounds(type.minimum_entry_count, type.maximum_entry_count, path); validateTypeDefinition(type.value_type, `${path}.value_type`, context); return;
-    case "record": validateFields(type.fields, path, context); return;
-    case "union":
-      if (!type.discriminator_field || !type.discriminator_description || type.variants.length === 0) fail(path, "requires a discriminator, description, and variants");
-      if (new Set(type.variants.map((variant) => variant.discriminator_value)).size !== type.variants.length) fail(path, "has duplicate discriminator values");
-      for (const variant of type.variants) {
-        assertClosedObject(variant as unknown as Record<string, unknown>, ["discriminator_value", "description", "fields"], `${path}.variants.${variant.discriminator_value || "<unnamed>"}`);
-        if (!variant.description) fail(`${path}.variants.${variant.discriminator_value}`, "requires a description");
-        if (variant.fields.some((field) => field.field_name === type.discriminator_field)) fail(`${path}.${type.discriminator_field}`, "variant cannot redeclare discriminator field");
-        validateFields(variant.fields, `${path}.${type.discriminator_field}`, context);
-      }
-      return;
-    case "schema_reference":
-      if (type.reference_scope !== "local" && type.reference_scope !== "external") fail(path, "reference_scope must be local or external");
-      if (!/^[A-Za-z][A-Za-z0-9_:-]*$/.test(type.type_name)) fail(path, "requires a valid type name");
-      if (type.reference_scope === "local" && (type.schema_id !== undefined || type.schema_version !== undefined)) fail(path, "local reference cannot specify external coordinates");
-      if (type.reference_scope === "external" && (type.schema_id === undefined || !type.schema_id || type.schema_version === undefined || !Number.isSafeInteger(type.schema_version) || type.schema_version < 1)) fail(path, "external reference requires valid schema coordinates");
-      return;
-    case "null": case "boolean": return;
+  if (isScalarTypeExpression(type)) {
+    validateScalarTypeDefinition(type, path);
+    return;
+  }
+  if (isCollectionTypeExpression(type)) {
+    validateCollectionTypeDefinition(type, path, context);
+    return;
+  }
+  if (type.type_kind === "map") { checkOptionalBounds(type.minimum_entry_count, type.maximum_entry_count, path); validateTypeDefinition(type.value_type, `${path}.value_type`, context); return; }
+  if (type.type_kind === "record") { validateFields(type.fields, path, context); return; }
+  if (type.type_kind === "union") { validateUnionTypeDefinition(type, path, context); return; }
+  if (type.type_kind === "schema_reference") { validateSchemaReferenceTypeDefinition(type, path); return; }
+}
+
+function validateScalarTypeDefinition(type: ScalarTypeExpression, path: string): void {
+  if (["safe_integer", "float64", "big_integer", "exact_decimal"].includes(type.type_kind)) return validateNumericTypeDefinition(type as SafeIntegerTypeExpression | Float64TypeExpression | BigIntegerTypeExpression | ExactDecimalTypeExpression, path);
+  if (type.type_kind === "text") return validateTextTypeDefinition(type, path);
+  if (type.type_kind === "bytes") return validateBytesTypeDefinition(type, path);
+  if (type.type_kind === "timestamp") return validateTimestampTypeDefinition(type, path);
+  if (type.type_kind === "digest") return validateDigestTypeDefinition(type, path);
+  if (type.type_kind === "enum") return validateEnumTypeDefinition(type, path);
+}
+
+function validateNumericTypeDefinition(type: SafeIntegerTypeExpression | Float64TypeExpression | BigIntegerTypeExpression | ExactDecimalTypeExpression, path: string): void {
+  if (type.type_kind === "safe_integer") { checkOptionalNumericBounds(type.minimum, type.maximum, path); return; }
+  if (type.type_kind === "float64") { if (type.minimum !== undefined && !Number.isFinite(type.minimum) || type.maximum !== undefined && !Number.isFinite(type.maximum)) fail(path, "bounds must be finite"); checkOptionalValueBounds(type.minimum, type.maximum, path); return; }
+  if (type.type_kind === "big_integer") { validateBigIntegerDefinitionBounds(type.minimum, type.maximum, path); return; }
+  if (type.scale_policy !== "significant" && type.scale_policy !== "insignificant") fail(path, "scale_policy must be significant or insignificant");
+  validateDecimalDefinitionBounds(type.minimum, type.maximum, path);
+}
+
+function validateTextTypeDefinition(type: TextTypeExpression, path: string): void {
+  if (type.identifier_kind !== undefined && !["identifier", "namespaced_identifier", "semver", "uri"].includes(type.identifier_kind)) fail(path, "identifier_kind is not registered");
+  checkOptionalBounds(type.minimum_code_point_count, type.maximum_code_point_count, path);
+}
+
+function validateBytesTypeDefinition(type: BytesTypeExpression, path: string): void {
+  checkOptionalBounds(type.minimum_byte_length, type.maximum_byte_length, path);
+  if ((type.bound_schema_id_field === undefined) !== (type.bound_schema_version_field === undefined)) fail(path, "schema-bound bytes requires both coordinate fields");
+  if (type.bound_schema_id_field !== undefined && !/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(type.bound_schema_id_field)) fail(path, "bound schema id field must be snake_case");
+  if (type.bound_schema_version_field !== undefined && !/^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(type.bound_schema_version_field)) fail(path, "bound schema version field must be snake_case");
+}
+
+function validateTimestampTypeDefinition(type: TimestampTypeExpression, path: string): void {
+  if (type.earliest !== undefined) validateTimestamp(type.earliest, path);
+  if (type.latest !== undefined) validateTimestamp(type.latest, path);
+  if (type.earliest !== undefined && type.latest !== undefined && type.earliest > type.latest) fail(path, "earliest exceeds latest");
+}
+
+function validateDigestTypeDefinition(type: DigestTypeExpression, path: string): void {
+  if (new Set(type.allowed_hash_algorithms).size !== type.allowed_hash_algorithms.length || type.allowed_hash_algorithms.length === 0 || type.allowed_hash_algorithms.some((algorithm) => !DIGEST_LENGTHS[algorithm])) fail(path, "requires allowed registered hash algorithms");
+}
+
+function validateEnumTypeDefinition(type: EnumTypeExpression, path: string): void {
+  if (new Set(type.values).size !== type.values.length || type.values.length === 0) fail(path, "requires a non-empty unique enum set");
+}
+
+function validateCollectionTypeDefinition(type: SequenceTypeExpression | SetTypeExpression | OrderedSetTypeExpression, path: string, context: SchemaValidationContext): void {
+  checkOptionalBounds(type.minimum_item_count, type.maximum_item_count, path);
+  if (type.type_kind === "ordered_set" && (!type.comparator_id || type.comparator_version < 1)) fail(path, "requires a comparator identifier and positive version");
+  if (type.type_kind === "ordered_set") {
+    const comparator = findComparator(type.comparator_id, type.comparator_version, context);
+    if (!comparator) fail(path, `references unknown comparator ${type.comparator_id}@${type.comparator_version}`);
+    validateComparatorCompatibility(type.element_type, comparator.sort_keys ?? [], path, context);
+  }
+  validateTypeDefinition(type.element_type, `${path}.element_type`, context);
+}
+
+function validateUnionTypeDefinition(type: UnionTypeExpression, path: string, context: SchemaValidationContext): void {
+  if (!type.discriminator_field || !type.discriminator_description || type.variants.length === 0) fail(path, "requires a discriminator, description, and variants");
+  if (new Set(type.variants.map((variant) => variant.discriminator_value)).size !== type.variants.length) fail(path, "has duplicate discriminator values");
+  for (const variant of type.variants) {
+    assertClosedObject(variant as unknown as Record<string, unknown>, ["discriminator_value", "description", "fields"], `${path}.variants.${variant.discriminator_value || "<unnamed>"}`);
+    if (!variant.description) fail(`${path}.variants.${variant.discriminator_value}`, "requires a description");
+    if (variant.fields.some((field) => field.field_name === type.discriminator_field)) fail(`${path}.${type.discriminator_field}`, "variant cannot redeclare discriminator field");
+    validateFields(variant.fields, `${path}.${type.discriminator_field}`, context);
   }
 }
 
+function validateSchemaReferenceTypeDefinition(type: SchemaReferenceTypeExpression, path: string): void {
+  if (type.reference_scope !== "local" && type.reference_scope !== "external") fail(path, "reference_scope must be local or external");
+  if (!/^[A-Za-z][A-Za-z0-9_:-]*$/.test(type.type_name)) fail(path, "requires a valid type name");
+  if (type.reference_scope === "local" && (type.schema_id !== undefined || type.schema_version !== undefined)) fail(path, "local reference cannot specify external coordinates");
+  if (type.reference_scope === "external" && (type.schema_id === undefined || !type.schema_id || type.schema_version === undefined || !Number.isSafeInteger(type.schema_version) || type.schema_version < 1)) fail(path, "external reference requires valid schema coordinates");
+}
+
 function validateFields(fields: ReadonlyArray<SchemaFieldDefinition>, path: string, context: SchemaValidationContext = {}): void {
+  validateFieldDefinitions(fields, path, context);
+  validateBoundBytesCoordinates(fields, path);
+}
+
+function validateFieldDefinitions(fields: ReadonlyArray<SchemaFieldDefinition>, path: string, context: SchemaValidationContext): void {
   const names = new Set<string>();
   for (const field of fields) {
     assertClosedObject(field as unknown as Record<string, unknown>, ["field_name", "description", "presence", "value_type"], `${path}.${field.field_name || "<unnamed>"}`);
@@ -397,19 +497,32 @@ function validateFields(fields: ReadonlyArray<SchemaFieldDefinition>, path: stri
     if (field.presence !== "required" && field.presence !== "optional") fail(`${path}.${field.field_name}.presence`, "must be required or optional");
     validateTypeDefinition(field.value_type, `${path}.${field.field_name}`, context);
   }
+}
+
+function validateBoundBytesCoordinates(fields: ReadonlyArray<SchemaFieldDefinition>, path: string): void {
   for (const field of fields) {
     const bytesType = field.value_type.type_kind === "bytes" ? field.value_type : undefined;
     if (!bytesType?.bound_schema_id_field) continue;
-    const idIndex = fields.findIndex((candidate) => candidate.field_name === bytesType.bound_schema_id_field);
-    const versionIndex = fields.findIndex((candidate) => candidate.field_name === bytesType.bound_schema_version_field);
-    const fieldIndex = fields.indexOf(field);
-    if (idIndex < 0 || versionIndex < 0 || idIndex !== fieldIndex - 2 || versionIndex !== fieldIndex - 1) fail(`${path}.${field.field_name}`, "SchemaBoundBytes coordinates must be adjacent fields immediately before the bytes field");
-    const idField = fields[idIndex];
-    const versionField = fields[versionIndex];
-    if (idField?.presence !== "required" || versionField?.presence !== "required") fail(`${path}.${field.field_name}`, "SchemaBoundBytes coordinate fields must be required");
-    if (idField?.value_type.type_kind !== "text" || idField.value_type.identifier_kind !== "namespaced_identifier") fail(`${path}.${bytesType.bound_schema_id_field}`, "SchemaBoundBytes schema id coordinate must be a NamespacedIdentifier");
-    if (versionField?.value_type.type_kind !== "safe_integer" || (versionField.value_type.minimum ?? 0) < 1) fail(`${path}.${bytesType.bound_schema_version_field}`, "SchemaBoundBytes schema version coordinate must be a positive safe integer");
+    const coordinates = findBoundBytesCoordinates(fields, field, bytesType);
+    if (coordinates === undefined) fail(`${path}.${field.field_name}`, "SchemaBoundBytes coordinates must be adjacent fields immediately before the bytes field");
+    validateBoundBytesCoordinateTypes(coordinates.idField, coordinates.versionField, bytesType, path, field.field_name);
   }
+}
+
+function findBoundBytesCoordinates(fields: ReadonlyArray<SchemaFieldDefinition>, field: SchemaFieldDefinition, bytesType: BytesTypeExpression): { readonly idField: SchemaFieldDefinition; readonly versionField: SchemaFieldDefinition } | undefined {
+  const idIndex = fields.findIndex((candidate) => candidate.field_name === bytesType.bound_schema_id_field);
+  const versionIndex = fields.findIndex((candidate) => candidate.field_name === bytesType.bound_schema_version_field);
+  const fieldIndex = fields.indexOf(field);
+  if (idIndex < 0 || versionIndex < 0 || idIndex !== fieldIndex - 2 || versionIndex !== fieldIndex - 1) return undefined;
+  const idField = fields[idIndex];
+  const versionField = fields[versionIndex];
+  return idField === undefined || versionField === undefined ? undefined : { idField, versionField };
+}
+
+function validateBoundBytesCoordinateTypes(idField: SchemaFieldDefinition, versionField: SchemaFieldDefinition, bytesType: BytesTypeExpression, path: string, fieldName: string): void {
+  if (idField.presence !== "required" || versionField.presence !== "required") fail(`${path}.${fieldName}`, "SchemaBoundBytes coordinate fields must be required");
+  if (idField.value_type.type_kind !== "text" || idField.value_type.identifier_kind !== "namespaced_identifier") fail(`${path}.${bytesType.bound_schema_id_field}`, "SchemaBoundBytes schema id coordinate must be a NamespacedIdentifier");
+  if (versionField.value_type.type_kind !== "safe_integer" || (versionField.value_type.minimum ?? 0) < 1) fail(`${path}.${bytesType.bound_schema_version_field}`, "SchemaBoundBytes schema version coordinate must be a positive safe integer");
 }
 
 function checkOptionalBounds(minimum: number | undefined, maximum: number | undefined, path: string): void {
@@ -429,43 +542,57 @@ function checkOptionalValueBounds(minimum: number | undefined, maximum: number |
 }
 
 function validateType(type: CanonicalTypeExpression, value: unknown, path: string, context: SchemaValidationContext, activeReferences: Set<string>): void {
-  switch (type.type_kind) {
-    case "null": if (value !== null) fail(path, "must be null"); return;
-    case "boolean": if (typeof value !== "boolean") fail(path, "must be boolean"); return;
-    case "safe_integer": if (typeof value !== "number" || !Number.isSafeInteger(value)) fail(path, "must be a safe integer"); checkNumberBounds(type, value, path); return;
-    case "big_integer": if (typeof value !== "bigint" && !(typeof value === "string" && BIG_INTEGER_PATTERN.test(value))) fail(path, "must be a BigInteger"); if (typeof value === "string") checkBigIntegerBounds(type, value, path); return;
-    case "float64": if (typeof value !== "number" || !Number.isFinite(value)) fail(path, "must be finite Float64"); checkNumberBounds(type, value, path); return;
-    case "exact_decimal": if (typeof value !== "string" || !EXACT_DECIMAL_PATTERN.test(value)) fail(path, "must be an ExactDecimal"); validateDecimalValue(type, value, path); return;
-    case "text": if (typeof value !== "string") fail(path, "must be text"); validateConstrainedText(type, value, path); return;
-    case "bytes": { const length = byteLength(value); if (type.bound_schema_id_field !== undefined && length < 1) fail(path, "SchemaBoundBytes must contain at least one byte"); checkCountBounds(type.minimum_byte_length, type.maximum_byte_length, length, path); return; }
-    case "timestamp": if (typeof value !== "string" || !TIMESTAMP_PATTERN.test(value)) fail(path, "must be a timestamp"); validateTimestamp(value, path); if (type.earliest !== undefined && value < type.earliest) fail(path, "is before earliest"); if (type.latest !== undefined && value > type.latest) fail(path, "is after latest"); return;
-    case "digest": if (typeof value !== "string" || !digestPattern(type.allowed_hash_algorithms).test(value)) fail(path, "must be an allowed digest"); return;
-    case "enum": if (typeof value !== "string" || !type.values.includes(value)) fail(path, "must be a registered enum value"); return;
-    case "sequence": case "set": case "ordered_set": validateCollection(type, value, path, context, activeReferences); return;
-    case "map": validateMap(type, value, path, context, activeReferences); return;
-    case "record": validateRecord(type.fields, value, path, context, activeReferences); return;
-    case "union": validateUnion(type, value, path, context, activeReferences); return;
-    case "schema_reference": {
-      if (type.reference_scope === "external" && type.type_name === "JsonValue" && type.schema_id === "core:JsonValue" && type.schema_version === 1) {
-        validateJsonValue(value, path);
-        return;
-      }
-      if (type.reference_scope === "external" && type.schema_id === `core:${type.type_name}` && authoritativeModelNames.includes(type.type_name as (typeof authoritativeModelNames)[number])) {
-        validateModelReferenceValue(type.type_name, value, path, context);
-        return;
-      }
-      const referenceKey = referenceKeyFor(type);
-      if (activeReferences.has(referenceKey)) fail(path, `reference cycle at ${referenceKey}`);
-      const target = resolveReferenceType(type, context);
-      const next = new Set(activeReferences); next.add(referenceKey);
-      const targetSchema = type.reference_scope === "external" ? resolveExternalSchema(type, context) : undefined;
-      const targetContext = targetSchema
-        ? { ...context, localDefinitions: new Map(targetSchema.type_definitions.map((definition) => [definition.type_name, definition.type_expression])) }
-        : context;
-      validateType(target, value, path, targetContext, next);
-      return;
-    }
-  }
+  if (isScalarTypeExpression(type)) return validateScalarValue(type, value, path);
+  if (isCollectionTypeExpression(type)) return validateCollection(type, value, path, context, activeReferences);
+  if (type.type_kind === "map") return validateMap(type, value, path, context, activeReferences);
+  if (type.type_kind === "record") return validateRecord(type.fields, value, path, context, activeReferences);
+  if (type.type_kind === "union") return validateUnion(type, value, path, context, activeReferences);
+  validateSchemaReferenceValue(type, value, path, context, activeReferences);
+}
+
+function validateScalarValue(type: ScalarTypeExpression, value: unknown, path: string): void {
+  if (type.type_kind === "null") { if (value !== null) fail(path, "must be null"); return; }
+  if (type.type_kind === "boolean") { if (typeof value !== "boolean") fail(path, "must be boolean"); return; }
+  if (["safe_integer", "big_integer", "float64", "exact_decimal"].includes(type.type_kind)) return validateNumericValue(type as SafeIntegerTypeExpression | BigIntegerTypeExpression | Float64TypeExpression | ExactDecimalTypeExpression, value, path);
+  if (type.type_kind === "text") { if (typeof value !== "string") fail(path, "must be text"); validateConstrainedText(type, value, path); return; }
+  if (type.type_kind === "bytes") { validateBytesValue(type, value, path); return; }
+  if (type.type_kind === "timestamp") { validateTimestampValue(type, value, path); return; }
+  if (type.type_kind === "digest") { if (typeof value !== "string" || !digestPattern(type.allowed_hash_algorithms).test(value)) fail(path, "must be an allowed digest"); return; }
+  const enumType = type as EnumTypeExpression;
+  if (typeof value !== "string" || !enumType.values.includes(value)) fail(path, "must be a registered enum value");
+}
+
+function validateNumericValue(type: SafeIntegerTypeExpression | BigIntegerTypeExpression | Float64TypeExpression | ExactDecimalTypeExpression, value: unknown, path: string): void {
+  if (type.type_kind === "safe_integer") { if (typeof value !== "number" || !Number.isSafeInteger(value)) fail(path, "must be a safe integer"); checkNumberBounds(type, value, path); return; }
+  if (type.type_kind === "big_integer") { if (typeof value !== "bigint" && !(typeof value === "string" && BIG_INTEGER_PATTERN.test(value))) fail(path, "must be a BigInteger"); if (typeof value === "string") checkBigIntegerBounds(type, value, path); return; }
+  if (type.type_kind === "float64") { if (typeof value !== "number" || !Number.isFinite(value)) fail(path, "must be finite Float64"); checkNumberBounds(type, value, path); return; }
+  if (typeof value !== "string" || !EXACT_DECIMAL_PATTERN.test(value)) fail(path, "must be an ExactDecimal");
+  validateDecimalValue(type, value, path);
+}
+
+function validateBytesValue(type: BytesTypeExpression, value: unknown, path: string): void {
+  const length = byteLength(value);
+  if (type.bound_schema_id_field !== undefined && length < 1) fail(path, "SchemaBoundBytes must contain at least one byte");
+  checkCountBounds(type.minimum_byte_length, type.maximum_byte_length, length, path);
+}
+
+function validateTimestampValue(type: TimestampTypeExpression, value: unknown, path: string): void {
+  if (typeof value !== "string" || !TIMESTAMP_PATTERN.test(value)) fail(path, "must be a timestamp");
+  validateTimestamp(value, path);
+  if (type.earliest !== undefined && value < type.earliest) fail(path, "is before earliest");
+  if (type.latest !== undefined && value > type.latest) fail(path, "is after latest");
+}
+
+function validateSchemaReferenceValue(type: SchemaReferenceTypeExpression, value: unknown, path: string, context: SchemaValidationContext, activeReferences: Set<string>): void {
+  if (type.reference_scope === "external" && type.type_name === "JsonValue" && type.schema_id === "core:JsonValue" && type.schema_version === 1) { validateJsonValue(value, path); return; }
+  if (type.reference_scope === "external" && type.schema_id === `core:${type.type_name}` && authoritativeModelNames.includes(type.type_name as (typeof authoritativeModelNames)[number])) { validateModelReferenceValue(type.type_name, value, path, context); return; }
+  const referenceKey = referenceKeyFor(type);
+  if (activeReferences.has(referenceKey)) fail(path, `reference cycle at ${referenceKey}`);
+  const target = resolveReferenceType(type, context);
+  const next = new Set(activeReferences); next.add(referenceKey);
+  const targetSchema = type.reference_scope === "external" ? resolveExternalSchema(type, context) : undefined;
+  const targetContext = targetSchema ? { ...context, localDefinitions: new Map(targetSchema.type_definitions.map((definition) => [definition.type_name, definition.type_expression])) } : context;
+  validateType(target, value, path, targetContext, next);
 }
 
 function validateModelReferenceValue(typeName: string, value: unknown, path: string, context: SchemaValidationContext, allowStageOutput = false): void {
@@ -480,25 +607,34 @@ function validateModelReferenceValue(typeName: string, value: unknown, path: str
     return;
   }
   if (typeName === "VisibleSourceStateEntry") {
-    const stateType = object["state_kind"];
-    if (stateType === "present") {
-      requireModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_kind", "artifact_version_id", "content_hash", "byte_length", "encoding", "analysis_metadata_digest", "valid_from_generation"], path);
-      rejectUnknownModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_kind", "artifact_version_id", "content_hash", "byte_length", "encoding", "language_hint", "analysis_metadata_digest", "valid_from_generation"], path);
-      if (typeof object["byte_length"] !== "number" || !Number.isSafeInteger(object["byte_length"]) || Number(object["byte_length"]) < 0) fail(`${path}.byte_length`, "must be a non-negative safe integer");
-      return;
-    }
-    if (stateType === "absent") {
-      requireModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_tombstone_id", "absence_kind", "absence_reason_code", "valid_from_generation"], path);
-      rejectUnknownModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_tombstone_id", "absence_kind", "absence_reason_code", "last_artifact_version_id", "valid_from_generation"], path);
-      if (object["absence_kind"] !== "deleted" && object["absence_kind"] !== "excluded") fail(`${path}.absence_kind`, "must be deleted or excluded");
-      return;
-    }
-    fail(`${path}.state_kind`, "must be present or absent");
+    validateVisibleSourceStateEntry(object, path);
+    return;
   }
   if (["DefinitionMatcher", "SubjectSelector", "StructuralFilter", "RelationSelector", "RegistrySelector", "KindSelector", "RecordStructuralSelector", "ChangeDescriptor"].includes(typeName)) {
     validatePublicQueryModel(typeName, object, path, context, allowStageOutput);
     return;
   }
+  validateAuthoritativeModel(typeName, object, path, context);
+}
+
+function validateVisibleSourceStateEntry(object: Record<string, unknown>, path: string): void {
+  const stateType = object["state_kind"];
+  if (stateType === "present") {
+    requireModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_kind", "artifact_version_id", "content_hash", "byte_length", "encoding", "analysis_metadata_digest", "valid_from_generation"], path);
+    rejectUnknownModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_kind", "artifact_version_id", "content_hash", "byte_length", "encoding", "language_hint", "analysis_metadata_digest", "valid_from_generation"], path);
+    if (typeof object["byte_length"] !== "number" || !Number.isSafeInteger(object["byte_length"]) || Number(object["byte_length"]) < 0) fail(`${path}.byte_length`, "must be a non-negative safe integer");
+    return;
+  }
+  if (stateType === "absent") {
+    requireModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_tombstone_id", "absence_kind", "absence_reason_code", "valid_from_generation"], path);
+    rejectUnknownModelFields(object, ["state_kind", "workspace_id", "artifact_id", "normalized_uri", "artifact_tombstone_id", "absence_kind", "absence_reason_code", "last_artifact_version_id", "valid_from_generation"], path);
+    if (object["absence_kind"] !== "deleted" && object["absence_kind"] !== "excluded") fail(`${path}.absence_kind`, "must be deleted or excluded");
+    return;
+  }
+  fail(`${path}.state_kind`, "must be present or absent");
+}
+
+function validateAuthoritativeModel(typeName: string, object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
   const model = modelContractRegistry.find((candidate) => candidate.name === typeName);
   if (!model) fail(path, `missing authoritative model definition for ${typeName}`);
   const fields = model.fields.map((field) => field.name);
@@ -529,6 +665,53 @@ const canonicalTypeRequiredFields: Readonly<Record<string, readonly string[]>> =
   record: ["type_kind", "fields"], union: ["type_kind", "discriminator_field", "discriminator_description", "variants"], schema_reference: ["type_kind", "reference_scope", "type_name"],
 };
 
+function validateCanonicalScalarConstraints(kind: string, object: Record<string, unknown>, path: string): void {
+  if (kind === "exact_decimal" && object["scale_policy"] !== "significant" && object["scale_policy"] !== "insignificant") fail(`${path}.scale_policy`, "must be significant or insignificant");
+  if (kind === "text" && object["identifier_kind"] !== undefined && !["identifier", "namespaced_identifier", "semver", "uri"].includes(String(object["identifier_kind"]))) fail(`${path}.identifier_kind`, "must be a registered identifier kind");
+  if (kind === "digest") {
+    const algorithms = object["allowed_hash_algorithms"];
+    if (!Array.isArray(algorithms) || algorithms.length === 0 || algorithms.some((algorithm) => algorithm !== "sha256")) fail(`${path}.allowed_hash_algorithms`, "must be a non-empty list of allowed digest algorithms");
+  }
+  if (kind === "enum" && (!Array.isArray(object["values"]) || object["values"].length === 0 || object["values"].some((item) => typeof item !== "string"))) fail(`${path}.values`, "must be a non-empty list of strings");
+}
+
+function validateCanonicalUnionVariant(variant: unknown, index: number, path: string, context: SchemaValidationContext, discriminatorField: string, discriminatorValues: Set<string>): void {
+  const variantPath = `${path}.variants[${index}]`;
+  if (variant === null || typeof variant !== "object" || Array.isArray(variant)) fail(variantPath, "must be a closed variant object");
+  const candidate = variant as Record<string, unknown>;
+  requireModelFields(candidate, ["discriminator_value", "description", "fields"], variantPath);
+  rejectUnknownModelFields(candidate, ["discriminator_value", "description", "fields"], variantPath);
+  if (typeof candidate["discriminator_value"] !== "string" || candidate["discriminator_value"].length === 0) fail(`${variantPath}.discriminator_value`, "must be non-empty");
+  if (discriminatorValues.has(candidate["discriminator_value"])) fail(`${variantPath}.discriminator_value`, "duplicate discriminator value");
+  discriminatorValues.add(candidate["discriminator_value"]);
+  if (typeof candidate["description"] !== "string" || candidate["description"].length === 0) fail(`${variantPath}.description`, "must be non-empty");
+  if (!Array.isArray(candidate["fields"])) fail(`${variantPath}.fields`, "must be an array");
+  validateSchemaFieldModels(candidate["fields"], `${variantPath}.fields`, context, discriminatorField);
+}
+
+function validateCanonicalUnion(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  if (typeof object["discriminator_field"] !== "string" || !SNAKE_CASE_FIELD_PATTERN.test(object["discriminator_field"]) || typeof object["discriminator_description"] !== "string" || object["discriminator_description"] === "") fail(path, "has an invalid union discriminator definition");
+  if (!Array.isArray(object["variants"]) || object["variants"].length === 0) fail(`${path}.variants`, "must be non-empty");
+  const discriminatorValues = new Set<string>();
+  for (const [index, variant] of (object["variants"] as unknown[]).entries()) validateCanonicalUnionVariant(variant, index, path, context, object["discriminator_field"] as string, discriminatorValues);
+}
+
+function validateCanonicalComposite(kind: string, object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  if (["sequence", "set", "ordered_set"].includes(kind)) validateCanonicalTypeExpressionModel(object["element_type"] as Record<string, unknown>, `${path}.element_type`, context);
+  if (kind === "map") validateCanonicalTypeExpressionModel(object["value_type"] as Record<string, unknown>, `${path}.value_type`, context);
+  if (kind === "record") {
+    if (!Array.isArray(object["fields"])) fail(`${path}.fields`, "must be an array");
+    validateSchemaFieldModels(object["fields"], `${path}.fields`, context);
+  }
+  if (kind === "union") validateCanonicalUnion(object, path, context);
+}
+
+function validateCanonicalSchemaReference(object: Record<string, unknown>, path: string): void {
+  if (object["reference_scope"] !== "local" && object["reference_scope"] !== "external") fail(`${path}.reference_scope`, "must be local or external");
+  if (typeof object["type_name"] !== "string" || object["type_name"].length === 0) fail(`${path}.type_name`, "must be non-empty");
+  if (object["reference_scope"] === "external" && (typeof object["schema_id"] !== "string" || !Number.isSafeInteger(object["schema_version"]))) fail(path, "external reference requires schema coordinates");
+}
+
 function validateCanonicalTypeExpressionModel(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
   const kind = object["type_kind"];
   if (typeof kind !== "string") fail(`${path}.type_kind`, "must be a registered canonical type kind");
@@ -537,43 +720,9 @@ function validateCanonicalTypeExpressionModel(object: Record<string, unknown>, p
   if (!allowedFields || !requiredFields) fail(`${path}.type_kind`, "must be a registered canonical type kind");
   requireModelFields(object, requiredFields, path);
   rejectUnknownModelFields(object, allowedFields, path);
-  if (kind === "exact_decimal" && object["scale_policy"] !== "significant" && object["scale_policy"] !== "insignificant") fail(`${path}.scale_policy`, "must be significant or insignificant");
-  if (kind === "text" && object["identifier_kind"] !== undefined && !["identifier", "namespaced_identifier", "semver", "uri"].includes(String(object["identifier_kind"]))) fail(`${path}.identifier_kind`, "must be a registered identifier kind");
-  if (kind === "digest") {
-    const algorithms = object["allowed_hash_algorithms"];
-    if (!Array.isArray(algorithms) || algorithms.length === 0 || algorithms.some((algorithm) => algorithm !== "sha256")) fail(`${path}.allowed_hash_algorithms`, "must be a non-empty list of allowed digest algorithms");
-  }
-  if (kind === "enum") {
-    if (!Array.isArray(object["values"]) || object["values"].length === 0 || object["values"].some((item) => typeof item !== "string")) fail(`${path}.values`, "must be a non-empty list of strings");
-  }
-  if (["sequence", "set", "ordered_set"].includes(kind)) validateCanonicalTypeExpressionModel(object["element_type"] as Record<string, unknown>, `${path}.element_type`, context);
-  if (kind === "map") validateCanonicalTypeExpressionModel(object["value_type"] as Record<string, unknown>, `${path}.value_type`, context);
-  if (kind === "record") {
-    if (!Array.isArray(object["fields"])) fail(`${path}.fields`, "must be an array");
-    validateSchemaFieldModels(object["fields"] as unknown[], `${path}.fields`, context);
-  }
-  if (kind === "union") {
-    if (typeof object["discriminator_field"] !== "string" || !SNAKE_CASE_FIELD_PATTERN.test(object["discriminator_field"]) || typeof object["discriminator_description"] !== "string" || object["discriminator_description"] === "") fail(path, "has an invalid union discriminator definition");
-    if (!Array.isArray(object["variants"]) || object["variants"].length === 0) fail(`${path}.variants`, "must be non-empty");
-    const discriminatorValues = new Set<string>();
-    for (const [index, variant] of (object["variants"] as unknown[]).entries()) {
-      if (variant === null || typeof variant !== "object" || Array.isArray(variant)) fail(`${path}.variants[${index}]`, "must be a closed variant object");
-      const candidate = variant as Record<string, unknown>;
-      requireModelFields(candidate, ["discriminator_value", "description", "fields"], `${path}.variants[${index}]`);
-      rejectUnknownModelFields(candidate, ["discriminator_value", "description", "fields"], `${path}.variants[${index}]`);
-      if (typeof candidate["discriminator_value"] !== "string" || candidate["discriminator_value"].length === 0) fail(`${path}.variants[${index}].discriminator_value`, "must be non-empty");
-      if (discriminatorValues.has(candidate["discriminator_value"])) fail(`${path}.variants[${index}].discriminator_value`, "duplicate discriminator value");
-      discriminatorValues.add(candidate["discriminator_value"]);
-      if (typeof candidate["description"] !== "string" || candidate["description"].length === 0) fail(`${path}.variants[${index}].description`, "must be non-empty");
-      if (!Array.isArray(candidate["fields"])) fail(`${path}.variants[${index}].fields`, "must be an array");
-      validateSchemaFieldModels(candidate["fields"] as unknown[], `${path}.variants[${index}].fields`, context, object["discriminator_field"] as string);
-    }
-  }
-  if (kind === "schema_reference") {
-    if (object["reference_scope"] !== "local" && object["reference_scope"] !== "external") fail(`${path}.reference_scope`, "must be local or external");
-    if (typeof object["type_name"] !== "string" || object["type_name"].length === 0) fail(`${path}.type_name`, "must be non-empty");
-    if (object["reference_scope"] === "external" && (typeof object["schema_id"] !== "string" || !Number.isSafeInteger(object["schema_version"]))) fail(path, "external reference requires schema coordinates");
-  }
+  validateCanonicalScalarConstraints(kind, object, path);
+  validateCanonicalComposite(kind, object, path, context);
+  if (kind === "schema_reference") validateCanonicalSchemaReference(object, path);
 }
 
 function validateSchemaFieldModels(values: unknown[], path: string, context: SchemaValidationContext, discriminatorField?: string): void {
@@ -618,6 +767,11 @@ interface PipelineStageOutputInfo {
   readonly index: number;
   readonly operator: string;
   readonly outputs?: readonly string[];
+}
+
+interface PipelineStageInfo {
+  readonly index: number;
+  readonly outputs: readonly string[];
 }
 
 function modelNameFromSchemaId(schemaId: string): string {
@@ -677,6 +831,17 @@ function validateOperationArgumentValue(operationId: string, fieldName: string, 
   validateType(logicalTypeExpression(logicalType), value, path, context, new Set());
 }
 
+function validateResolveSymbolArgumentConstraint(fieldName: string, fieldValue: unknown, object: Record<string, unknown>, path: string): void {
+  if (fieldName === "reference" && (typeof fieldValue !== "string" || fieldValue.length === 0)) fail(`${path}.reference`, "must be non-empty");
+  if (fieldName === "context_byte_offset" && !("context_artifact" in object)) fail(`${path}.context_artifact`, "is required when context_byte_offset is present");
+}
+
+function validateOperationSpecificArgumentConstraint(operationId: string, fieldName: string, fieldValue: unknown, object: Record<string, unknown>, path: string): void {
+  if (operationId === "core:resolve_symbol") { validateResolveSymbolArgumentConstraint(fieldName, fieldValue, object, path); return; }
+  if (operationId === "core:inspect_architecture" && fieldName === "scope" && Array.isArray(fieldValue) && fieldValue.length === 0) fail(`${path}.scope`, "must be non-empty when present");
+  if (operationId === "core:compare" && fieldName === "selection" && Array.isArray(fieldValue) && fieldValue.length === 0) fail(`${path}.selection`, "must be non-empty when present");
+}
+
 function validateInlineOperationArguments(operation: NonNullable<typeof operationDefinitions[number]>, argumentsValue: unknown, argumentPath: string, context: SchemaValidationContext, omittedField?: string, allowStageOutput = false): void {
   if (argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) fail(argumentPath, "must be a closed operation argument object");
   const object = argumentsValue as Record<string, unknown>;
@@ -687,10 +852,7 @@ function validateInlineOperationArguments(operation: NonNullable<typeof operatio
     if (!(field.name in object)) continue;
     const fieldValue = object[field.name];
     if (field.minimum_item_count !== undefined && (!Array.isArray(fieldValue) || fieldValue.length < field.minimum_item_count)) fail(`${argumentPath}.${field.name}`, "must satisfy the authoritative minimum item count");
-    if (operation.operation_id === "core:resolve_symbol" && field.name === "reference" && (typeof fieldValue !== "string" || fieldValue.length === 0)) fail(`${argumentPath}.reference`, "must be non-empty");
-    if (operation.operation_id === "core:resolve_symbol" && field.name === "context_byte_offset" && !("context_artifact" in object)) fail(`${argumentPath}.context_artifact`, "is required when context_byte_offset is present");
-    if (operation.operation_id === "core:inspect_architecture" && field.name === "scope" && Array.isArray(fieldValue) && fieldValue.length === 0) fail(`${argumentPath}.scope`, "must be non-empty when present");
-    if (operation.operation_id === "core:compare" && field.name === "selection" && Array.isArray(fieldValue) && fieldValue.length === 0) fail(`${argumentPath}.selection`, "must be non-empty when present");
+    validateOperationSpecificArgumentConstraint(operation.operation_id, field.name, fieldValue, object, argumentPath);
     validateOperationArgumentValue(operation.operation_id, field.name, field.logical_type, fieldValue, `${argumentPath}.${field.name}`, context, allowStageOutput);
   }
 }
@@ -750,6 +912,13 @@ function validateStageOutputCrossReferences(value: unknown, path: string, availa
   for (const [key, entry] of Object.entries(object)) validateStageOutputCrossReferences(entry, `${path}.${key}`, availableStageOutputs);
 }
 
+function validatePipelinePredicateLeaf(variant: string | undefined, predicate: Record<string, unknown>, path: string): void {
+  if (!variant || !predicateLeafNames.has(variant)) fail(`${path}.${variant ?? "<missing>"}`, "is not a registered predicate variant");
+  if (!Array.isArray(predicate[variant]) || predicate[variant].length === 0 || (predicate[variant] as unknown[]).some((item) => typeof item !== "string" || item.length === 0)) fail(`${path}.${variant}`, "must be a non-empty array of non-empty values");
+  const allowed = predicateLeafEnums[variant];
+  if (allowed && (predicate[variant] as string[]).some((item) => !allowed.includes(item))) fail(`${path}.${variant}`, "contains an unknown registered value");
+}
+
 function validatePipelinePredicate(value: unknown, path: string, depth = 0): void {
   if (depth > 32) fail(path, "exceeds the registered predicate recursion limit");
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be a closed predicate object");
@@ -766,130 +935,140 @@ function validatePipelinePredicate(value: unknown, path: string, depth = 0): voi
     validatePipelinePredicate(predicate["not"], `${path}.not`, depth + 1);
     return;
   }
-  if (!variant || !predicateLeafNames.has(variant)) fail(`${path}.${variant ?? "<missing>"}`, "is not a registered predicate variant");
-  if (!Array.isArray(predicate[variant]) || predicate[variant].length === 0 || (predicate[variant] as unknown[]).some((item) => typeof item !== "string" || item.length === 0)) fail(`${path}.${variant}`, "must be a non-empty array of non-empty values");
-  const allowed = predicateLeafEnums[variant];
-  if (allowed && (predicate[variant] as string[]).some((item) => !allowed.includes(item))) fail(`${path}.${variant}`, "contains an unknown registered value");
+  validatePipelinePredicateLeaf(variant, predicate, path);
 }
 
-function validatePipelineOperatorArguments(operator: string, argumentsValue: unknown, path: string, context: SchemaValidationContext, availableStageOutputs?: ReadonlyMap<string, PipelineStageOutputInfo>): readonly string[] | undefined {
-  if (argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) fail(`${path}.arguments`, "must be a closed operator argument object");
-  const args = argumentsValue as Record<string, unknown>;
-  if (operator === "source.operation") {
-    requireModelFields(args, ["operation", "operation_arguments"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["operation", "operation_arguments"], `${path}.arguments`);
-    const selected = validateRegisteredOperationArguments(args["operation"], args["operation_arguments"], `${path}.arguments.operation_arguments`, context, undefined, true);
-    validateStageOutputCrossReferences(args["operation_arguments"], `${path}.arguments.operation_arguments`, availableStageOutputs ?? new Map());
-    return selected.operation.result_streams;
+function validateSourceOperationOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext, availableStageOutputs: ReadonlyMap<string, PipelineStageOutputInfo>): readonly string[] {
+  requireModelFields(args, ["operation", "operation_arguments"], path);
+  rejectUnknownModelFields(args, ["operation", "operation_arguments"], path);
+  const selected = validateRegisteredOperationArguments(args["operation"], args["operation_arguments"], `${path}.operation_arguments`, context, undefined, true);
+  validateStageOutputCrossReferences(args["operation_arguments"], `${path}.operation_arguments`, availableStageOutputs);
+  return selected.operation.result_streams;
+}
+
+function validateSourceRegistryOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext): readonly string[] {
+  requireModelFields(args, ["matcher"], path);
+  rejectUnknownModelFields(args, ["matcher", "selector", "include_full_definitions"], path);
+  validateModelReferenceValue("DefinitionMatcher", args["matcher"], `${path}.matcher`, context);
+  if (args["selector"] !== undefined) validateModelReferenceValue("RegistrySelector", args["selector"], `${path}.selector`, context);
+  if (args["include_full_definitions"] !== undefined && typeof args["include_full_definitions"] !== "boolean") fail(`${path}.include_full_definitions`, "must be boolean");
+  return ["definitions", "definition_set"];
+}
+
+function validateRelationExpansionOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext): readonly string[] {
+  requireModelFields(args, ["direction", "relations"], path);
+  rejectUnknownModelFields(args, ["relations", "direction", "min_depth", "max_depth", "path_policy", "filter"], path);
+  if (!["inbound", "outbound", "both"].includes(String(args["direction"]))) fail(`${path}.direction`, "must be a registered direction");
+  validateModelReferenceValue("RelationSelector", args["relations"], `${path}.relations`, context);
+  for (const name of ["min_depth", "max_depth"]) if (args[name] !== undefined && (!Number.isSafeInteger(args[name]) || Number(args[name]) < 1)) fail(`${path}.${name}`, "must be a positive safe integer");
+  const minDepth = args["min_depth"] === undefined ? 1 : Number(args["min_depth"]);
+  const maxDepth = args["max_depth"] === undefined ? 1 : Number(args["max_depth"]);
+  if (maxDepth < minDepth) fail(`${path}.max_depth`, "must be at least min_depth after applying defaults");
+  if (args["path_policy"] !== undefined && !["simple_subjects", "simple_relations"].includes(String(args["path_policy"]))) fail(`${path}.path_policy`, "must be a registered path policy");
+  if (args["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", args["filter"], `${path}.filter`, context);
+  return ["subjects", "relations", "paths"];
+}
+
+function validateOperationExpansionOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext, availableStageOutputs: ReadonlyMap<string, PipelineStageOutputInfo>): readonly string[] {
+  requireModelFields(args, ["operation", "input_argument", "operation_arguments"], path);
+  rejectUnknownModelFields(args, ["operation", "input_argument", "operation_arguments"], path);
+  if (typeof args["input_argument"] !== "string" || args["input_argument"].length === 0) fail(`${path}.input_argument`, "must be non-empty");
+  const inputArgument = String(args["input_argument"]);
+  const selected = validateRegisteredOperationArguments(args["operation"], args["operation_arguments"], `${path}.operation_arguments`, context, inputArgument, true);
+  if (!selected.operation.batchable_fields.includes(inputArgument)) fail(`${path}.input_argument`, "must name a declared batchable operation argument");
+  validateStageOutputCrossReferences(args["operation_arguments"], `${path}.operation_arguments`, availableStageOutputs);
+  return selected.operation.result_streams;
+}
+
+function validateJoinOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext): readonly string[] {
+  requireModelFields(args, ["predicate", "output"], path);
+  const predicate = String(args["predicate"]);
+  if (!["same_subject", "same_entity", "same_artifact", "portable_key_equal", "relation_exists"].includes(predicate)) fail(`${path}.predicate`, "must be a registered join predicate");
+  rejectUnknownModelFields(args, predicate === "relation_exists" ? ["predicate", "relation_selector", "direction", "output"] : ["predicate", "output"], path);
+  if (!["pairs", "left", "right", "grouped"].includes(String(args["output"]))) fail(`${path}.output`, "must be a registered join output");
+  if (predicate === "relation_exists") {
+    requireModelFields(args, ["relation_selector", "direction"], path);
+    validateModelReferenceValue("RelationSelector", args["relation_selector"], `${path}.relation_selector`, context);
+    if (!["outbound", "inbound", "both"].includes(String(args["direction"]))) fail(`${path}.direction`, "must be a registered direction");
   }
-  if (operator === "source.registry") {
-    requireModelFields(args, ["matcher"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["matcher", "selector", "include_full_definitions"], `${path}.arguments`);
-    validateModelReferenceValue("DefinitionMatcher", args["matcher"], `${path}.arguments.matcher`, context);
-    if (args["selector"] !== undefined) validateModelReferenceValue("RegistrySelector", args["selector"], `${path}.arguments.selector`, context);
-    if (args["include_full_definitions"] !== undefined && typeof args["include_full_definitions"] !== "boolean") fail(`${path}.arguments.include_full_definitions`, "must be boolean");
-    return ["definitions", "definition_set"];
+  return [String(args["output"])] as const;
+}
+
+function validateSelectOutput(candidate: Record<string, unknown>, path: string, context: SchemaValidationContext, availableStageOutputs: ReadonlyMap<string, PipelineStageOutputInfo>, names: Set<string>): void {
+  requireModelFields(candidate, ["name", "input", "projection"], path);
+  rejectUnknownModelFields(candidate, ["name", "input", "projection", "filter"], path);
+  if (typeof candidate["name"] !== "string" || candidate["name"].length === 0 || names.has(candidate["name"] as string)) fail(`${path}.name`, "must be a unique non-empty output name");
+  names.add(candidate["name"] as string);
+  validateStageOutputReferenceModel(candidate["input"], `${path}.input`);
+  const projection = String(candidate["projection"]);
+  const builtinProjection = ["subjects", "relations", "paths", "definitions"].includes(projection);
+  const input = candidate["input"] as Record<string, unknown>;
+  const upstream = availableStageOutputs.get(String(input["stage_id"]));
+  const upstreamProjection = upstream?.operator === "source.operation" && upstream.outputs?.includes(projection) === true;
+  if (!builtinProjection && !upstreamProjection) fail(`${path}.projection`, "must be a registered result projection or exact upstream operation output");
+  if (candidate["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", candidate["filter"], `${path}.filter`, context);
+}
+
+function validateSelectOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext, availableStageOutputs: ReadonlyMap<string, PipelineStageOutputInfo>): readonly string[] {
+  requireModelFields(args, ["outputs"], path);
+  rejectUnknownModelFields(args, ["outputs"], path);
+  if (!Array.isArray(args["outputs"]) || args["outputs"].length === 0) fail(`${path}.outputs`, "must be a non-empty array");
+  const names = new Set<string>();
+  for (const [index, output] of (args["outputs"] as unknown[]).entries()) {
+    if (output === null || typeof output !== "object" || Array.isArray(output)) fail(`${path}.outputs[${index}]`, "must be a closed select output");
+    validateSelectOutput(output as Record<string, unknown>, `${path}.outputs[${index}]`, context, availableStageOutputs, names);
   }
+  return [...names];
+}
+
+function validateDeduplicateOperator(args: Record<string, unknown>, path: string): readonly string[] {
+  requireModelFields(args, ["identity"], path);
+  rejectUnknownModelFields(args, ["identity", "include_possible"], path);
+  if (!["subject", "entity", "artifact", "portable_key"].includes(String(args["identity"]))) fail(`${path}.identity`, "must be a registered deduplication identity");
+  if (args["identity"] === "portable_key" && args["include_possible"] !== true) fail(`${path}.include_possible`, "must be true for portable_key deduplication");
+  if (args["include_possible"] !== undefined && typeof args["include_possible"] !== "boolean") fail(`${path}.include_possible`, "must be boolean");
+  return ["subjects"];
+}
+
+function validateBindingOperator(args: Record<string, unknown>, path: string, context: SchemaValidationContext): readonly string[] {
+  rejectUnknownModelFields(args, ["record_categories", "producer_ids", "filter"], path);
+  if (args["record_categories"] !== undefined && (!Array.isArray(args["record_categories"]) || args["record_categories"].length === 0)) fail(`${path}.record_categories`, "must be a non-empty array");
+  if (args["producer_ids"] !== undefined && (!Array.isArray(args["producer_ids"]) || args["producer_ids"].length === 0)) fail(`${path}.producer_ids`, "must be a non-empty array");
+  if (args["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", args["filter"], `${path}.filter`, context);
+  return ["selector"];
+}
+
+function validateSimplePipelineOperator(operator: string, args: Record<string, unknown>, path: string, context: SchemaValidationContext): readonly string[] | undefined {
   if (["set.union", "set.intersection", "set.difference"].includes(operator)) {
-    rejectUnknownModelFields(args, [], `${path}.arguments`);
+    rejectUnknownModelFields(args, [], path);
     return ["subjects"];
-  }
-  if (operator === "expand.relations") {
-    requireModelFields(args, ["direction", "relations"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["relations", "direction", "min_depth", "max_depth", "path_policy", "filter"], `${path}.arguments`);
-    if (!["inbound", "outbound", "both"].includes(String(args["direction"]))) fail(`${path}.arguments.direction`, "must be a registered direction");
-    validateModelReferenceValue("RelationSelector", args["relations"], `${path}.arguments.relations`, context);
-    for (const name of ["min_depth", "max_depth"]) if (args[name] !== undefined && (!Number.isSafeInteger(args[name]) || Number(args[name]) < 1)) fail(`${path}.arguments.${name}`, "must be a positive safe integer");
-    const minDepth = args["min_depth"] === undefined ? 1 : Number(args["min_depth"]);
-    const maxDepth = args["max_depth"] === undefined ? 1 : Number(args["max_depth"]);
-    if (maxDepth < minDepth) fail(`${path}.arguments.max_depth`, "must be at least min_depth after applying defaults");
-    if (args["path_policy"] !== undefined && !["simple_subjects", "simple_relations"].includes(String(args["path_policy"]))) fail(`${path}.arguments.path_policy`, "must be a registered path policy");
-    if (args["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", args["filter"], `${path}.arguments.filter`, context);
-    return ["subjects", "relations", "paths"];
-  }
-  if (operator === "expand.operation") {
-    requireModelFields(args, ["operation", "input_argument", "operation_arguments"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["operation", "input_argument", "operation_arguments"], `${path}.arguments`);
-    if (typeof args["input_argument"] !== "string" || args["input_argument"].length === 0) fail(`${path}.arguments.input_argument`, "must be non-empty");
-    const selected = validateRegisteredOperationArguments(args["operation"], args["operation_arguments"], `${path}.arguments.operation_arguments`, context, String(args["input_argument"]), true);
-    if (!selected.operation.batchable_fields.includes(String(args["input_argument"]))) fail(`${path}.arguments.input_argument`, "must name a declared batchable operation argument");
-    validateStageOutputCrossReferences(args["operation_arguments"], `${path}.arguments.operation_arguments`, availableStageOutputs ?? new Map());
-    return selected.operation.result_streams;
   }
   if (operator === "filter") {
-    requireModelFields(args, ["predicate"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["predicate"], `${path}.arguments`);
-    validatePipelinePredicate(args["predicate"], `${path}.arguments.predicate`);
+    requireModelFields(args, ["predicate"], path);
+    rejectUnknownModelFields(args, ["predicate"], path);
+    validatePipelinePredicate(args["predicate"], `${path}.predicate`);
     return ["subjects"];
   }
-  if (operator === "join") {
-    requireModelFields(args, ["predicate", "output"], `${path}.arguments`);
-    const predicate = String(args["predicate"]);
-    if (!["same_subject", "same_entity", "same_artifact", "portable_key_equal", "relation_exists"].includes(predicate)) fail(`${path}.arguments.predicate`, "must be a registered join predicate");
-    rejectUnknownModelFields(args, predicate === "relation_exists" ? ["predicate", "relation_selector", "direction", "output"] : ["predicate", "output"], `${path}.arguments`);
-    if (!["pairs", "left", "right", "grouped"].includes(String(args["output"]))) fail(`${path}.arguments.output`, "must be a registered join output");
-    if (predicate === "relation_exists") {
-      requireModelFields(args, ["relation_selector", "direction"], `${path}.arguments`);
-      validateModelReferenceValue("RelationSelector", args["relation_selector"], `${path}.arguments.relation_selector`, context);
-      if (!["outbound", "inbound", "both"].includes(String(args["direction"]))) fail(`${path}.arguments.direction`, "must be a registered direction");
-    }
-    return [String(args["output"])] as const;
-  }
-  if (operator === "deduplicate") {
-    requireModelFields(args, ["identity"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["identity", "include_possible"], `${path}.arguments`);
-    if (!["subject", "entity", "artifact", "portable_key"].includes(String(args["identity"]))) fail(`${path}.arguments.identity`, "must be a registered deduplication identity");
-    if (args["identity"] === "portable_key" && args["include_possible"] !== true) fail(`${path}.arguments.include_possible`, "must be true for portable_key deduplication");
-    if (args["include_possible"] !== undefined && typeof args["include_possible"] !== "boolean") fail(`${path}.arguments.include_possible`, "must be boolean");
-    return ["subjects"];
-  }
-  if (operator === "select") {
-    requireModelFields(args, ["outputs"], `${path}.arguments`);
-    rejectUnknownModelFields(args, ["outputs"], `${path}.arguments`);
-    if (!Array.isArray(args["outputs"]) || args["outputs"].length === 0) fail(`${path}.arguments.outputs`, "must be a non-empty array");
-    const names = new Set<string>();
-    for (const [index, output] of (args["outputs"] as unknown[]).entries()) {
-      if (output === null || typeof output !== "object" || Array.isArray(output)) fail(`${path}.arguments.outputs[${index}]`, "must be a closed select output");
-      const candidate = output as Record<string, unknown>;
-      requireModelFields(candidate, ["name", "input", "projection"], `${path}.arguments.outputs[${index}]`);
-      rejectUnknownModelFields(candidate, ["name", "input", "projection", "filter"], `${path}.arguments.outputs[${index}]`);
-      if (typeof candidate["name"] !== "string" || candidate["name"].length === 0 || names.has(candidate["name"])) fail(`${path}.arguments.outputs[${index}].name`, "must be a unique non-empty output name");
-      names.add(candidate["name"]);
-      validateStageOutputReferenceModel(candidate["input"], `${path}.arguments.outputs[${index}].input`);
-      const projection = String(candidate["projection"]);
-      const builtinProjection = ["subjects", "relations", "paths", "definitions"].includes(projection);
-      const input = candidate["input"] as Record<string, unknown>;
-      const upstream = availableStageOutputs?.get(String(input["stage_id"]));
-      const upstreamProjection = upstream?.operator === "source.operation" && upstream.outputs?.includes(projection) === true;
-      if (!builtinProjection && !upstreamProjection) fail(`${path}.arguments.outputs[${index}].projection`, "must be a registered result projection or exact upstream operation output");
-      if (candidate["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", candidate["filter"], `${path}.arguments.outputs[${index}].filter`, context);
-    }
-    return [...names];
-  }
-  if (operator === "bind.record_selector" || operator === "bind.subject_record_selector") {
-    rejectUnknownModelFields(args, ["record_categories", "producer_ids", "filter"], `${path}.arguments`);
-    if (args["record_categories"] !== undefined && (!Array.isArray(args["record_categories"]) || args["record_categories"].length === 0)) fail(`${path}.arguments.record_categories`, "must be a non-empty array");
-    if (args["producer_ids"] !== undefined && (!Array.isArray(args["producer_ids"]) || args["producer_ids"].length === 0)) fail(`${path}.arguments.producer_ids`, "must be a non-empty array");
-    if (args["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", args["filter"], `${path}.arguments.filter`, context);
-    return ["selector"];
-  }
+  if (operator === "deduplicate") return validateDeduplicateOperator(args, path);
+  if (operator === "bind.record_selector" || operator === "bind.subject_record_selector") return validateBindingOperator(args, path, context);
+  return undefined;
+}
+
+function validatePipelineOperatorArguments(operator: string, argumentsValue: unknown, path: string, context: SchemaValidationContext, availableStageOutputs: ReadonlyMap<string, PipelineStageOutputInfo> = new Map()): readonly string[] | undefined {
+  if (argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) fail(`${path}.arguments`, "must be a closed operator argument object");
+  const args = argumentsValue as Record<string, unknown>;
+  if (operator === "source.operation") return validateSourceOperationOperator(args, `${path}.arguments`, context, availableStageOutputs);
+  if (operator === "source.registry") return validateSourceRegistryOperator(args, `${path}.arguments`, context);
+  const simpleResult = validateSimplePipelineOperator(operator, args, `${path}.arguments`, context);
+  if (simpleResult !== undefined) return simpleResult;
+  if (operator === "expand.relations") return validateRelationExpansionOperator(args, `${path}.arguments`, context);
+  if (operator === "expand.operation") return validateOperationExpansionOperator(args, `${path}.arguments`, context, availableStageOutputs);
+  if (operator === "join") return validateJoinOperator(args, `${path}.arguments`, context);
+  if (operator === "select") return validateSelectOperator(args, `${path}.arguments`, context, availableStageOutputs);
   fail(`${path}.operator`, "must name a registered core algebra operator");
 }
 
-function validatePipelineV3Model(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
-  const stageIds = new Map<string, { index: number; outputs: readonly string[] }>();
-  for (const [index, rawStage] of (object["stages"] as unknown[]).entries()) {
-    if (rawStage === null || typeof rawStage !== "object" || Array.isArray(rawStage)) fail(`${path}.stages[${index}]`, "must be a closed v3 stage object");
-    const stage = rawStage as Record<string, unknown>;
-    requireModelFields(stage, ["stage_id", "stage_type", "arguments"], `${path}.stages[${index}]`);
-    rejectUnknownModelFields(stage, ["stage_id", "stage_type", "operation", "operation_version", "operator", "arguments", "bindings", "inputs"], `${path}.stages[${index}]`);
-    const stageId = stage["stage_id"];
-    if (typeof stageId !== "string" || stageId.length === 0 || stageIds.has(stageId)) fail(`${path}.stages[${index}].stage_id`, "must be a unique non-empty identifier");
-    if (stage["stage_type"] !== "operation" && stage["stage_type"] !== "operator") fail(`${path}.stages[${index}].stage_type`, "must be operation or operator");
-    if (stage["arguments"] === null || typeof stage["arguments"] !== "object" || Array.isArray(stage["arguments"])) fail(`${path}.stages[${index}].arguments`, "must be an object");
-    const bindings = stage["bindings"] === undefined ? {} : stage["bindings"];
-    if (bindings === null || typeof bindings !== "object" || Array.isArray(bindings)) fail(`${path}.stages[${index}].bindings`, "must be an object");
-    const inputBindings = Array.isArray(stage["inputs"]) ? stage["inputs"] as unknown[] : Object.values(bindings as Record<string, unknown>);
+function validatePipelineStageBindings(inputBindings: readonly unknown[], index: number, path: string, stageIds: ReadonlyMap<string, PipelineStageInfo>): void {
     for (const [bindingIndex, rawBinding] of inputBindings.entries()) {
       if (rawBinding === null || typeof rawBinding !== "object" || Array.isArray(rawBinding)) fail(`${path}.stages[${index}].inputs[${bindingIndex}]`, "must be a binding");
       const binding = rawBinding as Record<string, unknown>;
@@ -898,7 +1077,9 @@ function validatePipelineV3Model(object: Record<string, unknown>, path: string, 
       const producer = stageIds.get(String(binding["stage_id"]));
       if (producer === undefined || producer.index >= index || !producer.outputs.includes(String(binding["output"]))) fail(`${path}.stages[${index}].inputs[${bindingIndex}]`, "must reference an earlier registered output");
     }
-    let outputs: readonly string[];
+}
+
+function validatePipelineStageArguments(stage: Record<string, unknown>, bindings: Record<string, unknown>, index: number, path: string, context: SchemaValidationContext, stageIds: ReadonlyMap<string, PipelineStageInfo>): readonly string[] {
     if (stage["stage_type"] === "operation") {
       if (typeof stage["operation"] !== "string") fail(`${path}.stages[${index}].operation`, "must be a registered operation");
       const operation = operationDefinitions.find((candidate) => candidate.operation_id === stage["operation"]);
@@ -910,15 +1091,36 @@ function validatePipelineV3Model(object: Record<string, unknown>, path: string, 
         boundArgs[field] = ["subjects", "sources", "targets", "containers", "artifacts"].includes(field) ? [selector] : selector;
       }
       const selected = validateRegisteredOperationArguments(stage["operation"], boundArgs, `${path}.stages[${index}].arguments`, context, undefined, true);
-      outputs = selected.operation.result_streams;
+      return selected.operation.result_streams;
     } else {
       if (typeof stage["operator"] !== "string") fail(`${path}.stages[${index}].operator`, "must be a registered operator");
-      outputs = validatePipelineOperatorArguments(stage["operator"], stage["arguments"], `${path}.stages[${index}]`, context, stageIds as unknown as ReadonlyMap<string, PipelineStageOutputInfo>) ?? [];
+      return validatePipelineOperatorArguments(stage["operator"], stage["arguments"], `${path}.stages[${index}]`, context, stageIds as unknown as ReadonlyMap<string, PipelineStageOutputInfo>) ?? [];
     }
+    return [];
+}
+
+function validatePipelineStage(rawStage: unknown, index: number, path: string, context: SchemaValidationContext, stageIds: Map<string, PipelineStageInfo>): void {
+    if (rawStage === null || typeof rawStage !== "object" || Array.isArray(rawStage)) fail(`${path}.stages[${index}]`, "must be a closed v3 stage object");
+    const stage = rawStage as Record<string, unknown>;
+    requireModelFields(stage, ["stage_id", "stage_type", "arguments"], `${path}.stages[${index}]`);
+    rejectUnknownModelFields(stage, ["stage_id", "stage_type", "operation", "operation_version", "operator", "arguments", "bindings", "inputs"], `${path}.stages[${index}]`);
+    const stageId = stage["stage_id"];
+    if (typeof stageId !== "string" || stageId.length === 0 || stageIds.has(stageId)) fail(`${path}.stages[${index}].stage_id`, "must be a unique non-empty identifier");
+    if (stage["stage_type"] !== "operation" && stage["stage_type"] !== "operator") fail(`${path}.stages[${index}].stage_type`, "must be operation or operator");
+    if (stage["arguments"] === null || typeof stage["arguments"] !== "object" || Array.isArray(stage["arguments"])) fail(`${path}.stages[${index}].arguments`, "must be an object");
+    const bindings = stage["bindings"] === undefined ? {} : stage["bindings"];
+    if (bindings === null || typeof bindings !== "object" || Array.isArray(bindings)) fail(`${path}.stages[${index}].bindings`, "must be an object");
+    const bindingObject = bindings as Record<string, unknown>;
+    const inputBindings = Array.isArray(stage["inputs"]) ? stage["inputs"] as unknown[] : Object.values(bindingObject);
+    validatePipelineStageBindings(inputBindings, index, path, stageIds);
+    const outputs = validatePipelineStageArguments(stage, bindingObject, index, path, context, stageIds);
     stageIds.set(stageId, { index, outputs });
-  }
+}
+
+function validatePipelineOutputs(outputsValue: unknown, path: string, stageIds: ReadonlyMap<string, PipelineStageInfo>): void {
+  if (!Array.isArray(outputsValue)) fail(`${path}.outputs`, "must be an array");
   const seen = new Set<string>();
-  for (const [index, rawOutput] of (object["outputs"] as unknown[]).entries()) {
+  for (const [index, rawOutput] of outputsValue.entries()) {
     if (rawOutput === null || typeof rawOutput !== "object" || Array.isArray(rawOutput)) fail(`${path}.outputs[${index}]`, "must be a v3 output");
     const output = rawOutput as Record<string, unknown>;
     requireModelFields(output, ["name", "stage_id", "output"], `${path}.outputs[${index}]`);
@@ -928,6 +1130,59 @@ function validatePipelineV3Model(object: Record<string, unknown>, path: string, 
     const key = `${String(output["stage_id"])}\u0000${String(output["output"])}`;
     if (seen.has(key)) fail(`${path}.outputs[${index}]`, "must not contain duplicate output references");
     seen.add(key);
+  }
+}
+
+function validatePipelineV3Model(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  const stageIds = new Map<string, PipelineStageInfo>();
+  for (const [index, rawStage] of (object["stages"] as unknown[]).entries()) validatePipelineStage(rawStage, index, path, context, stageIds);
+  validatePipelineOutputs(object["outputs"], path, stageIds);
+}
+
+function validateQueryPipelineStages(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  const stageIds = new Map<string, PipelineStageOutputInfo>();
+  for (const [index, stage] of (object["stages"] as unknown[]).entries()) {
+    const result = validateQueryStageModel(stage, `${path}.stages[${index}]`, context, stageIds);
+    const stageId = (stage as Record<string, unknown>)["stage_id"];
+    if (typeof stageId !== "string") fail(`${path}.stages[${index}].stage_id`, "must be non-empty");
+    if (stageIds.has(stageId)) fail(`${path}.stages[${index}].stage_id`, "duplicate stage identifier");
+    stageIds.set(stageId, result.outputNames === undefined ? { index, operator: result.operator } : { index, operator: result.operator, outputs: result.outputNames });
+    for (const [inputIndex, input] of ((stage as Record<string, unknown>)["inputs"] as unknown[]).entries()) {
+      const reference = input as Record<string, unknown>;
+      const target = stageIds.get(String(reference["stage_id"]));
+      if (!target) fail(`${path}.stages[${index}].inputs[${inputIndex}]`, "must reference an earlier pipeline stage");
+      if (target.index >= index) fail(`${path}.stages[${index}].inputs[${inputIndex}]`, "must reference an earlier pipeline stage");
+      if (target.outputs !== undefined && !target.outputs.includes(String(reference["output"]))) fail(`${path}.stages[${index}].inputs[${inputIndex}].output`, "is not a registered output of the referenced stage");
+    }
+    if (result.operator === "select") validateQuerySelectStageInputs(stage, index, path, stageIds);
+  }
+  validateQueryPipelineOutputs(object["outputs"] as unknown[], path, stageIds);
+}
+
+function validateQuerySelectStageInputs(stage: unknown, index: number, path: string, stageIds: ReadonlyMap<string, PipelineStageOutputInfo>): void {
+  const stageObject = stage as Record<string, unknown>;
+  const selectOutputs = (stageObject["arguments"] as Record<string, unknown>)["outputs"] as unknown[];
+  const declaredInputs = new Set(((stageObject["inputs"] as unknown[]).map((input) => `${String((input as Record<string, unknown>)["stage_id"])}\u0000${String((input as Record<string, unknown>)["output"])}`)));
+  for (const [outputIndex, selectedOutput] of selectOutputs.entries()) {
+    const reference = (selectedOutput as Record<string, unknown>)["input"] as Record<string, unknown>;
+    if (!declaredInputs.has(`${String(reference["stage_id"])}\u0000${String(reference["output"])}`)) fail(`${path}.stages[${index}].arguments.outputs[${outputIndex}].input`, "must reference a declared stage input");
+    const target = stageIds.get(String(reference["stage_id"]));
+    if (!target || target.index >= index) fail(`${path}.stages[${index}].arguments.outputs[${outputIndex}].input`, "must reference an earlier pipeline stage");
+    if (target.outputs !== undefined && !target.outputs.includes(String(reference["output"]))) fail(`${path}.stages[${index}].arguments.outputs[${outputIndex}].input.output`, "is not a registered output of the referenced stage");
+  }
+}
+
+function validateQueryPipelineOutputs(outputs: readonly unknown[], path: string, stageIds: ReadonlyMap<string, PipelineStageOutputInfo>): void {
+  const outputReferences = new Set<string>();
+  for (const [index, output] of outputs.entries()) {
+    validateStageOutputReferenceModel(output, `${path}.outputs[${index}]`);
+    const reference = output as Record<string, unknown>;
+    const outputKey = `${String(reference["stage_id"])}\u0000${String(reference["output"])}`;
+    if (outputReferences.has(outputKey)) fail(`${path}.outputs[${index}]`, "must not contain duplicate output references");
+    outputReferences.add(outputKey);
+    const target = stageIds.get(String(reference["stage_id"]));
+    if (!target) fail(`${path}.outputs[${index}].stage_id`, "must reference a declared pipeline stage");
+    if (target.outputs !== undefined && !target.outputs.includes(String(reference["output"]))) fail(`${path}.outputs[${index}].output`, "is not a registered output of the referenced stage");
   }
 }
 
@@ -949,43 +1204,7 @@ function validateQueryExpressionModel(object: Record<string, unknown>, path: str
       validatePipelineV3Model(object, path, context);
       return;
     }
-    const stageIds = new Map<string, PipelineStageOutputInfo>();
-    for (const [index, stage] of (object["stages"] as unknown[]).entries()) {
-      const result = validateQueryStageModel(stage, `${path}.stages[${index}]`, context, stageIds);
-      const stageId = (stage as Record<string, unknown>)["stage_id"];
-      if (typeof stageId !== "string") fail(`${path}.stages[${index}].stage_id`, "must be non-empty");
-      if (stageIds.has(stageId)) fail(`${path}.stages[${index}].stage_id`, "duplicate stage identifier");
-      stageIds.set(stageId, result.outputNames === undefined ? { index, operator: result.operator } : { index, operator: result.operator, outputs: result.outputNames });
-      for (const [inputIndex, input] of ((stage as Record<string, unknown>)["inputs"] as unknown[]).entries()) {
-        const reference = input as Record<string, unknown>;
-        const target = stageIds.get(String(reference["stage_id"]));
-        if (!target) fail(`${path}.stages[${index}].inputs[${inputIndex}]`, "must reference an earlier pipeline stage");
-        if (target.index >= index) fail(`${path}.stages[${index}].inputs[${inputIndex}]`, "must reference an earlier pipeline stage");
-        if (target.outputs !== undefined && !target.outputs.includes(String(reference["output"]))) fail(`${path}.stages[${index}].inputs[${inputIndex}].output`, "is not a registered output of the referenced stage");
-      }
-      if (result.operator === "select") {
-        const selectOutputs = ((stage as Record<string, unknown>)["arguments"] as Record<string, unknown>)["outputs"] as unknown[];
-        const declaredInputs = new Set(((stage as Record<string, unknown>)["inputs"] as unknown[]).map((input) => `${String((input as Record<string, unknown>)["stage_id"])}\u0000${String((input as Record<string, unknown>)["output"])}`));
-        for (const [outputIndex, selectedOutput] of selectOutputs.entries()) {
-          const reference = (selectedOutput as Record<string, unknown>)["input"] as Record<string, unknown>;
-          if (!declaredInputs.has(`${String(reference["stage_id"])}\u0000${String(reference["output"])}`)) fail(`${path}.stages[${index}].arguments.outputs[${outputIndex}].input`, "must reference a declared stage input");
-          const target = stageIds.get(String(reference["stage_id"]));
-          if (!target || target.index >= index) fail(`${path}.stages[${index}].arguments.outputs[${outputIndex}].input`, "must reference an earlier pipeline stage");
-          if (target.outputs !== undefined && !target.outputs.includes(String(reference["output"]))) fail(`${path}.stages[${index}].arguments.outputs[${outputIndex}].input.output`, "is not a registered output of the referenced stage");
-        }
-      }
-    }
-    const outputReferences = new Set<string>();
-    for (const [index, output] of (object["outputs"] as unknown[]).entries()) {
-      validateStageOutputReferenceModel(output, `${path}.outputs[${index}]`);
-      const reference = output as Record<string, unknown>;
-      const outputKey = `${String(reference["stage_id"])}\u0000${String(reference["output"])}`;
-      if (outputReferences.has(outputKey)) fail(`${path}.outputs[${index}]`, "must not contain duplicate output references");
-      outputReferences.add(outputKey);
-      const target = stageIds.get(String(reference["stage_id"]));
-      if (!target) fail(`${path}.outputs[${index}].stage_id`, "must reference a declared pipeline stage");
-      if (target.outputs !== undefined && !target.outputs.includes(String(reference["output"]))) fail(`${path}.outputs[${index}].output`, "is not a registered output of the referenced stage");
-    }
+    validateQueryPipelineStages(object, path, context);
     return;
   }
   if (expressionType === "recipe") {
@@ -1027,6 +1246,16 @@ function validateStageOutputReferenceModel(value: unknown, path: string): void {
 function validateQueryStageModel(value: unknown, path: string, context: SchemaValidationContext, availableStageOutputs: ReadonlyMap<string, PipelineStageOutputInfo> = new Map()): QueryStageValidationResult {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be a QueryStage object");
   const stage = value as Record<string, unknown>;
+  validateQueryStageShape(stage, path);
+  validateStageInputReferences(stage["inputs"] as unknown[], path);
+  const operator = String(stage["operator"]);
+  const inputCount = (stage["inputs"] as unknown[]).length;
+  validateQueryStageInputRules(operator, inputCount, stage["inputs"] as unknown[], path);
+  const outputNames = validatePipelineOperatorArguments(operator, stage["arguments"], path, context, availableStageOutputs);
+  return outputNames === undefined ? { operator } : { operator, outputNames };
+}
+
+function validateQueryStageShape(stage: Record<string, unknown>, path: string): void {
   requireModelFields(stage, ["stage_id", "operator", "inputs", "arguments"], path);
   rejectUnknownModelFields(stage, ["stage_id", "operator", "inputs", "arguments", "operation_version"], path);
   if (typeof stage["stage_id"] !== "string" || stage["stage_id"].length === 0) fail(`${path}.stage_id`, "must be non-empty");
@@ -1034,17 +1263,19 @@ function validateQueryStageModel(value: unknown, path: string, context: SchemaVa
   if (!Array.isArray(stage["inputs"])) fail(`${path}.inputs`, "must be an array");
   if (stage["arguments"] === null || typeof stage["arguments"] !== "object" || Array.isArray(stage["arguments"])) fail(`${path}.arguments`, "must be an arguments object");
   if (stage["operation_version"] !== undefined && (!Number.isSafeInteger(stage["operation_version"]) || Number(stage["operation_version"]) < 1)) fail(`${path}.operation_version`, "must be a positive safe integer");
-  for (const [index, input] of (stage["inputs"] as unknown[]).entries()) validateStageOutputReferenceModel(input, `${path}.inputs[${index}]`);
-  const operator = String(stage["operator"]);
-  const inputCount = (stage["inputs"] as unknown[]).length;
+}
+
+function validateStageInputReferences(inputs: unknown[], path: string): void {
+  for (const [index, input] of inputs.entries()) validateStageOutputReferenceModel(input, `${path}.inputs[${index}]`);
+}
+
+function validateQueryStageInputRules(operator: string, inputCount: number, inputs: unknown[], path: string): void {
   const minimumInputs: Readonly<Record<string, number>> = { "set.union": 2, "set.intersection": 2, deduplicate: 1, select: 1 };
   const exactInputs: Readonly<Record<string, number>> = { "set.difference": 2, "expand.relations": 1, "expand.operation": 1, filter: 1, join: 2, "bind.record_selector": 1, "bind.subject_record_selector": 1, "source.operation": 0, "source.registry": 0 };
   if (minimumInputs[operator] !== undefined && inputCount < minimumInputs[operator]) fail(`${path}.inputs`, `must contain at least ${minimumInputs[operator]} inputs for ${operator}`);
   if (exactInputs[operator] !== undefined && inputCount !== exactInputs[operator]) fail(`${path}.inputs`, `must contain exactly ${exactInputs[operator]} inputs for ${operator}`);
-  if (operator === "bind.record_selector" && String(((stage["inputs"] as unknown[])[0] as Record<string, unknown>)?.["output"]) !== "definition_set") fail(`${path}.inputs[0].output`, "must reference a registry definition_set input");
+  if (operator === "bind.record_selector" && String((inputs[0] as Record<string, unknown>)?.["output"]) !== "definition_set") fail(`${path}.inputs[0].output`, "must reference a registry definition_set input");
   if (operator === "bind.record_selector" || operator === "bind.subject_record_selector") fail(`${path}.operator`, "is recipe-only and is not accepted in caller-authored pipelines");
-  const outputNames = validatePipelineOperatorArguments(stage["operator"], stage["arguments"], path, context, availableStageOutputs);
-  return outputNames === undefined ? { operator: stage["operator"] } : { operator: stage["operator"], outputNames };
 }
 
 const schemaBoundModelCoordinates: Readonly<Record<string, readonly [string, string]>> = {
@@ -1065,68 +1296,156 @@ function validateModelSchemaBoundCoordinates(typeName: string, fieldName: string
   if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) fail(`${path}.${fieldName}`, "must be non-empty SchemaBoundBytes");
 }
 
-function validatePublicQueryModel(typeName: string, object: Record<string, unknown>, path: string, context: SchemaValidationContext, allowStageOutput = false): void {
-  const strings = (name: string): void => { const value = object[name]; if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) fail(`${path}.${name}`, "must be an array of strings"); };
-  const optionalBoolean = (name: string): void => { if (name in object && typeof object[name] !== "boolean") fail(`${path}.${name}`, "must be boolean"); };
-  if (typeName === "DefinitionMatcher") {
-    rejectUnknownModelFields(object, ["text", "mode", "definition_types", "namespaces", "limit"], path);
-    requireModelFields(object, ["text", "mode"], path);
-    if (typeof object["text"] !== "string" || object["text"].length === 0) fail(`${path}.text`, "must be non-empty text");
-    if (!["exact", "prefix", "contains", "semantic", "hybrid"].includes(String(object["mode"]))) fail(`${path}.mode`, "must be a closed matcher mode");
-    for (const name of ["definition_types", "namespaces"]) if (name in object) strings(name);
-    if ("limit" in object && (!Number.isSafeInteger(object["limit"]) || Number(object["limit"]) < 1)) fail(`${path}.limit`, "must be a positive safe integer");
+function validatePublicStringArray(object: Record<string, unknown>, name: string, path: string): void {
+  const value = object[name];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) fail(`${path}.${name}`, "must be an array of strings");
+}
+
+function validateDefinitionMatcher(object: Record<string, unknown>, path: string): void {
+  rejectUnknownModelFields(object, ["text", "mode", "definition_types", "namespaces", "limit"], path);
+  requireModelFields(object, ["text", "mode"], path);
+  if (typeof object["text"] !== "string" || object["text"].length === 0) fail(`${path}.text`, "must be non-empty text");
+  if (!["exact", "prefix", "contains", "semantic", "hybrid"].includes(String(object["mode"]))) fail(`${path}.mode`, "must be a closed matcher mode");
+  for (const name of ["definition_types", "namespaces"]) if (name in object) validatePublicStringArray(object, name, path);
+  if ("limit" in object && (!Number.isSafeInteger(object["limit"]) || Number(object["limit"]) < 1)) fail(`${path}.limit`, "must be a positive safe integer");
+}
+
+function validateSubjectSelector(object: Record<string, unknown>, path: string, context: SchemaValidationContext, allowStageOutput: boolean): void {
+  const subjectType = object["subject_type"];
+  if (subjectType === "entity") { requireModelFields(object, ["subject_type", "entity_id"], path); rejectUnknownModelFields(object, ["subject_type", "entity_id", "entity_record_id"], path); return; }
+  if (subjectType === "record") { requireModelFields(object, ["subject_type", "record_id"], path); rejectUnknownModelFields(object, ["subject_type", "record_id"], path); return; }
+  if (subjectType === "artifact") {
+    const hasId = typeof object["artifact_id"] === "string";
+    const hasPath = typeof object["path"] === "string";
+    if (hasId === hasPath) fail(`${path}.artifact_id`, "artifact selector requires exactly one of artifact_id or path");
+    rejectUnknownModelFields(object, ["subject_type", "artifact_id", "path", "artifact_version_id"], path);
     return;
   }
-  if (typeName === "SubjectSelector") {
-    const subjectType = object["subject_type"];
-    if (subjectType === "entity") { requireModelFields(object, ["subject_type", "entity_id"], path); rejectUnknownModelFields(object, ["subject_type", "entity_id", "entity_record_id"], path); return; }
-    if (subjectType === "record") { requireModelFields(object, ["subject_type", "record_id"], path); rejectUnknownModelFields(object, ["subject_type", "record_id"], path); return; }
-    if (subjectType === "artifact") {
-      const hasId = typeof object["artifact_id"] === "string";
-      const hasPath = typeof object["path"] === "string";
-      if (hasId === hasPath) fail(`${path}.artifact_id`, "artifact selector requires exactly one of artifact_id or path");
-      rejectUnknownModelFields(object, ["subject_type", "artifact_id", "path", "artifact_version_id"], path); return;
-    }
-    if (subjectType === "symbol") { requireModelFields(object, ["subject_type", "name"], path); rejectUnknownModelFields(object, ["subject_type", "name", "context_artifact", "context_byte_offset", "kind_selector"], path); if ("context_byte_offset" in object && (!Number.isSafeInteger(object["context_byte_offset"]) || Number(object["context_byte_offset"]) < 0)) fail(`${path}.context_byte_offset`, "must be a non-negative safe integer"); if (object["kind_selector"] !== undefined) validateModelReferenceValue("KindSelector", object["kind_selector"], `${path}.kind_selector`, context); return; }
-    if (subjectType === "stage_output") {
-      if (!allowStageOutput) fail(`${path}.subject_type`, "stage_output selectors are legal only in pipeline arguments");
-      requireModelFields(object, ["subject_type", "stage_id", "output"], path); rejectUnknownModelFields(object, ["subject_type", "stage_id", "output"], path); return;
-    }
-    fail(`${path}.subject_type`, "must be one of entity, record, artifact, symbol, or stage_output");
+  if (subjectType === "symbol") {
+    requireModelFields(object, ["subject_type", "name"], path);
+    rejectUnknownModelFields(object, ["subject_type", "name", "context_artifact", "context_byte_offset", "kind_selector"], path);
+    if ("context_byte_offset" in object && (!Number.isSafeInteger(object["context_byte_offset"]) || Number(object["context_byte_offset"]) < 0)) fail(`${path}.context_byte_offset`, "must be a non-negative safe integer");
+    if (object["kind_selector"] !== undefined) validateModelReferenceValue("KindSelector", object["kind_selector"], `${path}.kind_selector`, context);
+    return;
   }
-  if (typeName === "KindSelector") { rejectUnknownModelFields(object, ["kinds", "universal_kinds", "all_facets", "any_facets", "excluded_facets"], path); for (const name of ["kinds", "universal_kinds", "all_facets", "any_facets", "excluded_facets"]) if (name in object) strings(name); return; }
-  if (typeName === "StructuralFilter") { rejectUnknownModelFields(object, ["paths", "languages", "namespaces", "kind_selector", "subject_types", "include_external", "include_generated"], path); for (const name of ["paths", "languages", "namespaces"]) if (name in object) strings(name); if (object["kind_selector"] !== undefined) validateModelReferenceValue("KindSelector", object["kind_selector"], `${path}.kind_selector`, context); if (object["subject_types"] !== undefined) { strings("subject_types"); if ((object["subject_types"] as string[]).some((value) => !["entity", "record", "artifact"].includes(value))) fail(`${path}.subject_types`, "contains an unknown subject type"); } optionalBoolean("include_external"); optionalBoolean("include_generated"); return; }
-  if (typeName === "RelationSelector") { rejectUnknownModelFields(object, ["relation_kinds", "universal_kinds", "roles", "evidence_class", "possible_confidence"], path); for (const name of ["relation_kinds", "universal_kinds", "roles", "possible_confidence"]) if (name in object) strings(name); if (object["evidence_class"] !== undefined && !["confirmed", "possible", "both"].includes(String(object["evidence_class"]))) fail(`${path}.evidence_class`, "must be confirmed, possible, or both"); if (Array.isArray(object["possible_confidence"]) && (object["possible_confidence"] as string[]).some((value) => !["high", "medium", "low"].includes(value))) fail(`${path}.possible_confidence`, "contains an unknown confidence tier"); return; }
-  if (typeName === "RegistrySelector") { rejectUnknownModelFields(object, ["definition_types", "namespaces", "plugin_ids", "lifecycle_states"], path); for (const name of ["definition_types", "namespaces", "plugin_ids"]) if (name in object) strings(name); if (object["lifecycle_states"] !== undefined) { strings("lifecycle_states"); if ((object["lifecycle_states"] as string[]).some((value) => !["active", "deprecated", "retired"].includes(value))) fail(`${path}.lifecycle_states`, "contains an unknown lifecycle state"); } return; }
-  if (typeName === "RecordStructuralSelector") { rejectUnknownModelFields(object, ["record_categories", "kind_selector", "producer_ids", "filter"], path); const present = ["record_categories", "kind_selector", "producer_ids", "filter"].filter((name) => object[name] !== undefined); if (present.length === 0) fail(path, "must contain at least one selector dimension"); if (object["record_categories"] !== undefined) { strings("record_categories"); if ((object["record_categories"] as string[]).length === 0) fail(`${path}.record_categories`, "must be a non-empty array"); if ((object["record_categories"] as string[]).some((value) => !["entity", "relation", "fact", "evidence", "diagnostic"].includes(value))) fail(`${path}.record_categories`, "contains an unknown record category"); if (new Set(object["record_categories"] as string[]).size !== (object["record_categories"] as string[]).length) fail(`${path}.record_categories`, "must not contain duplicates"); } if (object["kind_selector"] !== undefined) validateModelReferenceValue("KindSelector", object["kind_selector"], `${path}.kind_selector`, context); if (object["producer_ids"] !== undefined) { strings("producer_ids"); if ((object["producer_ids"] as string[]).length === 0) fail(`${path}.producer_ids`, "must be a non-empty array"); } if (object["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", object["filter"], `${path}.filter`, context); return; }
+  if (subjectType === "stage_output") {
+    if (!allowStageOutput) fail(`${path}.subject_type`, "stage_output selectors are legal only in pipeline arguments");
+    requireModelFields(object, ["subject_type", "stage_id", "output"], path);
+    rejectUnknownModelFields(object, ["subject_type", "stage_id", "output"], path);
+    return;
+  }
+  fail(`${path}.subject_type`, "must be one of entity, record, artifact, symbol, or stage_output");
+}
+
+function validateKindSelector(object: Record<string, unknown>, path: string): void {
+  rejectUnknownModelFields(object, ["kinds", "universal_kinds", "all_facets", "any_facets", "excluded_facets"], path);
+  for (const name of ["kinds", "universal_kinds", "all_facets", "any_facets", "excluded_facets"]) if (name in object) validatePublicStringArray(object, name, path);
+}
+
+function validateStructuralFilter(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  rejectUnknownModelFields(object, ["paths", "languages", "namespaces", "kind_selector", "subject_types", "include_external", "include_generated"], path);
+  for (const name of ["paths", "languages", "namespaces"]) if (name in object) validatePublicStringArray(object, name, path);
+  if (object["kind_selector"] !== undefined) validateModelReferenceValue("KindSelector", object["kind_selector"], `${path}.kind_selector`, context);
+  if (object["subject_types"] !== undefined) {
+    validatePublicStringArray(object, "subject_types", path);
+    if ((object["subject_types"] as string[]).some((value) => !["entity", "record", "artifact"].includes(value))) fail(`${path}.subject_types`, "contains an unknown subject type");
+  }
+  for (const name of ["include_external", "include_generated"]) if (name in object && typeof object[name] !== "boolean") fail(`${path}.${name}`, "must be boolean");
+}
+
+function validateRelationSelector(object: Record<string, unknown>, path: string): void {
+  rejectUnknownModelFields(object, ["relation_kinds", "universal_kinds", "roles", "evidence_class", "possible_confidence"], path);
+  for (const name of ["relation_kinds", "universal_kinds", "roles", "possible_confidence"]) if (name in object) validatePublicStringArray(object, name, path);
+  if (object["evidence_class"] !== undefined && !["confirmed", "possible", "both"].includes(String(object["evidence_class"]))) fail(`${path}.evidence_class`, "must be confirmed, possible, or both");
+  if (Array.isArray(object["possible_confidence"]) && (object["possible_confidence"] as string[]).some((value) => !["high", "medium", "low"].includes(value))) fail(`${path}.possible_confidence`, "contains an unknown confidence tier");
+}
+
+function validateRegistrySelector(object: Record<string, unknown>, path: string): void {
+  rejectUnknownModelFields(object, ["definition_types", "namespaces", "plugin_ids", "lifecycle_states"], path);
+  for (const name of ["definition_types", "namespaces", "plugin_ids"]) if (name in object) validatePublicStringArray(object, name, path);
+  if (object["lifecycle_states"] !== undefined) {
+    validatePublicStringArray(object, "lifecycle_states", path);
+    if ((object["lifecycle_states"] as string[]).some((value) => !["active", "deprecated", "retired"].includes(value))) fail(`${path}.lifecycle_states`, "contains an unknown lifecycle state");
+  }
+}
+
+function validateRecordStructuralSelector(object: Record<string, unknown>, path: string, context: SchemaValidationContext): void {
+  rejectUnknownModelFields(object, ["record_categories", "kind_selector", "producer_ids", "filter"], path);
+  const present = ["record_categories", "kind_selector", "producer_ids", "filter"].filter((name) => object[name] !== undefined);
+  if (present.length === 0) fail(path, "must contain at least one selector dimension");
+  if (object["record_categories"] !== undefined) {
+    validatePublicStringArray(object, "record_categories", path);
+    const categories = object["record_categories"] as string[];
+    if (categories.length === 0) fail(`${path}.record_categories`, "must be a non-empty array");
+    if (categories.some((value) => !["entity", "relation", "fact", "evidence", "diagnostic"].includes(value))) fail(`${path}.record_categories`, "contains an unknown record category");
+    if (new Set(categories).size !== categories.length) fail(`${path}.record_categories`, "must not contain duplicates");
+  }
+  if (object["kind_selector"] !== undefined) validateModelReferenceValue("KindSelector", object["kind_selector"], `${path}.kind_selector`, context);
+  if (object["producer_ids"] !== undefined) {
+    validatePublicStringArray(object, "producer_ids", path);
+    if ((object["producer_ids"] as string[]).length === 0) fail(`${path}.producer_ids`, "must be a non-empty array");
+  }
+  if (object["filter"] !== undefined) validateModelReferenceValue("StructuralFilter", object["filter"], `${path}.filter`, context);
+}
+
+function validateChangeDescriptor(object: Record<string, unknown>, path: string): void {
   const changeType = object["change_type"];
   const changeFields: Record<string, readonly string[]> = { delete: ["change_type"], rename: ["change_type", "new_name"], move: ["change_type", "new_artifact_path", "new_container"], signature: ["change_type", "new_signature", "compatibility_assumptions"], type: ["change_type", "new_type", "compatibility_assumptions"], visibility: ["change_type", "new_visibility"], contract: ["change_type", "contract_change_code", "new_contract", "compatibility_assumptions"], behavior: ["change_type", "behavior_change_code", "description", "affected_effects"] };
-  const allowed = changeFields[String(changeType)]; if (!allowed) fail(`${path}.change_type`, "must be a closed ChangeDescriptor variant"); requireModelFields(object, allowed.filter((name) => !["new_container", "compatibility_assumptions", "affected_effects"].includes(name)), path); rejectUnknownModelFields(object, allowed, path); for (const name of ["compatibility_assumptions", "affected_effects"]) if (name in object) strings(name);
+  const allowed = changeFields[String(changeType)];
+  if (!allowed) fail(`${path}.change_type`, "must be a closed ChangeDescriptor variant");
+  requireModelFields(object, allowed.filter((name) => !["new_container", "compatibility_assumptions", "affected_effects"].includes(name)), path);
+  rejectUnknownModelFields(object, allowed, path);
+  for (const name of ["compatibility_assumptions", "affected_effects"]) if (name in object) validatePublicStringArray(object, name, path);
+}
+
+function validatePublicQueryModel(typeName: string, object: Record<string, unknown>, path: string, context: SchemaValidationContext, allowStageOutput = false): void {
+  if (typeName === "DefinitionMatcher") { validateDefinitionMatcher(object, path); return; }
+  if (typeName === "SubjectSelector") { validateSubjectSelector(object, path, context, allowStageOutput); return; }
+  if (typeName === "KindSelector") { validateKindSelector(object, path); return; }
+  if (typeName === "StructuralFilter") { validateStructuralFilter(object, path, context); return; }
+  if (typeName === "RelationSelector") { validateRelationSelector(object, path); return; }
+  if (typeName === "RegistrySelector") { validateRegistrySelector(object, path); return; }
+  if (typeName === "RecordStructuralSelector") { validateRecordStructuralSelector(object, path, context); return; }
+  validateChangeDescriptor(object, path);
 }
 
 function logicalTypeExpression(logicalType: string): CanonicalTypeExpression {
+  const collection = collectionLogicalTypeExpression(logicalType);
+  if (collection !== undefined) return collection;
+  const enumValues = logicalType.split("|").map((value) => value.trim()).filter(Boolean);
+  if (enumValues.length > 1) return { type_kind: "enum", values: enumValues };
+  const named = namedLogicalTypeExpression(logicalType);
+  if (named !== undefined) return named;
+  if (/^[a-z][a-z0-9_]*$/.test(logicalType)) return { type_kind: "enum", values: [logicalType] };
+  if (logicalType === "JsonValue") return { type_kind: "schema_reference", reference_scope: "external", type_name: "JsonValue", schema_id: "core:JsonValue", schema_version: 1 };
+  if (authoritativeModelNames.includes(logicalType as (typeof authoritativeModelNames)[number])) return { type_kind: "schema_reference", reference_scope: "external", type_name: logicalType, schema_id: `core:${logicalType}`, schema_version: 1 };
+  throw new Error(`missing authoritative logical type ${logicalType}`);
+}
+
+function collectionLogicalTypeExpression(logicalType: string): CanonicalTypeExpression | undefined {
   const sequence = logicalType.match(/^Sequence<(.+)>$/);
   if (sequence) return { type_kind: "sequence", element_type: logicalTypeExpression(sequence[1] ?? "") };
   const set = logicalType.match(/^Set<(.+)>$/);
   if (set) return { type_kind: "set", element_type: logicalTypeExpression(set[1] ?? "") };
   const orderedSet = logicalType.match(/^OrderedSet<(.+),\s*([^>]+)>$/);
   if (orderedSet) return { type_kind: "ordered_set", element_type: logicalTypeExpression(orderedSet[1] ?? ""), comparator_id: (orderedSet[2] ?? "").replace(/@\d+$/, ""), comparator_version: 1 };
-  const enumValues = logicalType.split("|").map((value) => value.trim()).filter(Boolean);
-  if (enumValues.length > 1) return { type_kind: "enum", values: enumValues };
-  if (logicalType === "Boolean") return { type_kind: "boolean" };
-  if (logicalType === "PositiveInteger") return { type_kind: "safe_integer", minimum: 1 };
-  if (logicalType === "Count") return { type_kind: "safe_integer", minimum: 0 };
-  if (logicalType === "Identifier") return { type_kind: "text", identifier_kind: "identifier" };
-  if (logicalType === "NamespacedIdentifier") return { type_kind: "text", identifier_kind: "namespaced_identifier" };
-  if (logicalType === "SemVer") return { type_kind: "text", identifier_kind: "semver" };
-  if (logicalType === "URI") return { type_kind: "text", identifier_kind: "uri" };
-  if (logicalType === "Text") return { type_kind: "text" };
-  if (logicalType === "Digest") return { type_kind: "digest", allowed_hash_algorithms: ["sha256"] };
-  if (logicalType === "Bytes" || logicalType === "SchemaBoundBytes") return { type_kind: "bytes" };
-  if (/^[a-z][a-z0-9_]*$/.test(logicalType)) return { type_kind: "enum", values: [logicalType] };
-  if (logicalType === "JsonValue") return { type_kind: "schema_reference", reference_scope: "external", type_name: "JsonValue", schema_id: "core:JsonValue", schema_version: 1 };
-  if (authoritativeModelNames.includes(logicalType as (typeof authoritativeModelNames)[number])) return { type_kind: "schema_reference", reference_scope: "external", type_name: logicalType, schema_id: `core:${logicalType}`, schema_version: 1 };
-  throw new Error(`missing authoritative logical type ${logicalType}`);
+  return undefined;
+}
+
+function namedLogicalTypeExpression(logicalType: string): CanonicalTypeExpression | undefined {
+  switch (logicalType) {
+    case "Boolean": return { type_kind: "boolean" };
+    case "PositiveInteger": return { type_kind: "safe_integer", minimum: 1 };
+    case "Count": return { type_kind: "safe_integer", minimum: 0 };
+    case "Identifier": return { type_kind: "text", identifier_kind: "identifier" };
+    case "NamespacedIdentifier": return { type_kind: "text", identifier_kind: "namespaced_identifier" };
+    case "SemVer": return { type_kind: "text", identifier_kind: "semver" };
+    case "URI": return { type_kind: "text", identifier_kind: "uri" };
+    case "Text": return { type_kind: "text" };
+    case "Digest": return { type_kind: "digest", allowed_hash_algorithms: ["sha256"] };
+    case "Bytes": case "SchemaBoundBytes": return { type_kind: "bytes" };
+    default: return undefined;
+  }
 }
 
 function requireModelFields(object: Record<string, unknown>, fields: readonly string[], path: string): void {
@@ -1155,6 +1474,12 @@ function validateMap(type: MapTypeExpression, value: unknown, path: string, cont
   for (const [key, item] of entries) validateType(type.value_type, item, `${path}.${key}`, context, activeReferences);
 }
 
+function validateSchemaBoundRecordField(field: SchemaFieldDefinition, object: Record<string, unknown>, path: string): void {
+  if (field.value_type.type_kind !== "bytes" || field.value_type.bound_schema_id_field === undefined || field.value_type.bound_schema_version_field === undefined) return;
+  if (typeof object[field.value_type.bound_schema_id_field] !== "string" || object[field.value_type.bound_schema_id_field] === "") fail(`${path}.${field.value_type.bound_schema_id_field}`, "is required by SchemaBoundBytes");
+  if (!Number.isSafeInteger(object[field.value_type.bound_schema_version_field]) || Number(object[field.value_type.bound_schema_version_field]) < 1) fail(`${path}.${field.value_type.bound_schema_version_field}`, "is required as a positive schema version by SchemaBoundBytes");
+}
+
 function validateRecord(fields: ReadonlyArray<SchemaFieldDefinition>, value: unknown, path: string, context: SchemaValidationContext, activeReferences: Set<string>): void {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail(path, "must be a record");
   const object = value as Record<string, unknown>;
@@ -1165,10 +1490,7 @@ function validateRecord(fields: ReadonlyArray<SchemaFieldDefinition>, value: unk
       if (field.presence === "required") fail(`${path}.${field.field_name}`, "is required");
       continue;
     }
-    if (field.value_type.type_kind === "bytes" && field.value_type.bound_schema_id_field !== undefined && field.value_type.bound_schema_version_field !== undefined) {
-      if (typeof object[field.value_type.bound_schema_id_field] !== "string" || object[field.value_type.bound_schema_id_field] === "") fail(`${path}.${field.value_type.bound_schema_id_field}`, "is required by SchemaBoundBytes");
-      if (!Number.isSafeInteger(object[field.value_type.bound_schema_version_field]) || Number(object[field.value_type.bound_schema_version_field]) < 1) fail(`${path}.${field.value_type.bound_schema_version_field}`, "is required as a positive schema version by SchemaBoundBytes");
-    }
+    validateSchemaBoundRecordField(field, object, path);
     validateType(field.value_type, object[field.field_name], `${path}.${field.field_name}`, context, activeReferences);
   }
 }
@@ -1381,22 +1703,44 @@ function findComparator(comparatorId: string, comparatorVersion: number, context
   return comparatorRegistry.find((entry) => entry.comparator_id === comparatorId && entry.comparator_version === comparatorVersion);
 }
 
+function comparatorModeMatchesType(mode: string, typeKind: CanonicalTypeExpression["type_kind"]): boolean {
+  if (mode === "text_utf8") return typeKind === "text" || typeKind === "enum";
+  if (mode === "safe_integer_numeric") return typeKind === "safe_integer";
+  if (mode === "big_integer_numeric") return typeKind === "big_integer";
+  if (mode === "float64_numeric") return typeKind === "float64";
+  if (mode === "exact_decimal_numeric") return typeKind === "exact_decimal";
+  if (mode === "timestamp_chronological") return typeKind === "timestamp";
+  if (mode === "digest_bytes") return typeKind === "digest";
+  if (mode === "uce_bytes") return typeKind === "bytes" || typeKind === "schema_reference" || typeKind === "text";
+  return mode === "bytes_lexicographic" && typeKind === "bytes";
+}
+
 function validateComparatorCompatibility(element: CanonicalTypeExpression, keys: readonly { value_path: string; comparison_mode: string }[], path: string, context: SchemaValidationContext): void {
   if (keys.length === 0) fail(path, "ordered-set comparator requires sort keys");
   for (const key of keys) {
     const target = comparatorPathType(element, key.value_path, context);
     if (!target) fail(`${path}.${key.value_path}`, "comparator sort-key path does not resolve on the ordered-set element");
-    const compatible = key.comparison_mode === "text_utf8" && (target.type_kind === "text" || target.type_kind === "enum")
-      || key.comparison_mode === "safe_integer_numeric" && target.type_kind === "safe_integer"
-      || key.comparison_mode === "big_integer_numeric" && target.type_kind === "big_integer"
-      || key.comparison_mode === "float64_numeric" && target.type_kind === "float64"
-      || key.comparison_mode === "exact_decimal_numeric" && target.type_kind === "exact_decimal"
-      || key.comparison_mode === "timestamp_chronological" && target.type_kind === "timestamp"
-      || key.comparison_mode === "digest_bytes" && target.type_kind === "digest"
-      || key.comparison_mode === "uce_bytes" && (target.type_kind === "bytes" || target.type_kind === "schema_reference" || target.type_kind === "text")
-      || key.comparison_mode === "bytes_lexicographic" && target.type_kind === "bytes";
-    if (!compatible) fail(`${path}.${key.value_path}`, `comparator mode ${key.comparison_mode} is incompatible with ${target.type_kind}`);
+    if (!comparatorModeMatchesType(key.comparison_mode, target.type_kind)) fail(`${path}.${key.value_path}`, `comparator mode ${key.comparison_mode} is incompatible with ${target.type_kind}`);
   }
+}
+
+function resolveAuthoritativeComparatorField(typeName: string, segment: string): CanonicalTypeExpression | undefined {
+  const field = modelContractRegistry.find((candidate) => candidate.name === typeName)?.fields.find((candidate) => candidate.name === segment);
+  if (!field) return undefined;
+  const numericField = ["operation_version", "recipe_version", "schema_version", "definition_revision", "participant_ordinal", "package_format_version", "contract_version"].includes(field.name);
+  const logicalType = field.logical_type === "Text" && field.name.endsWith("digest")
+    ? "Digest"
+    : field.logical_type === "Text" && (numericField || /(ordinal|count|length)$/.test(field.name))
+      ? "Count"
+      : field.logical_type;
+  return comparatorLogicalTypeExpression(logicalType);
+}
+
+function resolveComparatorPathSegment(type: CanonicalTypeExpression, segment: string, context: SchemaValidationContext): CanonicalTypeExpression | undefined {
+  if (type.type_kind === "record") return type.fields.find((field) => field.field_name === segment)?.value_type;
+  if (type.type_kind === "schema_reference" && type.reference_scope === "local") return context.localDefinitions?.get(type.type_name);
+  if (type.type_kind === "schema_reference" && type.reference_scope === "external" && authoritativeModelNames.includes(type.type_name as (typeof authoritativeModelNames)[number])) return resolveAuthoritativeComparatorField(type.type_name, segment);
+  return undefined;
 }
 
 function comparatorPathType(type: CanonicalTypeExpression, valuePath: string, context: SchemaValidationContext): CanonicalTypeExpression | undefined {
@@ -1404,15 +1748,8 @@ function comparatorPathType(type: CanonicalTypeExpression, valuePath: string, co
   const segments = valuePath.split("/").filter(Boolean);
   let current: CanonicalTypeExpression | undefined = type;
   for (const segment of segments) {
-    if (current?.type_kind === "record") current = current.fields.find((field) => field.field_name === segment)?.value_type;
-    else if (current?.type_kind === "schema_reference" && current.reference_scope === "local") current = context.localDefinitions?.get(current.type_name);
-    else if (current?.type_kind === "schema_reference" && current.reference_scope === "external" && authoritativeModelNames.includes(current.type_name as (typeof authoritativeModelNames)[number])) {
-      const reference = current;
-      const field = modelContractRegistry.find((candidate) => candidate.name === reference.type_name)?.fields.find((candidate) => candidate.name === segment);
-      const numericField = field ? ["operation_version", "recipe_version", "schema_version", "definition_revision", "participant_ordinal", "package_format_version", "contract_version"].includes(field.name) : false;
-      current = field ? comparatorLogicalTypeExpression(field.logical_type === "Text" && field.name.endsWith("digest") ? "Digest" : field.logical_type === "Text" && (numericField || /(ordinal|count|length)$/.test(field.name)) ? "Count" : field.logical_type) : undefined;
-    }
-    else return undefined;
+    current = current === undefined ? undefined : resolveComparatorPathSegment(current, segment, context);
+    if (current === undefined) return undefined;
   }
   return current;
 }

@@ -41,10 +41,25 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
 }
 async function readJson(path: string): Promise<unknown | undefined> { try { return JSON.parse(await readFile(path, "utf8")); } catch (error) { if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined; throw new DaemonError("core:daemon_recovery_failed", `Cannot read ${path}.`); } }
 
+function validateEndpointDescriptorFields(descriptor: EndpointDescriptor): void {
+  if (descriptor.protocol_version !== 1 || typeof descriptor.endpoint !== "string" || typeof descriptor.pid !== "number" || !Number.isSafeInteger(descriptor.pid) || typeof descriptor.owner_uid !== "number" || typeof descriptor.engine_build_id !== "string" || typeof descriptor.started_at !== "string") throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor fields are invalid.");
+  if (descriptor.private_interface_version !== undefined && (!Number.isSafeInteger(descriptor.private_interface_version) || descriptor.private_interface_version < 1)) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor fields are invalid.");
+  if (descriptor.rpc_capabilities !== undefined && (!Array.isArray(descriptor.rpc_capabilities) || descriptor.rpc_capabilities.some((entry) => typeof entry !== "string" || entry.length === 0))) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor fields are invalid.");
+}
+
+function decodeEndpointDescriptor(value: unknown): EndpointDescriptor {
+  if (!value || typeof value !== "object" || typeof (value as { descriptor_digest?: unknown }).descriptor_digest !== "string") throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor is incomplete.");
+  const descriptor = value as EndpointDescriptor;
+  validateEndpointDescriptorFields(descriptor);
+  const { descriptor_digest, ...unsigned } = descriptor;
+  if (descriptor_digest !== digest(unsigned)) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor digest does not verify.");
+  return descriptor;
+}
+
 export class EndpointDescriptorStore {
   constructor(private readonly paths: DaemonPaths) {}
   async write(descriptor: Omit<EndpointDescriptor, "descriptor_digest">): Promise<EndpointDescriptor> { const value = { ...descriptor, descriptor_digest: digest(descriptor) }; await atomicJson(this.paths.endpoint_descriptor, value); return value; }
-  async read(): Promise<EndpointDescriptor | undefined> { const value = await readJson(this.paths.endpoint_descriptor); if (value === undefined) return undefined; if (!value || typeof value !== "object" || typeof (value as { descriptor_digest?: unknown }).descriptor_digest !== "string") throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor is incomplete."); const descriptor = value as EndpointDescriptor; if (descriptor.protocol_version !== 1 || typeof descriptor.endpoint !== "string" || typeof descriptor.pid !== "number" || !Number.isSafeInteger(descriptor.pid) || typeof descriptor.owner_uid !== "number" || typeof descriptor.engine_build_id !== "string" || typeof descriptor.started_at !== "string" || (descriptor.private_interface_version !== undefined && (!Number.isSafeInteger(descriptor.private_interface_version) || descriptor.private_interface_version < 1)) || (descriptor.rpc_capabilities !== undefined && (!Array.isArray(descriptor.rpc_capabilities) || descriptor.rpc_capabilities.some((entry) => typeof entry !== "string" || entry.length === 0)))) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor fields are invalid."); const { descriptor_digest, ...unsigned } = descriptor; if (descriptor_digest !== digest(unsigned)) throw new DaemonError("core:daemon_recovery_failed", "Endpoint descriptor digest does not verify."); return descriptor; }
+  async read(): Promise<EndpointDescriptor | undefined> { const value = await readJson(this.paths.endpoint_descriptor); return value === undefined ? undefined : decodeEndpointDescriptor(value); }
   async remove(): Promise<void> { await rm(this.paths.endpoint_descriptor, { force: true }); }
 }
 

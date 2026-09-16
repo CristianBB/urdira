@@ -388,25 +388,33 @@ function validateRecords(input: FactDeltaValidationInput, delta: FactDelta): voi
   }));
   const manifestIds = baseRecordIds(input.accepted_manifest);
   if (canonicalJson(delta.input_record_ids) !== canonicalJson(manifestIds)) fail(input, "core:delta_scope_mismatch", "FactDelta direct record inputs do not match the accepted manifest.");
-  for (const recordId of delta.input_record_ids) {
+  validateBaseRecordInputs(input, delta.input_record_ids, baseRecords, manifestBaseRecords);
+  const stagedManifestEntries = manifestStagedEntries(input.accepted_manifest);
+  const stagedById = new Map(input.staged_records.map((entry) => [entry.staged_record_id, entry]));
+  const stagedManifestIds = new Set(stagedManifestEntries.map((entry) => entry.staged_record_id));
+  validateStagedManifestEntries(input, stagedManifestEntries, stagedById);
+  const extraStaged = input.staged_records.filter((entry) => !stagedManifestIds.has(entry.staged_record_id));
+  if (extraStaged.length > 0) fail(input, "core:undeclared_input", "FactDelta carries staged producer entries absent from the accepted manifest.", { input_type: "staged_record", undeclared_ids: extraStaged.map((entry) => entry.staged_record_id) });
+  for (const record of delta.proposed_records) validateProposedRecord(input, record);
+}
+
+function validateBaseRecordInputs(input: FactDeltaValidationInput, recordIds: readonly string[], baseRecords: ReadonlyMap<string, BaseCandidateRecord>, manifestBaseRecords: ReadonlyMap<string, string>): void {
+  for (const recordId of recordIds) {
     const baseRecord = baseRecords.get(recordId);
     if (baseRecord === undefined) fail(input, "core:reference_validation_failed", "FactDelta refers to an unknown base record.", { record_id: recordId, reference_failure_kind: "dangling_base_record" });
     if (manifestBaseRecords.get(recordId) !== baseRecord.record_digest) fail(input, "core:reference_validation_failed", "FactDelta base record digest does not match the accepted manifest.", { record_id: recordId, reference_failure_kind: "base_record_digest_mismatch" });
     if (input.target_registry.closed_record_ids?.has(recordId) || baseRecord.valid_to_generation !== undefined) fail(input, "core:reference_validation_failed", "FactDelta refers to a closing base record.", { record_id: recordId, reference_failure_kind: "closing_base_record" });
   }
-  const stagedManifestEntries = manifestStagedEntries(input.accepted_manifest);
-  const stagedById = new Map(input.staged_records.map((entry) => [entry.staged_record_id, entry]));
-  const stagedManifestIds = new Set(stagedManifestEntries.map((entry) => entry.staged_record_id));
-  for (const stagedEntry of stagedManifestEntries) {
+}
+
+function validateStagedManifestEntries(input: FactDeltaValidationInput, entries: readonly ValidatedStagedRecord[], stagedById: ReadonlyMap<string, ValidatedStagedRecord>): void {
+  for (const stagedEntry of entries) {
     const validated = stagedById.get(stagedEntry.staged_record_id);
     if (validated === undefined || validated.producing_work_item_id !== stagedEntry.producing_work_item_id || validated.proposal_record_key !== stagedEntry.proposal_record_key || validated.validated_record_digest !== stagedEntry.validated_record_digest || !hasString(validated.validated_record_digest)) {
       fail(input, "core:undeclared_input", "FactDelta contains a staged input that was not validated by its producer.", { input_type: "staged_record", undeclared_ids: [stagedEntry.staged_record_id] });
     }
     if (validated.transitive_artifact_version_ids.some((versionId) => !input.accepted_manifest.transitive_artifact_version_ids.includes(versionId) && !input.accepted_manifest.artifact_version_entries.some((entry) => isObject(entry) && entry["artifact_version_id"] === versionId))) fail(input, "core:undeclared_input", "Validated staged input contains an artifact outside the accepted closure.", { input_type: "staged_record", undeclared_ids: [stagedEntry.staged_record_id] });
   }
-  const extraStaged = input.staged_records.filter((entry) => !stagedManifestIds.has(entry.staged_record_id));
-  if (extraStaged.length > 0) fail(input, "core:undeclared_input", "FactDelta carries staged producer entries absent from the accepted manifest.", { input_type: "staged_record", undeclared_ids: extraStaged.map((entry) => entry.staged_record_id) });
-  for (const record of delta.proposed_records) validateProposedRecord(input, record);
 }
 
 function validateProposedRecord(input: FactDeltaValidationInput, record: ProposedRecord): void {
@@ -417,6 +425,10 @@ function validateProposedRecord(input: FactDeltaValidationInput, record: Propose
   if (definition.category !== record.category || definition.universal_kind !== record.universal_kind || definition.schema_version !== record.schema_version) {
     fail(input, "core:record_schema_invalid", "A proposed record is not valid for its registered target schema.", { proposal_record_key: record.proposal_record_key });
   }
+  validateProposedRecordPayload(input, record, definition);
+}
+
+function validateProposedRecordPayload(input: FactDeltaValidationInput, record: ProposedRecord, definition: RegisteredRecordKind): void {
   try {
     const attestedFacets = factDeltaStreamAttestedFacets(record);
     const facets = attestedFacets ?? parseLogicalJson(record.facets);
@@ -461,27 +473,6 @@ function dependencyValidationContext(input: FactDeltaValidationInput, inputRecor
 }
 
 function validateProposedDependency(input: FactDeltaValidationInput, dependency: ProposedRecordDependency, keys: ReadonlySet<string>, dependencyIds: Set<string>, context: DependencyValidationContext): void {
-  const digestFromReference = (reference: unknown): string | undefined => {
-    if (!isObject(reference)) return undefined;
-    for (const key of ["dependency_digest", "content_hash", "digest"]) if (typeof reference[key] === "string") return reference[key] as string;
-    return undefined;
-  };
-  const validateSourceReference = (reference: unknown, dependencyBasis: string): void => {
-    if (!isObject(reference) || Object.keys(reference).length === 0) fail(input, "core:dependency_validation_failed", "Dependency source reference must be a non-empty structured value.", { dependency_failure_kind: "empty_source_reference" });
-    const referenceType = typeof reference["reference_type"] === "string" ? reference["reference_type"] : typeof reference["type"] === "string" ? reference["type"] : undefined;
-    const proposalKey = typeof reference["proposal_record_key"] === "string" ? reference["proposal_record_key"] : undefined;
-    const recordId = typeof reference["record_id"] === "string" ? reference["record_id"] : undefined;
-    const stagedId = typeof reference["staged_record_id"] === "string" ? reference["staged_record_id"] : undefined;
-    if (referenceType === undefined) fail(input, "core:dependency_validation_failed", "Dependency source reference is missing its reference type.", { dependency_failure_kind: "source_reference_type_missing" });
-    if (referenceType !== "base_record" && referenceType !== "staged_record" && referenceType !== "local_proposal" && referenceType !== "proposal") fail(input, "core:dependency_validation_failed", "Dependency source reference has an unknown reference type.", { dependency_failure_kind: "source_reference_type_unknown", source_reference: reference });
-    if (referenceType === "base_record" && recordId === undefined) fail(input, "core:dependency_validation_failed", "Base dependency source reference is missing its record identity.", { dependency_failure_kind: "source_reference_id_missing" });
-    if (referenceType === "staged_record" && stagedId === undefined) fail(input, "core:dependency_validation_failed", "Staged dependency source reference is missing its staged identity.", { dependency_failure_kind: "source_reference_id_missing" });
-    if ((referenceType === "local_proposal" || referenceType === "proposal") && proposalKey === undefined) fail(input, "core:dependency_validation_failed", "Proposal dependency source reference is missing its proposal identity.", { dependency_failure_kind: "source_reference_id_missing" });
-    if (proposalKey !== undefined && !keys.has(proposalKey)) fail(input, "core:undeclared_input", "Dependency source refers to an unknown local proposal.", { source_reference: reference });
-    if (recordId !== undefined && !context.inputRecordIds.has(recordId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared base record.", { source_reference: reference });
-    if (stagedId !== undefined && !context.stagedRecordIds.has(stagedId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared staged record.", { source_reference: reference });
-    if (dependencyBasis === "base" && referenceType !== undefined && referenceType !== "base_record") fail(input, "core:dependency_validation_failed", "Base dependency source has the wrong reference type.", { source_reference: reference });
-  };
   if (dependencyIds.has(dependency.proposed_dependency_id) || !keys.has(dependency.proposal_record_key)) fail(input, "core:dependency_validation_failed", "A proposed dependency is not locally resolvable.");
   dependencyIds.add(dependency.proposed_dependency_id);
   if (!input.target_registry.dependency_roles.has(dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "A proposed dependency role is not registered.", { dependency_role: dependency.dependency_role });
@@ -489,12 +480,52 @@ function validateProposedDependency(input: FactDeltaValidationInput, dependency:
   const registered = input.target_registry.artifact_versions?.get(dependency.dependency_artifact_version_id);
   if (registered?.closed === true || input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id)?.closed === true) fail(input, "core:dependency_validation_failed", "A proposed dependency refers to a closing artifact version.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
   if (registered !== undefined && registered.artifact_id !== dependency.dependency_artifact_id) fail(input, "core:dependency_validation_failed", "A proposed dependency artifact/version identity is inconsistent.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id });
-  validateSourceReference(dependency.source_reference, dependency.dependency_basis);
+  validateDependencySourceReference(input, dependency.source_reference, dependency.dependency_basis, keys, context);
   const closure = input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id);
   const declared = context.declaredByVersion.get(dependency.dependency_artifact_version_id);
   const expectedDigest = closure?.digest ?? registered?.content_hash ?? (typeof declared?.["content_hash"] === "string" ? declared["content_hash"] as string : undefined);
-  if (expectedDigest !== undefined && digestFromReference(dependency.source_reference) !== expectedDigest) fail(input, "core:dependency_validation_failed", "Dependency content digest does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "digest_mismatch" });
+  if (expectedDigest !== undefined && dependencyDigestFromReference(dependency.source_reference) !== expectedDigest) fail(input, "core:dependency_validation_failed", "Dependency content digest does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "digest_mismatch" });
   if (closure !== undefined && (closure.dependency_artifact_id !== dependency.dependency_artifact_id || closure.dependency_role !== dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "Dependency role or artifact identity does not match the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_mismatch" });
+}
+
+function dependencyDigestFromReference(reference: unknown): string | undefined {
+  if (!isObject(reference)) return undefined;
+  for (const key of ["dependency_digest", "content_hash", "digest"]) if (typeof reference[key] === "string") return reference[key] as string;
+  return undefined;
+}
+
+function validateDependencySourceReference(input: FactDeltaValidationInput, reference: unknown, dependencyBasis: string, keys: ReadonlySet<string>, context: DependencyValidationContext): void {
+  const parsed = parseDependencySourceReference(input, reference);
+  validateDependencySourceMembership(input, parsed, dependencyBasis, keys, context);
+}
+
+interface ParsedDependencySourceReference {
+  readonly raw: Record<string, unknown>;
+  readonly referenceType: string;
+  readonly proposalKey?: string;
+  readonly recordId?: string;
+  readonly stagedId?: string;
+}
+
+function parseDependencySourceReference(input: FactDeltaValidationInput, reference: unknown): ParsedDependencySourceReference {
+  if (!isObject(reference) || Object.keys(reference).length === 0) fail(input, "core:dependency_validation_failed", "Dependency source reference must be a non-empty structured value.", { dependency_failure_kind: "empty_source_reference" });
+  const referenceType = typeof reference["reference_type"] === "string" ? reference["reference_type"] : typeof reference["type"] === "string" ? reference["type"] : undefined;
+  const proposalKey = typeof reference["proposal_record_key"] === "string" ? reference["proposal_record_key"] : undefined;
+  const recordId = typeof reference["record_id"] === "string" ? reference["record_id"] : undefined;
+  const stagedId = typeof reference["staged_record_id"] === "string" ? reference["staged_record_id"] : undefined;
+  if (referenceType === undefined) fail(input, "core:dependency_validation_failed", "Dependency source reference is missing its reference type.", { dependency_failure_kind: "source_reference_type_missing" });
+  if (!["base_record", "staged_record", "local_proposal", "proposal"].includes(referenceType)) fail(input, "core:dependency_validation_failed", "Dependency source reference has an unknown reference type.", { dependency_failure_kind: "source_reference_type_unknown", source_reference: reference });
+  if (referenceType === "base_record" && recordId === undefined) fail(input, "core:dependency_validation_failed", "Base dependency source reference is missing its record identity.", { dependency_failure_kind: "source_reference_id_missing" });
+  if (referenceType === "staged_record" && stagedId === undefined) fail(input, "core:dependency_validation_failed", "Staged dependency source reference is missing its staged identity.", { dependency_failure_kind: "source_reference_id_missing" });
+  if ((referenceType === "local_proposal" || referenceType === "proposal") && proposalKey === undefined) fail(input, "core:dependency_validation_failed", "Proposal dependency source reference is missing its proposal identity.", { dependency_failure_kind: "source_reference_id_missing" });
+  return { raw: reference, referenceType, ...(proposalKey === undefined ? {} : { proposalKey }), ...(recordId === undefined ? {} : { recordId }), ...(stagedId === undefined ? {} : { stagedId }) };
+}
+
+function validateDependencySourceMembership(input: FactDeltaValidationInput, reference: ParsedDependencySourceReference, dependencyBasis: string, keys: ReadonlySet<string>, context: DependencyValidationContext): void {
+  if (reference.proposalKey !== undefined && !keys.has(reference.proposalKey)) fail(input, "core:undeclared_input", "Dependency source refers to an unknown local proposal.", { source_reference: reference.raw });
+  if (reference.recordId !== undefined && !context.inputRecordIds.has(reference.recordId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared base record.", { source_reference: reference.raw });
+  if (reference.stagedId !== undefined && !context.stagedRecordIds.has(reference.stagedId)) fail(input, "core:undeclared_input", "Dependency source refers to an undeclared staged record.", { source_reference: reference.raw });
+  if (dependencyBasis === "base" && reference.referenceType !== "base_record") fail(input, "core:dependency_validation_failed", "Base dependency source has the wrong reference type.", { source_reference: reference.raw });
 }
 
 function validateDependencies(input: FactDeltaValidationInput, delta: FactDelta): void {
@@ -502,19 +533,21 @@ function validateDependencies(input: FactDeltaValidationInput, delta: FactDelta)
   const dependencyIds = new Set<string>();
   const context = dependencyValidationContext(input, delta.input_record_ids);
   for (const dependency of delta.proposed_dependencies) validateProposedDependency(input, dependency, keys, dependencyIds, context);
-  for (const dependency of input.base_record_dependencies) {
-    if (!keys.has(dependency.record_id) && !delta.input_record_ids.includes(dependency.record_id)) fail(input, "core:undeclared_input", "A base dependency is not declared by the accepted manifest.", { input_type: "base_record", undeclared_ids: [dependency.record_id] });
-    if (!input.target_registry.dependency_roles.has(dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "A base dependency role is not registered.", { dependency_role: dependency.dependency_role });
-    if (dependency.valid_to_generation !== undefined || input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id)?.closed === true) fail(input, "core:dependency_validation_failed", "A base dependency is closing.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closing_dependency" });
-    if (!context.declaredVersions.has(dependency.dependency_artifact_version_id)) fail(input, "core:dependency_validation_failed", "A base dependency version is outside the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "undeclared_version" });
-    const registered = input.target_registry.artifact_versions?.get(dependency.dependency_artifact_version_id);
-    if (registered !== undefined && (registered.artifact_id !== dependency.dependency_artifact_id || registered.closed === true)) fail(input, "core:dependency_validation_failed", "A base dependency artifact/version is not live.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "artifact_version_mismatch" });
-    const closure = input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id);
-    if (input.target_registry.dependency_closure !== undefined && closure === undefined) fail(input, "core:dependency_validation_failed", "A base dependency is absent from the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_missing" });
-    const dependencyValue = dependency as unknown as Record<string, unknown>;
-    const declaredDigest = typeof dependencyValue["dependency_digest"] === "string" ? dependencyValue["dependency_digest"] : typeof dependencyValue["content_hash"] === "string" ? dependencyValue["content_hash"] : undefined;
-    if (closure !== undefined && (closure.dependency_artifact_id !== dependency.dependency_artifact_id || closure.dependency_role !== dependency.dependency_role || (registered !== undefined && closure.digest !== registered.content_hash) || (declaredDigest !== undefined && closure.digest !== declaredDigest))) fail(input, "core:dependency_validation_failed", "A base dependency closure identity or content is inconsistent.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_mismatch" });
-  }
+  for (const dependency of input.base_record_dependencies) validateBaseDependency(input, dependency, keys, delta.input_record_ids, context);
+}
+
+function validateBaseDependency(input: FactDeltaValidationInput, dependency: RecordArtifactDependency, keys: ReadonlySet<string>, inputRecordIds: readonly string[], context: DependencyValidationContext): void {
+  if (!keys.has(dependency.record_id) && !inputRecordIds.includes(dependency.record_id)) fail(input, "core:undeclared_input", "A base dependency is not declared by the accepted manifest.", { input_type: "base_record", undeclared_ids: [dependency.record_id] });
+  if (!input.target_registry.dependency_roles.has(dependency.dependency_role)) fail(input, "core:dependency_validation_failed", "A base dependency role is not registered.", { dependency_role: dependency.dependency_role });
+  if (dependency.valid_to_generation !== undefined || input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id)?.closed === true) fail(input, "core:dependency_validation_failed", "A base dependency is closing.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closing_dependency" });
+  if (!context.declaredVersions.has(dependency.dependency_artifact_version_id)) fail(input, "core:dependency_validation_failed", "A base dependency version is outside the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "undeclared_version" });
+  const registered = input.target_registry.artifact_versions?.get(dependency.dependency_artifact_version_id);
+  if (registered !== undefined && (registered.artifact_id !== dependency.dependency_artifact_id || registered.closed === true)) fail(input, "core:dependency_validation_failed", "A base dependency artifact/version is not live.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "artifact_version_mismatch" });
+  const closure = input.target_registry.dependency_closure?.get(dependency.dependency_artifact_version_id);
+  if (input.target_registry.dependency_closure !== undefined && closure === undefined) fail(input, "core:dependency_validation_failed", "A base dependency is absent from the accepted closure.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_missing" });
+  const dependencyValue = dependency as unknown as Record<string, unknown>;
+  const declaredDigest = typeof dependencyValue["dependency_digest"] === "string" ? dependencyValue["dependency_digest"] : typeof dependencyValue["content_hash"] === "string" ? dependencyValue["content_hash"] : undefined;
+  if (closure !== undefined && (closure.dependency_artifact_id !== dependency.dependency_artifact_id || closure.dependency_role !== dependency.dependency_role || (registered !== undefined && closure.digest !== registered.content_hash) || (declaredDigest !== undefined && closure.digest !== declaredDigest))) fail(input, "core:dependency_validation_failed", "A base dependency closure identity or content is inconsistent.", { dependency_artifact_version_id: dependency.dependency_artifact_version_id, dependency_failure_kind: "closure_mismatch" });
 }
 
 function validateCompleteness(input: FactDeltaValidationInput, delta: FactDelta): void {
@@ -535,19 +568,32 @@ function validateCompleteness(input: FactDeltaValidationInput, delta: FactDelta)
   };
   const statuses = new Set(["complete", "partial", "unknown", "unsupported", "stale"]);
   for (const claim of delta.completeness_claims) {
-    const scopeId = Array.isArray(claim.replacement_scope_ids) ? claim.replacement_scope_ids[0] : claim.replacement_scope_ids;
-    const scope = input.expected_replacement_scopes.find((entry) => entry.replacement_scope_id === scopeId);
-    const reasonCodes = stringList(claim.reason_codes);
-    const diagnosticKeys = stringList(claim.diagnostic_proposal_keys);
-    const affectedArtifactIds = stringList(claim.affected_artifact_ids);
-    if (scope === undefined || claim.capability !== scope.capability || !statuses.has(claim.status)) fail(input, "core:replacement_scope_incomplete", "A completeness claim is invalid for its replacement scope.");
-    if (new Set(reasonCodes).size !== reasonCodes.length || reasonCodes.some((code) => !input.target_registry.identifiers.has(code))) fail(input, "core:unregistered_identifier", "A completeness claim uses an unregistered reason code.");
-    if (new Set(diagnosticKeys).size !== diagnosticKeys.length || diagnosticKeys.some((key) => !diagnosticRecords.has(key))) fail(input, "core:reference_validation_failed", "A completeness claim refers to an unknown diagnostic proposal.");
-    if (new Set(affectedArtifactIds).size !== affectedArtifactIds.length || affectedArtifactIds.some((id) => id !== input.work_item.artifact_id)) fail(input, "core:delta_scope_mismatch", "A completeness claim affects an artifact outside the work item.");
-    if (claim.status === "complete" && (reasonCodes.length > 0 || diagnosticKeys.length > 0) || claim.status !== "complete" && reasonCodes.length === 0 && diagnosticKeys.length === 0) {
-      fail(input, "core:replacement_scope_incomplete", "Completeness evidence does not match the reported status.");
-    }
+    validateCompletenessClaim(input, claim, statuses, diagnosticRecords, stringList);
   }
+}
+
+function validateCompletenessClaim(
+  input: FactDeltaValidationInput,
+  claim: FactDelta["completeness_claims"][number],
+  statuses: ReadonlySet<string>,
+  diagnosticRecords: ReadonlyMap<string, ProposedRecord>,
+  stringList: (value: unknown) => readonly string[],
+): void {
+  const scopeId = Array.isArray(claim.replacement_scope_ids) ? claim.replacement_scope_ids[0] : claim.replacement_scope_ids;
+  const scope = input.expected_replacement_scopes.find((entry) => entry.replacement_scope_id === scopeId);
+  const reasonCodes = stringList(claim.reason_codes);
+  const diagnosticKeys = stringList(claim.diagnostic_proposal_keys);
+  const affectedArtifactIds = stringList(claim.affected_artifact_ids);
+  if (scope === undefined || claim.capability !== scope.capability || !statuses.has(claim.status)) fail(input, "core:replacement_scope_incomplete", "A completeness claim is invalid for its replacement scope.");
+  if (new Set(reasonCodes).size !== reasonCodes.length || reasonCodes.some((code) => !input.target_registry.identifiers.has(code))) fail(input, "core:unregistered_identifier", "A completeness claim uses an unregistered reason code.");
+  if (new Set(diagnosticKeys).size !== diagnosticKeys.length || diagnosticKeys.some((key) => !diagnosticRecords.has(key))) fail(input, "core:reference_validation_failed", "A completeness claim refers to an unknown diagnostic proposal.");
+  if (new Set(affectedArtifactIds).size !== affectedArtifactIds.length || affectedArtifactIds.some((id) => id !== input.work_item.artifact_id)) fail(input, "core:delta_scope_mismatch", "A completeness claim affects an artifact outside the work item.");
+  if (!completenessEvidenceMatchesStatus(claim.status, reasonCodes, diagnosticKeys)) fail(input, "core:replacement_scope_incomplete", "Completeness evidence does not match the reported status.");
+}
+
+function completenessEvidenceMatchesStatus(status: string, reasonCodes: readonly string[], diagnosticKeys: readonly string[]): boolean {
+  const hasEvidence = reasonCodes.length > 0 || diagnosticKeys.length > 0;
+  return status === "complete" ? !hasEvidence : hasEvidence;
 }
 
 function validatedDelta(input: FactDeltaValidationInput): ValidatedFactDelta {

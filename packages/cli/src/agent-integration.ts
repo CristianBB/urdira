@@ -86,6 +86,19 @@ function hasUnquotedShellControl(command: string): boolean {
 }
 
 function extractTrailingHeadProjection(command: string): { readonly command: string; readonly line_limit?: number } | undefined {
+  const pipeIndex = findSafeProjectionPipe(command);
+  if (pipeIndex === undefined) return undefined;
+  if (pipeIndex === -1) return { command };
+  const projection = command.slice(pipeIndex + 1).trim();
+  const match = /^head\s+(?:-n\s+)?-(\d+)$|^head\s+-n\s+(\d+)$/u.exec(projection);
+  const rawLimit = match?.[1] ?? match?.[2];
+  if (rawLimit === undefined) return undefined;
+  const lineLimit = Number(rawLimit);
+  if (!Number.isSafeInteger(lineLimit) || lineLimit <= 0) return undefined;
+  return { command: command.slice(0, pipeIndex).trim(), line_limit: lineLimit };
+}
+
+function findSafeProjectionPipe(command: string): number | undefined {
   let quote: "'" | '"' | undefined;
   let escaped = false;
   let pipeIndex = -1;
@@ -103,14 +116,7 @@ function extractTrailingHeadProjection(command: string): { readonly command: str
     if (/[;&<>`$()\n\r]/u.test(character)) return undefined;
   }
   if (quote !== undefined) return undefined;
-  if (pipeIndex === -1) return { command };
-  const projection = command.slice(pipeIndex + 1).trim();
-  const match = /^head\s+(?:-n\s+)?-(\d+)$|^head\s+-n\s+(\d+)$/u.exec(projection);
-  const rawLimit = match?.[1] ?? match?.[2];
-  if (rawLimit === undefined) return undefined;
-  const lineLimit = Number(rawLimit);
-  if (!Number.isSafeInteger(lineLimit) || lineLimit <= 0) return undefined;
-  return { command: command.slice(0, pipeIndex).trim(), line_limit: lineLimit };
+  return pipeIndex;
 }
 
 function removeTrailingStderrDiscard(command: string): string {
@@ -171,12 +177,17 @@ function parseSimpleCodexSourceCommand(command: string): { readonly operation: "
   if (hasUnquotedShellControl(sourceCommand)) return undefined;
   const match = /^sed\s+-n\s+(?:'([0-9]+)(?:,([0-9]+))?p'|"([0-9]+)(?:,([0-9]+))?p"|([0-9]+)(?:,([0-9]+))?p)\s+(.+)$/u.exec(sourceCommand);
   if (match === null) return undefined;
+  const { startLine, endLine, path } = parseSedSourceMatch(match);
+  if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || !safeGlob(path) || path.startsWith("-")) return undefined;
+  return { operation: "source", args: { path, start_line: startLine, end_line: endLine } };
+}
+
+function parseSedSourceMatch(match: RegExpExecArray): { readonly startLine: number; readonly endLine: number; readonly path: string } {
   const startLine = Number(match[1] ?? match[3] ?? match[5]);
   const endLine = Number(match[2] ?? match[4] ?? match[6] ?? startLine);
   let path = match[7]!.trim();
   if (path.length >= 2 && ((path.startsWith("'") && path.endsWith("'")) || (path.startsWith('"') && path.endsWith('"')))) path = path.slice(1, -1);
-  if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || !safeGlob(path) || path.startsWith("-")) return undefined;
-  return { operation: "source", args: { path, start_line: startLine, end_line: endLine } };
+  return { startLine, endLine, path };
 }
 
 function parseSimpleCodexSearchCommand(command: string): { readonly operation: AgentSearchOperation; readonly args: Readonly<Record<string, unknown>> } | undefined {

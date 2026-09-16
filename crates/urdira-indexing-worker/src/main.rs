@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+//! Indexing worker process boundary. This binary owns the v3/v4 Rust
+//! indexing protocol, SQLite publication transactions, and cancellation
+//! handling; it never defines query policy or language-plugin contracts.
+//!
+//! The v4 implementation is delegated to `v4`, while this file keeps the
+//! stable command loop and dispatch surface shared by both generations.
+
 // v4 cold-scan pipeline (task P2-2b, plan `resilient-knitting-twilight.md`
 // §4/§6.1). All new code lives under `src/v4/`; this file is touched only
 // for this declaration and the `IndexingCommand::WorkspaceScan` dispatch

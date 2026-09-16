@@ -1144,7 +1144,8 @@ URDIRA_RELEASE_TARGET=<host-target> pnpm package:release
 URDIRA_RELEASE_TARGET=<host-target> URDIRA_SKIP_INSTALL=1 pnpm release:acceptance
 ```
 
-`pnpm verify` runs, in order, `check:architecture`, `build:native-artifacts`
+`pnpm verify` runs, in order, `check:architecture`, `check:maintainability`,
+`build:native-artifacts`
 (the compiled addon plus the release `urdira-indexing-worker` build),
 `check:native` (`cargo fmt`/`clippy`), `test:native` (the Rust workspace test
 suite, including the `urdira-tsgo-client`/`urdira-indexing-worker` residual

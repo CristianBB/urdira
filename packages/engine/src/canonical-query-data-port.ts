@@ -1,11 +1,23 @@
+/**
+ * SQLite-backed query data port. It owns exact record selection, source
+ * hydration, comparison, and semantic projection reads for one immutable
+ * snapshot; query algebra and response shaping remain in adjacent modules.
+ */
 import { canonicalBytes, digestBytes, digestCanonicalArray } from "@urdira/canonical";
-import { facetRegistry, languageRegistry, universalEntityKinds, universalRelationKinds, type QueryParticipant, type QueryScope, type SemanticAffectedArtifactPage, type SemanticAffectedArtifactView, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
+import { type QueryParticipant, type QueryScope, type SemanticAffectedArtifactPage, type SemanticAffectedArtifactView, type SemanticCoverageView, type SingleWorkspaceScope, type SnapshotCapabilityStateEntry, type SourceSpan, type StructuralFilter } from "@urdira/contracts";
 import type { RelationalValueRow } from "@urdira/storage";
 import type { SqliteDatabase } from "@urdira/storage";
 import { mapWithConcurrency } from "./concurrency.js";
 import { EngineError, EngineErrorWithDetails } from "./errors.js";
 import { QueryPlanError } from "./query-plan.js";
-import { toSubjectSelector } from "./recipe-executor.js";
+import { materializeHandleBindings } from "./stage-handle-materialization.js";
+import { discoverDefinitions } from "./query-definition-discovery.js";
+import { isTestArtifactPath, matchesArtifactGlob, matchesWordMode } from "./source-matching.js";
+import { lineNumberAt } from "./source-snippet-utils.js";
+import { sourceSnippet, type SourceSnippetValue } from "./source-snippet.js";
+import { buildGetSourceStreams } from "./source-stream-projection.js";
+import { contextIdentifierCandidates, recordValue, sourceArtifactRecord } from "./query-record-projections.js";
+import { compareChangeItem, compareCorrelationItem, compareMoveItem, compareParticipantItem, diffComparisonRecordSources, rewrapComparisonParticipantError, sortComparisonRecords, type ComparisonDiff, type ComparisonRecordSource } from "./query-comparison.js";
 import { expandRelations, findShortestPaths, type OperationEvaluation, type OperationInvocation, type QueryDataPort, type QueryOperationEvaluationTelemetry, type QueryStreamItem, type RelationEdge } from "./query-operators.js";
 import { decodeRow, object, type RecordRow } from "./query-record-decode.js";
 import type { RecordBodyInterner } from "./record-body-interner.js";
@@ -923,6 +935,21 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     return records;
   }
 
+  /** Keeps unchanged cached rows while yielding for corpus-scale arrays. */
+  private async filterDeltaSurvivors(
+    records: readonly CanonicalQueryRecord[],
+    removedIds: ReadonlySet<string>,
+    identityChangedIds: ReadonlySet<string>,
+  ): Promise<readonly CanonicalQueryRecord[]> {
+    const survivors: CanonicalQueryRecord[] = [];
+    for (let index = 0; index < records.length; index += 1) {
+      const record = records[index]!;
+      if (!removedIds.has(record.record_id) && !identityChangedIds.has(record.record_id)) survivors.push(record);
+      if ((index + 1) % RECORDS_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
+    }
+    return survivors;
+  }
+
   private async loadAllRecords(workspaceId: string, generation: number): Promise<readonly CanonicalQueryRecord[]> {
     const rows = await this.queryRecordRows(workspaceId, generation, "1 = 1", []);
     return this.decodeRows(rows);
@@ -963,15 +990,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       for (const record of await this.decodeRows(await this.queryRecordRows(workspaceId, gNew, `records.record_id IN (${idsChunk.map(() => "?").join(", ")})`, idsChunk))) refreshed.set(record.record_id, record);
     }
 
-    // `cached.records` is corpus-scale, so -- like `decodeRows`/`mergeSortedByRecordId`
-    // above -- this filters it in a chunked loop rather than one synchronous
-    // `Array.prototype.filter` pass, yielding every `RECORDS_YIELD_BATCH_SIZE` records.
-    const survivors: CanonicalQueryRecord[] = [];
-    for (let index = 0; index < cached.records.length; index += 1) {
-      const record = cached.records[index]!;
-      if (!removedIds.has(record.record_id) && !identityChangedIdSet.has(record.record_id)) survivors.push(record);
-      if ((index + 1) % RECORDS_YIELD_BATCH_SIZE === 0) await yieldToEventLoop();
-    }
+    const survivors = await this.filterDeltaSurvivors(cached.records, removedIds, identityChangedIdSet);
     return await mergeSortedByRecordId(survivors, [...refreshed.values()]);
   }
 
@@ -1384,7 +1403,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
       const chunk = leftIds.slice(offset, offset + DELTA_ID_CHUNK_SIZE);
       const left = new Set(chunk);
       const placeholders = chunk.map(() => "?").join(", ");
-      const rows = await this.database.all<{ source_subject_id: string; target_subject_id: string; relation_kind: string }>(
+      const rows = await this.database.all<RelationPairRow>(
         `SELECT source_subject_id, target_subject_id, relation_kind
            FROM graph_edges
           WHERE workspace_id = ? AND valid_from_generation <= ?
@@ -1392,11 +1411,7 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
             AND (source_subject_id IN (${placeholders}) OR target_subject_id IN (${placeholders}))`,
         [scope.workspace_id, generation, generation, ...chunk, ...chunk],
       );
-      for (const row of rows) {
-        if (kinds.size > 0 && !kinds.has(row.relation_kind)) continue;
-        if ((direction === "outbound" || direction === "both") && left.has(row.source_subject_id) && right.has(row.target_subject_id)) output.add(`${row.source_subject_id}\u0000${row.target_subject_id}`);
-        if ((direction === "inbound" || direction === "both") && left.has(row.target_subject_id) && right.has(row.source_subject_id)) output.add(`${row.target_subject_id}\u0000${row.source_subject_id}`);
-      }
+      collectRelationPairs(rows, left, right, kinds, direction, output);
     }
     return output;
   }
@@ -1819,33 +1834,11 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     for (const candidate of candidateRows) {
       const file = await this.artifact_text(effectiveScope, candidate.artifact_version_id);
       if (file === undefined) continue;
-      // Case-insensitive verification runs against normalizedTerm(source), so
-      // returned offsets are indices into the normalized string, not the raw
-      // source -- this caveat predates this change (see
-      // `WorkspaceProjectionRepository.searchLiteral`). Case-sensitive
-      // verification runs against the exact raw source and raw pattern.
-      // This storage-facing port keeps its historical false default; the
-      // public operation layer always supplies the contract default (true).
-      const caseSensitive = options.case_sensitive === true;
-      const comparable = caseSensitive ? file.text : normalizedTerm(file.text);
-      const needle = caseSensitive ? pattern : normalizedPattern;
-      const wordMode = options.word_mode ?? "substring";
-      const offsets: number[] = [];
-      const lineSpans: Pick<SourceSpan, "start_line" | "end_line">[] = [];
-      let start = 0;
-      while (true) {
-        const offset = comparable.indexOf(needle, start);
-        if (offset < 0) break;
-        if (matchesWordMode(comparable, offset, needle.length, wordMode)) {
-          offsets.push(offset);
-          lineSpans.push({
-            start_line: String(lineNumberAt(comparable, offset)),
-            end_line: String(lineNumberAt(comparable, Math.max(offset + needle.length - 1, offset))),
-          });
-        }
-        start = offset + Math.max(1, needle.length);
-      }
-      if (offsets.length > 0) matches.push({ artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id, offsets, line_spans: lineSpans });
+      // Case-insensitive offsets refer to normalized text; the helper retains
+      // that historical storage-port behavior while keeping this method's
+      // candidate-query orchestration readable.
+      const found = findLiteralOffsets({ text: file.text, pattern, normalizedPattern, caseSensitive: options.case_sensitive === true, wordMode: options.word_mode ?? "substring" });
+      if (found.offsets.length > 0) matches.push({ artifact_id: candidate.artifact_id, artifact_version_id: candidate.artifact_version_id, offsets: found.offsets, line_spans: found.lineSpans });
     }
     return matches;
   }
@@ -1895,64 +1888,6 @@ export class SqliteCanonicalQuerySnapshotPort implements CanonicalQuerySnapshotP
     if (this.textCache.size > TEXT_CACHE_LIMIT) { const oldest = this.textCache.keys().next().value; if (oldest !== undefined) this.textCache.delete(oldest); }
     return { text };
   }
-}
-
-function recordValue(record: CanonicalQueryRecord, classification: "confirmed" | "possible" = "confirmed"): Readonly<Record<string, unknown>> {
-  if (record.category === "artifact_subject") {
-    return {
-      subject_type: "artifact",
-      artifact_id: record.owner_artifact_id,
-      artifact_version_id: record.owner_artifact_version_id,
-      path: record.body["path"],
-      universal_kind: record.universal_kind,
-      kind: record.kind,
-      classification,
-      ...(record.primary_source_span === undefined ? {} : { source_span: record.primary_source_span }),
-      body: record.body,
-    };
-  }
-  const subjectType = record.category === "relation" ? "relation" : record.category === "diagnostic" ? "diagnostic" : "entity";
-  return {
-    subject_type: subjectType,
-    record_id: record.record_id,
-    ...(record.identity_id === undefined ? {} : { [`${subjectType}_id`]: record.identity_id }),
-    ...(record.identity_key === undefined ? {} : { identity_key: record.identity_key }),
-    universal_kind: record.universal_kind,
-    kind: record.kind,
-    classification,
-    ...(record.facets === undefined ? {} : { facets: record.facets }),
-    ...(record.primary_source_span === undefined ? {} : { source_span: record.primary_source_span }),
-    body: record.body,
-  };
-}
-
-/**
- * Extracts only identifier-shaped terms from a natural-language task. Plain
- * prose words are intentionally excluded: `records_by_name` is an exact
- * symbol lookup, so querying every word both wastes IPC time and gives a
- * misleading impression that natural-language ranking happened here.
- * Camel/Pascal case, underscores and dollar-prefixed names are stable,
- * language-neutral signals that the caller supplied a code identifier.
- */
-function contextIdentifierCandidates(task: string, queryClass: unknown): readonly string[] {
-  const tokens = task.match(/[$_\p{L}][$_\p{L}\p{N}]*/gu) ?? [];
-  const identifiers = tokens.filter((token) => token.includes("_") || token.includes("$") || /[\p{Ll}\p{N}][\p{Lu}]/u.test(token));
-  if ((queryClass === "identifier" || queryClass === "source_code") && tokens.length === 1) identifiers.push(tokens[0]!);
-  return [...new Set(identifiers)];
-}
-
-function sourceArtifactRecord(workspaceId: string, row: { readonly artifact_id: string; readonly artifact_version_id: string; readonly normalized_uri: string; readonly normalized_path: string | null }): CanonicalQueryRecord {
-  return {
-    record_id: `artifact-record:${row.artifact_version_id}`,
-    workspace_id: workspaceId,
-    category: "artifact_subject",
-    kind: "core:source_file",
-    universal_kind: "core:artifact",
-    owner_artifact_id: row.artifact_id,
-    owner_artifact_version_id: row.artifact_version_id,
-    facets: [],
-    body: { path: row.normalized_path ?? row.normalized_uri, artifact_id: row.artifact_id, artifact_version_id: row.artifact_version_id },
-  };
 }
 
 /**
@@ -2014,213 +1949,6 @@ function relationClassification(record: CanonicalQueryRecord): "confirmed" | "po
   return record.body["classification"] === "possible" ? "possible" : "confirmed";
 }
 
-/**
- * Frente Q-4 (2026-09-08): `core:compare`'s diff/item helpers. Cross-
- * workspace correlation uses `identity_key` -- decision 03's "Workspaces,
- * comparisons, and freshness" section names this exact concept ("portable
- * symbol keys, exact paths, content digests") as the only thing decision 25
- * ever documents as stable across two DIFFERENT workspace snapshots;
- * `record_id`/`identity_id` are per-workspace/per-generation digests with
- * no cross-workspace meaning (they are not even guaranteed stable across
- * two generations of the SAME workspace). A record with no `identity_key`
- * (diagnostics, artifact-subject rows) never participates in a comparison
- * pair -- `recordsForComparisonParticipant` already filters those out
- * before this runs.
- */
-interface ComparisonPair {
-  readonly base: CanonicalQueryRecord;
-  readonly target: CanonicalQueryRecord;
-}
-
-interface ComparisonDiff {
-  readonly added: readonly CanonicalQueryRecord[];
-  readonly removed: readonly CanonicalQueryRecord[];
-  readonly changed: readonly ComparisonPair[];
-  readonly moved: readonly ComparisonPair[];
-  readonly correlated: readonly ComparisonPair[];
-  readonly possibleCorrelated: readonly ComparisonPair[];
-}
-
-/** Content identity, deliberately excluding location (`owner_artifact_id`/`primary_source_span`) so a pure rename/move is never misclassified as `changed`. */
-function comparisonContentDigest(record: CanonicalQueryRecord): string {
-  return digestOf({ kind: record.kind, universal_kind: record.universal_kind, category: record.category, body: record.body, facets: record.facets ?? [] });
-}
-
-function comparisonLocationKey(record: CanonicalQueryRecord): string {
-  return `${record.owner_artifact_id}\0${record.owner_artifact_version_id}\0${JSON.stringify(record.primary_source_span ?? null)}`;
-}
-
-function compareCanonicalIdentity(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function sortComparisonRecords(records: readonly CanonicalQueryRecord[]): readonly CanonicalQueryRecord[] {
-  return [...records].sort((left, right) => compareCanonicalIdentity(left.identity_key ?? left.record_id, right.identity_key ?? right.record_id));
-}
-
-function sortComparisonPairs(pairs: readonly ComparisonPair[]): readonly ComparisonPair[] {
-  return [...pairs].sort((left, right) => compareCanonicalIdentity(left.target.identity_key ?? left.target.record_id, right.target.identity_key ?? right.target.record_id));
-}
-
-/**
- * Diffs two per-participant record sources by `identity_key`. The source
- * backed by bounded range batches is consumed incrementally; only the base
- * identity map is retained. `correlationPolicy === "include_possible"` additionally
- * looks for an EXACT content-digest match between an otherwise-`added` and
- * an otherwise-`removed` record (a rename: `identity_key` changed but the
- * record's own content did not) and reports it as a `possible`-tier
- * correlation -- it never removes the pair from `added`/`removed`
- * themselves (those two streams are a strict `identity_key` set
- * difference, unconditionally; decision 03: "any selected set can be
- * paginated without consuming another set").
- */
-interface ComparisonRecordSource {
-  readonly records: readonly CanonicalQueryRecord[] | AsyncIterable<readonly CanonicalQueryRecord[]>;
-  readonly ordered_by_identity: boolean;
-}
-
-async function* comparisonRecords(source: ComparisonRecordSource): AsyncIterable<CanonicalQueryRecord> {
-  let previousKey: string | undefined;
-  const consume = async function* (records: AsyncIterable<readonly CanonicalQueryRecord[]>): AsyncIterable<CanonicalQueryRecord> {
-    for await (const batch of records) for (const record of batch) {
-      const key = record.identity_key;
-      if (key === undefined) continue;
-      if (previousKey !== undefined && compareCanonicalIdentity(key, previousKey) < 0) {
-        throw new EngineErrorWithDetails(
-          "core:required_capability_unsupported",
-          "core:compare requires records_for_query_batches to be ordered by identity_key; refusing an unordered adapter stream rather than materializing it for sorting.",
-          { capability: "core:records_for_query_batches_order", reason_codes: ["comparison_identity_order_unavailable"] },
-        );
-      }
-      if (key === previousKey) continue;
-      previousKey = key;
-      yield record;
-    }
-  };
-  if (Symbol.asyncIterator in Object(source.records)) yield* consume(source.records as AsyncIterable<readonly CanonicalQueryRecord[]>);
-  else {
-    for (const record of source.records as readonly CanonicalQueryRecord[]) {
-      const key = record.identity_key;
-      if (key === undefined) continue;
-      if (previousKey !== undefined && compareCanonicalIdentity(key, previousKey) < 0) throw new EngineErrorWithDetails("core:required_capability_unsupported", "core:compare requires records_for_query_batches to be ordered by identity_key; refusing an unordered adapter stream rather than materializing it for sorting.", { capability: "core:records_for_query_batches_order", reason_codes: ["comparison_identity_order_unavailable"] });
-      if (key === previousKey) continue;
-      previousKey = key;
-      yield record;
-    }
-  }
-}
-
-async function diffComparisonRecordSources(baseSource: ComparisonRecordSource, targetSource: ComparisonRecordSource, correlationPolicy: "strict" | "include_possible"): Promise<ComparisonDiff> {
-  if (!baseSource.ordered_by_identity || !targetSource.ordered_by_identity) {
-    throw new EngineErrorWithDetails(
-      "core:required_capability_unsupported",
-      "core:compare requires both participants to provide records_for_query_batches ordered by identity_key; refusing an unordered adapter rather than materializing it for sorting.",
-      { capability: "core:records_for_query_batches_order", reason_codes: ["comparison_identity_order_unavailable"] },
-    );
-  }
-  const baseIterator = comparisonRecords(baseSource)[Symbol.asyncIterator]();
-  const targetIterator = comparisonRecords(targetSource)[Symbol.asyncIterator]();
-  let baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined;
-  let targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined;
-  const added: CanonicalQueryRecord[] = [];
-  const removed: CanonicalQueryRecord[] = [];
-  const changed: ComparisonPair[] = [];
-  const moved: ComparisonPair[] = [];
-  const correlated: ComparisonPair[] = [];
-  while (baseRecord !== undefined || targetRecord !== undefined) {
-    if (baseRecord === undefined) { added.push(targetRecord!); targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
-    if (targetRecord === undefined) { removed.push(baseRecord); baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
-    const baseKey = baseRecord.identity_key!;
-    const targetKey = targetRecord.identity_key!;
-    const order = compareCanonicalIdentity(baseKey, targetKey);
-    if (order < 0) { removed.push(baseRecord); baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
-    if (order > 0) { added.push(targetRecord); targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined; continue; }
-    correlated.push({ base: baseRecord, target: targetRecord });
-    if (comparisonContentDigest(baseRecord) !== comparisonContentDigest(targetRecord)) changed.push({ base: baseRecord, target: targetRecord });
-    else if (comparisonLocationKey(baseRecord) !== comparisonLocationKey(targetRecord)) moved.push({ base: baseRecord, target: targetRecord });
-    baseRecord = (await baseIterator.next()).value as CanonicalQueryRecord | undefined;
-    targetRecord = (await targetIterator.next()).value as CanonicalQueryRecord | undefined;
-  }
-  const possibleCorrelated: ComparisonPair[] = [];
-  if (correlationPolicy === "include_possible" && added.length > 0 && removed.length > 0) {
-    const removedByDigest = new Map<string, CanonicalQueryRecord[]>();
-    for (const record of removed) {
-      const digest = comparisonContentDigest(record);
-      const bucket = removedByDigest.get(digest);
-      if (bucket === undefined) removedByDigest.set(digest, [record]); else bucket.push(record);
-    }
-    const matchedRemoved = new Set<string>();
-    for (const targetRecord of added) {
-      const bucket = removedByDigest.get(comparisonContentDigest(targetRecord));
-      if (bucket === undefined) continue;
-      const baseRecord = bucket.find((candidate) => !matchedRemoved.has(candidate.record_id));
-      if (baseRecord === undefined) continue;
-      matchedRemoved.add(baseRecord.record_id);
-      possibleCorrelated.push({ base: baseRecord, target: targetRecord });
-    }
-  }
-  return { added: sortComparisonRecords(added), removed: sortComparisonRecords(removed), changed: sortComparisonPairs(changed), moved: sortComparisonPairs(moved), correlated: sortComparisonPairs(correlated), possibleCorrelated: sortComparisonPairs(possibleCorrelated) };
-}
-
-/**
- * `added`/`removed` items: the flat `recordValue()` shape (so the
- * pre-existing, generic MCP renderer -- `describeBundle`, keyed off a
- * top-level `subject_type`/`name`/`kind`/`path` -- already renders these
- * usefully with zero renderer changes) plus the registry-documented
- * `participant` field (`operationStreamFields["core:compare"].added` /
- * `.removed`, `packages/contracts/src/registries.ts`) naming which
- * participant role the subject belongs to.
- */
-function compareParticipantItem(record: CanonicalQueryRecord, participantRole: string): QueryStreamItem {
-  const value = { ...recordValue(record, "confirmed"), participant: participantRole };
-  return { value, stable_sort_key: `confirmed\0${record.identity_key ?? record.record_id}` };
-}
-
-/** `changed`/`moved`/`correlated` items: same flat, renderer-friendly base
- * (the TARGET record's own shape) plus the registry-documented single
- * named field (`change`/`move`/`correlation`) carrying the before/after (or
- * correlation) detail a flat subject alone cannot express. */
-function compareChangeItem(pair: ComparisonPair): QueryStreamItem {
-  const value = { ...recordValue(pair.target, "confirmed"), change: { identity_key: pair.target.identity_key, before: recordValue(pair.base, "confirmed"), after: recordValue(pair.target, "confirmed") } };
-  return { value, stable_sort_key: `confirmed\0${pair.target.identity_key ?? pair.target.record_id}` };
-}
-
-function compareMoveItem(pair: ComparisonPair): QueryStreamItem {
-  const value = {
-    ...recordValue(pair.target, "confirmed"),
-    move: {
-      identity_key: pair.target.identity_key,
-      before: { artifact_id: pair.base.owner_artifact_id, artifact_version_id: pair.base.owner_artifact_version_id, source_span: pair.base.primary_source_span },
-      after: { artifact_id: pair.target.owner_artifact_id, artifact_version_id: pair.target.owner_artifact_version_id, source_span: pair.target.primary_source_span },
-    },
-  };
-  return { value, stable_sort_key: `confirmed\0${pair.target.identity_key ?? pair.target.record_id}` };
-}
-
-function compareCorrelationItem(pair: ComparisonPair, classification: "confirmed" | "possible", correlationClass: "identity_key" | "content_digest"): QueryStreamItem {
-  const value = { ...recordValue(pair.target, classification), correlation: { correlation_class: correlationClass, base_record_id: pair.base.record_id, target_record_id: pair.target.record_id } };
-  return { value, stable_sort_key: `${classification}\0${pair.target.identity_key ?? pair.target.record_id}` };
-}
-
-/**
- * Preserves an already-typed error's own `code`/`details` (duck-typed:
- * both `EngineError`/`EngineErrorWithDetails` here and the daemon's own
- * `DaemonError` -- a different class, a different package, never imported
- * here -- carry exactly these two fields) instead of masking it behind a
- * generic fallback code. Falls back to `fallbackCode`/`fallbackDetails`
- * only for a genuinely untyped failure (a thrown string, a raw `TypeError`
- * from somewhere unexpected, a rejected promise with no `code`).
- */
-function rewrapComparisonParticipantError(error: unknown, fallbackCode: string, fallbackMessage: string, fallbackDetails: Readonly<Record<string, unknown>>): EngineErrorWithDetails {
-  const candidate = error as { readonly code?: unknown; readonly details?: unknown };
-  if (typeof candidate?.code === "string" && candidate.code.length > 0) {
-    const details = candidate.details !== null && typeof candidate.details === "object" ? candidate.details as Record<string, unknown> : fallbackDetails;
-    return new EngineErrorWithDetails(candidate.code, fallbackMessage, details);
-  }
-  const detail = error instanceof Error ? error.message : String(error);
-  return new EngineErrorWithDetails(fallbackCode, `${fallbackMessage} (${detail})`, fallbackDetails);
-}
-
 function strings(value: unknown): readonly string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
@@ -2260,46 +1988,6 @@ function subjectIdentity(value: unknown): string | undefined {
 function subjectIdentities(value: unknown): readonly string[] {
   const record = object(value);
   return ["record_id", "entity_id", "relation_id", "diagnostic_id", "identity_key"].flatMap((field) => typeof record[field] === "string" ? [record[field] as string] : []);
-}
-
-/** Resolve execution-local pipeline bindings at the data boundary. The
- * executor passes stage_output tokens together with their sealed handles so a
- * dependent stage never receives an expanded selector array from JavaScript.
- * This adapter hydrates only the selectors required by the concrete legacy
- * operation implementation; SQL-aware adapters may consume `input_handles`
- * directly and skip this compatibility materialisation. */
-async function materializeHandleBindings(value: unknown, handles: ReadonlyMap<string, unknown> | undefined): Promise<unknown> {
-  if (Array.isArray(value)) {
-    const output: unknown[] = [];
-    for (const entry of value) {
-      if (isStageOutputToken(entry)) {
-        const handle = handles?.get(`${entry.stage_id}.${entry.output}`) as StageSetHandle | undefined;
-        if (handle?.iterate === undefined) { output.push(entry); continue; }
-        for await (const item of handle.iterate()) output.push(toSubjectSelector(item));
-      } else output.push(await materializeHandleBindings(entry, handles));
-    }
-    return output;
-  }
-  if (isStageOutputToken(value)) {
-    const handle = handles?.get(`${value.stage_id}.${value.output}`) as StageSetHandle | undefined;
-    if (handle?.iterate === undefined) return value;
-    if (handle.row_count !== 1) throw new EngineErrorWithDetails("core:stage_type_mismatch", "A scalar stage binding must resolve to exactly one row.", { referenced_stage_id: value.stage_id, referenced_output: value.output, actual_count: handle.row_count, cardinality: "one" });
-    for await (const item of handle.iterate()) return toSubjectSelector(item);
-    return value;
-  }
-  if (value !== null && typeof value === "object") {
-    const output: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = await materializeHandleBindings(entry, handles);
-    return output;
-  }
-  return value;
-}
-
-function isStageOutputToken(value: unknown): value is { readonly subject_type: "stage_output"; readonly stage_id: string; readonly output: string } {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    && (value as Record<string, unknown>)["subject_type"] === "stage_output"
-    && typeof (value as Record<string, unknown>)["stage_id"] === "string"
-    && typeof (value as Record<string, unknown>)["output"] === "string";
 }
 
 /** The final `:`-delimited segment of an `identity_key` (e.g. `createCanvas` out of `jsts:parameter:...:5578:createCanvas`) -- the entity/relation name, per the jsts identity-key format `records_by_name` pushes its LIKE scan down against. */
@@ -2367,41 +2055,41 @@ function recordContainsByteOffset(record: CanonicalQueryRecord, offset: number):
  * `core:selector_ambiguous` listing every candidate id, rather than
  * silently returning nothing or picking one at random.
  */
+function resolveSymbolSelector(selector: Record<string, unknown>, maps: IdentityMaps): readonly CanonicalQueryRecord[] {
+  const name = String(selector["name"] ?? "");
+  let candidates: readonly CanonicalQueryRecord[] = maps.entities.filter((record) => record.body["name"] === name || record.body["qualified_name"] === name);
+  candidates = filterByKindSelector(candidates, selector["kind_selector"]);
+  const contextArtifact = typeof selector["context_artifact"] === "string" ? selector["context_artifact"] : undefined;
+  if (contextArtifact !== undefined) {
+    const container = resolveArtifactContainer(contextArtifact, maps);
+    // A structural snapshot normally contains a module/container record,
+    // but source-safe or partially materialized snapshots can expose the
+    // declaration's path before that container is present in `maps`. The
+    // declaration path is authoritative in both cases, so use it as a
+    // direct narrowing key and fall back to the owning artifact id when a
+    // container record is available.
+    const narrowed = candidates.filter((record) =>
+      record.body["path"] === contextArtifact ||
+      record.body["name"] === contextArtifact ||
+      record.owner_artifact_id === contextArtifact ||
+      (container !== undefined && record.owner_artifact_id === container.owner_artifact_id),
+    );
+    if (narrowed.length > 0) candidates = narrowed;
+  }
+  if (candidates.length === 0) return [];
+  if (candidates.length > 1) {
+    throw new EngineErrorWithDetails("core:selector_ambiguous", `Symbol "${name}" resolved to ${candidates.length} declarations; narrow with context_artifact or kind_selector.`, {
+      selector_pointer: "/target",
+      confirmed_candidate_ids: candidates.map((record) => record.identity_id ?? record.record_id),
+      possible_candidate_ids: [],
+    });
+  }
+  return [candidates[0]!];
+}
+
 function resolveSelectorToRecords(selectorValue: unknown, maps: IdentityMaps): readonly CanonicalQueryRecord[] {
   const selector = object(selectorValue);
-  if (selector["subject_type"] === "symbol") {
-    const name = String(selector["name"] ?? "");
-    let candidates: readonly CanonicalQueryRecord[] = maps.entities.filter((record) => record.body["name"] === name || record.body["qualified_name"] === name);
-    candidates = filterByKindSelector(candidates, selector["kind_selector"]);
-    const contextArtifact = typeof selector["context_artifact"] === "string" ? selector["context_artifact"] : undefined;
-    if (contextArtifact !== undefined) {
-      const container = resolveArtifactContainer(contextArtifact, maps);
-      // A structural snapshot normally contains a module/container record,
-      // but source-safe or partially materialized snapshots can expose the
-      // declaration's path before that container is present in `maps`. The
-      // declaration path is authoritative in both cases, so use it as a
-      // direct narrowing key and fall back to the owning artifact id when a
-      // container record is available. Without the direct check, a valid
-      // `context_artifact` was silently ignored and `core:get_source` still
-      // returned `core:selector_ambiguous`.
-      const narrowed = candidates.filter((record) =>
-        record.body["path"] === contextArtifact ||
-        record.body["name"] === contextArtifact ||
-        record.owner_artifact_id === contextArtifact ||
-        (container !== undefined && record.owner_artifact_id === container.owner_artifact_id),
-      );
-      if (narrowed.length > 0) candidates = narrowed;
-    }
-    if (candidates.length === 0) return [];
-    if (candidates.length > 1) {
-      throw new EngineErrorWithDetails("core:selector_ambiguous", `Symbol "${name}" resolved to ${candidates.length} declarations; narrow with context_artifact or kind_selector.`, {
-        selector_pointer: "/target",
-        confirmed_candidate_ids: candidates.map((record) => record.identity_id ?? record.record_id),
-        possible_candidate_ids: [],
-      });
-    }
-    return [candidates[0]!];
-  }
+  if (selector["subject_type"] === "symbol") return resolveSymbolSelector(selector, maps);
   if (selector["subject_type"] === "artifact") {
     if (typeof selector["artifact_id"] === "string") {
       const byId = maps.by_any_id.get(selector["artifact_id"]);
@@ -2562,185 +2250,6 @@ function relatedTests(subjects: readonly CanonicalQueryRecord[], maps: IdentityM
   return [...new Map(tests.map((record) => [record.record_id, record])).values()];
 }
 
-interface SourceSnippetValue {
-  readonly text: string;
-  readonly span: SourceSpan;
-  readonly truncated: boolean;
-  readonly redacted: boolean;
-  readonly redactions: readonly [];
-}
-
-function lineStart(text: string, index: number): number {
-  const newline = text.lastIndexOf("\n", index - 1);
-  return newline === -1 ? 0 : newline + 1;
-}
-
-function lineEnd(text: string, index: number): number {
-  const newline = text.indexOf("\n", index);
-  return newline === -1 ? text.length : newline + 1;
-}
-
-// Adversarial review 2026-09-06 (Frente N): `sourceSnippet`'s two truncation
-// points below (`maxCharactersPerSnippet`, `remainingBudget`) previously cut
-// with a plain `String.prototype.slice(0, limit)`. For any line whose
-// content puts a UTF-16 surrogate pair (an astral character -- most emoji,
-// some CJK extension characters) exactly on that boundary, a plain slice
-// keeps the high surrogate and drops its low surrogate, leaving a lone
-// (unpaired) surrogate in `snippet.text`. That string round-trips through
-// JSON fine (JSON allows unpaired surrogates as `\uXXXX` escapes) but is
-// invalid Unicode text once decoded by a consumer that enforces well-formed
-// UTF-16/UTF-8 (a strict `TextEncoder`/`JSON.parse` reviver, a terminal that
-// rejects WTF-8, `Buffer.from(text, "utf8")` substituting U+FFFD, ...) --
-// exactly the "line >200 chars" truncation case Frente N's adversarial
-// review asked to check "¿corta en medio de un code point UTF-16
-// surrogate?" for. `codePointBefore`/`codePointAt` above already apply the
-// identical one-unit backup for glob-pattern matching; this mirrors that.
-function truncateWithoutSplittingSurrogatePair(text: string, limit: number): string {
-  if (limit >= text.length) return text;
-  if (limit <= 0) return "";
-  const trailing = text.charCodeAt(limit - 1);
-  const boundary = trailing >= 0xd800 && trailing <= 0xdbff ? limit - 1 : limit;
-  return text.slice(0, boundary);
-}
-
-function lineNumberAt(text: string, index: number): number {
-  let line = 1;
-  for (let cursor = 0; cursor < index; cursor += 1) if (text[cursor] === "\n") line += 1;
-  return line;
-}
-
-function extendSpanForContext(text: string, start: number, end: number, contextLines: number): { readonly start: number; readonly end: number } {
-  if (contextLines <= 0) return { start, end };
-  let extendedStart = lineStart(text, start);
-  let extendedEnd = lineEnd(text, Math.max(end - 1, start));
-  for (let line = 0; line < contextLines; line += 1) {
-    if (extendedStart > 0) extendedStart = lineStart(text, extendedStart - 1);
-    if (extendedEnd < text.length) extendedEnd = lineEnd(text, extendedEnd);
-  }
-  return { start: extendedStart, end: extendedEnd };
-}
-
-async function sourceSnippet(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, record: CanonicalQueryRecord, mode: "signature" | "relevant" | "body" | "line", maxCharactersPerSnippet: number, contextLines: number, remainingBudget: number): Promise<SourceSnippetValue | undefined> {
-  if (remainingBudget <= 0) return undefined;
-  const file = await snapshots.artifact_text?.(scope, record.owner_artifact_version_id);
-  if (file === undefined) return undefined;
-  const bodyStart = record.body["start"];
-  const bodyEnd = record.body["end"];
-  const canonicalSpan = record.primary_source_span;
-  // A source-catalog artifact represents the complete file and therefore has
-  // no entity span. Treat its implicit span as the full artifact; requiring a
-  // structural container solely to manufacture start=0/end=file.length would
-  // defeat source-ready direct artifact reads and force a full corpus load.
-  const wholeArtifact = record.category === "artifact_subject";
-  const start = typeof bodyStart === "number" ? bodyStart : canonicalSpan === undefined ? wholeArtifact ? 0 : undefined : Number(canonicalSpan.start_byte);
-  const end = typeof bodyEnd === "number" ? bodyEnd : canonicalSpan === undefined ? wholeArtifact ? file.text.length : undefined : Number(canonicalSpan.end_byte);
-  if (typeof start !== "number" || typeof end !== "number" || start < 0 || end < start) return undefined;
-  if (end > file.text.length) return undefined;
-  const text = file.text;
-  let coreEnd = end;
-  // E-P0j adversarial review (2026-09-07, fix-ep0j-review): "signature"
-  // used to always cut the first line starting at `start` -- correct back
-  // when `start` was the identifier's own span (pre-Frente-E-P0j), but
-  // `start` is now the WHOLE declaration span, which for a class/interface
-  // member can begin at that member's own leading decorator(s)
-  // (`@Injectable()\n  method() {}` -- `ClassElement::span()`/the Rust
-  // producer's own `decl_start` include the decorator; confirmed live,
-  // `decl_span_covers_member_decorators_but_not_a_top_level_declarations_own_leading_decorator`,
-  // `urdira-jsts-syntax-worker`). Left as `start`, "signature" mode would
-  // render `@Injectable()` instead of the member's actual signature line --
-  // exactly the fidelity regression Frente E-P0j's own consumer review
-  // (`docs/evidence/2026-09-07-v4-entity-declaration-spans.md` §3) missed
-  // (its only worked example was a plain `export function foo(...)`, never
-  // a decorated member). `body["name_start"]` (additive as of that same
-  // task) is the identifier's own position within `[start, end)` when
-  // present -- anchoring the signature's line on IT instead, when in
-  // range, recovers the real signature line (`method() {` or `value:
-  // number = 1;`) regardless of what precedes it on an earlier line.
-  // Falls back to `start` unchanged (byte-identical to before this fix)
-  // when `name_start` is absent/out of range -- an older record predating
-  // this field, a non-jsts subject, or a degenerate span (module/external
-  // entities, whose `name_start === start`, changes nothing either way).
-  const nameStart = record.body["name_start"];
-  const signatureAnchor = mode === "signature" && typeof nameStart === "number" && Number.isFinite(nameStart) && nameStart >= start && nameStart < end
-    ? lineStart(text, nameStart)
-    : start;
-  if (mode === "signature") {
-    const newline = text.indexOf("\n", signatureAnchor);
-    coreEnd = newline === -1 || newline >= end ? end : newline;
-  }
-  // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): "line" always renders the
-  // FULL source line the span starts on -- not merely `[start, coreEnd)`
-  // (which, for a reference occurrence, is often just the identifier
-  // token) -- regardless of `contextLines` (inline policy snippets always
-  // call this with `contextLines: 0`, since "one more line of context"
-  // would defeat R13's one-line-per-bundle budget accounting).
-  let { start: sliceStart, end: sliceEnd } = mode === "line"
-    ? { start: lineStart(text, start), end: lineEnd(text, Math.max(coreEnd - 1, start)) }
-    : extendSpanForContext(text, signatureAnchor, coreEnd, contextLines);
-  const effectiveLimit = Math.min(maxCharactersPerSnippet, remainingBudget);
-  const coreLength = coreEnd - signatureAnchor;
-  // Context is useful only if it still contains the requested declaration.
-  // When surrounding lines exceed the caller's projection, center the bounded
-  // window around that declaration instead of returning only the earliest
-  // leading lines. The projection remains exact and explicitly truncated.
-  let contextClipped = false;
-  if (mode !== "line" && sliceEnd - sliceStart > effectiveLimit && coreLength <= effectiveLimit) {
-    contextClipped = true;
-    const surrounding = effectiveLimit - coreLength;
-    const before = Math.floor(surrounding / 2);
-    sliceStart = Math.max(sliceStart, signatureAnchor - before);
-    sliceEnd = Math.min(sliceEnd, sliceStart + effectiveLimit);
-    if (sliceEnd < coreEnd) {
-      sliceEnd = coreEnd;
-      sliceStart = Math.max(0, sliceEnd - effectiveLimit);
-    }
-  }
-  let snippetText = text.slice(sliceStart, sliceEnd);
-  let truncated = contextClipped;
-  if (snippetText.length > maxCharactersPerSnippet) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, maxCharactersPerSnippet); truncated = true; }
-  if (snippetText.length > remainingBudget) { snippetText = truncateWithoutSplittingSurrogatePair(snippetText, remainingBudget); truncated = true; }
-  const useStoredLines = contextLines === 0 && canonicalSpan !== undefined;
-  return {
-    text: snippetText,
-    span: {
-      artifact_version_id: canonicalSpan?.artifact_version_id ?? record.owner_artifact_version_id,
-      start_byte: String(sliceStart),
-      end_byte: String(sliceEnd),
-      start_line: useStoredLines && canonicalSpan?.start_line !== undefined ? canonicalSpan.start_line : String(lineNumberAt(text, sliceStart)),
-      end_line: useStoredLines && canonicalSpan?.end_line !== undefined ? canonicalSpan.end_line : String(lineNumberAt(text, Math.max(sliceEnd - 1, sliceStart))),
-    },
-    truncated,
-    redacted: false,
-    redactions: [],
-  };
-}
-
-/**
- * `core:get_source`'s subject-to-snippet body, shared by the full in-memory
- * path and the pushdown path in `CanonicalRecordQueryDataPort.execute` --
- * once `subjects` is resolved (by either path's own id-lookup), the rest of
- * the operation (mode/budget handling, `sourceSnippet` calls) is identical.
- */
-async function buildGetSourceStreams(snapshots: CanonicalQuerySnapshotPort, scope: QueryScope, subjects: readonly CanonicalQueryRecord[], args: Readonly<Record<string, unknown>>, deferSource = false): Promise<Readonly<Record<string, readonly QueryStreamItem[]>>> {
-  const sourceOptions = object(args["source"]);
-  const mode = sourceOptions["mode"] === "none" || sourceOptions["mode"] === "signature" || sourceOptions["mode"] === "relevant" || sourceOptions["mode"] === "body" ? sourceOptions["mode"] : "body";
-  const maxCharactersPerSnippet = typeof sourceOptions["max_characters_per_snippet"] === "number" ? sourceOptions["max_characters_per_snippet"] : 4000;
-  const maxTotalCharacters = typeof sourceOptions["max_total_characters"] === "number" ? sourceOptions["max_total_characters"] : 16000;
-  const contextLines = typeof sourceOptions["context_lines"] === "number" ? sourceOptions["context_lines"] : 0;
-  let remainingBudget = maxTotalCharacters;
-  const sources: QueryStreamItem[] = [];
-  for (const record of subjects) {
-    const snippet = mode === "none" || deferSource ? undefined : await sourceSnippet(snapshots, scope, record, mode, maxCharactersPerSnippet, contextLines, remainingBudget);
-    if (snippet !== undefined) remainingBudget -= snippet.text.length;
-    sources.push({
-      value: { result_set: "sources", primary_result: recordValue(record), assessment: { classification: "confirmed", completeness: "complete" }, provenance_path: [], essential_related_entities: [], optional_source_snippets: snippet === undefined ? [] : [snippet] },
-      ...(deferSource && mode !== "none" ? { source_hydration: { scope, record, options: { mode, max_characters_per_snippet: maxCharactersPerSnippet, max_total_characters: maxTotalCharacters, context_lines: contextLines } } } : {}),
-      stable_sort_key: `confirmed\0${record.identity_key ?? record.record_id}`,
-    });
-  }
-  return { sources };
-}
-
 /** Optional third argument only ever supplied by `trySemanticSearch` -- every other caller's evaluation has no semantic lane, so `OperationEvaluation.semantic_state` stays absent for them exactly as before this field existed. */
 // Query completeness dimensions are a public, response-budgeted projection of
 // the much larger persisted SnapshotCapabilityStateEntry values. Keeping the
@@ -2805,6 +2314,30 @@ function result(streams: Readonly<Record<string, readonly QueryStreamItem[]>>, s
   return { streams, completeness: { overall_status: overall, dimensions: completenessDimensions(states) }, diagnostics: [], ...(semanticState === undefined ? {} : { semantic_state: semanticState }) };
 }
 
+function resolveComparisonRoles(operation: OperationInvocation, scope: Extract<QueryScope, { readonly scope_type: "comparison" }>): readonly [QueryParticipant, QueryParticipant] {
+  if (scope.participants.length !== 2) {
+    throw new EngineErrorWithDetails("core:participant_role_invalid", `core:compare requires exactly two participants (base/target); received ${scope.participants.length}.`, { operation: operation.operation_id, provided_roles: scope.participants.map((participant) => participant.role), required_roles: ["base", "target"] });
+  }
+  const base = scope.participants.find((participant) => participant.role === "base");
+  const target = scope.participants.find((participant) => participant.role === "target");
+  if (base !== undefined && target !== undefined) return [base, target];
+  if (base === undefined && target === undefined) return scope.participants as [QueryParticipant, QueryParticipant];
+  throw new EngineErrorWithDetails("core:participant_role_invalid", `core:compare received one of "base"/"target" without the other; provide both roles or neither.`, { operation: operation.operation_id, provided_roles: scope.participants.map((participant) => participant.role), required_roles: ["base", "target"] });
+}
+
+function comparisonStreams(diff: ComparisonDiff, requestedKinds: ReadonlySet<string>, policy: "strict" | "include_possible", baseRole: string, targetRole: string): Record<string, QueryStreamItem[]> {
+  const streams: Record<string, QueryStreamItem[]> = {};
+  if (requestedKinds.has("added")) streams["added"] = diff.added.map((record) => compareParticipantItem(record, targetRole));
+  if (requestedKinds.has("removed")) streams["removed"] = diff.removed.map((record) => compareParticipantItem(record, baseRole));
+  if (requestedKinds.has("changed")) streams["changed"] = diff.changed.map((pair) => compareChangeItem(pair));
+  if (requestedKinds.has("moved")) streams["moved"] = diff.moved.map((pair) => compareMoveItem(pair));
+  if (requestedKinds.has("correlated")) streams["correlated"] = [
+    ...diff.correlated.map((pair) => compareCorrelationItem(pair, "confirmed", "identity_key")),
+    ...(policy === "include_possible" ? diff.possibleCorrelated.map((pair) => compareCorrelationItem(pair, "possible", "content_digest")) : []),
+  ];
+  return streams;
+}
+
 function evaluationRowCount(evaluation: OperationEvaluation): number {
   return Object.values(evaluation.streams).reduce((total, stream) => total + stream.length, 0);
 }
@@ -2813,6 +2346,35 @@ function withEvaluationTelemetry(evaluation: OperationEvaluation, telemetry: Que
   const state = evaluation.telemetry ?? {};
   Object.assign(state, { candidates: evaluationRowCount(evaluation), rows_hydrated: evaluationRowCount(evaluation), ...telemetry });
   return { ...evaluation, telemetry: state };
+}
+
+function parseAffectedPageArguments(args: Record<string, unknown>): { readonly requestedSetId: string; readonly cursorToken: string | undefined; readonly requestedLimit: number; readonly cursor: AffectedCursor | undefined } {
+  const requestedSetId = typeof args["affected_artifact_set_id"] === "string" ? args["affected_artifact_set_id"] : "";
+  const cursorToken = typeof args["cursor"] === "string" ? args["cursor"] : undefined;
+  const requestedLimit = typeof args["limit"] === "number" && Number.isSafeInteger(args["limit"]) && (args["limit"] as number) > 0
+    ? Math.min(args["limit"] as number, SEMANTIC_AFFECTED_PAGE_MAX_LIMIT)
+    : SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT;
+  if (cursorToken === undefined) return { requestedSetId, cursorToken, requestedLimit, cursor: undefined };
+  try {
+    return { requestedSetId, cursorToken, requestedLimit, cursor: decodeAffectedCursor(cursorToken) };
+  } catch (error) {
+    throw new SemanticQueryError("core:cursor_invalid", error instanceof Error ? error.message : "Malformed core:semantic_affected_page cursor.", { reason_code: "malformed_cursor" });
+  }
+}
+
+function graphPushdownPlan(operation: OperationInvocation, args: Record<string, unknown>): { readonly sourceSelectors: unknown; readonly targetSelectors: unknown; readonly direction: "inbound" | "outbound" | "both"; readonly maxDepth: number } {
+  const sourceSelectors = operation.operation_id === "core:get_outline" ? [args["container"]]
+    : operation.operation_id === "core:find_references" ? (Array.isArray(args["target"]) ? args["target"] : [args["target"]])
+    : operation.operation_id === "core:expand_relations" ? args["subjects"]
+    : args["sources"];
+  const targetSelectors = operation.operation_id === "core:find_paths" ? args["targets"] : undefined;
+  const direction = operation.operation_id === "core:get_outline" ? "outbound"
+    : operation.operation_id === "core:find_references" ? "inbound"
+    : args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
+  const maxDepth = operation.operation_id === "core:get_outline" ? (typeof args["depth"] === "number" ? args["depth"] : 1)
+    : operation.operation_id === "core:find_references" ? 1
+    : typeof args["max_depth"] === "number" ? args["max_depth"] : operation.operation_id === "core:find_paths" ? 4 : 1;
+  return { sourceSelectors, targetSelectors, direction, maxDepth };
 }
 
 function indexedTelemetryIndex(operationId: string): string {
@@ -2974,38 +2536,6 @@ function matchesPathPrefix(path: string | undefined, pathPrefixes: readonly stri
   return path !== undefined && pathPrefixes.some((prefix) => path.startsWith(prefix));
 }
 
-export function matchesArtifactGlob(path: string, pattern: string): boolean {
-  const normalizedPath = path.replaceAll("\\", "/");
-  const normalizedPattern = pattern.replaceAll("\\", "/");
-  let expression = "^";
-  for (let index = 0; index < normalizedPattern.length; index += 1) {
-    const character = normalizedPattern[index] ?? "";
-    if (character === "*" && normalizedPattern[index + 1] === "*") {
-      // `**/` also matches zero directories, as in the native Glob tools;
-      // plain `.*` would incorrectly require at least one nested directory
-      // for patterns such as `src/**/*.ts`.
-      if (normalizedPattern[index + 2] === "/") {
-        expression += "(?:.*/)?";
-        index += 2;
-      } else {
-        expression += ".*";
-        index += 1;
-      }
-    } else if (character === "*") expression += "[^/]*";
-    else if (character === "?") expression += "[^/]";
-    else expression += character.replace(/[|\\{}()[\]^$+*?.-]/g, "\\$&");
-  }
-  return new RegExp(`${expression}$`).test(normalizedPath);
-}
-
-export function isTestArtifactPath(path: string): boolean {
-  const normalized = path.replaceAll("\\", "/").toLocaleLowerCase("en-US");
-  const segments = normalized.split("/");
-  const file = segments.at(-1) ?? "";
-  return segments.some((segment) => segment === "test" || segment === "tests" || segment === "__tests__")
-    || /(?:^|[._-])(?:test|spec)(?:[._-]|$)/u.test(file);
-}
-
 function isTestFacingSymbolName(name: string): boolean {
   // Exact structural fallback for APIs that production code deliberately
   // exposes to tests. These names are useful retrieval vocabulary when the
@@ -3024,26 +2554,6 @@ function literalGlobPrefix(pattern: string): string {
   const normalized = pattern.replaceAll("\\", "/");
   const wildcard = normalized.search(/[?*]/u);
   return wildcard < 0 ? normalized : normalized.slice(0, wildcard);
-}
-
-function codePointBefore(value: string, offset: number): string {
-  if (offset <= 0) return "";
-  const trailing = value.charCodeAt(offset - 1);
-  return trailing >= 0xdc00 && trailing <= 0xdfff && offset >= 2 ? value.slice(offset - 2, offset) : value.slice(offset - 1, offset);
-}
-
-function codePointAt(value: string, offset: number): string {
-  if (offset >= value.length) return "";
-  const width = (value.codePointAt(offset) ?? 0) > 0xffff ? 2 : 1;
-  return value.slice(offset, offset + width);
-}
-
-export function matchesWordMode(value: string, offset: number, length: number, mode: "substring" | "identifier" | "token"): boolean {
-  if (mode === "substring") return true;
-  const boundaryCharacter = mode === "identifier" ? /[$\p{ID_Continue}]/u : /[_\p{L}\p{M}\p{N}]/u;
-  const before = codePointBefore(value, offset);
-  const after = codePointAt(value, offset + length);
-  return (before.length === 0 || !boundaryCharacter.test(before)) && (after.length === 0 || !boundaryCharacter.test(after));
 }
 
 /**
@@ -3255,6 +2765,138 @@ type EntitySemanticCoverageView = SemanticCoverageView & {
   readonly covered_entity_count: number;
 };
 
+function semanticCoverageMetrics(inputs: {
+  readonly counts: { readonly artifact_count: number; readonly oversized_count: number };
+  readonly coveredCount: number;
+  readonly indexSupported: boolean;
+  readonly isCurrent: boolean;
+}): { readonly materializationState: "complete" | "degraded" | "updating" | "unavailable"; readonly pending: number; readonly excluded: number } {
+  const eligible = Math.max(0, inputs.counts.artifact_count - inputs.counts.oversized_count);
+  const materializationState: "complete" | "degraded" | "updating" | "unavailable" = !inputs.indexSupported ? "unavailable" : inputs.isCurrent ? (inputs.coveredCount >= eligible ? "complete" : "degraded") : "updating";
+  const settled = materializationState === "complete" || materializationState === "degraded";
+  return {
+    materializationState,
+    pending: settled ? 0 : Math.max(0, eligible - inputs.coveredCount),
+    excluded: settled ? inputs.counts.oversized_count + Math.max(0, eligible - inputs.coveredCount) : inputs.counts.oversized_count,
+  };
+}
+
+function semanticBindingDigest(provider: ResolvedSemanticProvider | undefined, marker: SemanticIndexStateSnapshot | undefined): string {
+  const profileId = provider?.profile.embedding_profile_id ?? marker?.profile_id ?? "core:no-provider-configured";
+  const executableBindingId = provider?.binding.executable_binding_digest ?? marker?.executable_binding_id ?? "core:no-binding-configured";
+  return digestOf({ profile_id: profileId, executable_binding_id: executableBindingId });
+}
+
+/** Expands one indexed graph frontier, retaining unseen records by alias. */
+function expandIndexedGraphFrontier(
+  rows: readonly IndexedGraphEdge[],
+  frontierAliases: ReadonlySet<string>,
+  direction: "inbound" | "outbound" | "both",
+  byAlias: ReadonlyMap<string, CanonicalQueryRecord>,
+  seen: Set<string>,
+): readonly CanonicalQueryRecord[] {
+  const next: CanonicalQueryRecord[] = [];
+  for (const edge of rows) {
+    const endpointIds: string[] = [];
+    if ((direction === "outbound" || direction === "both") && frontierAliases.has(edge.source_subject_id)) endpointIds.push(edge.target_subject_id);
+    if ((direction === "inbound" || direction === "both") && frontierAliases.has(edge.target_subject_id)) endpointIds.push(edge.source_subject_id);
+    for (const endpointId of endpointIds) {
+      const record = byAlias.get(endpointId);
+      if (record !== undefined && !seen.has(record.record_id)) { seen.add(record.record_id); next.push(record); }
+    }
+  }
+  return next;
+}
+
+/** Finds verified literal occurrences and their source line spans. */
+function relationClosureEndpointIds(rows: readonly IndexedGraphEdge[], frontierAliases: ReadonlySet<string>, relationKind: string, direction: "inbound" | "outbound"): ReadonlySet<string> {
+  const endpointIds = new Set<string>();
+  for (const edge of rows) {
+    if (edge.relation_kind !== relationKind) continue;
+    if (direction === "outbound" && frontierAliases.has(edge.source_subject_id)) endpointIds.add(edge.target_subject_id);
+    if (direction === "inbound" && frontierAliases.has(edge.target_subject_id)) endpointIds.add(edge.source_subject_id);
+  }
+  return endpointIds;
+}
+
+function updateRelationClosureMetadata(input: {
+  readonly record: CanonicalQueryRecord;
+  readonly rows: readonly IndexedGraphEdge[];
+  readonly relationKind: string;
+  readonly direction: "inbound" | "outbound";
+  readonly frontier: readonly CanonicalQueryRecord[];
+  readonly provenance: Map<string, Set<string>> | undefined;
+  readonly certainty: Map<string, boolean> | undefined;
+}): void {
+  const ids = new Set([input.record.record_id, input.record.identity_id, input.record.identity_key]);
+  const proofs = input.rows.filter((edge) => edge.relation_kind === input.relationKind && ids.has(input.direction === "outbound" ? edge.target_subject_id : edge.source_subject_id));
+  if (input.certainty !== undefined) input.certainty.set(input.record.record_id, proofs.length > 0 && proofs.every((edge) => edge.evidence_class === "possible" || input.frontier.some((parent) => [parent.record_id, parent.identity_id, parent.identity_key].includes(input.direction === "outbound" ? edge.source_subject_id : edge.target_subject_id) && input.certainty!.get(parent.record_id) === true)));
+  if (input.provenance !== undefined) {
+    const recordProofs = input.provenance.get(input.record.record_id) ?? new Set<string>();
+    for (const edge of input.rows) if (edge.relation_kind === input.relationKind && ids.has(input.direction === "outbound" ? edge.target_subject_id : edge.source_subject_id)) {
+      recordProofs.add(edge.relation_record_id);
+      for (const parent of input.frontier) for (const proof of input.provenance.get(parent.record_id) ?? []) recordProofs.add(proof);
+    }
+    input.provenance.set(input.record.record_id, recordProofs);
+  }
+}
+
+function sortOutlineChildren(contains: ReadonlyMap<CanonicalQueryRecord, CanonicalQueryRecord[]>): void {
+  for (const children of contains.values()) children.sort((left, right) => {
+    const leftStart = left.primary_source_span?.start_byte;
+    const rightStart = right.primary_source_span?.start_byte;
+    if (leftStart !== undefined && rightStart !== undefined) {
+      const diff = Number(leftStart) - Number(rightStart);
+      if (diff !== 0) return diff;
+    } else if (leftStart !== undefined) return -1;
+    else if (rightStart !== undefined) return 1;
+    return (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id);
+  });
+}
+
+function collectOutlineMembers(container: CanonicalQueryRecord, contains: ReadonlyMap<CanonicalQueryRecord, readonly CanonicalQueryRecord[]>, depth: number): { readonly members: readonly CanonicalQueryRecord[]; readonly rootLevelKeys: ReadonlySet<string> } {
+  const seen = new Set<string>([container.identity_key ?? container.record_id]);
+  let frontier = [container];
+  const members: CanonicalQueryRecord[] = [];
+  const rootLevelKeys = new Set<string>();
+  for (let level = 0; level < depth; level += 1) {
+    const next: CanonicalQueryRecord[] = [];
+    for (const parent of frontier) for (const child of contains.get(parent) ?? []) {
+      const key = child.identity_key ?? child.record_id;
+      if (!seen.has(key)) { seen.add(key); members.push(child); next.push(child); if (level === 0) rootLevelKeys.add(key); }
+    }
+    frontier = next;
+  }
+  return { members, rootLevelKeys };
+}
+
+function findLiteralOffsets(input: {
+  readonly text: string;
+  readonly pattern: string;
+  readonly normalizedPattern: string;
+  readonly caseSensitive: boolean;
+  readonly wordMode: "substring" | "identifier" | "token";
+}): { readonly offsets: readonly number[]; readonly lineSpans: readonly Pick<SourceSpan, "start_line" | "end_line">[] } {
+  const comparable = input.caseSensitive ? input.text : normalizedTerm(input.text);
+  const needle = input.caseSensitive ? input.pattern : input.normalizedPattern;
+  const offsets: number[] = [];
+  const lineSpans: Pick<SourceSpan, "start_line" | "end_line">[] = [];
+  let start = 0;
+  while (true) {
+    const offset = comparable.indexOf(needle, start);
+    if (offset < 0) break;
+    if (matchesWordMode(comparable, offset, needle.length, input.wordMode)) {
+      offsets.push(offset);
+      lineSpans.push({
+        start_line: String(lineNumberAt(comparable, offset)),
+        end_line: String(lineNumberAt(comparable, Math.max(offset + needle.length - 1, offset))),
+      });
+    }
+    start = offset + Math.max(1, needle.length);
+  }
+  return { offsets, lineSpans };
+}
+
 function buildSemanticCoverageView(inputs: {
   readonly provider: ResolvedSemanticProvider | undefined;
   readonly marker: SemanticIndexStateSnapshot | undefined;
@@ -3276,26 +2918,20 @@ function buildSemanticCoverageView(inputs: {
   readonly affectedPage: SemanticAffectedArtifactPage | undefined;
 }): EntitySemanticCoverageView {
   const { provider, marker, isCurrent, counts, coveredCount, indexSupported, entityCount, coveredEntityCount, realCounts, affectedPage } = inputs;
-  const eligible = Math.max(0, counts.artifact_count - counts.oversized_count);
-  const materializationState: "complete" | "degraded" | "updating" | "unavailable" = !indexSupported ? "unavailable" : isCurrent ? (coveredCount >= eligible ? "complete" : "degraded") : "updating";
-  const settled = materializationState === "complete" || materializationState === "degraded";
-  const pending = settled ? 0 : Math.max(0, eligible - coveredCount);
-  const excluded = settled ? counts.oversized_count + Math.max(0, eligible - coveredCount) : counts.oversized_count;
-  const profileId = provider?.profile.embedding_profile_id ?? marker?.profile_id ?? "core:no-provider-configured";
-  const executableBindingId = provider?.binding.executable_binding_digest ?? marker?.executable_binding_id ?? "core:no-binding-configured";
+  const metrics = semanticCoverageMetrics({ counts, coveredCount, indexSupported, isCurrent });
   return {
-    semantic_index_binding_id: digestOf({ profile_id: profileId, executable_binding_id: executableBindingId }),
-    materialization_state: materializationState,
+    semantic_index_binding_id: semanticBindingDigest(provider, marker),
+    materialization_state: metrics.materializationState,
     artifact_count: counts.artifact_count,
     covered_artifact_count: coveredCount,
-    pending_artifact_count: pending,
-    excluded_artifact_count: excluded,
+    pending_artifact_count: metrics.pending,
+    excluded_artifact_count: metrics.excluded,
     unsupported_artifact_count: realCounts?.unsupported_artifact_count ?? 0,
     failed_artifact_count: realCounts?.failed_artifact_count ?? 0,
     // Invariant (plan 2026-09-06): affected = status <> 'covered'. Real total
     // from the affected page when available; the old "pending" heuristic
     // otherwise (a port with no status-table capability at all).
-    affected_artifact_count: affectedPage?.total ?? pending,
+    affected_artifact_count: affectedPage?.total ?? metrics.pending,
     entity_count: realCounts?.entity_count ?? entityCount,
     covered_entity_count: realCounts?.covered_entity_count ?? coveredEntityCount,
     ...(affectedPage === undefined ? {} : { affected_artifact_set_id: affectedPage.affected_artifact_set_id, affected_artifact_page: affectedPage }),
@@ -3455,29 +3091,34 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return selectors.flatMap((selector) => resolveSelectorToRecords(selector, maps));
   }
 
+  /** Fallback relation scan used when the snapshot has no native edge index. */
+  private async scanRelationEdges(scope: QueryScope, subjectIds: readonly string[], direction: "inbound" | "outbound" | "both"): Promise<readonly IndexedGraphEdge[]> {
+    const aliases = new Set(subjectIds);
+    const edges: IndexedGraphEdge[] = [];
+    let cursor: string | undefined;
+    while (true) {
+      const page = await this.snapshots.records_by_selector_page!(scope, { categories: ["relation"] }, ROW_FETCH_BATCH_SIZE, cursor);
+      for (const relation of page.records) {
+        const source = typeof relation.body["source_id"] === "string" ? relation.body["source_id"] : undefined;
+        const target = typeof relation.body["target_id"] === "string" ? relation.body["target_id"] : undefined;
+        if (source === undefined || target === undefined) continue;
+        const matchesOutbound = (direction === "outbound" || direction === "both") && aliases.has(source);
+        const matchesInbound = (direction === "inbound" || direction === "both") && aliases.has(target);
+        if (matchesOutbound || matchesInbound) edges.push({ edge_id: relation.record_id, source_subject_id: source, target_subject_id: target, relation_record_id: relation.record_id, relation_kind: relation.universal_kind, role: "", evidence_class: "" });
+      }
+      if (page.next_cursor === undefined || page.records.length === 0) break;
+      cursor = page.next_cursor;
+    }
+    return edges;
+  }
+
   private async indexedEdges(scope: QueryScope, subjectIds: readonly string[], direction: "inbound" | "outbound" | "both"): Promise<readonly IndexedGraphEdge[] | undefined> {
     if (this.snapshots.graph_edges_by_subject_ids !== undefined) {
       const indexed = await this.snapshots.graph_edges_by_subject_ids(scope, subjectIds, direction);
       if (indexed !== undefined) return indexed;
     }
     if (this.snapshots.records_by_selector_page === undefined) return undefined;
-    const aliases = new Set(subjectIds);
-    const edges: IndexedGraphEdge[] = [];
-    let cursor: string | undefined;
-    while (true) {
-      const page = await this.snapshots.records_by_selector_page(scope, { categories: ["relation"] }, ROW_FETCH_BATCH_SIZE, cursor);
-      for (const relation of page.records) {
-        const source = typeof relation.body["source_id"] === "string" ? relation.body["source_id"] : undefined;
-        const target = typeof relation.body["target_id"] === "string" ? relation.body["target_id"] : undefined;
-        if (source === undefined || target === undefined) continue;
-        if ((direction === "outbound" || direction === "both") && aliases.has(source) || (direction === "inbound" || direction === "both") && aliases.has(target)) {
-          edges.push({ edge_id: relation.record_id, source_subject_id: source, target_subject_id: target, relation_record_id: relation.record_id, relation_kind: relation.universal_kind, role: "", evidence_class: "" });
-        }
-      }
-      if (page.next_cursor === undefined || page.records.length === 0) break;
-      cursor = page.next_cursor;
-    }
-    return edges;
+    return this.scanRelationEdges(scope, subjectIds, direction);
   }
 
   private async indexedGraphRecords(scope: QueryScope, traversalRoots: readonly CanonicalQueryRecord[], retainedRecords: readonly CanonicalQueryRecord[], direction: "inbound" | "outbound" | "both", maxDepth: number): Promise<readonly CanonicalQueryRecord[] | undefined> {
@@ -3502,18 +3143,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const rows = await this.indexedEdges(scope, [...frontierAliases], direction);
       if (rows === undefined) return undefined;
       await hydrate(rows);
-      const byAlias = aliasMap();
-      const next: CanonicalQueryRecord[] = [];
-      for (const edge of rows) {
-        const endpointIds: string[] = [];
-        if ((direction === "outbound" || direction === "both") && frontierAliases.has(edge.source_subject_id)) endpointIds.push(edge.target_subject_id);
-        if ((direction === "inbound" || direction === "both") && frontierAliases.has(edge.target_subject_id)) endpointIds.push(edge.source_subject_id);
-        for (const endpointId of endpointIds) {
-          const record = byAlias.get(endpointId);
-          if (record !== undefined && !seen.has(record.record_id)) { seen.add(record.record_id); next.push(record); }
-        }
-      }
-      frontier = next;
+      frontier = [...expandIndexedGraphFrontier(rows, frontierAliases, direction, aliasMap(), seen)];
     }
     // The fallback's expansion relation stream includes every selected edge
     // whose endpoints are both reachable, including cycle/back edges touching
@@ -3566,31 +3196,13 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
       const frontierAliases = new Set(frontier.flatMap((record) => [record.record_id, record.identity_id, record.identity_key].filter((value): value is string => value !== undefined)));
       const rows = await this.indexedEdges(scope, [...frontierAliases], direction);
       if (rows === undefined) return undefined;
-      const endpointIds = new Set<string>();
-      for (const edge of rows) {
-        if (edge.relation_kind !== relationKind) continue;
-        if (direction === "outbound" && frontierAliases.has(edge.source_subject_id)) endpointIds.add(edge.target_subject_id);
-        if (direction === "inbound" && frontierAliases.has(edge.target_subject_id)) endpointIds.add(edge.source_subject_id);
-      }
+      const endpointIds = relationClosureEndpointIds(rows, frontierAliases, relationKind, direction);
       if (endpointIds.size === 0) { frontier = []; break; }
       const hydrated = await this.snapshots.records_by_ids(scope, [...endpointIds]);
       const next: CanonicalQueryRecord[] = [];
       for (const record of hydrated) {
         if (seen.has(record.record_id)) continue;
-        if (certainty !== undefined) {
-          const ids = new Set([record.record_id, record.identity_id, record.identity_key]);
-          const proofs = rows.filter((edge) => edge.relation_kind === relationKind && ids.has(direction === "outbound" ? edge.target_subject_id : edge.source_subject_id));
-          certainty.set(record.record_id, proofs.length > 0 && proofs.every((edge) => edge.evidence_class === "possible" || frontier.some((parent) => [parent.record_id, parent.identity_id, parent.identity_key].includes(direction === "outbound" ? edge.source_subject_id : edge.target_subject_id) && certainty.get(parent.record_id) === true)));
-        }
-        if (provenance !== undefined) {
-          const ids = new Set([record.record_id, record.identity_id, record.identity_key]);
-          const proofs = provenance.get(record.record_id) ?? new Set<string>();
-          for (const edge of rows) if (edge.relation_kind === relationKind && ids.has(direction === "outbound" ? edge.target_subject_id : edge.source_subject_id)) {
-            proofs.add(edge.relation_record_id);
-            for (const parent of frontier) for (const proof of provenance.get(parent.record_id) ?? []) proofs.add(proof);
-          }
-          provenance.set(record.record_id, proofs);
-        }
+        updateRelationClosureMetadata({ record, rows, relationKind, direction, frontier, provenance, certainty });
         seen.add(record.record_id);
         discovered.set(record.record_id, record);
         next.push(record);
@@ -3763,133 +3375,97 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return result({ entry_points: containers.map((record) => item(record)), public_surfaces: publicSurfaces.map((record) => item(record)), layers: [] }, capabilityStates);
   }
 
+  private async evaluateOutlineOperation(operation: OperationInvocation, args: Record<string, unknown>, maps: IdentityMaps, evaluated: (streams: Readonly<Record<string, readonly QueryStreamItem[]>>) => OperationEvaluation): Promise<OperationEvaluation> {
+    const container = resolveSelectorsToRecords(args["container"] === undefined ? [] : [args["container"]], maps)[0];
+    if (container === undefined) throw new EngineErrorWithDetails("core:selector_not_found", "The get_outline container could not be resolved.", { selector_pointer: "/container" });
+    const depth = typeof args["depth"] === "number" ? args["depth"] : 1;
+    const contains = new Map<CanonicalQueryRecord, CanonicalQueryRecord[]>();
+    for (const relation of maps.relations) {
+      if (relation.universal_kind !== "core:contains") continue;
+      const endpoints = relationEndpoints(relation, maps.by_any_id);
+      if (endpoints.source === undefined || endpoints.target === undefined) continue;
+      const children = contains.get(endpoints.source) ?? [];
+      children.push(endpoints.target);
+      contains.set(endpoints.source, children);
+    }
+    sortOutlineChildren(contains);
+    const { members, rootLevelKeys } = collectOutlineMembers(container, contains, depth);
+    const inScopeIdentityKeys = new Set<string>([container.identity_key ?? container.record_id, ...members.map((record) => record.identity_key ?? record.record_id)]);
+    const pendingSites = await this.pendingSitesStreamForOutline(operation.scope, container, inScopeIdentityKeys);
+    let remainingOutlineSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
+    const memberItems: QueryStreamItem[] = [];
+    for (const record of members) {
+      const key = record.identity_key ?? record.record_id;
+      if (!rootLevelKeys.has(key)) { memberItems.push(item(record)); continue; }
+      const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "signature", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingOutlineSnippetBudget);
+      if (snippet !== undefined) remainingOutlineSnippetBudget -= snippet.text.length;
+      memberItems.push(item(record, "confirmed", snippet));
+    }
+    return evaluated({ members: memberItems, pending_sites: pendingSites });
+  }
+
+  private async evaluateReferenceOperation(operation: OperationInvocation, args: Record<string, unknown>, maps: IdentityMaps, evaluated: (streams: Readonly<Record<string, readonly QueryStreamItem[]>>) => OperationEvaluation): Promise<OperationEvaluation> {
+    const selectors = args["target"] === undefined ? [] : Array.isArray(args["target"]) ? args["target"] : [args["target"]];
+    const targets = new Set(resolveSelectorsToRecords(selectors, maps));
+    const relations = maps.relations.filter((record) => {
+      const target = relationEndpoints(record, maps.by_any_id).target;
+      return target !== undefined && targets.has(target);
+    });
+    const owners = relations.flatMap((record) => {
+      const source = relationEndpoints(record, maps.by_any_id).source;
+      return source === undefined ? [] : [source];
+    });
+    let remainingReferenceSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
+    const referenceItems: QueryStreamItem[] = [];
+    for (const record of relations) {
+      const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "line", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingReferenceSnippetBudget);
+      if (snippet !== undefined) remainingReferenceSnippetBudget -= snippet.text.length;
+      referenceItems.push(item(record, relationClassification(record), snippet));
+    }
+    return evaluated({ references: referenceItems, owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
+  }
+
+  private evaluateExpandRelationsOperation(operation: OperationInvocation, args: Record<string, unknown>, maps: IdentityMaps, evaluated: (streams: Readonly<Record<string, readonly QueryStreamItem[]>>) => OperationEvaluation): OperationEvaluation {
+    const idOf = (record: CanonicalQueryRecord): string => record.identity_key ?? record.record_id;
+    const rootIds = resolveSelectorsToRecords(args["subjects"], maps).map(idOf);
+    const direction = args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
+    const relationKinds = strings(object(args["relations"])["universal_kinds"]);
+    const minDepth = typeof args["min_depth"] === "number" ? args["min_depth"] : 1;
+    const maxDepth = typeof args["max_depth"] === "number" ? args["max_depth"] : 1;
+    const edges: RelationEdge[] = maps.relations.flatMap((record) => {
+      const endpoints = relationEndpoints(record, maps.by_any_id);
+      if (endpoints.source === undefined || endpoints.target === undefined) return [];
+      if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return [];
+      return [{ source: idOf(endpoints.source), target: idOf(endpoints.target), relation_kind: record.universal_kind, classification: relationClassification(record), stable_sort_key: record.identity_key ?? record.record_id }];
+    });
+    const expanded = rootIds.length === 0 ? [] : expandRelations(edges, rootIds, { direction, min_depth: minDepth, max_depth: maxDepth, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) });
+    const discoveredIds = new Map<string, CanonicalQueryRecord>();
+    for (const entry of expanded) {
+      const record = maps.by_any_id.get(entry.subject);
+      if (record !== undefined && !discoveredIds.has(entry.subject)) discoveredIds.set(entry.subject, record);
+    }
+    const reachableIds = new Set([...rootIds, ...discoveredIds.keys()]);
+    const relationsUsed = maps.relations.filter((record) => {
+      if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return false;
+      const endpoints = relationEndpoints(record, maps.by_any_id);
+      return endpoints.source !== undefined && endpoints.target !== undefined && reachableIds.has(idOf(endpoints.source)) && reachableIds.has(idOf(endpoints.target));
+    });
+    const paths = args["path_policy"] === undefined || discoveredIds.size === 0 || rootIds.length === 0
+      ? []
+      : findShortestPaths(edges, rootIds, [...discoveredIds.keys()], { direction, max_depth: maxDepth, all_shortest: false, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) }).map((path): QueryStreamItem => ({
+          value: { subjects: path.subjects.map((id) => maps.by_any_id.get(id)).filter((value): value is CanonicalQueryRecord => value !== undefined).map((record) => recordValue(record)), relation_kinds: path.relation_kinds, length: path.subjects.length - 1, classification: path.classification },
+          stable_sort_key: path.stable_sort_key,
+          result_classification: path.classification,
+        }));
+    return evaluated({ subjects: [...discoveredIds.values()].map((record) => item(record)), relations: relationsUsed.map((record) => item(record, relationClassification(record))), paths });
+  }
+
   private async evaluateGraphOperation(operation: OperationInvocation, records: readonly CanonicalQueryRecord[], maps: IdentityMaps, capabilityStates: readonly SnapshotCapabilityStateEntry[]): Promise<OperationEvaluation | undefined> {
     const args = object(operation.arguments);
     const evaluated = (streams: Readonly<Record<string, readonly QueryStreamItem[]>>): OperationEvaluation => result(streams, capabilityStates);
-    if (operation.operation_id === "core:get_outline") {
-      const container = resolveSelectorsToRecords(args["container"] === undefined ? [] : [args["container"]], maps)[0];
-      if (container === undefined) throw new EngineErrorWithDetails("core:selector_not_found", "The get_outline container could not be resolved.", { selector_pointer: "/container" });
-      const depth = typeof args["depth"] === "number" ? args["depth"] : 1;
-      const contains = new Map<CanonicalQueryRecord, CanonicalQueryRecord[]>();
-      for (const relation of maps.relations) {
-        if (relation.universal_kind !== "core:contains") continue;
-        const endpoints = relationEndpoints(relation, maps.by_any_id);
-        if (endpoints.source === undefined || endpoints.target === undefined) continue;
-        const children = contains.get(endpoints.source) ?? [];
-        children.push(endpoints.target);
-        contains.set(endpoints.source, children);
-      }
-      // 2026-09-06 flecos-v4 fidelity fix: `maps.relations`' own order is
-      // NOT guaranteed to be declaration order (it is whatever order the
-      // underlying `records` array holds `core:contains` rows in, which for
-      // some producers -- e.g. `jsts:entity_parameter`'s own `contains` rows,
-      // emitted by iterating a `BTreeMap<entity_id, _>` -- sorts by the
-      // ENTITY ID STRING, not numerically by byte offset: `"10"` sorts
-      // before `"9"` lexicographically). An agent reading `get_outline`
-      // expects a callable's parameters listed left-to-right as declared, so
-      // sort each parent's children by their own `primary_source_span.
-      // start_byte` (numeric) before emitting -- falling back to `start_line`
-      // then to `identity_key`/`record_id` only when a span is missing
-      // entirely (e.g. a synthetic `external_module`/`external_symbol`
-      // entity, whose span is always `0`/`0`, so those simply keep whatever
-      // stable order `Array.prototype.sort` gives ties).
-      for (const children of contains.values()) {
-        children.sort((left, right) => {
-          const leftStart = left.primary_source_span?.start_byte;
-          const rightStart = right.primary_source_span?.start_byte;
-          if (leftStart !== undefined && rightStart !== undefined) {
-            const diff = Number(leftStart) - Number(rightStart);
-            if (diff !== 0) return diff;
-          } else if (leftStart !== undefined) return -1;
-          else if (rightStart !== undefined) return 1;
-          return (left.identity_key ?? left.record_id).localeCompare(right.identity_key ?? right.record_id);
-        });
-      }
-      const seen = new Set<string>([container.identity_key ?? container.record_id]);
-      let frontier = [container];
-      const members: CanonicalQueryRecord[] = [];
-      // Plan 2026-09-06 (Frente N, SNIPPET_POLICY): tracks which members were
-      // discovered at level 0 (direct children of `container`) -- exactly
-      // "solo la raíz" -- so the snippet hydration loop below can skip
-      // deeper-nested members instead of paying for (and returning) a
-      // snippet on every one of a potentially large `depth > 1` outline.
-      const rootLevelKeys = new Set<string>();
-      for (let level = 0; level < depth; level += 1) {
-        const next: CanonicalQueryRecord[] = [];
-        for (const parent of frontier) for (const child of contains.get(parent) ?? []) {
-          const key = child.identity_key ?? child.record_id;
-          if (!seen.has(key)) { seen.add(key); members.push(child); next.push(child); if (level === 0) rootLevelKeys.add(key); }
-        }
-        frontier = next;
-      }
-      const inScopeIdentityKeys = new Set<string>([container.identity_key ?? container.record_id, ...members.map((record) => record.identity_key ?? record.record_id)]);
-      const pendingSites = await this.pendingSitesStreamForOutline(operation.scope, container, inScopeIdentityKeys);
-      let remainingOutlineSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
-      const memberItems: QueryStreamItem[] = [];
-      for (const record of members) {
-        const key = record.identity_key ?? record.record_id;
-        if (!rootLevelKeys.has(key)) { memberItems.push(item(record)); continue; }
-        const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "signature", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingOutlineSnippetBudget);
-        if (snippet !== undefined) remainingOutlineSnippetBudget -= snippet.text.length;
-        memberItems.push(item(record, "confirmed", snippet));
-      }
-      return evaluated({ members: memberItems, pending_sites: pendingSites });
-    }
-    if (operation.operation_id === "core:find_references") {
-      const selectors = args["target"] === undefined ? [] : Array.isArray(args["target"]) ? args["target"] : [args["target"]];
-      const targets = new Set(resolveSelectorsToRecords(selectors, maps));
-      const relations = maps.relations.filter((record) => {
-        const target = relationEndpoints(record, maps.by_any_id).target;
-        return target !== undefined && targets.has(target);
-      });
-      const owners = relations.flatMap((record) => {
-        const source = relationEndpoints(record, maps.by_any_id).source;
-        return source === undefined ? [] : [source];
-      });
-      let remainingReferenceSnippetBudget = INLINE_SNIPPET_TOTAL_BUDGET;
-      const referenceItems: QueryStreamItem[] = [];
-      for (const record of relations) {
-        const snippet = await sourceSnippet(this.snapshots, operation.scope, record, "line", INLINE_SNIPPET_MAX_CHARS_PER_SNIPPET, 0, remainingReferenceSnippetBudget);
-        if (snippet !== undefined) remainingReferenceSnippetBudget -= snippet.text.length;
-        referenceItems.push(item(record, relationClassification(record), snippet));
-      }
-      return evaluated({ references: referenceItems, owners: [...new Map(owners.map((record) => [record.record_id, record])).values()].map((record) => item(record)) });
-    }
-    if (operation.operation_id === "core:expand_relations") {
-      const rootRecords = resolveSelectorsToRecords(args["subjects"], maps);
-      const idOf = (record: CanonicalQueryRecord): string => record.identity_key ?? record.record_id;
-      const rootIds = rootRecords.map(idOf);
-      const direction = args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
-      const relationKinds = strings(object(args["relations"])["universal_kinds"]);
-      const minDepth = typeof args["min_depth"] === "number" ? args["min_depth"] : 1;
-      const maxDepth = typeof args["max_depth"] === "number" ? args["max_depth"] : 1;
-      const edges: RelationEdge[] = maps.relations.flatMap((record) => {
-        const endpoints = relationEndpoints(record, maps.by_any_id);
-        if (endpoints.source === undefined || endpoints.target === undefined) return [];
-        if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return [];
-        return [{ source: idOf(endpoints.source), target: idOf(endpoints.target), relation_kind: record.universal_kind, classification: relationClassification(record), stable_sort_key: record.identity_key ?? record.record_id }];
-      });
-      const expanded = rootIds.length === 0 ? [] : expandRelations(edges, rootIds, { direction, min_depth: minDepth, max_depth: maxDepth, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) });
-      const discoveredIds = new Map<string, CanonicalQueryRecord>();
-      for (const entry of expanded) {
-        const record = maps.by_any_id.get(entry.subject);
-        if (record !== undefined && !discoveredIds.has(entry.subject)) discoveredIds.set(entry.subject, record);
-      }
-      const reachableIds = new Set([...rootIds, ...discoveredIds.keys()]);
-      const relationsUsed = maps.relations.filter((record) => {
-        if (relationKinds.length > 0 && !relationKinds.includes(record.universal_kind)) return false;
-        const endpoints = relationEndpoints(record, maps.by_any_id);
-        return endpoints.source !== undefined && endpoints.target !== undefined && reachableIds.has(idOf(endpoints.source)) && reachableIds.has(idOf(endpoints.target));
-      });
-      const paths = args["path_policy"] === undefined || discoveredIds.size === 0 || rootIds.length === 0
-        ? []
-        : findShortestPaths(edges, rootIds, [...discoveredIds.keys()], { direction, max_depth: maxDepth, all_shortest: false, ...(relationKinds.length > 0 ? { relation_kinds: relationKinds } : {}) }).map((path): QueryStreamItem => ({
-            value: { subjects: path.subjects.map((id) => maps.by_any_id.get(id)).filter((value): value is CanonicalQueryRecord => value !== undefined).map((record) => recordValue(record)), relation_kinds: path.relation_kinds, length: path.subjects.length - 1, classification: path.classification },
-            stable_sort_key: path.stable_sort_key,
-            result_classification: path.classification,
-          }));
-      return evaluated({ subjects: [...discoveredIds.values()].map((record) => item(record)), relations: relationsUsed.map((record) => item(record, relationClassification(record))), paths });
-    }
+    if (operation.operation_id === "core:get_outline") return this.evaluateOutlineOperation(operation, args, maps, evaluated);
+    if (operation.operation_id === "core:find_references") return this.evaluateReferenceOperation(operation, args, maps, evaluated);
+    if (operation.operation_id === "core:expand_relations") return this.evaluateExpandRelationsOperation(operation, args, maps, evaluated);
     if (operation.operation_id === "core:find_paths") {
       const sources = resolveSelectorsToRecords(args["sources"], maps);
       const targets = new Set(resolveSelectorsToRecords(args["targets"], maps));
@@ -3982,22 +3558,12 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
 
   private async tryGraphPushdown(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
     if (!["core:get_outline", "core:find_references", "core:expand_relations", "core:find_paths"].includes(operation.operation_id)) return undefined;
-    const args = object(operation.arguments);
-    const sourceSelectors = operation.operation_id === "core:get_outline" ? [args["container"]]
-      : operation.operation_id === "core:find_references" ? (Array.isArray(args["target"]) ? args["target"] : [args["target"]])
-      : operation.operation_id === "core:expand_relations" ? args["subjects"]
-      : args["sources"];
-    const roots = await this.resolveIndexedGraphSelectors(operation.scope, sourceSelectors);
+    const plan = graphPushdownPlan(operation, object(operation.arguments));
+    const roots = await this.resolveIndexedGraphSelectors(operation.scope, plan.sourceSelectors);
     if (roots === undefined) return undefined;
-    const retained = operation.operation_id === "core:find_paths" ? await this.resolveIndexedGraphSelectors(operation.scope, args["targets"]) : [];
+    const retained = plan.targetSelectors === undefined ? [] : await this.resolveIndexedGraphSelectors(operation.scope, plan.targetSelectors);
     if (retained === undefined) return undefined;
-    const direction = operation.operation_id === "core:get_outline" ? "outbound"
-      : operation.operation_id === "core:find_references" ? "inbound"
-      : args["direction"] === "inbound" ? "inbound" : args["direction"] === "both" ? "both" : "outbound";
-    const maxDepth = operation.operation_id === "core:get_outline" ? (typeof args["depth"] === "number" ? args["depth"] : 1)
-      : operation.operation_id === "core:find_references" ? 1
-      : typeof args["max_depth"] === "number" ? args["max_depth"] : operation.operation_id === "core:find_paths" ? 4 : 1;
-    const records = await this.indexedGraphRecords(operation.scope, roots, retained, direction, maxDepth);
+    const records = await this.indexedGraphRecords(operation.scope, roots, retained, plan.direction, plan.maxDepth);
     if (records === undefined) return undefined;
     const capabilityStates = await this.snapshots.capability_states?.(operation.scope) ?? [];
     return this.evaluateGraphOperation(operation, records, await identityMaps(records), capabilityStates);
@@ -5481,12 +5047,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   private async trySemanticAffectedPage(operation: OperationInvocation): Promise<OperationEvaluation | undefined> {
     if (operation.operation_id !== "core:semantic_affected_page") return undefined;
     const scope = requireSingleWorkspaceScope(operation.scope);
-    const args = object(operation.arguments);
-    const requestedSetId = typeof args["affected_artifact_set_id"] === "string" ? args["affected_artifact_set_id"] as string : "";
-    const cursorToken = typeof args["cursor"] === "string" ? args["cursor"] as string : undefined;
-    const requestedLimit = typeof args["limit"] === "number" && Number.isSafeInteger(args["limit"]) && (args["limit"] as number) > 0
-      ? Math.min(args["limit"] as number, SEMANTIC_AFFECTED_PAGE_MAX_LIMIT)
-      : SEMANTIC_AFFECTED_FIRST_PAGE_LIMIT;
+    const { requestedSetId, requestedLimit, cursor: decodedCursor } = parseAffectedPageArguments(object(operation.arguments));
 
     const provider = this.options.semantic;
     if (provider === undefined || this.snapshots.semantic_affected_documents === undefined) {
@@ -5495,12 +5056,6 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
         `core:semantic_affected_page requires a configured semantic provider and an affected-documents-capable snapshot port for workspace "${scope.workspace_id}".`,
         { capability: "core:semantic_affected_documents", workspace_snapshot_binding_ids: [scope.workspace_id], reason_codes: [provider === undefined ? "no_provider_configured" : "snapshot_port_unsupported"] },
       );
-    }
-
-    let decodedCursor: AffectedCursor | undefined;
-    if (cursorToken !== undefined) {
-      try { decodedCursor = decodeAffectedCursor(cursorToken); }
-      catch (error) { throw new SemanticQueryError("core:cursor_invalid", error instanceof Error ? error.message : "Malformed core:semantic_affected_page cursor.", { reason_code: "malformed_cursor" }); }
     }
 
     const marker = this.snapshots.semantic_index_state !== undefined ? await this.snapshots.semantic_index_state(operation.scope) : undefined;
@@ -5596,16 +5151,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
   private async executeCompare(operation: OperationInvocation): Promise<OperationEvaluation> {
     const scope = operation.scope;
     if (scope.scope_type !== "comparison") throw new EngineErrorWithDetails("core:invalid_query_scope", "core:compare requires a comparison scope.", { recipe_id: operation.operation_id, required_scope_kind: "comparison", required_roles: [], provided_scope_kind: scope.scope_type, provided_roles: [] });
-    if (scope.participants.length !== 2) {
-      throw new EngineErrorWithDetails("core:participant_role_invalid", `core:compare requires exactly two participants (base/target); received ${scope.participants.length}.`, { operation: operation.operation_id, provided_roles: scope.participants.map((participant) => participant.role), required_roles: ["base", "target"] });
-    }
-    const explicitBase = scope.participants.find((participant) => participant.role === "base");
-    const explicitTarget = scope.participants.find((participant) => participant.role === "target");
-    let baseParticipant: QueryParticipant;
-    let targetParticipant: QueryParticipant;
-    if (explicitBase !== undefined && explicitTarget !== undefined) { baseParticipant = explicitBase; targetParticipant = explicitTarget; }
-    else if (explicitBase === undefined && explicitTarget === undefined) { [baseParticipant, targetParticipant] = scope.participants as [QueryParticipant, QueryParticipant]; }
-    else throw new EngineErrorWithDetails("core:participant_role_invalid", `core:compare received one of "base"/"target" without the other; provide both roles or neither.`, { operation: operation.operation_id, provided_roles: scope.participants.map((participant) => participant.role), required_roles: ["base", "target"] });
+    const [baseParticipant, targetParticipant] = resolveComparisonRoles(operation, scope);
 
     const args = object(operation.arguments);
     const requestedKinds = new Set(strings(args["comparison_kinds"]));
@@ -5619,17 +5165,7 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     ]);
     const diff = await diffComparisonRecordSources(baseRecords, targetRecords, correlationPolicy);
 
-    const streams: Record<string, QueryStreamItem[]> = {};
-    if (requestedKinds.has("added")) streams["added"] = diff.added.map((record) => compareParticipantItem(record, targetParticipant.role));
-    if (requestedKinds.has("removed")) streams["removed"] = diff.removed.map((record) => compareParticipantItem(record, baseParticipant.role));
-    if (requestedKinds.has("changed")) streams["changed"] = diff.changed.map((pair) => compareChangeItem(pair));
-    if (requestedKinds.has("moved")) streams["moved"] = diff.moved.map((pair) => compareMoveItem(pair));
-    if (requestedKinds.has("correlated")) {
-      streams["correlated"] = [
-        ...diff.correlated.map((pair) => compareCorrelationItem(pair, "confirmed", "identity_key")),
-        ...(correlationPolicy === "include_possible" ? diff.possibleCorrelated.map((pair) => compareCorrelationItem(pair, "possible", "content_digest")) : []),
-      ];
-    }
+    const streams = comparisonStreams(diff, requestedKinds, correlationPolicy, baseParticipant.role, targetParticipant.role);
 
     const capabilityStates = [...(await base.port.capability_states?.(base.scope) ?? []), ...(await target.port.capability_states?.(target.scope) ?? [])];
     return result(streams, capabilityStates);
@@ -5882,45 +5418,20 @@ export class CanonicalRecordQueryDataPort implements QueryDataPort {
     return evaluated(Object.fromEntries(boundOperation.result_streams.map((stream) => [stream, []])));
   }
 }
+type RelationPairRow = Readonly<{ source_subject_id: string; target_subject_id: string; relation_kind: string }>;
 
-/**
- * Minimal `core:discover_definitions` implementation: matches `matcher.text`
- * against the REGISTRY definition inventory (universal entity/relation
- * kinds as the `record_kind` family, `facetRegistry` as the `facet` family,
- * `languageRegistry` as the `language` family) -- not against workspace
- * records, which is a different, already-implemented, operation
- * (`core:find_records`). Needed end-to-end so the `core:definition_to_instances`
- * recipe's `bind.record_selector` stage (Bug Group 1) has a real upstream
- * `definition_set` to bind from; not itself one of the four listed bug
- * groups, but the recipe cannot be exercised without it. `semantic`/`hybrid`
- * matcher modes degrade to `contains` here (no embedding model is involved
- * in matching registry definition names), which is a deliberate, documented
- * simplification.
- */
-function discoverDefinitions(args: Record<string, unknown>): Readonly<Record<string, readonly QueryStreamItem[]>> {
-  const matcher = object(args["matcher"]);
-  const text = String(matcher["text"] ?? "");
-  const mode = String(matcher["mode"] ?? "exact");
-  const matcherTypes = strings(matcher["definition_types"]);
-  const selectorTypes = strings(object(args["selector"])["definition_types"]);
-  const allowedTypes = selectorTypes.length > 0 ? new Set(selectorTypes) : matcherTypes.length > 0 ? new Set(matcherTypes) : undefined;
-  const inventory: { readonly definition_type: string; readonly definition_id: string }[] = [
-    ...universalEntityKinds.map((kind) => ({ definition_type: "record_kind", definition_id: kind })),
-    ...universalRelationKinds.map((kind) => ({ definition_type: "record_kind", definition_id: kind })),
-    ...facetRegistry.map((facet) => ({ definition_type: "facet", definition_id: facet })),
-    ...languageRegistry.map((language) => ({ definition_type: "language", definition_id: language.id })),
-  ];
-  const matches = (id: string): boolean => {
-    const local = id.includes(":") ? id.slice(id.indexOf(":") + 1) : id;
-    if (mode === "exact") return id === text || local === text;
-    if (mode === "prefix") return id.startsWith(text) || local.startsWith(text);
-    return id.includes(text) || local.includes(text);
-  };
-  const matched = inventory.filter((definition) => (allowedTypes === undefined || allowedTypes.has(definition.definition_type)) && (text.length === 0 || matches(definition.definition_id)));
-  const definitions: QueryStreamItem[] = matched.map((definition, index) => ({
-    value: { subject_type: "definition", definition_type: definition.definition_type, definition_id: definition.definition_id, match_class: mode === "exact" ? "exact" : "lexical", match_terms: [text] },
-    stable_sort_key: `confirmed\0${String(index).padStart(6, "0")}\0${definition.definition_id}`,
-  }));
-  const definitionSet: QueryStreamItem[] = matched.length === 0 ? [] : [{ value: { definitions: matched }, stable_sort_key: "0" }];
-  return { definitions, definition_set: definitionSet };
+/** Adds graph rows that satisfy the requested relation direction and kind set. */
+function collectRelationPairs(
+  rows: readonly RelationPairRow[],
+  left: ReadonlySet<string>,
+  right: ReadonlySet<string>,
+  kinds: ReadonlySet<string>,
+  direction: "inbound" | "outbound" | "both",
+  output: Set<string>,
+): void {
+  for (const row of rows) {
+    if (kinds.size > 0 && !kinds.has(row.relation_kind)) continue;
+    if ((direction === "outbound" || direction === "both") && left.has(row.source_subject_id) && right.has(row.target_subject_id)) output.add(`${row.source_subject_id}\u0000${row.target_subject_id}`);
+    if ((direction === "inbound" || direction === "both") && left.has(row.target_subject_id) && right.has(row.source_subject_id)) output.add(`${row.target_subject_id}\u0000${row.source_subject_id}`);
+  }
 }

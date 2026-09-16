@@ -113,3 +113,6 @@ Historical implementation plans, private agent/editor configuration, raw
 benchmark transcripts, and host-local paths are intentionally not part of the
 public repository. All public documentation and code comments are written in
 English.
+
+The repository also maintains a [mantenibilidad y explicabilidad guide](maintainability.md).
+Read it before refactoring production code, support scripts, or tests.

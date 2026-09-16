@@ -745,31 +745,31 @@ function validateQueryBeforeIpc(payload: JsonRecord): void {
   try {
     buildQueryAdmissionPlan(payload as unknown as QueryRequest);
   } catch (error) {
-    if (error instanceof Error) {
-      const details = isRecord((error as Error & { readonly details?: unknown }).details) ? (error as Error & { readonly details: Record<string, unknown> }).details : undefined;
-      const pointer = details !== undefined && typeof details["schema_pointer"] === "string"
-        ? details["schema_pointer"]
-        : details !== undefined && typeof details["object_pointer"] === "string" ? details["object_pointer"] : undefined;
-      const received = details?.["received"];
-      const example = details?.["example"];
-      const render = (value: unknown): string => {
-        try {
-          const encoded = JSON.stringify(value);
-          return encoded.length > 480 ? `${encoded.slice(0, 477)}...` : encoded;
-        } catch {
-          return String(value);
-        }
-      };
-      const suffix = [
-        pointer === undefined ? undefined : `pointer ${pointer}`,
-        received === undefined ? undefined : `received ${render(received)}`,
-        example === undefined ? undefined : `example ${render(example)}`,
-        /(?:^|[/.])filter(?:[/.:]|$)/iu.test(`${pointer ?? ""} ${error.message}`) ? structuralFilterGuidance : undefined,
-      ].filter((value): value is string => value !== undefined).join("; ");
-      throw new McpProtocolError(`${error.message}${suffix.length === 0 ? "" : ` (${suffix})`}`);
-    }
+    if (error instanceof Error) throw new McpProtocolError(formatQueryAdmissionError(error));
     throw new McpProtocolError("Query does not match the published API v3 schema. Example: {\"api_version\":3,\"scope\":{\"scope_type\":\"single_workspace\",\"workspace_id\":\"<workspace_id>\"},\"expression\":{\"expression_type\":\"operation\",\"operation\":\"core:find_artifacts\",\"arguments\":{}}}");
   }
+}
+
+function formatQueryAdmissionError(error: Error & { readonly details?: unknown }): string {
+  const details = isRecord(error.details) ? error.details : undefined;
+  const pointer = details !== undefined && typeof details["schema_pointer"] === "string"
+    ? details["schema_pointer"]
+    : details !== undefined && typeof details["object_pointer"] === "string" ? details["object_pointer"] : undefined;
+  const render = (value: unknown): string => {
+    try {
+      const encoded = JSON.stringify(value);
+      return encoded.length > 480 ? `${encoded.slice(0, 477)}...` : encoded;
+    } catch {
+      return String(value);
+    }
+  };
+  const suffix = [
+    pointer === undefined ? undefined : `pointer ${pointer}`,
+    details?.["received"] === undefined ? undefined : `received ${render(details["received"])}`,
+    details?.["example"] === undefined ? undefined : `example ${render(details["example"])}`,
+    /(?:^|[/.])filter(?:[/.:]|$)/iu.test(`${pointer ?? ""} ${error.message}`) ? structuralFilterGuidance : undefined,
+  ].filter((value): value is string => value !== undefined).join("; ");
+  return `${error.message}${suffix.length === 0 ? "" : ` (${suffix})`}`;
 }
 
 function assertPublicQueryFields(query: JsonRecord): void {
@@ -785,14 +785,28 @@ function assertPublicQueryFields(query: JsonRecord): void {
 function queryPayload(input: unknown, continuationStore: ContinuationRefStore = continuationRefs): { readonly call: string; readonly payload: JsonRecord } {
   const raw = requireRecord(input, "tool arguments");
   const outer = requireRecord(canonicalKeys(raw), "tool arguments");
-  const candidate = outer["request_type"] === "query" && isRecord(outer["query"])
-    ? outer["query"]
-    : outer["request_type"] === "continuation" && isRecord(outer["continuation"])
-      ? outer["continuation"]
-      : isRecord(outer["request"]) ? outer["request"] : outer;
+  const candidate = queryCandidateFromOuter(outer);
   const canonical = requireRecord(canonicalKeys(candidate), "query request");
   assertPublicQueryFields(canonical);
   const apiVersion = requireApiVersion(canonical["api_version"]);
+  const continuation = queryContinuationPayload(canonical, apiVersion, continuationStore);
+  if (continuation !== undefined) return continuation;
+  if (!isRecord(canonical["expression"])) throw new McpProtocolError("urdira_query requires expression, or cursor.");
+  const scope = requireScope(canonical["scope"]);
+  const options = mergeQueryOptions(canonical["options"]);
+  preserveExplicitSourceProjection(options, canonical["options"], canonical["expression"]);
+  const payload = { api_version: apiVersion, scope, expression: canonical["expression"], options };
+  validateQueryBeforeIpc(payload);
+  return { call: "core:query", payload };
+}
+
+function queryCandidateFromOuter(outer: JsonRecord): JsonRecord {
+  if (outer["request_type"] === "query" && isRecord(outer["query"])) return outer["query"];
+  if (outer["request_type"] === "continuation" && isRecord(outer["continuation"])) return outer["continuation"];
+  return isRecord(outer["request"]) ? outer["request"] : outer;
+}
+
+function queryContinuationPayload(canonical: JsonRecord, apiVersion: number, continuationStore: ContinuationRefStore): { readonly call: string; readonly payload: JsonRecord } | undefined {
   const hasCursor = typeof canonical["cursor"] === "string";
   const hasRef = typeof canonical["continuation_ref"] === "string";
   if (hasCursor && hasRef) throw new McpProtocolError("Provide exactly one of cursor or continuation_ref.");
@@ -804,12 +818,7 @@ function queryPayload(input: unknown, continuationStore: ContinuationRefStore = 
     const budget = resolvedRef?.budget ?? mergeResponseBudget(canonical["response_budget"]);
     return { call: "core:query_continue", payload: { api_version: apiVersion, scope, cursor: canonical["cursor"], response_budget: budget } };
   }
-  if (!isRecord(canonical["expression"])) throw new McpProtocolError("urdira_query requires expression, or cursor.");
-  const options = mergeQueryOptions(canonical["options"]);
-  preserveExplicitSourceProjection(options, canonical["options"], canonical["expression"]);
-  const payload = { api_version: apiVersion, scope, expression: canonical["expression"], options };
-  validateQueryBeforeIpc(payload);
-  return { call: "core:query", payload };
+  return undefined;
 }
 
 function indexStatusPayload(input: unknown): JsonRecord {
@@ -843,11 +852,7 @@ async function invokeBenchmarkDiscover(
   dependencies: { readonly client: UrdiraMcpClient },
   context: UrdiraMcpToolContext = {},
 ): Promise<CallToolResult> {
-  const args = requireRecord(input, "benchmark discovery arguments");
-  const workspaceRoot = args["workspace_root"];
-  const path = args["path"];
-  if (typeof workspaceRoot !== "string" || workspaceRoot.length === 0) throw new McpProtocolError("workspace_root is required.");
-  if (typeof path !== "string" || path.length === 0) throw new McpProtocolError("path is required.");
+  const { workspaceRoot, path } = benchmarkDiscoveryArgs(input);
   const requestOptions: LocalIpcRequestOptions = {
     ...(context.signal === undefined ? {} : { signal: context.signal }),
     ...(context.onProgress === undefined ? {} : { on_progress: context.onProgress }),
@@ -858,19 +863,12 @@ async function invokeBenchmarkDiscover(
   const workspace = statusPayload !== undefined && Array.isArray(statusPayload["workspaces"]) && isRecord(statusPayload["workspaces"][0])
     ? statusPayload["workspaces"][0] as JsonRecord
     : undefined;
-  const workspaceId = workspace !== undefined && typeof workspace["workspace_id"] === "string" ? workspace["workspace_id"] : undefined;
-  const workspaceStatus = workspace !== undefined && typeof workspace["workspace_status"] === "string" ? workspace["workspace_status"] : undefined;
-  const freshnessStatus = workspace !== undefined && typeof workspace["freshness_status"] === "string" ? workspace["freshness_status"] : undefined;
-  const sourceReady = workspaceId !== undefined && workspace !== undefined && workspace["source_ready"] === true && typeof workspace["source_snapshot_id"] === "string";
-  const structuralReady = workspaceId !== undefined && workspace !== undefined && (workspace["structural_ready"] === true || (workspace["structural_ready"] === undefined && (workspaceStatus === "ready" || workspaceStatus === "degraded"))) && (freshnessStatus === undefined || freshnessStatus === "equivalent" || freshnessStatus === "current");
-  const ready = structuralReady || sourceReady;
+  const state = benchmarkWorkspaceState(workspace);
   const result: JsonRecord = {
     internal_calls: ["core:index_status"],
-    index_status: statusResponse.outcome === "success"
-      ? { workspace_id: workspaceId, workspace_status: workspaceStatus, freshness_status: freshnessStatus, source_ready: workspace?.["source_ready"], structural_ready: workspace?.["structural_ready"], source_snapshot_id: workspace?.["source_snapshot_id"], current_snapshot_id: workspace?.["current_snapshot_id"] }
-      : { error: responseError(statusResponse) },
+    index_status: benchmarkStatusResult(statusResponse, workspace, state),
   };
-  if (!ready) {
+  if (!state.ready) {
     result["artifact_lookup"] = { skipped: true, reason: "index_not_ready_or_not_current", ...(workspace?.["operation_availability"] === undefined ? {} : { operation_availability: workspace["operation_availability"] }) };
     return { content: [{ type: "text", text: stableJson(result) }] };
   }
@@ -879,22 +877,58 @@ async function invokeBenchmarkDiscover(
   // path lookup does not pay for the structural record/capability corpus. The
   // structural snapshot remains the fallback for retained pre-source-first
   // workspaces that have no source snapshot.
-  const sourceBinding = sourceReady || !structuralReady;
-  const queryRequest = {
-    request_type: "query",
-    query: {
-      api_version: 3,
-      scope: { scope_type: "single_workspace", workspace_id: workspaceId, ...(sourceBinding ? { snapshot_id: workspace!["source_snapshot_id"] } : {}) },
-      expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: { filter: { paths: [path] } } },
-    },
-  };
+  const queryRequest = benchmarkQueryRequest(state, workspace, path);
   const query = queryPayload(queryRequest);
   const queryResponse = await dependencies.client.call(query.call, query.payload, requestOptions);
   result["internal_calls"] = ["core:index_status", query.call];
-  result["artifact_lookup"] = queryResponse.outcome === "success"
-    ? { path, result: renderQueryPageText(publicQueryPage(queryResponse.payload, "single_workspace", extractResponseBudget(query.call, query.payload), { render: "text", page_kind: "query", snippet_lines: DEFAULT_SNIPPET_LINES }) as JsonRecord) }
-    : { path, error: responseError(queryResponse) };
+  result["artifact_lookup"] = benchmarkArtifactResult(path, queryResponse, query);
   return { content: [{ type: "text", text: stableJson(result) }] };
+}
+
+function benchmarkDiscoveryArgs(input: unknown): { readonly workspaceRoot: string; readonly path: string } {
+  const args = requireRecord(input, "benchmark discovery arguments");
+  const workspaceRoot = args["workspace_root"];
+  const path = args["path"];
+  if (typeof workspaceRoot !== "string" || workspaceRoot.length === 0) throw new McpProtocolError("workspace_root is required.");
+  if (typeof path !== "string" || path.length === 0) throw new McpProtocolError("path is required.");
+  return { workspaceRoot, path };
+}
+
+function benchmarkStatusResult(response: IpcResponse, workspace: JsonRecord | undefined, state: ReturnType<typeof benchmarkWorkspaceState>): JsonRecord {
+  if (response.outcome !== "success") return { error: responseError(response) };
+  return { workspace_id: state.workspaceId, workspace_status: state.workspaceStatus, freshness_status: state.freshnessStatus, source_ready: workspace?.["source_ready"], structural_ready: workspace?.["structural_ready"], source_snapshot_id: workspace?.["source_snapshot_id"], current_snapshot_id: workspace?.["current_snapshot_id"] };
+}
+
+function benchmarkArtifactResult(path: string, response: IpcResponse, query: { readonly call: string; readonly payload: unknown }): JsonRecord {
+  if (response.outcome !== "success") return { path, error: responseError(response) };
+  return { path, result: renderQueryPageText(publicQueryPage(response.payload, "single_workspace", extractResponseBudget(query.call, query.payload as JsonRecord), { render: "text", page_kind: "query", snippet_lines: DEFAULT_SNIPPET_LINES }) as JsonRecord) };
+}
+
+function benchmarkWorkspaceState(workspace: JsonRecord | undefined): { readonly workspaceId: string | undefined; readonly workspaceStatus: string | undefined; readonly freshnessStatus: string | undefined; readonly sourceReady: boolean; readonly structuralReady: boolean; readonly ready: boolean } {
+  const workspaceId = workspace !== undefined && typeof workspace["workspace_id"] === "string" ? workspace["workspace_id"] : undefined;
+  const workspaceStatus = workspace !== undefined && typeof workspace["workspace_status"] === "string" ? workspace["workspace_status"] : undefined;
+  const freshnessStatus = workspace !== undefined && typeof workspace["freshness_status"] === "string" ? workspace["freshness_status"] : undefined;
+  const sourceReady = workspaceId !== undefined && workspace !== undefined && workspace["source_ready"] === true && typeof workspace["source_snapshot_id"] === "string";
+  const structuralReady = workspaceId !== undefined && isBenchmarkStructuralReady(workspace ?? {}, workspaceStatus, freshnessStatus);
+  return { workspaceId, workspaceStatus, freshnessStatus, sourceReady, structuralReady, ready: structuralReady || sourceReady };
+}
+
+function isBenchmarkStructuralReady(workspace: JsonRecord, workspaceStatus: string | undefined, freshnessStatus: string | undefined): boolean {
+  const published = workspace["structural_ready"] === true || (workspace["structural_ready"] === undefined && (workspaceStatus === "ready" || workspaceStatus === "degraded"));
+  const fresh = freshnessStatus === undefined || freshnessStatus === "equivalent" || freshnessStatus === "current";
+  return published && fresh;
+}
+
+function benchmarkQueryRequest(state: { readonly workspaceId: string | undefined; readonly sourceReady: boolean; readonly structuralReady: boolean }, workspace: JsonRecord | undefined, path: string): JsonRecord {
+  const sourceBinding = state.sourceReady || !state.structuralReady;
+  return {
+    request_type: "query",
+    query: {
+      api_version: 3,
+      scope: { scope_type: "single_workspace", workspace_id: state.workspaceId, ...(sourceBinding ? { snapshot_id: workspace?.["source_snapshot_id"] } : {}) },
+      expression: { expression_type: "operation", operation: "core:find_artifacts", arguments: { filter: { paths: [path] } } },
+    },
+  };
 }
 
 function responseError(response: IpcResponse): JsonRecord {
@@ -953,62 +987,84 @@ function shedToBudget(envelope: JsonRecord, maxCharacters: number, measure: (val
   if (measured(current) <= maxCharacters) return { envelope: current, truncated, droppedItems };
 
   const report = isRecord(current["completeness_report"]) ? current["completeness_report"] as JsonRecord : undefined;
-  if (report !== undefined && Array.isArray(report["dimensions"])) {
-    for (const cap of [4, 2, 1, 0]) {
-      if (measured(current) <= maxCharacters) break;
-      const dimensions = (report["dimensions"] as JsonRecord[]).map((dimension) => {
-        const ids = Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"] as unknown[] : [];
-        if (ids.length <= cap) return dimension;
-        truncated = true;
-        return { ...dimension, affected_artifact_ids: ids.slice(0, cap) };
-      });
-      current = { ...current, completeness_report: { ...report, dimensions } };
-    }
+  const completeness = shedCompletenessDimensions(current, report, measured, maxCharacters);
+  current = completeness.envelope;
+  truncated ||= completeness.truncated;
+
+  if (measured(current) > maxCharacters && Array.isArray(current["result_sets"])) {
+    const optional = trimOptionalBundlePayloads(current);
+    current = optional.envelope;
+    truncated ||= optional.truncated;
   }
 
   if (measured(current) > maxCharacters && Array.isArray(current["result_sets"])) {
-    const trimBundle = (bundle: unknown): unknown => {
-      if (!isRecord(bundle)) return bundle;
-      const hasSnippets = Array.isArray(bundle["optional_source_snippets"]) && bundle["optional_source_snippets"].length > 0;
-      const hasRelated = Array.isArray(bundle["essential_related_entities"]) && bundle["essential_related_entities"].length > 0;
-      if (!hasSnippets && !hasRelated) return bundle;
-      truncated = true;
-      return { ...bundle, optional_source_snippets: [], essential_related_entities: [] };
-    };
-    const trimStream = (stream: unknown): unknown => isRecord(stream) && Array.isArray(stream["result_bundles"]) ? { ...stream, result_bundles: (stream["result_bundles"] as unknown[]).map(trimBundle) } : stream;
-    const resultSets = (current["result_sets"] as JsonRecord[]).map((entry) => ({ ...entry, confirmed: trimStream(entry["confirmed"]), possible: trimStream(entry["possible"]) }));
-    current = { ...current, result_sets: resultSets };
-  }
-
-  if (measured(current) > maxCharacters && Array.isArray(current["result_sets"])) {
-    const resultSets = [...(current["result_sets"] as JsonRecord[])];
-    let guard = 0;
-    while (measured({ ...current, result_sets: resultSets }) > maxCharacters && guard < 1_000_000) {
-      guard += 1;
-      let removed = false;
-      for (let index = resultSets.length - 1; index >= 0; index -= 1) {
-        const entry = resultSets[index] as JsonRecord;
-        const confirmed = entry["confirmed"] as JsonRecord;
-        const possible = entry["possible"] as JsonRecord;
-        const confirmedBundles = bundlesOf(confirmed);
-        const possibleBundles = bundlesOf(possible);
-        if (confirmedBundles.length > 0) {
-          resultSets[index] = { ...entry, confirmed: { ...confirmed, result_bundles: confirmedBundles.slice(0, -1) } };
-          droppedItems += 1; truncated = true; removed = true;
-          break;
-        }
-        if (possibleBundles.length > 0) {
-          resultSets[index] = { ...entry, possible: { ...possible, result_bundles: possibleBundles.slice(0, -1) } };
-          droppedItems += 1; truncated = true; removed = true;
-          break;
-        }
-      }
-      if (!removed) break;
-    }
-    current = { ...current, result_sets: resultSets };
+    const dropped = dropTrailingResultBundles(current, measured, maxCharacters);
+    current = dropped.envelope;
+    truncated ||= dropped.truncated;
+    droppedItems += dropped.droppedItems;
   }
 
   return { envelope: current, truncated, droppedItems };
+}
+
+function shedCompletenessDimensions(envelope: JsonRecord, report: JsonRecord | undefined, measure: (value: JsonRecord) => number, maxCharacters: number): { readonly envelope: JsonRecord; readonly truncated: boolean } {
+  if (report === undefined || !Array.isArray(report["dimensions"])) return { envelope, truncated: false };
+  let current = envelope;
+  let truncated = false;
+  for (const cap of [4, 2, 1, 0]) {
+    if (measure(current) <= maxCharacters) break;
+    const dimensions = (report["dimensions"] as JsonRecord[]).map((dimension) => {
+      const ids = Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"] as unknown[] : [];
+      if (ids.length <= cap) return dimension;
+      truncated = true;
+      return { ...dimension, affected_artifact_ids: ids.slice(0, cap) };
+    });
+    current = { ...current, completeness_report: { ...report, dimensions } };
+  }
+  return { envelope: current, truncated };
+}
+
+function trimOptionalBundlePayloads(envelope: JsonRecord): { readonly envelope: JsonRecord; readonly truncated: boolean } {
+  let truncated = false;
+  const trimBundle = (bundle: unknown): unknown => {
+    if (!isRecord(bundle)) return bundle;
+    const hasSnippets = Array.isArray(bundle["optional_source_snippets"]) && bundle["optional_source_snippets"].length > 0;
+    const hasRelated = Array.isArray(bundle["essential_related_entities"]) && bundle["essential_related_entities"].length > 0;
+    if (!hasSnippets && !hasRelated) return bundle;
+    truncated = true;
+    return { ...bundle, optional_source_snippets: [], essential_related_entities: [] };
+  };
+  const trimStream = (stream: unknown): unknown => isRecord(stream) && Array.isArray(stream["result_bundles"])
+    ? { ...stream, result_bundles: (stream["result_bundles"] as unknown[]).map(trimBundle) } : stream;
+  const resultSets = (envelope["result_sets"] as JsonRecord[]).map((entry) => ({ ...entry, confirmed: trimStream(entry["confirmed"]), possible: trimStream(entry["possible"]) }));
+  return { envelope: { ...envelope, result_sets: resultSets }, truncated };
+}
+
+function dropTrailingResultBundles(envelope: JsonRecord, measure: (value: JsonRecord) => number, maxCharacters: number): { readonly envelope: JsonRecord; readonly truncated: boolean; readonly droppedItems: number } {
+  const resultSets = [...(envelope["result_sets"] as JsonRecord[])];
+  let droppedItems = 0;
+  let guard = 0;
+  while (measure({ ...envelope, result_sets: resultSets }) > maxCharacters && guard < 1_000_000) {
+    guard += 1;
+    let removed = false;
+    for (let index = resultSets.length - 1; index >= 0; index -= 1) {
+      const entry = resultSets[index] as JsonRecord;
+      const confirmed = entry["confirmed"] as JsonRecord;
+      const possible = entry["possible"] as JsonRecord;
+      const confirmedBundles = bundlesOf(confirmed);
+      const possibleBundles = bundlesOf(possible);
+      if (confirmedBundles.length > 0) {
+        resultSets[index] = { ...entry, confirmed: { ...confirmed, result_bundles: confirmedBundles.slice(0, -1) } };
+        droppedItems += 1; removed = true; break;
+      }
+      if (possibleBundles.length > 0) {
+        resultSets[index] = { ...entry, possible: { ...possible, result_bundles: possibleBundles.slice(0, -1) } };
+        droppedItems += 1; removed = true; break;
+      }
+    }
+    if (!removed) break;
+  }
+  return { envelope: { ...envelope, result_sets: resultSets }, truncated: droppedItems > 0, droppedItems };
 }
 
 // A page's `render` mode changes what an agent actually pays for, so the
@@ -1329,23 +1385,8 @@ function describeBundle(bundle: JsonRecord, resultSetLabel: string): BundleDescr
   const primary = isRecord(bundle["primary_result"]) ? bundle["primary_result"] as JsonRecord : {};
   if (resultSetLabel === "semantic_coverage" && typeof primary["materialization_state"] === "string") return describeSemanticCoverage(primary);
   if (resultSetLabel === "semantic_affected_artifacts" && Array.isArray(primary["artifacts"])) return describeSemanticAffectedPage(primary);
-  // Defensive support for the fully-typed `PrimaryResultView` union
-  // (`{ result_type: "entity", subject, record: { payload, kind, ... } }`)
-  // alongside the flat `recordValue()` shape everything actually emits today.
-  const nestedRecord = isRecord(primary["record"]) ? primary["record"] as JsonRecord : undefined;
-  const body: JsonRecord = isRecord(primary["body"]) ? primary["body"] as JsonRecord : nestedRecord && isRecord(nestedRecord["payload"]) ? nestedRecord["payload"] as JsonRecord : {};
-  const span = isRecord(primary["source_span"]) ? primary["source_span"] as JsonRecord : undefined;
-  const snippets = Array.isArray(bundle["optional_source_snippets"]) ? bundle["optional_source_snippets"] as JsonRecord[] : [];
-  const snippetSpan = isRecord(snippets[0]?.["span"]) ? snippets[0]!["span"] as JsonRecord : undefined;
-
-  const path = firstNonEmptyString(body["path"], primary["path"]);
-  const line = describeLine(body, span) ?? describeLine({}, snippetSpan);
-  const subjectType = firstNonEmptyString(primary["subject_type"], primary["result_type"]);
-  const name = firstNonEmptyString(body["qualified_name"], body["name"]);
-  const rawKind = firstNonEmptyString(body["kind"]);
-  const recordKind = firstNonEmptyString(primary["kind"], nestedRecord?.["kind"], primary["universal_kind"]);
-
-  const snippetText = typeof snippets[0]?.["text"] === "string" ? snippets[0]["text"] as string : undefined;
+  const fields = descriptorFields(bundle, primary);
+  const { body, snippets, path, line, subjectType, name, rawKind, recordKind, snippetText } = fields;
   // A source bundle may carry a source span solely as the locator for its
   // snippet. Treat only occurrence-level `matches` (or an explicit
   // match_count) as grep-style results; otherwise source retrieval would
@@ -1363,22 +1404,49 @@ function describeBundle(bundle: JsonRecord, resultSetLabel: string): BundleDescr
   // render those compactly, capped at `snippet_lines`.
   const isCompactSnippetStyle = !isMatchStyle && resultSetLabel !== "sources" && resultSetLabel !== "context";
 
-  let label: string;
+  const label = describeBundleLabel(subjectType, body, name, rawKind, recordKind, primary);
+
+  return { path, line, label, snippetText, isMatchStyle, isCompactSnippetStyle };
+}
+
+function descriptorFields(bundle: JsonRecord, primary: JsonRecord): {
+  readonly body: JsonRecord;
+  readonly snippets: JsonRecord[];
+  readonly path: string | undefined;
+  readonly line: string | undefined;
+  readonly subjectType: string | undefined;
+  readonly name: string | undefined;
+  readonly rawKind: string | undefined;
+  readonly recordKind: string | undefined;
+  readonly snippetText: string | undefined;
+} {
+  const nestedRecord = isRecord(primary["record"]) ? primary["record"] as JsonRecord : undefined;
+  const body: JsonRecord = isRecord(primary["body"]) ? primary["body"] as JsonRecord : nestedRecord && isRecord(nestedRecord["payload"]) ? nestedRecord["payload"] as JsonRecord : {};
+  const span = isRecord(primary["source_span"]) ? primary["source_span"] as JsonRecord : undefined;
+  const snippets = Array.isArray(bundle["optional_source_snippets"]) ? bundle["optional_source_snippets"] as JsonRecord[] : [];
+  const snippetSpan = isRecord(snippets[0]?.["span"]) ? snippets[0]!["span"] as JsonRecord : undefined;
+  return {
+    body,
+    snippets,
+    path: firstNonEmptyString(body["path"], primary["path"]),
+    line: describeLine(body, span) ?? describeLine({}, snippetSpan),
+    subjectType: firstNonEmptyString(primary["subject_type"], primary["result_type"]),
+    name: firstNonEmptyString(body["qualified_name"], body["name"]),
+    rawKind: firstNonEmptyString(body["kind"]),
+    recordKind: firstNonEmptyString(primary["kind"], nestedRecord?.["kind"], primary["universal_kind"]),
+    snippetText: typeof snippets[0]?.["text"] === "string" ? snippets[0]["text"] as string : undefined,
+  };
+}
+
+function describeBundleLabel(subjectType: string | undefined, body: JsonRecord, name: string | undefined, rawKind: string | undefined, recordKind: string | undefined, primary: JsonRecord): string {
   if (subjectType === "diagnostic") {
     const message = firstNonEmptyString(body["message"]);
     const code = firstNonEmptyString(body["code"]);
-    label = message !== undefined ? (code !== undefined ? `${code}: ${message}` : message) : code ?? "diagnostic";
-  } else if (subjectType === "relation") {
-    label = `(${recordKind ?? "reference"})`;
-  } else if (name !== undefined) {
-    label = rawKind !== undefined ? `${name} ${rawKind}` : recordKind !== undefined ? `${name} ${recordKind}` : name;
-  } else if (recordKind !== undefined) {
-    label = recordKind;
-  } else {
-    label = compactPreview(primary);
+    return message !== undefined ? (code !== undefined ? `${code}: ${message}` : message) : code ?? "diagnostic";
   }
-
-  return { path, line, label, snippetText, isMatchStyle, isCompactSnippetStyle };
+  if (subjectType === "relation") return `(${recordKind ?? "reference"})`;
+  if (name !== undefined) return rawKind !== undefined ? `${name} ${rawKind}` : recordKind !== undefined ? `${name} ${recordKind}` : name;
+  return recordKind ?? compactPreview(primary);
 }
 
 const COMPACT_SNIPPET_LINE_MAX_CHARS = 200;
@@ -1447,16 +1515,24 @@ function compactSourceCoordinates(snippet: JsonRecord, primary: JsonRecord): str
   const startLine = firstNonEmptyString(span?.["start_line"]);
   const endLine = firstNonEmptyString(span?.["end_line"]);
   const parts = [
-    ...(artifact === undefined ? [] : [`artifact=${artifact}`]),
-    ...(version === undefined ? [] : [`version=${version}`]),
-    ...(startByte === undefined || endByte === undefined ? [] : [`bytes=${startByte}..${endByte}`]),
-    ...(startLine === undefined || endLine === undefined ? [] : [`lines=${startLine}..${endLine}`]),
-    ...(snippet["truncated"] === true ? ["truncated=yes"] : []),
-    ...(snippet["redacted"] === true ? ["redacted=yes"] : []),
-  ];
+    optionalCoordinatePart("artifact", artifact),
+    optionalCoordinatePart("version", version),
+    startByte === undefined || endByte === undefined ? undefined : `bytes=${startByte}..${endByte}`,
+    startLine === undefined || endLine === undefined ? undefined : `lines=${startLine}..${endLine}`,
+    snippet["truncated"] === true ? "truncated=yes" : undefined,
+    snippet["redacted"] === true ? "redacted=yes" : undefined,
+  ].filter((part): part is string => part !== undefined);
+  appendRedactionCoordinate(snippet, parts);
+  return parts.length === 0 ? undefined : parts.join(" ");
+}
+
+function appendRedactionCoordinate(snippet: JsonRecord, parts: string[]): void {
   const redactions = Array.isArray(snippet["redactions"]) ? snippet["redactions"] : [];
   if (redactions.length > 0) parts.push(`redactions=${stableJson(redactions)}`);
-  return parts.length === 0 ? undefined : parts.join(" ");
+}
+
+function optionalCoordinatePart(label: string, value: string | undefined): string | undefined {
+  return value === undefined ? undefined : `${label}=${value}`;
 }
 
 function reusableIdentityLine(primary: JsonRecord, sourceAlreadyIdentifiesOwner: boolean): string | undefined {
@@ -1517,26 +1593,42 @@ function reusableAttributesLine(primary: JsonRecord): string | undefined {
 function appendBundleDetails(bundle: JsonRecord, lines: string[], sources: Map<string, string>): void {
   const snippets = Array.isArray(bundle["optional_source_snippets"]) ? bundle["optional_source_snippets"].filter(isRecord) : [];
   const primary = isRecord(bundle["primary_result"]) ? bundle["primary_result"] : {};
+  const refs = appendBundleSources(snippets, primary, lines, sources);
+  appendBundleSemanticDetails(bundle, primary, snippets.length > 0, refs, lines);
+}
+
+function appendBundleSources(snippets: readonly JsonRecord[], primary: JsonRecord, lines: string[], sources: Map<string, string>): string[] {
   const refs: string[] = [];
   for (const snippet of snippets) {
-    const version = (isRecord(snippet["span"]) ? snippet["span"]["artifact_version_id"] : undefined) ?? snippet["artifact_version_id"] ?? primary["owner_artifact_version_id"] ?? primary["artifact_version_id"];
-    const artifact = snippet["artifact_id"] ?? primary["owner_artifact_id"] ?? primary["artifact_id"];
-    const span = snippet["span"];
-    // Without exact ownership and span, equal text is not proof of identity.
-    const key = version !== undefined && span !== undefined ? JSON.stringify([primary["workspace_id"] ?? primary["participant"] ?? null, artifact, version, span]) : undefined;
+    const key = sourceCoordinateKey(snippet, primary);
     let ref = key === undefined ? undefined : sources.get(key);
-    if (ref === undefined) {
-      ref = `source:${sources.size + 1}`;
-      sources.set(key ?? `unshared:${sources.size}`, ref);
-      const coordinates = compactSourceCoordinates(snippet, primary);
-      lines.push(coordinates === undefined ? ref : `${ref} ${coordinates}`);
-      const text = snippet["text"];
-      if (typeof text === "string") lines.push(...text.split("\n").map((line) => `    ${line}`));
-    }
+    if (ref === undefined) ref = appendNewSource(snippet, primary, key, lines, sources);
     refs.push(ref);
   }
+  return refs;
+}
+
+function sourceCoordinateKey(snippet: JsonRecord, primary: JsonRecord): string | undefined {
+  const span = snippet["span"];
+  const version = (isRecord(span) ? span["artifact_version_id"] : undefined) ?? snippet["artifact_version_id"] ?? primary["owner_artifact_version_id"] ?? primary["artifact_version_id"];
+  const artifact = snippet["artifact_id"] ?? primary["owner_artifact_id"] ?? primary["artifact_id"];
+  // Without exact ownership and span, equal text is not proof of identity.
+  return version !== undefined && span !== undefined ? JSON.stringify([primary["workspace_id"] ?? primary["participant"] ?? null, artifact, version, span]) : undefined;
+}
+
+function appendNewSource(snippet: JsonRecord, primary: JsonRecord, key: string | undefined, lines: string[], sources: Map<string, string>): string {
+  const ref = `source:${sources.size + 1}`;
+  sources.set(key ?? `unshared:${sources.size}`, ref);
+  const coordinates = compactSourceCoordinates(snippet, primary);
+  lines.push(coordinates === undefined ? ref : `${ref} ${coordinates}`);
+  const text = snippet["text"];
+  if (typeof text === "string") lines.push(...text.split("\n").map((line) => `    ${line}`));
+  return ref;
+}
+
+function appendBundleSemanticDetails(bundle: JsonRecord, primary: JsonRecord, sourceAlreadyIdentifiesOwner: boolean, refs: readonly string[], lines: string[]): void {
   const semanticLines = [
-    reusableIdentityLine(primary, snippets.length > 0),
+    reusableIdentityLine(primary, sourceAlreadyIdentifiesOwner),
     reusableRelationLine(primary),
     reusableAssessmentLine(bundle),
     reusableEvidenceLine(bundle),
@@ -1559,8 +1651,13 @@ function appendStreamLines(resultSetLabel: string, streamPage: unknown, possible
     appendGroupedDescriptors([{ ...describeBundle(bundle, resultSetLabel), snippetText: undefined }], possible, lines, snippetLines);
     appendBundleDetails(bundle, lines, sources);
   }
-  if (streamPage["has_next"] === true && typeof streamPage["next_cursor"] === "string" && streamPage["next_cursor"].length > 0) cursors.push({ label, cursor: streamPage["next_cursor"] });
-  if (streamPage["has_previous"] === true && typeof streamPage["previous_cursor"] === "string" && streamPage["previous_cursor"].length > 0) cursors.push({ label: `${label}.previous`, cursor: streamPage["previous_cursor"] });
+  appendStreamCursor(streamPage, "has_next", "next_cursor", label, cursors);
+  appendStreamCursor(streamPage, "has_previous", "previous_cursor", `${label}.previous`, cursors);
+}
+
+function appendStreamCursor(streamPage: JsonRecord, presenceKey: "has_next" | "has_previous", cursorKey: "next_cursor" | "previous_cursor", label: string, cursors: { readonly label: string; readonly cursor: string }[]): void {
+  const cursor = streamPage[cursorKey];
+  if (streamPage[presenceKey] === true && typeof cursor === "string" && cursor.length > 0) cursors.push({ label, cursor });
 }
 
 function appendContinuationLines(lines: string[], cursors: readonly { readonly label: string; readonly cursor: string }[], continuationScope?: JsonRecord, continuationResponseBudget?: JsonRecord, continuationStore: ContinuationRefStore = continuationRefs): void {
@@ -1584,21 +1681,32 @@ function appendFreshnessAndCoverage(page: JsonRecord, lines: string[], pageHasMo
   const completeness = page["completeness_report"];
   if (isRecord(completeness) && typeof completeness["overall_status"] === "string") {
     const dimensions = Array.isArray(completeness["dimensions"]) ? completeness["dimensions"] as JsonRecord[] : [];
-    const affected = dimensions.reduce((sum, dimension) => sum + (typeof dimension["affected_artifact_count"] === "number" ? dimension["affected_artifact_count"] : Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"].length : 0), 0);
+    const affected = dimensions.reduce((sum, dimension) => sum + affectedArtifactCount(dimension), 0);
     lines.push(`coverage: ${completeness["overall_status"]}${affected > 0 ? ` (${affected} files affected)` : ""}`);
-    for (const dimension of dimensions) {
-      const capability = firstNonEmptyString(dimension["capability"]);
-      const status = firstNonEmptyString(dimension["status"]);
-      if (capability !== undefined && status !== undefined && status !== "complete") lines.push(`capability: ${capability}=${status}`);
-      const affectedIds = Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"].filter((entry): entry is string => typeof entry === "string") : [];
-      if (affectedIds.length > 0) lines.push(`affected_artifacts${capability === undefined ? "" : `(${capability})`}: ${affectedIds.join(" ")}`);
-      const reasonCodes = Array.isArray(dimension["reason_codes"]) ? dimension["reason_codes"].filter((entry): entry is string => typeof entry === "string") : [];
-      if (reasonCodes.length > 0) lines.push(`coverage_reasons${capability === undefined ? "" : `(${capability})`}: ${reasonCodes.join(" ")}`);
-      const diagnosticIds = Array.isArray(dimension["diagnostic_record_ids"]) ? dimension["diagnostic_record_ids"].filter((entry): entry is string => typeof entry === "string") : [];
-      if (diagnosticIds.length > 0) lines.push(`coverage_diagnostics${capability === undefined ? "" : `(${capability})`}: ${diagnosticIds.join(" ")}`);
-    }
+    for (const dimension of dimensions) lines.push(...renderCoverageDimension(dimension));
   }
   lines.push(`page_coverage: ${pageHasMore ? "incomplete" : "complete"}${pageHasMore ? "; action=continue" : ""}`);
+}
+
+function affectedArtifactCount(dimension: JsonRecord): number {
+  if (typeof dimension["affected_artifact_count"] === "number") return dimension["affected_artifact_count"];
+  return Array.isArray(dimension["affected_artifact_ids"]) ? dimension["affected_artifact_ids"].length : 0;
+}
+
+function renderCoverageDimension(dimension: JsonRecord): string[] {
+  const capability = firstNonEmptyString(dimension["capability"]);
+  const lines: string[] = [];
+  const status = firstNonEmptyString(dimension["status"]);
+  if (capability !== undefined && status !== undefined && status !== "complete") lines.push(`capability: ${capability}=${status}`);
+  appendCoverageList(lines, "affected_artifacts", capability, dimension["affected_artifact_ids"]);
+  appendCoverageList(lines, "coverage_reasons", capability, dimension["reason_codes"]);
+  appendCoverageList(lines, "coverage_diagnostics", capability, dimension["diagnostic_record_ids"]);
+  return lines;
+}
+
+function appendCoverageList(lines: string[], label: string, capability: string | undefined, value: unknown): void {
+  const values = Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+  if (values.length > 0) lines.push(`${label}${capability === undefined ? "" : `(${capability})`}: ${values.join(" ")}`);
 }
 
 function renderDiagnosticsText(report: JsonRecord): string[] {
@@ -1647,24 +1755,11 @@ function bundleCountOf(resultSet: JsonRecord): number {
 
 /** Render every selected stream and requested source; identical owned ranges share page-local references. */
 function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SNIPPET_LINES, continuationScope?: JsonRecord, continuationResponseBudget?: JsonRecord, continuationStore: ContinuationRefStore = continuationRefs): string {
-  const resultSets = Array.isArray(page["result_sets"]) ? page["result_sets"] as JsonRecord[] : [];
-  const totalItems = typeof page["returned_items"] === "number" ? page["returned_items"] : resultSets.reduce((sum, resultSet) => sum + bundleCountOf(resultSet), 0);
+  const resultSets = recordArray(page["result_sets"]);
+  const totalItems = queryPageTotalItems(page, resultSets);
   const cursors: { readonly label: string; readonly cursor: string }[] = [];
-  const hasMore = resultSets.some((resultSet) => {
-    return [resultSet["confirmed"], resultSet["possible"]].some((stream) => isRecord(stream) && stream["has_next"] === true && typeof stream["next_cursor"] === "string" && stream["next_cursor"].length > 0);
-  });
-
-
-  const nonEmptySets = resultSets.filter((resultSet) => bundleCountOf(resultSet) > 0);
-  const breakdown = nonEmptySets.length > 1 ? ` (${nonEmptySets.map((resultSet) => `${resultSet["result_set"]}: ${bundleCountOf(resultSet)}`).join(", ")})` : "";
-  const lines: string[] = [totalItems === 0 ? "no results" : `# ${totalItems} result${totalItems === 1 ? "" : "s"}${breakdown}`];
-
-  const truncation = page["truncation"];
-  if (isRecord(truncation) && truncation["truncated"] === true) {
-    const droppedItems = typeof truncation["dropped_items"] === "number" ? truncation["dropped_items"] : 0;
-    const reason = firstNonEmptyString(truncation["reason"]) ?? "response_budget";
-    lines.push(`TRUNCATED: dropped ${droppedItems} item${droppedItems === 1 ? "" : "s"} (${reason})`);
-  }
+  const hasMore = queryPageHasMore(resultSets);
+  const lines = queryPageHeader(page, resultSets, totalItems, hasMore);
   appendFreshnessAndCoverage(page, lines, hasMore);
   lines.push(`page: shown=${totalItems}; more=${hasMore ? "yes" : "no"}`);
   appendExecutionMetadata(page, lines);
@@ -1680,23 +1775,144 @@ function renderQueryPageText(page: JsonRecord, snippetLines: number = DEFAULT_SN
     if (showStreamHeaders) lines.push("");
   }
 
-  const diagnosticReport = page["diagnostic_report"];
-  if (isRecord(diagnosticReport)) {
-    const diagnosticLines = renderDiagnosticsText(diagnosticReport);
-    if (diagnosticLines.length > 0) { lines.push(...diagnosticLines); lines.push(""); }
-    const total = typeof diagnosticReport["total"] === "number" ? diagnosticReport["total"] : diagnosticLines.length;
-    const returned = typeof diagnosticReport["returned"] === "number" ? diagnosticReport["returned"] : diagnosticLines.length;
-    if (total > 0) lines.push(`diagnostics: shown=${returned} total=${total} more=${diagnosticReport["has_more"] === true ? "yes" : "no"}`);
-  }
+  appendDiagnosticReport(page["diagnostic_report"], lines);
 
   appendContinuationLines(lines, cursors, continuationScope, continuationResponseBudget, continuationStore);
 
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
+function recordArray(value: unknown): JsonRecord[] {
+  return Array.isArray(value) ? value as JsonRecord[] : [];
+}
+
+function queryPageTotalItems(page: JsonRecord, resultSets: readonly JsonRecord[]): number {
+  return typeof page["returned_items"] === "number" ? page["returned_items"] : resultSets.reduce((sum, resultSet) => sum + bundleCountOf(resultSet), 0);
+}
+
+function queryPageHasMore(resultSets: readonly JsonRecord[]): boolean {
+  return resultSets.some((resultSet) => [resultSet["confirmed"], resultSet["possible"]].some((stream) => isRecord(stream) && stream["has_next"] === true && typeof stream["next_cursor"] === "string" && stream["next_cursor"].length > 0));
+}
+
+function queryPageHeader(page: JsonRecord, resultSets: readonly JsonRecord[], totalItems: number, hasMore: boolean): string[] {
+  const nonEmptySets = resultSets.filter((resultSet) => bundleCountOf(resultSet) > 0);
+  const breakdown = nonEmptySets.length > 1 ? ` (${nonEmptySets.map((resultSet) => `${resultSet["result_set"]}: ${bundleCountOf(resultSet)}`).join(", ")})` : "";
+  const lines = [totalItems === 0 ? "no results" : `# ${totalItems} result${totalItems === 1 ? "" : "s"}${breakdown}`];
+  const truncation = page["truncation"];
+  if (isRecord(truncation) && truncation["truncated"] === true) {
+    const droppedItems = typeof truncation["dropped_items"] === "number" ? truncation["dropped_items"] : 0;
+    const reason = firstNonEmptyString(truncation["reason"]) ?? "response_budget";
+    lines.push(`TRUNCATED: dropped ${droppedItems} item${droppedItems === 1 ? "" : "s"} (${reason})`);
+  }
+  return lines;
+}
+
+function appendDiagnosticReport(value: unknown, lines: string[]): void {
+  if (!isRecord(value)) return;
+  const diagnosticLines = renderDiagnosticsText(value);
+  if (diagnosticLines.length > 0) { lines.push(...diagnosticLines); lines.push(""); }
+  const total = typeof value["total"] === "number" ? value["total"] : diagnosticLines.length;
+  const returned = typeof value["returned"] === "number" ? value["returned"] : diagnosticLines.length;
+  if (total > 0) lines.push(`diagnostics: shown=${returned} total=${total} more=${value["has_more"] === true ? "yes" : "no"}`);
+}
+
 /** Renders an `index_status` page (see `publicIndexStatusPage`) as compact plain text: a few lines per workspace. */
+function renderV4WorkspaceLaneDetails(workspace: JsonRecord): string[] {
+  if (workspace["storage_format"] !== "v4") return [];
+  const structural = isRecord(workspace["structural"]) ? workspace["structural"] as JsonRecord : {};
+  const lexical = isRecord(workspace["lexical"]) ? workspace["lexical"] as JsonRecord : {};
+  const semantic = isRecord(workspace["semantic"]) ? workspace["semantic"] as JsonRecord : {};
+  const structuralQueryable = structural["queryable"] === true;
+  const lexicalCurrent = lexical["current"] === true;
+  const semanticCurrent = semantic["current"] === true;
+  const lines = renderLaneStatusLines(structural, lexical, semantic, structuralQueryable, lexicalCurrent, semanticCurrent);
+  const lastScan = isRecord(workspace["last_scan"]) ? workspace["last_scan"] as JsonRecord : undefined;
+  if (lastScan !== undefined) lines.push(renderLastScanLine(lastScan));
+  if (!lexicalCurrent) lines.push("  hint: search_text will report partial until lexical catches up");
+  if (!semanticCurrent) lines.push("  hint: search_semantic is unavailable until semantic indexing catches up");
+  return lines;
+}
+
+function renderLaneStatusLines(structural: JsonRecord, lexical: JsonRecord, semantic: JsonRecord, structuralQueryable: boolean, lexicalCurrent: boolean, semanticCurrent: boolean): string[] {
+  const profileId = firstNonEmptyString(semantic["profile_id"]);
+  return [
+    `  structural: queryable_gen=${structural["queryable_generation"] ?? "-"}, durable_gen=${structural["durable_generation"] ?? "-"}${structuralQueryable ? "" : " (lagging)"}`,
+    `  lexical: completed_gen=${lexical["completed_generation"] ?? "-"} (${lexicalCurrent ? "current" : "lagging"})`,
+    `  semantic: completed_gen=${semantic["completed_generation"] ?? "-"} (${semanticCurrent ? "current" : "lagging"})${profileId !== undefined ? `, profile=${profileId}` : ""}`,
+  ];
+}
+
+function renderLastScanLine(lastScan: JsonRecord): string {
+  const kind = firstNonEmptyString(lastScan["kind"]) ?? "?";
+  const changedPaths = typeof lastScan["changed_paths"] === "number" ? `, changed_paths=${lastScan["changed_paths"]}` : "";
+  const timings = isRecord(lastScan["timings"]) ? lastScan["timings"] as JsonRecord : undefined;
+  const wallMs = typeof timings?.["total_ms"] === "number" ? `, wall_ms=${timings["total_ms"]}` : "";
+  const reconcile = isRecord(lastScan["reconcile"]) ? lastScan["reconcile"] as JsonRecord : undefined;
+  const label = reconcile !== undefined && typeof reconcile["mode"] === "string" ? `kind=${kind}/${reconcile["mode"]}` : `kind=${kind}`;
+  const reconcileSummary = renderReconcileSummary(reconcile);
+  const metadataRefreshed = renderMetadataRefresh(reconcile);
+  const indexPackImport = isRecord(lastScan["import"]) ? lastScan["import"] as JsonRecord : undefined;
+  const importSummary = renderImportSummary(indexPackImport);
+  return `  last_scan: ${label}${reconcileSummary}${metadataRefreshed}${changedPaths}${wallMs}${importSummary}`;
+}
+
+function renderReconcileSummary(reconcile: JsonRecord | undefined): string {
+  if (reconcile === undefined || typeof reconcile["added"] !== "number" || typeof reconcile["changed"] !== "number" || typeof reconcile["deleted"] !== "number" || typeof reconcile["frontier_size"] !== "number") return "";
+  return ` (+${reconcile["added"]} ~${reconcile["changed"]} -${reconcile["deleted"]} of ${reconcile["frontier_size"]})`;
+}
+
+function renderMetadataRefresh(reconcile: JsonRecord | undefined): string {
+  return reconcile !== undefined && typeof reconcile["metadata_refreshed"] === "number" && reconcile["metadata_refreshed"] > 0 ? `, refreshed=${reconcile["metadata_refreshed"]}` : "";
+}
+
+function renderImportSummary(indexPackImport: JsonRecord | undefined): string {
+  if (indexPackImport === undefined || typeof indexPackImport["import_wall_ms"] !== "number") return "";
+  const bytes = typeof indexPackImport["pack_bytes"] === "number" ? `${indexPackImport["pack_bytes"]} bytes, ` : "";
+  return `, import=${indexPackImport["imported"] === true ? "ok" : "failed"} (${bytes}import_wall_ms=${indexPackImport["import_wall_ms"]})`;
+}
+
+function renderWorkspaceOperationalDetails(workspace: JsonRecord): string[] {
+  const lines: string[] = [];
+  const availableOperations = stringArray(workspace["available_operations"]);
+  const blockedOperations = stringArray(workspace["blocked_operations"]);
+  if (availableOperations.length > 0) lines.push(`  use now: ${availableOperations.map((operation) => operation.replace(/^core:/, "")).join(", ")}`);
+  if (blockedOperations.length > 0) lines.push(`  wait for structural: ${blockedOperations.map((operation) => operation.replace(/^core:/, "")).join(", ")}`);
+  const capabilityReason = structuralReadinessReason(workspace["readiness"]);
+  if (capabilityReason !== undefined) lines.push(`  typescript symbol resolution: unavailable (${capabilityReason.replace(/^core:/, "")})`);
+  if (typeof workspace["retry_after_ms"] === "number") lines.push(`  retry_after_ms=${workspace["retry_after_ms"]}`);
+  const lastScanError = firstNonEmptyString(workspace["last_scan_error_code"]);
+  if (lastScanError !== undefined) {
+    const at = firstNonEmptyString(workspace["last_scan_error_at"]);
+    lines.push(`  last_scan_error: ${lastScanError}${at !== undefined ? ` at ${at}` : ""}`);
+  }
+  const capabilities = Array.isArray(workspace["capabilities"]) ? workspace["capabilities"] as JsonRecord[] : [];
+  if (capabilities.length > 0) lines.push(`  capabilities: ${capabilities.length} (${capabilityStatusCounts(capabilities)})`);
+  const plugins = Array.isArray(workspace["plugins"]) ? workspace["plugins"] as JsonRecord[] : [];
+  if (plugins.length > 0) lines.push(`  plugins: ${plugins.length}`);
+  return lines;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function structuralReadinessReason(readiness: unknown): string | undefined {
+  if (Array.isArray(readiness) || !isRecord(readiness) || !isRecord(readiness["structural"])) return undefined;
+  const reasons = readiness["structural"]["reason_codes"];
+  return Array.isArray(reasons) ? reasons.find((value): value is string => typeof value === "string") : undefined;
+}
+
+function capabilityStatusCounts(capabilities: readonly JsonRecord[]): string {
+  const byStatus = new Map<string, number>();
+  for (const capability of capabilities) {
+    const status = firstNonEmptyString(capability["status"]) ?? "unknown";
+    byStatus.set(status, (byStatus.get(status) ?? 0) + 1);
+  }
+  return [...byStatus.entries()].map(([status, count]) => `${status}: ${count}`).join(", ");
+}
+
 function renderIndexStatusText(page: JsonRecord): string {
-  const workspaces = Array.isArray(page["workspaces"]) ? page["workspaces"] as JsonRecord[] : [];
+  const workspaces = workspaceRecords(page["workspaces"]);
   if (workspaces.length === 0) return "no workspaces registered\nhint: call urdira_index_status with workspace_root set to the exact repository root to register one.";
 
   const lines: string[] = [];
@@ -1712,112 +1928,22 @@ function renderIndexStatusText(page: JsonRecord): string {
     lines.push(`workspace_id=${id}${root !== undefined ? ` (${root})` : ""}: ${status}, freshness=${freshness}${generation !== undefined ? `, generation=${generation}` : ""}`);
     lines.push(`  query_scope=${JSON.stringify({ scope_type: "single_workspace", workspace_id: id })}`);
     lines.push(`  ready: source=${sourceReady}, structural=${structuralReady}, semantic=${semanticReady}`);
-    // P4-d: v4 lane detail -- absent entirely for a v3 workspace (`storage_format`
-    // is only ever "v3"/"v4", set unconditionally by `v4StatusFields`,
-    // `packages/daemon/src/runtime.ts`), so a v3 render is byte-for-byte
-    // unchanged from before this task. One compact line per lane
-    // (generation(s) plus a "current"/"lagging" tag from the daemon's own
-    // `current`/`queryable` booleans), the last completed scan's kind/paths/
-    // wall time, and a hint only when a lane is actually lagging -- an agent
-    // reading `search_text_ready: false` on an otherwise-successful query
-    // should see WHY without a second lookup.
-    if (workspace["storage_format"] === "v4") {
-      const structural = isRecord(workspace["structural"]) ? workspace["structural"] as JsonRecord : {};
-      const lexical = isRecord(workspace["lexical"]) ? workspace["lexical"] as JsonRecord : {};
-      const semantic = isRecord(workspace["semantic"]) ? workspace["semantic"] as JsonRecord : {};
-      const structuralQueryable = structural["queryable"] === true;
-      const lexicalCurrent = lexical["current"] === true;
-      const semanticCurrent = semantic["current"] === true;
-      lines.push(`  structural: queryable_gen=${structural["queryable_generation"] ?? "-"}, durable_gen=${structural["durable_generation"] ?? "-"}${structuralQueryable ? "" : " (lagging)"}`);
-      lines.push(`  lexical: completed_gen=${lexical["completed_generation"] ?? "-"} (${lexicalCurrent ? "current" : "lagging"})`);
-      const profileId = firstNonEmptyString(semantic["profile_id"]);
-      lines.push(`  semantic: completed_gen=${semantic["completed_generation"] ?? "-"} (${semanticCurrent ? "current" : "lagging"})${profileId !== undefined ? `, profile=${profileId}` : ""}`);
-      const lastScan = isRecord(workspace["last_scan"]) ? workspace["last_scan"] as JsonRecord : undefined;
-      if (lastScan !== undefined) {
-        const kind = firstNonEmptyString(lastScan["kind"]) ?? "?";
-        const changedPaths = typeof lastScan["changed_paths"] === "number" ? `, changed_paths=${lastScan["changed_paths"]}` : "";
-        const timings = isRecord(lastScan["timings"]) ? lastScan["timings"] as JsonRecord : undefined;
-        const wallMs = typeof timings?.["total_ms"] === "number" ? `, wall_ms=${timings["total_ms"]}` : "";
-        // Frente E: `kind === "reconcile"` carries a `ReconcileSummary` --
-        // render it as `reconcile/<mode> (+added ~changed -deleted of
-        // frontier_size)` instead of the plain `kind=reconcile` an agent
-        // could otherwise mistake for a scan that never actually measured
-        // anything.
-        const reconcile = isRecord(lastScan["reconcile"]) ? lastScan["reconcile"] as JsonRecord : undefined;
-        const label = reconcile !== undefined && typeof reconcile["mode"] === "string"
-          ? `kind=${kind}/${reconcile["mode"]}`
-          : `kind=${kind}`;
-        const reconcileSummary = reconcile !== undefined
-          && typeof reconcile["added"] === "number" && typeof reconcile["changed"] === "number"
-          && typeof reconcile["deleted"] === "number" && typeof reconcile["frontier_size"] === "number"
-          ? ` (+${reconcile["added"]} ~${reconcile["changed"]} -${reconcile["deleted"]} of ${reconcile["frontier_size"]})`
-          : "";
-        // Frente E-fix: `metadata_refreshed` is a newer field an older
-        // worker's `ReconcileSummary` may not carry at all -- conditional
-        // on both presence and being worth mentioning (0 is the common,
-        // uninteresting case for an already-settled tree).
-        const metadataRefreshed = reconcile !== undefined
-          && typeof reconcile["metadata_refreshed"] === "number" && reconcile["metadata_refreshed"] > 0
-          ? `, refreshed=${reconcile["metadata_refreshed"]}`
-          : "";
-        // P-1 (2026-09-08): set only when this reconcile followed a
-        // `core:index_pack_export` pack import -- `import_wall_ms` isolates
-        // the import's own cost (stat + native copy/verify + atomic rename)
-        // from `wall_ms` above (this reconcile scan's own cost), previously
-        // only approximable as `ready_elapsed_ms - reconcile_wall`.
-        const indexPackImport = isRecord(lastScan["import"]) ? lastScan["import"] as JsonRecord : undefined;
-        const importSummary = indexPackImport !== undefined && typeof indexPackImport["import_wall_ms"] === "number"
-          ? `, import=${indexPackImport["imported"] === true ? "ok" : "failed"} (${typeof indexPackImport["pack_bytes"] === "number" ? `${indexPackImport["pack_bytes"]} bytes, ` : ""}import_wall_ms=${indexPackImport["import_wall_ms"]})`
-          : "";
-        lines.push(`  last_scan: ${label}${reconcileSummary}${metadataRefreshed}${changedPaths}${wallMs}${importSummary}`);
-      }
-      if (!lexicalCurrent) lines.push("  hint: search_text will report partial until lexical catches up");
-      if (!semanticCurrent) lines.push("  hint: search_semantic is unavailable until semantic indexing catches up");
-    }
-    const availableOperations = Array.isArray(workspace["available_operations"]) ? workspace["available_operations"].filter((value): value is string => typeof value === "string") : [];
-    const blockedOperations = Array.isArray(workspace["blocked_operations"]) ? workspace["blocked_operations"].filter((value): value is string => typeof value === "string") : [];
-    if (availableOperations.length > 0) lines.push(`  use now: ${availableOperations.map((operation) => operation.replace(/^core:/, "")).join(", ")}`);
-    if (blockedOperations.length > 0) lines.push(`  wait for structural: ${blockedOperations.map((operation) => operation.replace(/^core:/, "")).join(", ")}`);
-    const capabilityReason = Array.isArray(workspace["readiness"])
-      ? undefined
-      : isRecord(workspace["readiness"]) && isRecord(workspace["readiness"]["structural"])
-        ? Array.isArray(workspace["readiness"]["structural"]["reason_codes"]) ? workspace["readiness"]["structural"]["reason_codes"].find((value): value is string => typeof value === "string") : undefined
-        : undefined;
-    if (capabilityReason !== undefined) lines.push(`  typescript symbol resolution: unavailable (${capabilityReason.replace(/^core:/, "")})`);
-    const retryAfter = workspace["retry_after_ms"];
-    if (typeof retryAfter === "number") lines.push(`  retry_after_ms=${retryAfter}`);
-
-    const lastScanError = firstNonEmptyString(workspace["last_scan_error_code"]);
-    if (lastScanError !== undefined) {
-      const at = firstNonEmptyString(workspace["last_scan_error_at"]);
-      lines.push(`  last_scan_error: ${lastScanError}${at !== undefined ? ` at ${at}` : ""}`);
-    }
-
-    const capabilities = Array.isArray(workspace["capabilities"]) ? workspace["capabilities"] as JsonRecord[] : [];
-    if (capabilities.length > 0) {
-      const byStatus = new Map<string, number>();
-      for (const capability of capabilities) {
-        const capabilityStatus = firstNonEmptyString(capability["status"]) ?? "unknown";
-        byStatus.set(capabilityStatus, (byStatus.get(capabilityStatus) ?? 0) + 1);
-      }
-      lines.push(`  capabilities: ${capabilities.length} (${[...byStatus.entries()].map(([capabilityStatus, count]) => `${capabilityStatus}: ${count}`).join(", ")})`);
-    }
-
-    const plugins = Array.isArray(workspace["plugins"]) ? workspace["plugins"] as JsonRecord[] : [];
-    if (plugins.length > 0) lines.push(`  plugins: ${plugins.length}`);
+    lines.push(...renderV4WorkspaceLaneDetails(workspace));
+    lines.push(...renderWorkspaceOperationalDetails(workspace));
   }
-  // v4 (plan §6, Frente H): a single, installation-wide hint line -- not
-  // per-workspace -- whenever the daemon's startup/last-refresh orphan
-  // sweep (`core:index_status`'s `orphaned_workspace_data`, daemon
-  // `runtime.ts`) found leftover on-disk data no registered workspace owns
-  // any more. Silent when `count` is 0 or the field is absent (a daemon
-  // with no durable storage configured at all never populates it).
-  const orphanedWorkspaceData = isRecord(page["orphaned_workspace_data"]) ? page["orphaned_workspace_data"] as JsonRecord : undefined;
-  if (typeof orphanedWorkspaceData?.["count"] === "number" && orphanedWorkspaceData["count"] > 0) {
-    const bytes = typeof orphanedWorkspaceData["bytes"] === "number" ? ` (${Math.round(orphanedWorkspaceData["bytes"] / (1024 * 1024))} MB)` : "";
-    lines.push(`orphaned workspace data: ${orphanedWorkspaceData["count"]} set(s)${bytes} -- run "urdira workspace orphans" to review`);
-  }
+  appendOrphanedWorkspaceHint(page, lines);
   return lines.join("\n");
+}
+
+function workspaceRecords(value: unknown): JsonRecord[] {
+  return Array.isArray(value) ? value as JsonRecord[] : [];
+}
+
+function appendOrphanedWorkspaceHint(page: JsonRecord, lines: string[]): void {
+  const orphaned = isRecord(page["orphaned_workspace_data"]) ? page["orphaned_workspace_data"] as JsonRecord : undefined;
+  if (typeof orphaned?.["count"] !== "number" || orphaned["count"] <= 0) return;
+  const bytes = typeof orphaned["bytes"] === "number" ? ` (${Math.round(orphaned["bytes"] / (1024 * 1024))} MB)` : "";
+  lines.push(`orphaned workspace data: ${orphaned["count"]} set(s)${bytes} -- run "urdira workspace orphans" to review`);
 }
 
 export interface FormatUrdiraResultOptions {
@@ -1885,29 +2011,33 @@ function renderWebContent(page: JsonRecord, pageKind: "query" | "index_status", 
 export function formatUrdiraResult(value: unknown, options: FormatUrdiraResultOptions = {}): CallToolResult {
   const stable = stableValue(value);
   const error = isRecord(stable) && isRecord(stable["error"]) && typeof stable["error"]["code"] === "string" ? stable["error"] : undefined;
-  if (error) {
-    const mapped = operationError(String(error["code"]), String(error["message"] ?? "Urdira operation failed."), isRecord(error["details"]) ? error["details"] : {});
-    for (const field of ["workspace_id", "query_execution_id"]) if (typeof error[field] === "string") mapped[field] = error[field];
-    const result: CallToolResult = {
-      isError: true,
-      content: [{ type: "text", text: stableJson({ error: mapped }) }],
-    };
-    return options.presentation_profile === "web" ? { ...result, structuredContent: { error: mapped } } : result;
-  }
-  if (options.render === "json") {
-    const result: CallToolResult = {
-      content: [{ type: "text", text: options.presentation_profile === "web" ? renderWebContent(isRecord(stable) ? stable : {}, options.page_kind ?? "query", "json", options.continuation_scope, options.continuation_response_budget, options.continuation_ref_store) : stableJson({ page: stable }) }],
-    };
-    return options.presentation_profile === "web" ? { ...result, structuredContent: { page: stable } } : result;
-  }
+  if (error !== undefined) return formatOperationErrorResult(error, options.presentation_profile);
+  if (options.render === "json") return formatJsonResult(stable, options);
+  return formatTextResult(stable, options);
+}
+
+function formatOperationErrorResult(error: JsonRecord, presentationProfile: McpPresentationProfile | undefined): CallToolResult {
+  const mapped = operationError(String(error["code"]), String(error["message"] ?? "Urdira operation failed."), isRecord(error["details"]) ? error["details"] : {});
+  for (const field of ["workspace_id", "query_execution_id"]) if (typeof error[field] === "string") mapped[field] = error[field];
+  const result: CallToolResult = { isError: true, content: [{ type: "text", text: stableJson({ error: mapped }) }] };
+  return presentationProfile === "web" ? { ...result, structuredContent: { error: mapped } } : result;
+}
+
+function formatJsonResult(stable: unknown, options: FormatUrdiraResultOptions): CallToolResult {
+  const text = options.presentation_profile === "web"
+    ? renderWebContent(isRecord(stable) ? stable : {}, options.page_kind ?? "query", "json", options.continuation_scope, options.continuation_response_budget, options.continuation_ref_store)
+    : stableJson({ page: stable });
+  const result: CallToolResult = { content: [{ type: "text", text }] };
+  return options.presentation_profile === "web" ? { ...result, structuredContent: { page: stable } } : result;
+}
+
+function formatTextResult(stable: unknown, options: FormatUrdiraResultOptions): CallToolResult {
   const page = isRecord(stable) ? stable : {};
   const pageKind = options.page_kind ?? "query";
   const text = options.presentation_profile === "web"
     ? renderWebContent(page, pageKind, "text", options.continuation_scope, options.continuation_response_budget, options.continuation_ref_store)
     : pageKind === "index_status" ? renderIndexStatusText(page) : renderQueryPageText(page, options.snippet_lines ?? DEFAULT_SNIPPET_LINES, options.continuation_scope, options.continuation_response_budget, options.continuation_ref_store);
-  const result: CallToolResult = {
-    content: [{ type: "text", text }],
-  };
+  const result: CallToolResult = { content: [{ type: "text", text }] };
   return options.presentation_profile === "web" ? { ...result, structuredContent: { page: stable } } : result;
 }
 
@@ -1969,17 +2099,7 @@ async function fetchWorkspaceStatusForDegradation(client: UrdiraMcpClient, works
 }
 
 function renderContextDegradationText(errorCode: string, errorMessage: string, errorDetails: Readonly<Record<string, unknown>>, workspace: JsonRecord | undefined): string {
-  const startupPhase = firstNonEmptyString(workspace?.["startup_phase"]);
-  const structuralStageOrdinal = typeof workspace?.["structural_stage_ordinal"] === "number" ? workspace["structural_stage_ordinal"] : undefined;
-  const waitedMs = typeof errorDetails["waited_ms"] === "number" ? errorDetails["waited_ms"] : undefined;
-  const retryAfterMs = typeof workspace?.["retry_after_ms"] === "number" ? workspace["retry_after_ms"] : typeof errorDetails["retry_after_ms"] === "number" ? errorDetails["retry_after_ms"] : undefined;
-  const detailParts = [
-    startupPhase !== undefined ? `phase=${startupPhase}` : undefined,
-    structuralStageOrdinal !== undefined ? `structural_stage_ordinal=${structuralStageOrdinal}` : undefined,
-    waitedMs !== undefined ? `waited_ms=${waitedMs}` : undefined,
-    retryAfterMs !== undefined ? `retry_after_ms=${retryAfterMs}` : undefined,
-  ].filter((value): value is string => value !== undefined);
-
+  const detailParts = degradationDetailParts(errorDetails, workspace);
   const syntaxReady = workspace?.["structural_stage_1_ready"] === true || workspace?.["syntax_ready"] === true;
   const lines = [
     `indexing: the workspace is still indexing, so urdira_context (structural frontier) is not ready yet (${errorCode}: ${errorMessage})`,
@@ -1992,6 +2112,19 @@ function renderContextDegradationText(errorCode: string, errorMessage: string, e
     "results from these are honestly labeled partial while indexing runs; urdira_context becomes available once structural indexing completes.",
   ];
   return lines.join("\n");
+}
+
+function degradationDetailParts(errorDetails: Readonly<Record<string, unknown>>, workspace: JsonRecord | undefined): string[] {
+  const startupPhase = firstNonEmptyString(workspace?.["startup_phase"]);
+  const structuralStageOrdinal = typeof workspace?.["structural_stage_ordinal"] === "number" ? workspace["structural_stage_ordinal"] : undefined;
+  const waitedMs = typeof errorDetails["waited_ms"] === "number" ? errorDetails["waited_ms"] : undefined;
+  const retryAfterMs = typeof workspace?.["retry_after_ms"] === "number" ? workspace["retry_after_ms"] : typeof errorDetails["retry_after_ms"] === "number" ? errorDetails["retry_after_ms"] : undefined;
+  return [
+    startupPhase === undefined ? undefined : `phase=${startupPhase}`,
+    structuralStageOrdinal === undefined ? undefined : `structural_stage_ordinal=${structuralStageOrdinal}`,
+    waitedMs === undefined ? undefined : `waited_ms=${waitedMs}`,
+    retryAfterMs === undefined ? undefined : `retry_after_ms=${retryAfterMs}`,
+  ].filter((value): value is string => value !== undefined);
 }
 
 async function buildContextDegradationResult(client: UrdiraMcpClient, payload: JsonRecord, error: NonNullable<IpcResponse["error"]>, requestOptions: LocalIpcRequestOptions, presentationProfile: McpPresentationProfile): Promise<CallToolResult | undefined> {
@@ -2055,39 +2188,66 @@ async function fitQueryPage(raw: unknown, scopeKind: "single_workspace" | "compa
 }
 
 async function invoke(name: UrdiraMcpToolName, input: unknown, dependencies: { client: UrdiraMcpClient }, context: UrdiraMcpToolContext = {}, presentationProfile: McpPresentationProfile = "agent"): Promise<CallToolResult> {
+  const continuationStore = continuationStoreFor(dependencies.client);
+  const invocation = prepareInvocation(name, input, continuationStore);
+  const { render, snippetLines, payload, call } = invocation;
+  if (call === "core:query") validateQueryBeforeIpc(payload);
+  const requestOptions = invocationRequestOptions(context, call, payload);
+  const response = await dependencies.client.call(call, payload, requestOptions);
+  const degraded = await degradedInvocationResult(response, render, payload, dependencies.client, requestOptions, presentationProfile);
+  if (degraded !== undefined) return degraded;
+  const scopeKind = isRecord(payload["scope"]) && payload["scope"]["scope_type"] === "comparison" ? "comparison" : "single_workspace";
+  const responseBudget = extractResponseBudget(call, payload);
+  const renderContext = invocationRenderContext(render, call, snippetLines, presentationProfile, continuationStore, payload, responseBudget);
+  const page = await renderInvocationPage(response, call, scopeKind, responseBudget, renderContext, dependencies.client, requestOptions);
+  return formatUrdiraResult(page, renderContext);
+}
+
+function invocationRequestOptions(context: UrdiraMcpToolContext, call: string, payload: JsonRecord): LocalIpcRequestOptions {
+  return { ...(context.signal === undefined ? {} : { signal: context.signal }), ...(context.onProgress === undefined ? {} : { on_progress: context.onProgress }), deadline_at: deadlineForPayload(call, payload) };
+}
+
+async function degradedInvocationResult(response: IpcResponse, render: "text" | "json", payload: JsonRecord, client: UrdiraMcpClient, requestOptions: LocalIpcRequestOptions, presentationProfile: McpPresentationProfile): Promise<CallToolResult | undefined> {
+  if (response.outcome !== "error" || render === "json" || response.error === undefined || !CONTEXT_DEGRADATION_ERROR_CODES.has(response.error.code) || !isBuildContextOperationPayload(payload)) return undefined;
+  return response.error === undefined ? undefined : buildContextDegradationResult(client, payload, response.error, requestOptions, presentationProfile);
+}
+
+function invocationRenderContext(render: "text" | "json", call: string, snippetLines: number, presentationProfile: McpPresentationProfile, continuationStore: ContinuationRefStore, payload: JsonRecord, responseBudget: JsonRecord | undefined): RenderContext & { readonly presentation_profile: McpPresentationProfile } {
+  const pageKind: "query" | "index_status" = call === "core:index_status" ? "index_status" : "query";
+  return { render, page_kind: pageKind, presentation_profile: presentationProfile, snippet_lines: snippetLines, continuation_ref_store: continuationStore, ...(isRecord(payload["scope"]) ? { continuation_scope: payload["scope"] as JsonRecord } : {}), ...(isRecord(responseBudget) ? { continuation_response_budget: responseBudget } : {}) };
+}
+
+async function renderInvocationPage(response: IpcResponse, call: string, scopeKind: "single_workspace" | "comparison", responseBudget: JsonRecord | undefined, renderContext: RenderContext, client: UrdiraMcpClient, requestOptions: LocalIpcRequestOptions): Promise<unknown> {
+  if (response.outcome !== "success") return { error: responseError(response) };
+  if (call === "core:index_status") return publicIndexStatusPage(response.payload);
+  return fitQueryPage(response.payload, scopeKind, responseBudget, renderContext, client, requestOptions);
+}
+
+function prepareInvocation(name: UrdiraMcpToolName, input: unknown, continuationStore: ContinuationRefStore): { readonly render: "text" | "json"; readonly snippetLines: number; readonly payload: JsonRecord; readonly call: "core:index_status" | "core:query" | "core:query_continue" } {
   const raw = requireRecord(input, "tool arguments");
   const canonical = canonicalKeys(raw);
   const render: "text" | "json" = isRecord(canonical) && canonical["render"] === "json" ? "json" : "text";
-  // Plan 2026-09-06 (Frente N, §5.1.3): read off the raw args exactly like
-  // `render` above -- see `snippetLinesFieldSchema`'s doc comment for why
-  // this stays outside `options`/`response_budget` entirely.
-  const rawSnippetLines = isRecord(canonical) ? canonical["snippet_lines"] : undefined;
-  const snippetLines = typeof rawSnippetLines === "number" && Number.isSafeInteger(rawSnippetLines) ? Math.max(0, Math.min(3, rawSnippetLines)) : DEFAULT_SNIPPET_LINES;
-  const indexStatus = name === "urdira_index_status";
-  const continuationStore = continuationStoreFor(dependencies.client);
-  const query = name === "urdira_query" || (name === "urdira_context" && isRecord(canonical) && canonical["request_type"] === "continuation") ? queryPayload(input, continuationStore) : undefined;
-  const payload = query?.payload ?? (indexStatus ? indexStatusPayload(input) : queryRequestFromIntent("core:build_context", requireRecord(canonical, "tool arguments")));
-  const call = query?.call ?? (indexStatus ? "core:index_status" : "core:query");
-  if (call === "core:query") validateQueryBeforeIpc(payload);
-  const progress = context.onProgress;
-  const requestOptions: LocalIpcRequestOptions = {
-    ...(context.signal === undefined ? {} : { signal: context.signal }),
-    ...(progress === undefined ? {} : { on_progress: progress }),
-    deadline_at: deadlineForPayload(call, payload),
-  };
-  const response = await dependencies.client.call(call, payload, requestOptions);
-  if (response.outcome === "error" && render !== "json" && response.error !== undefined && CONTEXT_DEGRADATION_ERROR_CODES.has(response.error.code) && isBuildContextOperationPayload(payload)) {
-    const degraded = await buildContextDegradationResult(dependencies.client, payload, response.error, requestOptions, presentationProfile);
-    if (degraded !== undefined) return degraded;
-  }
-  const scopeKind = isRecord(payload["scope"]) && payload["scope"]["scope_type"] === "comparison" ? "comparison" : "single_workspace";
-  const responseBudget = extractResponseBudget(call, payload);
-  const pageKind: "query" | "index_status" = call === "core:index_status" ? "index_status" : "query";
-  const renderContext: RenderContext & { readonly presentation_profile: McpPresentationProfile } = { render, page_kind: pageKind, presentation_profile: presentationProfile, snippet_lines: snippetLines, continuation_ref_store: continuationStore, ...(isRecord(payload["scope"]) ? { continuation_scope: payload["scope"] as JsonRecord } : {}), ...(isRecord(responseBudget) ? { continuation_response_budget: responseBudget } : {}) };
-  const page = response.outcome === "success"
-    ? (call === "core:index_status" ? publicIndexStatusPage(response.payload) : await fitQueryPage(response.payload, scopeKind, responseBudget, renderContext, dependencies.client, requestOptions))
-    : { error: responseError(response) };
-  return formatUrdiraResult(page, renderContext);
+  const snippetLines = invocationSnippetLines(canonical);
+  const query = isContinuationInvocation(name, canonical) ? queryPayload(input, continuationStore) : undefined;
+  const resolved = resolveInvocationPayload(name, input, canonical, query);
+  const { payload, call } = resolved;
+  return { render, snippetLines, payload, call };
+}
+
+function invocationSnippetLines(canonical: unknown): number {
+  // `snippet_lines` is intentionally read at the top level, not from options.
+  const raw = isRecord(canonical) ? canonical["snippet_lines"] : undefined;
+  return typeof raw === "number" && Number.isSafeInteger(raw) ? Math.max(0, Math.min(3, raw)) : DEFAULT_SNIPPET_LINES;
+}
+
+function isContinuationInvocation(name: UrdiraMcpToolName, canonical: unknown): boolean {
+  return name === "urdira_query" || (name === "urdira_context" && isRecord(canonical) && canonical["request_type"] === "continuation");
+}
+
+function resolveInvocationPayload(name: UrdiraMcpToolName, input: unknown, canonical: unknown, query: ReturnType<typeof queryPayload> | undefined): { readonly payload: JsonRecord; readonly call: "core:index_status" | "core:query" | "core:query_continue" } {
+  if (query !== undefined) return { payload: query.payload, call: query.call as "core:index_status" | "core:query" | "core:query_continue" };
+  if (name === "urdira_index_status") return { payload: indexStatusPayload(input), call: "core:index_status" };
+  return { payload: queryRequestFromIntent("core:build_context", requireRecord(canonical, "tool arguments")), call: "core:query" };
 }
 
 function compactAdvertisedSchema(value: JsonSchema): JsonSchema {

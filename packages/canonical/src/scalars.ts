@@ -44,18 +44,22 @@ export function normalizeExactDecimal(value: unknown, scalePolicy: "significant"
 }
 
 export function normalizeTimestamp(value: unknown): string {
-  if (typeof value !== "string" || !/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{9})Z$/.test(value)) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TIMESTAMP_INVALID" });
-  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{9})Z$/)!;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
+  const fields = timestampFields(value);
+  validateTimestampFields(fields);
+  return fields.raw;
+}
+
+function timestampFields(value: unknown): { readonly raw: string; readonly year: number; readonly month: number; readonly day: number; readonly hour: number; readonly minute: number; readonly second: number } {
+  const match = typeof value === "string" ? value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{9})Z$/) : undefined;
+  if (!match) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TIMESTAMP_INVALID" });
+  return { raw: value as string, year: Number(match[1]), month: Number(match[2]), day: Number(match[3]), hour: Number(match[4]), minute: Number(match[5]), second: Number(match[6]) };
+}
+
+function validateTimestampFields(fields: { readonly year: number; readonly month: number; readonly day: number; readonly hour: number; readonly minute: number; readonly second: number }): void {
+  const { year, month, day, hour, minute, second } = fields;
   if (year < 1 || year > 9999 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TIMESTAMP_INVALID" });
   const date = dateFromFields(year, month, day, hour, minute, second);
   if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day || date.getUTCHours() !== hour || date.getUTCMinutes() !== minute || date.getUTCSeconds() !== second) fail("uce:schema_validation_failed", "normalize", { value_path: "", validation_kind: "TIMESTAMP_INVALID" });
-  return value;
 }
 
 export function timestampNanoseconds(value: string): bigint {

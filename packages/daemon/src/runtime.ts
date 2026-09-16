@@ -1,8 +1,13 @@
+/**
+ * Daemon lifecycle and orchestration boundary. This module composes storage,
+ * query engines, watchers, schedulers, and injected plugin/runtime ports; it
+ * does not define their domain contracts or expose a network transport.
+ */
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DaemonError } from "./errors.js";
 import { basename, dirname, join, resolve } from "node:path";
-import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, countFilesUpToBudget, KQUEUE_FILE_WATCH_BUDGET, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type CanonicalQuerySnapshotPort, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
+import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, countFilesUpToBudget, KQUEUE_FILE_WATCH_BUDGET, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type CanonicalQuerySnapshotPort, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanRequest, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
 import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
 import { sweepWorkspaceDataDir, type OrphanReport } from "./orphan-sweep.js";
@@ -14,7 +19,7 @@ import { EndpointDescriptorStore, LastKnownGoodStore, ProcessLock, daemonPaths, 
 import { buildSemanticProvider, ensureSemanticAssets, type SemanticModelProvisioningNotice, type SemanticProviderDescriptor } from "./semantic-provider-runtime.js";
 import { ensureSemanticAssetsInProcess, runSemanticReconcileSharded, startNeuralSemanticProviderHost, type NeuralSemanticProviderHost, type SemanticProcessRun } from "./semantic-process.js";
 import { resolveV4SemanticEntitySource } from "./semantic-v4-wiring.js";
-import { IPC_DEFAULT_MAX_FRAME_BYTES, LocalIpcClient, LocalIpcServer, type LocalIpcClientOptions, type LocalIpcRequestOptions, type IpcProgress, type IpcResponse, type IpcRequestHandler } from "./protocol.js";
+import { IPC_DEFAULT_MAX_FRAME_BYTES, LocalIpcServer, type IpcProgress, type IpcRequestHandler } from "./protocol.js";
 import { DaemonScheduler, PersistentCursorRecovery, type PersistedCursorState, type SchedulerOptions } from "./scheduler.js";
 import { DAEMON_PRIVATE_INTERFACE_VERSION, daemonRpcCapabilities } from "./compatibility.js";
 
@@ -1030,25 +1035,65 @@ function v4WorkspaceReadinessFrom(
     structural_stage_1_ready: structuralReady,
     structural_ready: structuralReady,
     semantic_ready: semanticReady,
+    ...v4ReadinessStatusFields(workspace, sourceReady, structuralReady, semanticReady, queryable, scanRunning, sourceSnapshotId),
+    ...v4ReadinessGenerationFields(state),
+  } as WorkspaceReadiness;
+}
+
+function v4ReadinessStatusFields(workspace: RegisteredWorkspace, sourceReady: boolean, structuralReady: boolean, semanticReady: boolean, queryable: boolean, scanRunning: boolean, sourceSnapshotId: string | undefined): Readonly<Record<string, unknown>> {
+  return {
+    ...v4ReadinessSnapshotFields(workspace, sourceSnapshotId),
+    ...v4ReadinessSourceFields(workspace, sourceReady),
+    ...v4ReadinessStructuralFields(structuralReady, queryable, scanRunning),
+    ...v4ReadinessSemanticFields(semanticReady, structuralReady),
+    readiness_reason_codes: v4ReadinessReasonCodes(sourceReady, structuralReady, semanticReady, scanRunning),
+    ...(scanRunning && !structuralReady ? { retry_after_ms: 1000 } : {}),
+  };
+}
+
+function v4ReadinessSnapshotFields(workspace: RegisteredWorkspace, sourceSnapshotId: string | undefined): Readonly<Record<string, unknown>> {
+  return {
     ...(sourceSnapshotId === undefined ? {} : { source_snapshot_id: sourceSnapshotId }),
     ...(workspace.current_snapshot_id === undefined ? {} : { structural_snapshot_id: workspace.current_snapshot_id, ...(sourceSnapshotId === undefined ? {} : { structural_source_snapshot_id: sourceSnapshotId }) }),
+  };
+}
+
+function v4ReadinessSourceFields(workspace: RegisteredWorkspace, sourceReady: boolean): Readonly<Record<string, unknown>> {
+  return {
     source_availability: sourceReady ? "available" : "unavailable",
     source_completeness: sourceReady ? "complete" : "unknown",
     source_freshness: sourceReady ? "equivalent" : "degraded",
     source_build_state: sourceReady ? "idle" : workspace.status === "indexing" ? "building" : "not_started",
+  };
+}
+
+function v4ReadinessStructuralFields(structuralReady: boolean, queryable: boolean, scanRunning: boolean): Readonly<Record<string, unknown>> {
+  return {
     structural_availability: structuralReady ? "available" : "unavailable",
     structural_completeness: structuralReady ? "complete" : queryable ? "partial" : "unknown",
     structural_freshness: structuralReady ? "equivalent" : "degraded",
     structural_build_state: structuralReady ? "idle" : scanRunning ? "building" : "not_started",
+  };
+}
+
+function v4ReadinessSemanticFields(semanticReady: boolean, structuralReady: boolean): Readonly<Record<string, unknown>> {
+  return {
     semantic_availability: semanticReady ? "available" : "unavailable",
     semantic_completeness: semanticReady ? "complete" : "unknown",
     semantic_build_state: semanticReady ? "idle" : structuralReady ? "building" : "not_started",
-    readiness_reason_codes: [
-      ...(sourceReady ? [] : ["core:source_catalog_unavailable"]),
-      ...(structuralReady ? [] : [scanRunning ? "core:analysis_in_progress" : "core:structural_snapshot_unavailable"]),
-      ...(semanticReady ? [] : [structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"]),
-    ],
-    ...(scanRunning && !structuralReady ? { retry_after_ms: 1000 } : {}),
+  };
+}
+
+function v4ReadinessReasonCodes(sourceReady: boolean, structuralReady: boolean, semanticReady: boolean, scanRunning: boolean): readonly string[] {
+  return [
+    ...(sourceReady ? [] : ["core:source_catalog_unavailable"]),
+    ...(structuralReady ? [] : [scanRunning ? "core:analysis_in_progress" : "core:structural_snapshot_unavailable"]),
+    ...(semanticReady ? [] : [structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"]),
+  ];
+}
+
+function v4ReadinessGenerationFields(state: V4WorkspaceReadinessState): Readonly<Record<string, unknown>> {
+  return {
     ...(state.queryable_generation === undefined ? {} : { structural_queryable_generation: state.queryable_generation }),
     ...(state.durable_generation === undefined ? {} : { structural_durable_generation: state.durable_generation }),
     ...(state.lexical_completed_generation === undefined ? {} : { lexical_completed_generation: state.lexical_completed_generation }),
@@ -1057,6 +1102,62 @@ function v4WorkspaceReadinessFrom(
     ...(state.upgrade_running === undefined ? {} : { upgrade_running: state.upgrade_running }),
     ...(state.upgrade_pending_sites === undefined ? {} : { upgrade_pending_sites: state.upgrade_pending_sites }),
   };
+}
+
+interface V3ReadinessStateRead {
+  readonly sourceState: Awaited<ReturnType<WorkspaceDatabase["sourceIndex"]["getState"]>>;
+  readonly structuralGeneration: number | undefined;
+  readonly structuralStageId: string | undefined;
+  readonly structuralStageOrdinal: number | undefined;
+  readonly structuralStageCount: number | undefined;
+}
+
+/** Reads the v3 readiness inputs with read-only SQLite access and monotone fallback. */
+async function readV3ReadinessState(workspace: RegisteredWorkspace, storage: DurableStorage | undefined): Promise<V3ReadinessStateRead> {
+  let sourceState: V3ReadinessStateRead["sourceState"];
+  let structuralGeneration: number | undefined;
+  let structuralStageId: string | undefined;
+  let structuralStageOrdinal: number | undefined;
+  let structuralStageCount: number | undefined;
+  try {
+    if (storage === undefined) throw new Error("storage unavailable");
+    const dbSectionStartedAt = readinessTimingEnabled() ? performance.now() : undefined;
+    const database = await storage.openWorkspaceReadOnly(workspace.workspace_id);
+    try {
+      sourceState = await database.sourceIndex.getState();
+      if (workspace.current_snapshot_id !== undefined) {
+        const snapshot = await database.repositories.snapshots.get(workspace.current_snapshot_id);
+        structuralGeneration = snapshot?.generation;
+        if (snapshot !== undefined) {
+          structuralStageId = snapshot.publication_stage_id;
+          structuralStageOrdinal = snapshot.publication_stage_ordinal;
+          structuralStageCount = snapshot.publication_stage_count;
+        }
+      }
+    } finally {
+      await database.close().catch(() => undefined);
+      if (dbSectionStartedAt !== undefined) recordReadinessPollMs(performance.now() - dbSectionStartedAt);
+    }
+    lastKnownSourceState.set(workspace.workspace_id, { sourceState, structuralGeneration, structuralStageId, structuralStageOrdinal, structuralStageCount });
+  } catch (error) {
+    if (scanFailureErrorCode(error) === "storage:workspace_not_found") {
+      sourceState = undefined;
+      structuralGeneration = undefined;
+      structuralStageId = undefined;
+      structuralStageOrdinal = undefined;
+      structuralStageCount = undefined;
+      warnReadinessDbFailure(workspace.workspace_id, error, false);
+    } else {
+      const lastKnown = lastKnownSourceState.get(workspace.workspace_id);
+      sourceState = lastKnown?.sourceState;
+      structuralGeneration = lastKnown?.structuralGeneration;
+      structuralStageId = lastKnown?.structuralStageId;
+      structuralStageOrdinal = lastKnown?.structuralStageOrdinal;
+      structuralStageCount = lastKnown?.structuralStageCount;
+      warnReadinessDbFailure(workspace.workspace_id, error, lastKnown !== undefined);
+    }
+  }
+  return { sourceState, structuralGeneration, structuralStageId, structuralStageOrdinal, structuralStageCount };
 }
 
 async function workspaceReadiness(
@@ -1079,102 +1180,33 @@ async function workspaceReadiness(
   // no I/O at all -- so there is no readiness-poll cost regression here.
   const v4State = v4ReadinessState.get(workspace.workspace_id);
   if (v4State !== undefined) return v4WorkspaceReadinessFrom(workspace, v4State, semantic, scanRunning);
-  let sourceState: Awaited<ReturnType<WorkspaceDatabase["sourceIndex"]["getState"]>>;
-  let structuralGeneration: number | undefined;
-  let structuralStageId: string | undefined;
-  let structuralStageOrdinal: number | undefined;
-  let structuralStageCount: number | undefined;
-  try {
-    if (storage === undefined) throw new Error("storage unavailable");
-    const dbSectionStartedAt = readinessTimingEnabled() ? performance.now() : undefined;
-    // Read-only: never contends with a held publish write transaction on
-    // this workspace's own database (see `openWorkspaceReadOnly`'s doc
-    // comment). This used to be `storage.openWorkspace`, whose own writes
-    // (schema/identity bookkeeping, lease acquisition) queue behind a
-    // long-running publish transaction and hit SQLITE_BUSY past the busy
-    // timeout -- that was "the flap": `source_ready` flipping false for the
-    // whole duration of every publish transaction.
-    const database = await storage.openWorkspaceReadOnly(workspace.workspace_id);
-    try {
-      sourceState = await database.sourceIndex.getState();
-      if (workspace.current_snapshot_id !== undefined) {
-        const snapshot = await database.repositories.snapshots.get(workspace.current_snapshot_id);
-        structuralGeneration = snapshot?.generation;
-        if (snapshot !== undefined) {
-          structuralStageId = snapshot.publication_stage_id;
-          structuralStageOrdinal = snapshot.publication_stage_ordinal;
-          structuralStageCount = snapshot.publication_stage_count;
-        }
-      }
-    } finally {
-      await database.close().catch(() => undefined);
-      if (dbSectionStartedAt !== undefined) recordReadinessPollMs(performance.now() - dbSectionStartedAt);
-    }
-    // Remember this successful read: the catch branch below falls back to
-    // it for any transient failure that is not a genuine "workspace
-    // unregistered/missing" (see that branch's comment).
-    lastKnownSourceState.set(workspace.workspace_id, { sourceState, structuralGeneration, structuralStageId, structuralStageOrdinal, structuralStageCount });
-  } catch (error) {
-    if (scanFailureErrorCode(error) === "storage:workspace_not_found") {
-      // Genuinely unregistered, or its database file is missing (crash
-      // mid-registration): there is no last-known reading that means
-      // anything here, and nothing to protect against flapping -- report
-      // unavailable, exactly as before.
-      sourceState = undefined;
-      structuralGeneration = undefined;
-      structuralStageId = undefined;
-      structuralStageOrdinal = undefined;
-      structuralStageCount = undefined;
-      warnReadinessDbFailure(workspace.workspace_id, error, false);
-    } else {
-      // Any other failure (SQLITE_BUSY, a transient SQL error against a
-      // database mid-registration, a worker hiccup, ...) is presumed
-      // transient: serve the last successfully computed readiness instead
-      // of flapping `source_ready` false underneath every in-flight
-      // query/status poll -- monotone availability, once a workspace has
-      // been seen ready a single failed poll must not make it regress.
-      const lastKnown = lastKnownSourceState.get(workspace.workspace_id);
-      if (lastKnown) {
-        sourceState = lastKnown.sourceState;
-        structuralGeneration = lastKnown.structuralGeneration;
-        structuralStageId = lastKnown.structuralStageId;
-        structuralStageOrdinal = lastKnown.structuralStageOrdinal;
-        structuralStageCount = lastKnown.structuralStageCount;
-      } else {
-        sourceState = undefined;
-        structuralGeneration = undefined;
-        structuralStageId = undefined;
-        structuralStageOrdinal = undefined;
-        structuralStageCount = undefined;
-      }
-      warnReadinessDbFailure(workspace.workspace_id, error, lastKnown !== undefined);
-    }
-  }
+  const { sourceState, structuralGeneration, structuralStageId, structuralStageOrdinal, structuralStageCount } = await readV3ReadinessState(workspace, storage);
 
+  return v3WorkspaceReadinessFrom(workspace, sourceState, structuralGeneration, structuralStageId, structuralStageOrdinal, structuralStageCount, semantic, scanRunning);
+}
+
+function v3WorkspaceReadinessFrom(
+  workspace: RegisteredWorkspace,
+  sourceState: V3ReadinessStateRead["sourceState"] | undefined,
+  structuralGeneration: number | undefined,
+  structuralStageId: string | undefined,
+  structuralStageOrdinal: number | undefined,
+  structuralStageCount: number | undefined,
+  semantic: ReadonlyMap<string, SemanticMaterializationStatusView>,
+  scanRunning: boolean,
+): WorkspaceReadiness {
   const source = sourceState;
   const sourceAvailable = source !== undefined;
-  const sourceSnapshotId = sourceAvailable ? `source-snapshot:${source.current_generation}` : undefined;
+  const sourceSnapshotId = sourceSnapshotIdentifier(source);
   const sourceReady = sourceAvailable;
   const structuralUnsupported = (workspace.selected_plugin_ids ?? []).length === 0;
-  const finalStructuralStage = structuralStageCount === undefined || structuralStageOrdinal === undefined || structuralStageOrdinal >= structuralStageCount;
-  const structuralReady = workspace.current_snapshot_id !== undefined
-    && sourceAvailable
-    && structuralGeneration !== undefined
-    && structuralGeneration >= source.current_generation
-    && finalStructuralStage
-    && workspace.status !== "indexing"
-    && workspace.last_scan_error === undefined;
-  const structuralStale = workspace.current_snapshot_id !== undefined && sourceAvailable && structuralGeneration !== undefined && source.current_generation > structuralGeneration;
+  const structuralReady = v3StructuralReady(workspace, source, structuralGeneration, structuralStageOrdinal, structuralStageCount);
+  const structuralStale = v3StructuralStale(workspace, source, structuralGeneration);
   // Stage 1 publishes parser/syntax facts before the later structural closure;
   // expose it as its own frontier so callers need not wait for semantic work.
   const syntaxReady = sourceReady && (structuralReady || (structuralStageOrdinal !== undefined && structuralStageOrdinal >= 1));
   const semanticView = semantic.get(workspace.workspace_id);
   const semanticReady = structuralReady && semanticView?.materialization_state === "complete" && semanticView.source_snapshot_id === workspace.current_snapshot_id;
-  const sourceReasonCodes = sourceAvailable ? [] : ["core:source_catalog_unavailable"];
-  const structuralReasonCodes = structuralReady
-    ? []
-    : [structuralStale ? "core:source_snapshot_changed" : scanRunning ? "core:analysis_in_progress" : structuralUnsupported ? "core:plugin_unavailable" : "core:structural_snapshot_unavailable"];
-  const semanticReasonCodes = semanticReady ? [] : [structuralUnsupported ? "core:plugin_unavailable" : structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"];
   // `sourceIndex.getState()` returns a row from the workspace's FIRST
   // catalog fragment onward, not only after the completion fragment: every
   // batch (partial or complete) writes/updates the `source_index_state` row
@@ -1194,55 +1226,118 @@ async function workspaceReadiness(
     structural_stage_1_ready: syntaxReady,
     structural_ready: structuralReady,
     semantic_ready: semanticReady,
+    ...v3ReadinessSnapshotFields(workspace, sourceSnapshotId),
+    ...v3ReadinessSourceFields(workspace, sourceAvailable, sourceCatalogSettling),
+    ...v3ReadinessStructuralFields(structuralReady, structuralStageId, structuralStageOrdinal, structuralStageCount, structuralUnsupported, structuralStale, scanRunning),
+    ...v3ReadinessSemanticFields(semanticReady, structuralUnsupported, structuralReady),
+    readiness_reason_codes: v3ReadinessReasonCodes(sourceAvailable, structuralReady, structuralStale, structuralUnsupported, semanticReady, scanRunning),
+    ...(scanRunning && !structuralReady ? { retry_after_ms: 1000 } : {}),
+  } as WorkspaceReadiness;
+}
+
+function sourceSnapshotIdentifier(source: V3ReadinessStateRead["sourceState"] | undefined): string | undefined {
+  return source === undefined ? undefined : `source-snapshot:${source.current_generation}`;
+}
+
+function v3StructuralReady(workspace: RegisteredWorkspace, source: V3ReadinessStateRead["sourceState"] | undefined, structuralGeneration: number | undefined, structuralStageOrdinal: number | undefined, structuralStageCount: number | undefined): boolean {
+  const finalStructuralStage = structuralStageCount === undefined || structuralStageOrdinal === undefined || structuralStageOrdinal >= structuralStageCount;
+  return workspace.current_snapshot_id !== undefined
+    && source !== undefined
+    && structuralGeneration !== undefined
+    && structuralGeneration >= source.current_generation
+    && finalStructuralStage
+    && workspace.status !== "indexing"
+    && workspace.last_scan_error === undefined;
+}
+
+function v3StructuralStale(workspace: RegisteredWorkspace, source: V3ReadinessStateRead["sourceState"] | undefined, structuralGeneration: number | undefined): boolean {
+  return workspace.current_snapshot_id !== undefined && source !== undefined && structuralGeneration !== undefined && source.current_generation > structuralGeneration;
+}
+
+function v3ReadinessSnapshotFields(workspace: RegisteredWorkspace, sourceSnapshotId: string | undefined): Readonly<Record<string, unknown>> {
+  return {
     ...(sourceSnapshotId === undefined ? {} : { source_snapshot_id: sourceSnapshotId }),
     ...(workspace.current_snapshot_id === undefined ? {} : { structural_snapshot_id: workspace.current_snapshot_id, ...(sourceSnapshotId === undefined ? {} : { structural_source_snapshot_id: sourceSnapshotId }) }),
+  };
+}
+
+function v3ReadinessSourceFields(workspace: RegisteredWorkspace, sourceAvailable: boolean, sourceCatalogSettling: boolean): Readonly<Record<string, unknown>> {
+  return {
     source_availability: sourceAvailable ? "available" : "unavailable",
     source_completeness: sourceAvailable ? (sourceCatalogSettling ? "partial" : "complete") : "unknown",
     source_freshness: sourceAvailable ? (sourceCatalogSettling ? "changes_pending" : "equivalent") : "degraded",
     source_build_state: sourceAvailable ? (sourceCatalogSettling ? "building" : "idle") : workspace.status === "indexing" ? "building" : "not_started",
+  };
+}
+
+function v3ReadinessStructuralFields(structuralReady: boolean, structuralStageId: string | undefined, structuralStageOrdinal: number | undefined, structuralStageCount: number | undefined, structuralUnsupported: boolean, structuralStale: boolean, scanRunning: boolean): Readonly<Record<string, unknown>> {
+  return {
     structural_availability: structuralReady || structuralStageId !== undefined ? "available" : "unavailable",
     structural_completeness: structuralReady ? "complete" : structuralStageId !== undefined ? "partial" : structuralUnsupported ? "unsupported" : "unknown",
     structural_freshness: structuralReady ? "equivalent" : structuralStale ? "changes_pending" : "degraded",
     structural_build_state: structuralReady ? "idle" : structuralUnsupported ? "disabled" : scanRunning ? "building" : "not_started",
     ...(structuralStageId === undefined || structuralStageOrdinal === undefined || structuralStageCount === undefined ? {} : { structural_stage_id: structuralStageId, structural_stage_ordinal: structuralStageOrdinal, structural_stage_count: structuralStageCount }),
-    semantic_availability: semanticReady ? "available" : "unavailable",
-    semantic_completeness: semanticReady ? "complete" : structuralUnsupported ? "unsupported" : "unknown",
-    semantic_build_state: semanticReady ? "idle" : structuralUnsupported ? "disabled" : structuralReady ? "building" : "not_started",
-    readiness_reason_codes: [...sourceReasonCodes, ...structuralReasonCodes, ...semanticReasonCodes],
-    ...(scanRunning && !structuralReady ? { retry_after_ms: 1000 } : {}),
   };
 }
 
-function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown> {
-  const completedStage = readiness.structural_ready ? 3 : readiness.structural_stage_ordinal ?? 0;
-  const operationReady = (operation: (typeof operationRegistry)[number]): boolean => {
-    if (operation.required_frontier === "source") return readiness.source_ready;
-    if (operation.required_frontier === "syntax") return readiness.structural_stage_1_ready;
-    if (operation.required_frontier === "semantic") return readiness.semantic_ready;
-    return completedStage >= operation.required_stage;
+function v3ReadinessSemanticFields(semanticReady: boolean, structuralUnsupported: boolean, structuralReady: boolean): Readonly<Record<string, unknown>> {
+  return {
+    semantic_availability: semanticReady ? "available" : "unavailable",
+    semantic_completeness: semanticReady ? "complete" : structuralUnsupported ? "unsupported" : "unknown",
+    semantic_build_state: semanticReady ? "idle" : structuralUnsupported ? "disabled" : structuralReady ? "building" : "not_started",
   };
+}
+
+function v3ReadinessReasonCodes(sourceAvailable: boolean, structuralReady: boolean, structuralStale: boolean, structuralUnsupported: boolean, semanticReady: boolean, scanRunning: boolean): readonly string[] {
+  const sourceReasonCodes = sourceAvailable ? [] : ["core:source_catalog_unavailable"];
+  const structuralReasonCodes = structuralReady ? [] : [structuralStale ? "core:source_snapshot_changed" : scanRunning ? "core:analysis_in_progress" : structuralUnsupported ? "core:plugin_unavailable" : "core:structural_snapshot_unavailable"];
+  const semanticReasonCodes = semanticReady ? [] : [structuralUnsupported ? "core:plugin_unavailable" : structuralReady ? "core:semantic_indexing_in_progress" : "core:structural_required"];
+  return [...sourceReasonCodes, ...structuralReasonCodes, ...semanticReasonCodes];
+}
+
+function operationAvailability(readiness: WorkspaceReadiness): { readonly available: readonly string[]; readonly blocked: readonly Record<string, unknown>[]; readonly blockedIds: readonly string[] } {
+  const completedStage = readiness.structural_ready ? 3 : readiness.structural_stage_ordinal ?? 0;
   const queryOperations = operationRegistry.filter((operation) => operation.operation_id !== "core:index_status" && operation.lifecycle_state === "active");
-  const available = queryOperations.filter(operationReady).map((operation) => operation.operation_id);
-  const blocked = queryOperations.filter((operation) => !available.includes(operation.operation_id)).map((operation) => operation.operation_id);
-  const structuralReasonCodes = readiness.structural_ready
-    ? []
-    : readiness.structural_freshness === "changes_pending"
-      ? ["core:source_snapshot_changed"]
-      : readiness.structural_completeness === "unsupported"
-        ? ["core:plugin_unavailable"]
-        : readiness.structural_completeness === "partial"
-          ? ["core:structural_stage_in_progress"]
-        : readiness.structural_build_state === "building"
-          ? ["core:analysis_in_progress"]
-          : ["core:structural_snapshot_unavailable"];
-  const semanticReasonCodes = readiness.semantic_ready
-    ? []
-    : readiness.semantic_completeness === "unsupported"
-      ? ["core:plugin_unavailable"]
-      : readiness.structural_ready
-        ? ["core:semantic_indexing_in_progress"]
-        : ["core:structural_required"];
-  const blockedReasonCode = structuralReasonCodes[0] ?? "core:analysis_in_progress";
+  const available = queryOperations.filter((operation) => operationReadyForReadiness(operation, readiness, completedStage)).map((operation) => operation.operation_id);
+  const blockedOperations = queryOperations.filter((operation) => !available.includes(operation.operation_id));
+  const blockedReasonCode = readinessBlockedReasonCode(readiness);
+  return {
+    available,
+    blockedIds: blockedOperations.map((operation) => operation.operation_id),
+    blocked: blockedOperations.map((operation) => blockedOperationProjection(operation, readiness, blockedReasonCode)),
+  };
+}
+
+function operationReadyForReadiness(operation: (typeof operationRegistry)[number], readiness: WorkspaceReadiness, completedStage: number): boolean {
+  if (operation.required_frontier === "source") return readiness.source_ready;
+  if (operation.required_frontier === "syntax") return readiness.structural_stage_1_ready;
+  if (operation.required_frontier === "semantic") return readiness.semantic_ready;
+  return completedStage >= operation.required_stage;
+}
+
+function readinessBlockedReasonCode(readiness: WorkspaceReadiness): string {
+  if (readiness.structural_ready) return "core:analysis_in_progress";
+  if (readiness.structural_freshness === "changes_pending") return "core:source_snapshot_changed";
+  if (readiness.structural_completeness === "unsupported") return "core:plugin_unavailable";
+  if (readiness.structural_completeness === "partial") return "core:structural_stage_in_progress";
+  if (readiness.structural_build_state === "building") return "core:analysis_in_progress";
+  return "core:structural_snapshot_unavailable";
+}
+
+function blockedOperationProjection(operation: (typeof operationRegistry)[number], readiness: WorkspaceReadiness, reasonCode: string): Record<string, unknown> {
+  const retryable = operation.required_frontier === "source"
+    ? readiness.source_build_state === "building"
+    : operation.required_frontier === "semantic"
+      ? readiness.semantic_build_state === "building"
+      : readiness.structural_build_state === "building";
+  return { operation: operation.operation_id, required_layer: operation.required_frontier, retryable, reason_code: reasonCode, ...(retryable && readiness.retry_after_ms !== undefined ? { retry_after_ms: readiness.retry_after_ms } : {}) };
+}
+
+function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown> {
+  const availability = operationAvailability(readiness);
+  const available = availability.available;
+  const blocked = availability.blockedIds;
+  const { structural: structuralReasonCodes, semantic: semanticReasonCodes } = readinessDetailReasonCodes(readiness);
   // v4 (P2-7): `scripts/native-acceleration-controller.mjs` polls
   // `core:index_status` for `structural_ready` (already true, unchanged --
   // see `v4WorkspaceReadinessFrom`) AND `structural_durable`: `true` once
@@ -1256,68 +1351,97 @@ function readinessPayload(readiness: WorkspaceReadiness): Record<string, unknown
     ...readiness,
     structural_durable: structuralDurable,
     ...(readiness.source_snapshot_id === undefined ? {} : { source_snapshot_id: readiness.source_snapshot_id }),
-    readiness: {
-      source: {
-        availability: readiness.source_availability,
-        completeness: readiness.source_completeness,
-        freshness: readiness.source_freshness,
-        build_state: readiness.source_build_state,
-        ...(readiness.source_snapshot_id === undefined ? {} : { snapshot_id: readiness.source_snapshot_id }),
-        reason_codes: readiness.source_ready ? [] : ["core:source_catalog_unavailable"],
-      },
-      syntax: {
-        availability: readiness.structural_stage_1_ready ? "available" : "unavailable",
-        completeness: readiness.structural_stage_1_ready ? "complete" : "unknown",
-        freshness: readiness.structural_stage_1_ready ? "equivalent" : "degraded",
-        build_state: readiness.structural_stage_1_ready ? "idle" : readiness.structural_build_state === "building" ? "building" : "not_started",
-        ...(readiness.source_snapshot_id === undefined ? {} : { based_on_source_snapshot_id: readiness.source_snapshot_id }),
-        reason_codes: readiness.structural_stage_1_ready ? [] : ["core:syntax_indexing_in_progress"],
-        ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }),
-      },
-      structural: {
-        availability: readiness.structural_availability,
-        completeness: readiness.structural_completeness,
-        freshness: readiness.structural_freshness,
-        build_state: readiness.structural_build_state,
-        ...(readiness.structural_source_snapshot_id === undefined ? {} : { based_on_source_snapshot_id: readiness.structural_source_snapshot_id }),
-        reason_codes: structuralReasonCodes,
-        ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }),
-        // v4 (P2-7): `Queryable`/`ScanCompleted` generations -- see
-        // `V4WorkspaceReadinessState`'s doc comment. Absent entirely for a
-        // v3 workspace (neither field is ever set on its `WorkspaceReadiness`).
-        ...(readiness.structural_queryable_generation === undefined ? {} : { queryable_generation: readiness.structural_queryable_generation }),
-        ...(readiness.structural_durable_generation === undefined ? {} : { durable_generation: readiness.structural_durable_generation }),
-      },
-      semantic: {
-        availability: readiness.semantic_availability,
-        completeness: readiness.semantic_completeness,
-        build_state: readiness.semantic_build_state,
-        reason_codes: semanticReasonCodes,
-        ...(readiness.semantic_completed_generation === undefined ? {} : { completed_generation: readiness.semantic_completed_generation }),
-      },
-      // v4 (P2-7): lexical maintenance is wired for v4 (unlike semantic --
-      // see `runV4WorkspaceScan`'s doc comment); this sub-object only
-      // appears once a completed pass has recorded a generation (v3
-      // workspaces never set `lexical_completed_generation`, and a v4
-      // workspace with no lexical pass completed yet also omits it, rather
-      // than reporting a misleading `0`).
-      ...(readiness.lexical_completed_generation === undefined ? {} : { lexical: { completed_generation: readiness.lexical_completed_generation } }),
-    },
+    readiness: readinessDetailProjection(readiness, structuralReasonCodes, semanticReasonCodes),
     operation_availability: {
       available_now: available,
-      blocked: blocked.map((operation) => {
-        const definition = queryOperations.find((candidate) => candidate.operation_id === operation)!;
-        const retryable = definition.required_frontier === "source"
-          ? readiness.source_build_state === "building"
-          : definition.required_frontier === "semantic"
-            ? readiness.semantic_build_state === "building"
-            : readiness.structural_build_state === "building";
-        return { operation, required_layer: definition.required_frontier, retryable, reason_code: blockedReasonCode, ...(retryable && readiness.retry_after_ms !== undefined ? { retry_after_ms: readiness.retry_after_ms } : {}) };
-      }),
+      blocked: availability.blocked,
     },
     available_operations: available,
     blocked_operations: blocked,
   };
+}
+
+function readinessDetailProjection(readiness: WorkspaceReadiness, structuralReasonCodes: readonly string[], semanticReasonCodes: readonly string[]): Record<string, unknown> {
+  return {
+    source: sourceReadinessDetail(readiness),
+    syntax: syntaxReadinessDetail(readiness),
+    structural: structuralReadinessDetail(readiness, structuralReasonCodes),
+    semantic: semanticReadinessDetail(readiness, semanticReasonCodes),
+    ...lexicalReadinessDetail(readiness),
+  };
+}
+
+function sourceReadinessDetail(readiness: WorkspaceReadiness): Record<string, unknown> {
+  return {
+    availability: readiness.source_availability,
+    completeness: readiness.source_completeness,
+    freshness: readiness.source_freshness,
+    build_state: readiness.source_build_state,
+    ...(readiness.source_snapshot_id === undefined ? {} : { snapshot_id: readiness.source_snapshot_id }),
+    reason_codes: readiness.source_ready ? [] : ["core:source_catalog_unavailable"],
+  };
+}
+
+function syntaxReadinessDetail(readiness: WorkspaceReadiness): Record<string, unknown> {
+  return {
+    availability: readiness.structural_stage_1_ready ? "available" : "unavailable",
+    completeness: readiness.structural_stage_1_ready ? "complete" : "unknown",
+    freshness: readiness.structural_stage_1_ready ? "equivalent" : "degraded",
+    build_state: readiness.structural_stage_1_ready ? "idle" : readiness.structural_build_state === "building" ? "building" : "not_started",
+    ...(readiness.source_snapshot_id === undefined ? {} : { based_on_source_snapshot_id: readiness.source_snapshot_id }),
+    reason_codes: readiness.structural_stage_1_ready ? [] : ["core:syntax_indexing_in_progress"],
+    ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }),
+  };
+}
+
+function structuralReadinessDetail(readiness: WorkspaceReadiness, reasonCodes: readonly string[]): Record<string, unknown> {
+  return {
+    availability: readiness.structural_availability,
+    completeness: readiness.structural_completeness,
+    freshness: readiness.structural_freshness,
+    build_state: readiness.structural_build_state,
+    ...(readiness.structural_source_snapshot_id === undefined ? {} : { based_on_source_snapshot_id: readiness.structural_source_snapshot_id }),
+    reason_codes: reasonCodes,
+    ...(readiness.retry_after_ms === undefined ? {} : { retry_after_ms: readiness.retry_after_ms }),
+    ...(readiness.structural_queryable_generation === undefined ? {} : { queryable_generation: readiness.structural_queryable_generation }),
+    ...(readiness.structural_durable_generation === undefined ? {} : { durable_generation: readiness.structural_durable_generation }),
+  };
+}
+
+function semanticReadinessDetail(readiness: WorkspaceReadiness, reasonCodes: readonly string[]): Record<string, unknown> {
+  return {
+    availability: readiness.semantic_availability,
+    completeness: readiness.semantic_completeness,
+    build_state: readiness.semantic_build_state,
+    reason_codes: reasonCodes,
+    ...(readiness.semantic_completed_generation === undefined ? {} : { completed_generation: readiness.semantic_completed_generation }),
+  };
+}
+
+function lexicalReadinessDetail(readiness: WorkspaceReadiness): Record<string, unknown> {
+  return readiness.lexical_completed_generation === undefined ? {} : { lexical: { completed_generation: readiness.lexical_completed_generation } };
+}
+
+function readinessDetailReasonCodes(readiness: WorkspaceReadiness): { readonly structural: readonly string[]; readonly semantic: readonly string[] } {
+  const structural = readiness.structural_ready
+    ? []
+    : readiness.structural_freshness === "changes_pending"
+      ? ["core:source_snapshot_changed"]
+      : readiness.structural_completeness === "unsupported"
+        ? ["core:plugin_unavailable"]
+        : readiness.structural_completeness === "partial"
+          ? ["core:structural_stage_in_progress"]
+          : readiness.structural_build_state === "building"
+            ? ["core:analysis_in_progress"]
+            : ["core:structural_snapshot_unavailable"];
+  const semantic = readiness.semantic_ready
+    ? []
+    : readiness.semantic_completeness === "unsupported"
+      ? ["core:plugin_unavailable"]
+      : readiness.structural_ready
+        ? ["core:semantic_indexing_in_progress"]
+        : ["core:structural_required"];
+  return { structural, semantic };
 }
 
 /**
@@ -1373,24 +1497,7 @@ function v4StatusFields(
   const semanticCurrent = readiness.semantic_ready;
   return {
     storage_format: readiness.storage_format,
-    structural: {
-      ...(readiness.structural_queryable_generation === undefined ? {} : { queryable_generation: readiness.structural_queryable_generation }),
-      ...(structuralDurableGeneration === undefined ? {} : { durable_generation: structuralDurableGeneration }),
-      // v3 has no separate queryable-vs-durable phase (a v3 structural
-      // snapshot is only ever visible once fully durable, `readinessPayload`'s
-      // own `structuralDurable` comment above) -- `queryable` mirrors
-      // `structural_ready` there instead of a generation comparison.
-      queryable: isV4 ? readiness.structural_queryable_generation !== undefined : readiness.structural_ready,
-    },
-    lexical: {
-      ...(lexicalCompletedGeneration === undefined ? {} : { completed_generation: lexicalCompletedGeneration }),
-      current: lexicalCurrent,
-    },
-    semantic: {
-      ...(semanticCompletedGeneration === undefined ? {} : { completed_generation: semanticCompletedGeneration }),
-      current: semanticCurrent,
-      ...(semanticView?.embedding_profile_id === undefined ? {} : { profile_id: semanticView.embedding_profile_id }),
-    },
+    ...statusLaneFields(readiness, semanticView, isV4, structuralDurableGeneration, lexicalCompletedGeneration, lexicalCurrent, semanticCompletedGeneration, semanticCurrent),
     // P1-D-c (decision 28): the background residual tsgo pass, v4-only
     // (a v3 workspace never sets any `upgrade_*` field, see
     // `V4WorkspaceReadinessState`'s own doc comment) -- `running` is a
@@ -1403,20 +1510,7 @@ function v4StatusFields(
       ...(readiness.upgrade_pending_sites === undefined ? {} : { pending_sites: readiness.upgrade_pending_sites }),
       running: readiness.upgrade_running ?? false,
     },
-    ...(isV4 && lastScanSummary !== undefined ? {
-      last_scan: {
-        kind: lastScanSummary.kind,
-        ...(lastScanSummary.changed_paths === undefined ? {} : { changed_paths: lastScanSummary.changed_paths }),
-        timings: lastScanSummary.timings,
-        ...(scanTimeline === undefined ? {} : { timeline: relativeTimeline(scanTimeline) }),
-        // Frente E: set only for `kind === "reconcile"`.
-        ...(lastScanSummary.reconcile === undefined ? {} : { reconcile: lastScanSummary.reconcile }),
-        // P-1 (2026-09-08): set only when this reconcile followed a
-        // `core:index_pack_export` pack import -- see `V4LastScanSummary
-        // .import`'s own doc comment.
-        ...(lastScanSummary.import === undefined ? {} : { import: lastScanSummary.import }),
-      },
-    } : {}),
+    ...lastScanFields(isV4, lastScanSummary, scanTimeline),
     // Folds the lane arithmetic above into one answer per operation family:
     // `search_text` is source-frontier gated (always "available" once
     // `source_ready`) but its RESULTS stay partial until the lexical sidecar
@@ -1430,6 +1524,41 @@ function v4StatusFields(
     // site to confirmed for this workspace" (a v3 workspace, or a v4
     // workspace whose pass has not completed even once yet, is `false`).
     calls_upgraded: readiness.upgrade_completed_generation !== undefined,
+  };
+}
+
+function statusLaneFields(
+  readiness: WorkspaceReadiness,
+  semanticView: SemanticMaterializationStatusView | undefined,
+  isV4: boolean,
+  structuralDurableGeneration: number | undefined,
+  lexicalCompletedGeneration: number | undefined,
+  lexicalCurrent: boolean,
+  semanticCompletedGeneration: number | undefined,
+  semanticCurrent: boolean,
+): Readonly<Record<string, unknown>> {
+  return {
+    structural: {
+      ...(readiness.structural_queryable_generation === undefined ? {} : { queryable_generation: readiness.structural_queryable_generation }),
+      ...(structuralDurableGeneration === undefined ? {} : { durable_generation: structuralDurableGeneration }),
+      queryable: isV4 ? readiness.structural_queryable_generation !== undefined : readiness.structural_ready,
+    },
+    lexical: { ...(lexicalCompletedGeneration === undefined ? {} : { completed_generation: lexicalCompletedGeneration }), current: lexicalCurrent },
+    semantic: { ...(semanticCompletedGeneration === undefined ? {} : { completed_generation: semanticCompletedGeneration }), current: semanticCurrent, ...(semanticView?.embedding_profile_id === undefined ? {} : { profile_id: semanticView.embedding_profile_id }) },
+  };
+}
+
+function lastScanFields(isV4: boolean, summary: V4LastScanSummary | undefined, timeline: V4ScanTimeline | undefined): Readonly<Record<string, unknown>> {
+  if (!isV4 || summary === undefined) return {};
+  return {
+    last_scan: {
+      kind: summary.kind,
+      ...(summary.changed_paths === undefined ? {} : { changed_paths: summary.changed_paths }),
+      timings: summary.timings,
+      ...(timeline === undefined ? {} : { timeline: relativeTimeline(timeline) }),
+      ...(summary.reconcile === undefined ? {} : { reconcile: summary.reconcile }),
+      ...(summary.import === undefined ? {} : { import: summary.import }),
+    },
   };
 }
 
@@ -1576,19 +1705,30 @@ function mergeScanRequestIntoBuffer(buffer: ScanRequestBuffer, changedUris: read
 function workspaceAdministrativeView(registry: WorkspaceRegistry, workspace: RegisteredWorkspace, indexingActivity?: WorkspaceIndexingActivity): Readonly<Record<string, unknown>> {
   const vcs = normalizedVcsState(workspace.vcs_state);
   const codebase = workspace.codebase_id === undefined ? undefined : registry.getCodebase(workspace.codebase_id);
-  const branch = typeof vcs?.["branch"] === "string" ? vcs["branch"] : undefined;
-  const detached = vcs?.["detached"] === true;
-  const shortCommit = typeof vcs?.["short_commit"] === "string" ? vcs["short_commit"] : undefined;
-  const workspaceLabel = branch ?? (detached && shortCommit !== undefined ? `detached@${shortCommit}` : basename(workspace.canonical_root));
   return {
     ...workspace,
     project_name: codebase?.display_name ?? workspace.project_name ?? basename(workspace.canonical_root),
-    workspace_label: workspaceLabel,
+    workspace_label: workspaceLabelFor(workspace, vcs),
     workspace_kind: vcs === undefined ? "directory" : "worktree",
     directory_name: basename(workspace.canonical_root),
-    ...(workspace.status !== "indexing" || indexingActivity === undefined ? {} : { indexing_activity: indexingActivity }),
-    ...(vcs === undefined ? {} : { vcs_state: vcs }),
+    ...indexingActivityField(workspace, indexingActivity),
+    ...vcsField(vcs),
   };
+}
+
+function workspaceLabelFor(workspace: RegisteredWorkspace, vcs: Readonly<Record<string, unknown>> | undefined): string {
+  const branch = typeof vcs?.["branch"] === "string" ? vcs["branch"] : undefined;
+  const detached = vcs?.["detached"] === true;
+  const shortCommit = typeof vcs?.["short_commit"] === "string" ? vcs["short_commit"] : undefined;
+  return branch ?? (detached && shortCommit !== undefined ? `detached@${shortCommit}` : basename(workspace.canonical_root));
+}
+
+function indexingActivityField(workspace: RegisteredWorkspace, indexingActivity: WorkspaceIndexingActivity | undefined): Readonly<Record<string, unknown>> {
+  return workspace.status === "indexing" && indexingActivity !== undefined ? { indexing_activity: indexingActivity } : {};
+}
+
+function vcsField(vcs: Readonly<Record<string, unknown>> | undefined): Readonly<Record<string, unknown>> {
+  return vcs === undefined ? {} : { vcs_state: vcs };
 }
 
 function workspaceRootFromRequest(payload: unknown): string | undefined {
@@ -1799,20 +1939,33 @@ function enforceWarmRecordsBudget(cache: ReadonlyMap<string, CachedWorkspaceQuer
 // (`workspace-v4-bootstrap.ts`, P2-7) -- one shared definition, since
 // `ensureV4Workspace` and this module must agree on exactly the same path.
 
-async function acquireWorkspaceQueryEngine(workspaceId: string, registry: WorkspaceRegistry, storage: DurableStorage, cursorCache: CursorCache, cache: Map<string, CachedWorkspaceQueryEngine>, interner: RecordBodyInterner, lru: WarmRecordsLru, semanticProvider?: ResolvedSemanticProvider, allowSourceBinding = false): Promise<CachedWorkspaceQueryEngine> {
+async function resolveQueryWorkspaceId(workspaceId: string, registry: WorkspaceRegistry): Promise<string> {
   const registeredWorkspace = await findQueryWorkspace(workspaceId, registry);
-  const sourceWorkspace = allowSourceBinding ? registeredWorkspace : undefined;
-  const resolution = registeredWorkspace !== undefined && registeredWorkspace.status !== "removed"
-    ? { workspace_id: workspaceId }
-    : { error: { code: "core:workspace_not_found" as const, details: { workspace_id: workspaceId } } };
-  if ("error" in resolution) throw new DaemonError(resolution.error.code, `The requested query workspace ${workspaceId} is unavailable. Call urdira_index_status with the exact workspace_root and copy query_scope.workspace_id byte-for-byte; never synthesize or shorten a workspace id.`, resolution.error.details);
-  const cached = cache.get(resolution.workspace_id);
-  if (cached) { touchWarmLru(lru, resolution.workspace_id); return cached; }
+  if (registeredWorkspace !== undefined && registeredWorkspace.status !== "removed") return workspaceId;
+  throw new DaemonError("core:workspace_not_found", `The requested query workspace ${workspaceId} is unavailable. Call urdira_index_status with the exact workspace_root and copy query_scope.workspace_id byte-for-byte; never synthesize or shorten a workspace id.`, { workspace_id: workspaceId });
+}
+
+async function attachV4Sidecars(database: { readonly exec: (sql: string) => Promise<unknown> }, workspaceId: string, filename: string): Promise<void> {
+  for (const kind of ["lexical", "semantic"] as const) {
+    const sidecarPath = sidecarDatabasePathFor(filename, kind);
+    if (!existsSync(sidecarPath)) continue;
+    try {
+      await database.exec(`ATTACH DATABASE '${sidecarPath.replace(/'/g, "''")}' AS v4_${kind}`);
+    } catch (error) {
+      console.error(`[urdira] failed to attach v4 ${kind} sidecar for workspace ${workspaceId}:`, error);
+    }
+  }
+}
+
+async function acquireWorkspaceQueryEngine(workspaceId: string, registry: WorkspaceRegistry, storage: DurableStorage, cursorCache: CursorCache, cache: Map<string, CachedWorkspaceQueryEngine>, interner: RecordBodyInterner, lru: WarmRecordsLru, semanticProvider?: ResolvedSemanticProvider, allowSourceBinding = false): Promise<CachedWorkspaceQueryEngine> {
+  const resolvedWorkspaceId = await resolveQueryWorkspaceId(workspaceId, registry);
+  const cached = cache.get(resolvedWorkspaceId);
+  if (cached) { touchWarmLru(lru, resolvedWorkspaceId); return cached; }
   // Query engines never mutate workspace state. Keep their cached handles
   // explicitly read-only so the Rust composition worker remains the sole
   // structural/lexical writer and a query cannot accidentally open a
   // competing SQLite writer connection during publication.
-  const database = await storage.openWorkspaceReadOnly(resolution.workspace_id);
+  const database = await storage.openWorkspaceReadOnly(resolvedWorkspaceId);
   // `semanticProvider` (resolved once at `DaemonRuntime.start`, see
   // `DaemonRuntimeOptions.semantic_provider`'s doc comment) is threaded
   // through as the query port's `options.semantic` -- exactly the pair the
@@ -1836,7 +1989,7 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   // empty workspace.
   const structuralStoreDir = structuralStoreDirFor(database.database.filename);
   const structuralStoreKind = await readStructuralStore(database.database);
-  if (structuralStoreKind === "native") await restorePersistedV4Readiness(database.database, resolution.workspace_id);
+  if (structuralStoreKind === "native") await restorePersistedV4Readiness(database.database, resolvedWorkspaceId);
   // v4 (P2-7): `SqliteCanonicalQuerySnapshotPort`'s `search_literal`/
   // `semantic_index_state`/`semantic_vectors` methods run unqualified SQL
   // against `lexical_index_state`/`lexical_fts`/`lexical_documents`/
@@ -1853,21 +2006,7 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
   // ATTACHed table names are disjoint from the main schema's by
   // construction (P2-1), so leaving the unqualified references in that
   // shared port completely unchanged still resolves correctly.
-  if (structuralStoreKind === "native") {
-    for (const kind of ["lexical", "semantic"] as const) {
-      const sidecarPath = sidecarDatabasePathFor(database.database.filename, kind);
-      if (!existsSync(sidecarPath)) continue;
-      try {
-        await database.database.exec(`ATTACH DATABASE '${sidecarPath.replace(/'/g, "''")}' AS v4_${kind}`);
-      } catch (error) {
-        // Best-effort: a failed ATTACH (e.g. a transient file lock) must not
-        // break structural queries -- it only means `search_literal`/
-        // semantic reads see "no such table" until the NEXT cache miss
-        // (workspace eviction/restart) retries the attach.
-        console.error(`[urdira] failed to attach v4 ${kind} sidecar for workspace ${resolution.workspace_id}:`, error);
-      }
-    }
-  }
+  if (structuralStoreKind === "native") await attachV4Sidecars(database.database, resolvedWorkspaceId, database.database.filename);
   const sqliteSnapshotPort = new SqliteCanonicalQuerySnapshotPort(database.database, storage.cas, interner);
   const snapshotPort = structuralStoreKind === "native" && existsSync(structuralStoreDir)
     ? NativeCanonicalQuerySnapshotPort.open(database.database, structuralStoreDir, sqliteSnapshotPort, interner)
@@ -1902,8 +2041,8 @@ async function acquireWorkspaceQueryEngine(workspaceId: string, registry: Worksp
     snapshot_port: snapshotPort,
     ...(operationTelemetry === undefined ? {} : { operation_telemetry: operationTelemetry }),
   };
-  cache.set(resolution.workspace_id, entry);
-  touchWarmLru(lru, resolution.workspace_id);
+  cache.set(resolvedWorkspaceId, entry);
+  touchWarmLru(lru, resolvedWorkspaceId);
   return entry;
 }
 
@@ -2371,6 +2510,26 @@ function mapV4ChangedPaths(requestedUris: readonly string[] | undefined, authori
   return [...byPath.values()];
 }
 
+/**
+ * Selects the worker scope for one v4 scan. The precedence is deliberately
+ * explicit: an imported pack is reconciled, an uninitialized/forced workspace
+ * is scanned fully, and only a known set of requested paths uses `changed`.
+ * Keeping this policy pure makes the watcher/coalescing signals auditable
+ * without mixing them with transport or persistence effects.
+ */
+function selectV4ScanScope(input: {
+  readonly importedFromIndexPack: boolean;
+  readonly firstScan: boolean;
+  readonly forceFull: boolean;
+  readonly requestedUris: readonly string[] | undefined;
+  readonly authoritativeDeletes: readonly ScanWatcherHint[];
+}): ScanScope {
+  if (input.importedFromIndexPack) return { kind: "reconcile" };
+  if (input.firstScan || input.forceFull) return { kind: "full" };
+  if (input.requestedUris === undefined) return { kind: "reconcile" };
+  return { kind: "changed", paths: mapV4ChangedPaths(input.requestedUris, input.authoritativeDeletes) };
+}
+
 interface RunV4WorkspaceScanInput {
   readonly workspace: RegisteredWorkspace;
   readonly workspaceId: string;
@@ -2403,6 +2562,97 @@ interface RunV4WorkspaceScanInput {
    * `.abort()` on a map with no entry for this workspace.
    */
   readonly preemptMaintenanceForPublish?: (workspaceId: string) => void;
+}
+
+type V4ScanOutcome = Awaited<ReturnType<typeof runRustWorkspaceScan>>;
+
+/**
+ * Runs a v4 scan and performs the one supported recovery: a worker that has
+ * lost its in-memory prior generation retries once with `full`. Other errors
+ * are intentionally propagated so the caller's common rollback policy remains
+ * the single authority for failed scans.
+ */
+async function runV4ScanAttemptWithFallback(input: {
+  readonly transport: RustWorkspaceScanTransport;
+  readonly workspaceId: string;
+  readonly initialScope: ScanScope;
+  readonly buildRequest: (scope: ScanScope) => WorkspaceScanRequest;
+  readonly onQueryableLive: (event: { readonly generation: number }) => void;
+  readonly timeline: V4ScanTimeline;
+}): Promise<{ readonly outcome: V4ScanOutcome; readonly scope: ScanScope }> {
+  let scope = input.initialScope;
+  try {
+    input.timeline.request_sent_at = Date.now();
+    debugTiming(`workspace=${input.workspaceId} request_sent_at scope=${scope.kind}`);
+    return { outcome: await runRustWorkspaceScan(input.transport, input.buildRequest(scope), input.onQueryableLive), scope };
+  } catch (error) {
+    const canRetry = (scope.kind === "changed" || scope.kind === "reconcile")
+      && error instanceof Error
+      && error.message.includes("requires a prior generation; send scope: Full");
+    if (!canRetry) throw error;
+    if (!v4ChangedScopeUnsupportedWarned.has(input.workspaceId)) {
+      v4ChangedScopeUnsupportedWarned.add(input.workspaceId);
+      console.warn(`[urdira] v4 workspace scan: worker has no prior generation cached for workspace ${input.workspaceId} yet; falling back to Full once (this warning is logged once per workspace).`);
+    }
+    scope = { kind: "full" };
+    input.timeline.request_sent_at = Date.now();
+    debugTiming(`workspace=${input.workspaceId} request_sent_at scope=full (retry)`);
+    return { outcome: await runRustWorkspaceScan(input.transport, input.buildRequest(scope), input.onQueryableLive), scope };
+  }
+}
+
+function recordV4ScanSummary(workspaceId: string, scope: ScanScope, outcome: V4ScanOutcome, indexPackImportOutcome?: V4IndexPackImportOutcome | undefined): void {
+  v4LastScanSummaries.set(workspaceId, scope.kind === "changed"
+    ? { kind: "changed", changed_paths: scope.paths.length, timings: outcome.timings }
+    : scope.kind === "reconcile"
+      ? { kind: "reconcile", timings: outcome.timings, ...(outcome.reconcile === undefined ? {} : { reconcile: outcome.reconcile }), ...(indexPackImportOutcome === undefined ? {} : { import: indexPackImportOutcome }) }
+      : { kind: "full", timings: outcome.timings });
+}
+
+function isV4ResidualEnabled(): boolean {
+  return process.env["URDIRA_V4_RESIDUAL"] !== undefined && process.env["URDIRA_V4_RESIDUAL"] !== "0";
+}
+
+function publishV4Readiness(workspaceId: string, scope: ScanScope, outcome: V4ScanOutcome): boolean {
+  const priorReadiness = v4ReadinessState.get(workspaceId);
+  const residualEnabled = isV4ResidualEnabled();
+  const isReconcileNoop = scope.kind === "reconcile" && outcome.reconcile?.mode === "noop";
+  v4ReadinessState.set(workspaceId, {
+    queryable_generation: outcome.queryable?.generation ?? outcome.generation,
+    durable_generation: outcome.generation,
+    lexical_completed_generation: priorReadiness?.lexical_completed_generation,
+    semantic_completed_generation: priorReadiness?.semantic_completed_generation,
+    upgrade_completed_generation: priorReadiness?.upgrade_completed_generation,
+    upgrade_pending_sites: priorReadiness?.upgrade_pending_sites,
+    upgrade_running: residualEnabled ? true : priorReadiness?.upgrade_running,
+    semantic_maintenance_submitted: priorReadiness?.semantic_maintenance_submitted === true || !isReconcileNoop,
+  });
+  return priorReadiness?.semantic_maintenance_submitted !== true || !isReconcileNoop;
+}
+
+/** Finalizes a successful v4 scan and publishes its readiness/maintenance state. */
+function finalizeV4WorkspaceScan(input: {
+  readonly workspaceId: string;
+  readonly registry: WorkspaceRegistry;
+  readonly scope: ScanScope;
+  readonly outcome: V4ScanOutcome;
+  readonly indexPackImportOutcome?: V4IndexPackImportOutcome | undefined;
+  readonly timeline: V4ScanTimeline;
+  readonly submitLexicalMaintenance: (workspaceId: string) => void;
+  readonly submitSemanticMaintenance: (workspaceId: string) => void;
+}): void {
+  const { workspaceId, registry, scope, outcome, indexPackImportOutcome, timeline, submitLexicalMaintenance, submitSemanticMaintenance } = input;
+  timeline.completed_at = Date.now();
+  debugTiming(`workspace=${workspaceId} completed_at generation=${outcome.generation}`);
+  recordV4ScanSummary(workspaceId, scope, outcome, indexPackImportOutcome);
+  const shouldSubmitSemantic = publishV4Readiness(workspaceId, scope, outcome);
+  timeline.readiness_updated_at = Date.now();
+  debugTiming(`workspace=${workspaceId} readiness_updated_at (durable)`);
+  registry.markReady(workspaceId, outcome.snapshot_id, "ready");
+  v4ActiveScanTimelines.delete(workspaceId);
+  v4LastScanTimelines.set(workspaceId, timeline);
+  submitLexicalMaintenance(workspaceId);
+  if (shouldSubmitSemantic) submitSemanticMaintenance(workspaceId);
 }
 
 /**
@@ -2557,6 +2807,14 @@ async function importPendingV4IndexPack(paths: V4WorkspacePaths, packPath: strin
  * `last_scan_error`) -- duplicating that here would be a second, divergent
  * copy of the same policy.
  */
+async function importPendingV4IndexPackIfNeeded(paths: V4WorkspacePaths, workspaceId: string, firstScan: boolean, pendingIndexPackPaths?: Map<string, string>): Promise<{ readonly imported: boolean; readonly outcome?: V4IndexPackImportOutcome }> {
+  const pendingPackPath = firstScan ? pendingIndexPackPaths?.get(workspaceId) : undefined;
+  if (pendingPackPath === undefined) return { imported: false };
+  pendingIndexPackPaths?.delete(workspaceId);
+  const outcome = await importPendingV4IndexPack(paths, pendingPackPath, workspaceId);
+  return { imported: outcome.imported, outcome };
+}
+
 async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void> {
   const { workspace, workspaceId, durableStorage, requestedUris, authoritativeDeletes, activity, registry, resolveTransport, submitLexicalMaintenance, submitSemanticMaintenance, pendingIndexPackPaths, preemptMaintenanceForPublish } = input;
   // Visible to a readiness poll racing this scan's own first await, before
@@ -2596,14 +2854,9 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // derives and republishes the authoritative difference between the
   // donor's tree and this workspace's own -- a `full` scan here would
   // needlessly redo the donor's own work from scratch.
-  let importedFromIndexPack = false;
-  let indexPackImportOutcome: V4IndexPackImportOutcome | undefined;
-  const pendingPackPath = isFirstScan ? pendingIndexPackPaths?.get(workspaceId) : undefined;
-  if (pendingPackPath !== undefined) {
-    pendingIndexPackPaths?.delete(workspaceId);
-    indexPackImportOutcome = await importPendingV4IndexPack(paths, pendingPackPath, workspaceId);
-    importedFromIndexPack = indexPackImportOutcome.imported;
-  }
+  const indexPackImport = await importPendingV4IndexPackIfNeeded(paths, workspaceId, isFirstScan, pendingIndexPackPaths);
+  const importedFromIndexPack = indexPackImport.imported;
+  const indexPackImportOutcome = indexPackImport.outcome;
   // `requestedUris === undefined` is `mergeScanRequestIntoBuffer`'s own
   // "unsafe/lost-coverage" signal (an explicit reindex, or a coalesced
   // buffer that saw one) -- treated the same way v3's full scan already
@@ -2623,13 +2876,7 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
   // `core:reindex` and the outdated-workspace-format recovery sweep, both
   // populate it before scheduling this scan.
   const forceFull = forceFullScans.delete(workspaceId);
-  let scope: ScanScope = importedFromIndexPack
-    ? { kind: "reconcile" }
-    : isFirstScan || forceFull
-      ? { kind: "full" }
-      : requestedUris === undefined
-        ? { kind: "reconcile" }
-        : { kind: "changed", paths: mapV4ChangedPaths(requestedUris, authoritativeDeletes) };
+  let scope = selectV4ScanScope({ importedFromIndexPack, firstScan: isFirstScan, forceFull, requestedUris, authoritativeDeletes });
   // P3-1: the worker rejects `Changed{paths: []}` outright (`crates/urdira-
   // indexing-worker/src/v4/delta.rs`, "requires at least one path") -- found
   // live via `tests/v4-mutation-harness.test.ts`'s rename mutation, which
@@ -2707,44 +2954,11 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
     debugTiming(`workspace=${workspaceId} readiness_updated_at (queryable)`);
     notifyReadinessChanged(workspaceId);
   };
-  let outcome: Awaited<ReturnType<typeof runRustWorkspaceScan>>;
+  let outcome: V4ScanOutcome;
   try {
-    try {
-      timeline.request_sent_at = Date.now();
-      debugTiming(`workspace=${workspaceId} request_sent_at scope=${scope.kind}`);
-      outcome = await runRustWorkspaceScan(transport, buildRequest(scope), onQueryableLive);
-    } catch (error) {
-      // P3-1: `ScanScope::Changed` is a real, implemented path server-side
-      // now (`crates/urdira-indexing-worker/src/v4/delta.rs`) -- this is no
-      // longer a blanket "not supported yet" fallback. The ONE legitimate
-      // reason a `Changed` request can still fail this way is the worker
-      // having no prior generation for this workspace cached (a freshly
-      // restarted worker process that has never scanned this workspace, or
-      // this daemon process's own `isFirstScan`/`current_snapshot_id` state
-      // disagreeing with what the worker persisted) -- `delta::run` rejects
-      // that case explicitly with this exact message
-      // (`crates/urdira-indexing-worker/src/v4/delta.rs`), and a `Full` scan
-      // is the only correct recovery (there is nothing to diff against).
-      // Every OTHER `Changed`-scope failure (a real bug, a corrupt delta, an
-      // I/O error) is NOT caught here -- it propagates to the outer `catch`
-      // below (rollback + timeline bookkeeping), same as any other scan
-      // failure, rather than being silently masked by a full-rescan retry.
-      // Frente E: `run_reconcile` rejects the identical "no prior
-      // generation" case with the SAME message substring (`scan.rs`'s own
-      // doc comment on that error) -- covered here too, same retry-to-full
-      // recovery, since a workspace `reconcile` targets always needs SOME
-      // prior generation to diff against.
-      const isUninitializedState = (scope.kind === "changed" || scope.kind === "reconcile") && error instanceof Error && error.message.includes("requires a prior generation; send scope: Full");
-      if (!isUninitializedState) throw error;
-      if (!v4ChangedScopeUnsupportedWarned.has(workspaceId)) {
-        v4ChangedScopeUnsupportedWarned.add(workspaceId);
-        console.warn(`[urdira] v4 workspace scan: worker has no prior generation cached for workspace ${workspaceId} yet; falling back to Full once (this warning is logged once per workspace).`);
-      }
-      scope = { kind: "full" };
-      timeline.request_sent_at = Date.now();
-      debugTiming(`workspace=${workspaceId} request_sent_at scope=full (retry)`);
-      outcome = await runRustWorkspaceScan(transport, buildRequest(scope), onQueryableLive);
-    }
+    const attempt = await runV4ScanAttemptWithFallback({ transport, workspaceId, initialScope: scope, buildRequest, onQueryableLive, timeline });
+    outcome = attempt.outcome;
+    scope = attempt.scope;
   } catch (error) {
     // Reached by a genuine failure from EITHER attempt above (the initial
     // `Changed`/`Full` call, or the "no prior generation" retry) -- one
@@ -2755,87 +2969,7 @@ async function runV4WorkspaceScan(input: RunV4WorkspaceScanInput): Promise<void>
     v4LastScanTimelines.set(workspaceId, timeline);
     throw error;
   }
-  timeline.completed_at = Date.now();
-  debugTiming(`workspace=${workspaceId} completed_at generation=${outcome.generation}`);
-  // P4-d: `scope` here is whichever request actually succeeded -- either
-  // the original request, or the `Full` retry after a `Changed`/`Reconcile`
-  // rejection (both reassignments above keep `scope` pointing at the
-  // attempt that produced `outcome`).
-  v4LastScanSummaries.set(workspaceId, scope.kind === "changed"
-    ? { kind: "changed", changed_paths: scope.paths.length, timings: outcome.timings }
-    : scope.kind === "reconcile"
-      // `exactOptionalPropertyTypes`: omit `reconcile` entirely rather than
-      // assigning `undefined` -- `outcome.reconcile` is absent only if the
-      // worker predates Frente E, an older-binary edge case worth keeping
-      // distinguishable from "reconcile ran and reported nothing".
-      ? { kind: "reconcile", timings: outcome.timings, ...(outcome.reconcile === undefined ? {} : { reconcile: outcome.reconcile }), ...(indexPackImportOutcome === undefined ? {} : { import: indexPackImportOutcome }) }
-      : { kind: "full", timings: outcome.timings });
-  const priorReadiness = v4ReadinessState.get(workspaceId);
-  // P1-D-c: the residual pass is gated behind the SAME env var
-  // `indexing-core-process-transport.ts` forwards to the worker child
-  // process (`URDIRA_V4_RESIDUAL`) -- read here too so `upgrade_running`
-  // does not optimistically latch `true` forever when the pass is not even
-  // enabled (no `upgrade_completed` event would ever arrive to clear it).
-  // `upgrade_completed_generation`/`upgrade_pending_sites` are carried
-  // forward explicitly (this `.set` replaces the whole record, same
-  // convention `lexical_completed_generation`/`semantic_completed_generation`
-  // already follow above) -- a residual pass's own reported completion must
-  // survive the NEXT structural scan, not be wiped by it.
-  const residualEnabled = process.env["URDIRA_V4_RESIDUAL"] !== undefined && process.env["URDIRA_V4_RESIDUAL"] !== "0";
-  // Frente S-H (Part 1): a true `Reconcile`/`Noop` (R3, `crates/urdira-
-  // indexing-worker/src/v4/scan.rs`) means nothing changed -- no new
-  // generation published, nothing new for semantic/lexical maintenance to
-  // catch up on. Once maintenance has been submitted at least once for this
-  // workspace (`semantic_maintenance_submitted`, below), a further no-op
-  // scan skips resubmitting it entirely -- see the tail of this function for
-  // why this matters beyond a "cheap fast-path lookup": the THREADED path
-  // spawns a real child process per submission, and without this check the
-  // periodic reconciliation sweep's own coalesced-pending retry (`submit
-  // SemanticMaintenance`'s own `semanticMaintenancePending` mechanism)
-  // spawns one every time a no-op sweep tick's own scan happens to land
-  // while an earlier, real pass is still running.
-  const isReconcileNoop = scope.kind === "reconcile" && outcome.reconcile?.mode === "noop";
-  v4ReadinessState.set(workspaceId, {
-    queryable_generation: outcome.queryable?.generation ?? outcome.generation,
-    durable_generation: outcome.generation,
-    lexical_completed_generation: priorReadiness?.lexical_completed_generation,
-    semantic_completed_generation: priorReadiness?.semantic_completed_generation,
-    upgrade_completed_generation: priorReadiness?.upgrade_completed_generation,
-    upgrade_pending_sites: priorReadiness?.upgrade_pending_sites,
-    upgrade_running: residualEnabled ? true : priorReadiness?.upgrade_running,
-    semantic_maintenance_submitted: priorReadiness?.semantic_maintenance_submitted === true || !isReconcileNoop,
-  });
-  timeline.readiness_updated_at = Date.now();
-  debugTiming(`workspace=${workspaceId} readiness_updated_at (durable)`);
-  registry.markReady(workspaceId, outcome.snapshot_id, "ready");
-  v4ActiveScanTimelines.delete(workspaceId);
-  v4LastScanTimelines.set(workspaceId, timeline);
-  // v4 storage wiring (2026-09-07): semantic maintenance (`reconcileSemanticProjection`)
-  // used to be deliberately skipped here -- its entity-grain lane (decision
-  // 17, `@urdira/engine`'s `semantic-reconciler.ts`) read `record_occurrences`/
-  // `record_value_nodes` directly, structural v3 tables that do not exist at
-  // all in the v4 catalog schema (docs/evidence/2026-09-02-v4-p2-1-schema.md).
-  // `submitSemanticMaintenance` now resolves a native-store-backed
-  // `SemanticEntityRecordSource` for a v4 workspace (`resolveV4SemanticEntitySource`,
-  // `semantic-v4-wiring.ts`) and feeds it to the SAME reconciler.
-  // `reconcileSemanticProjection`'s own already-complete fast path means a
-  // scan that published nothing new (e.g. a `reconcile` no-op whose
-  // `completed_generation` already matches the current one) costs this call
-  // two cheap point lookups when it runs in-process -- but Frente S-H found
-  // live that submitting it UNCONDITIONALLY on every scan, combined with
-  // `submitSemanticMaintenance`'s own coalesced-pending retry, spawns a
-  // whole new child process on the THREADED path (the shipped default) for
-  // every no-op periodic-sweep tick that happens to land while an earlier
-  // real pass is still running -- see `isReconcileNoop`/
-  // `semantic_maintenance_submitted` above. Skipped here ONLY once
-  // maintenance has genuinely been submitted at least once already for this
-  // workspace; always still submitted lexical maintenance regardless (a
-  // separate, smaller-blast-radius lever left as a follow-up, not fixed by
-  // this frente -- lexical's own coalesced retry is not spawning a
-  // subprocess for the SAME test-observed failure mode this frente was
-  // asked to fix).
-  submitLexicalMaintenance(workspaceId);
-  if (!isReconcileNoop || priorReadiness?.semantic_maintenance_submitted !== true) submitSemanticMaintenance(workspaceId);
+  finalizeV4WorkspaceScan({ workspaceId, registry, scope, outcome, indexPackImportOutcome, timeline, submitLexicalMaintenance, submitSemanticMaintenance });
 }
 
 function hasPotentialWorkspaceForkDonor(workspace: RegisteredWorkspace, registry: WorkspaceRegistry): boolean {
@@ -5372,10 +5506,4 @@ export class DaemonRuntime {
     if (cached === undefined) return undefined;
     return cached.snapshot_port.has_warm_records({ scope_type: "single_workspace", workspace_id: workspaceId });
   }
-}
-
-export class DaemonClient {
-  private readonly client: LocalIpcClient;
-  constructor(endpoint: string, options: Omit<LocalIpcClientOptions, "endpoint"> = {}) { this.client = new LocalIpcClient({ ...options, endpoint }); }
-  async call(call: string, payload: unknown, options: LocalIpcRequestOptions = {}): Promise<IpcResponse> { return this.client.request(call, payload, options); }
 }
