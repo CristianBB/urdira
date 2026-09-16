@@ -41,6 +41,13 @@ languages require a compatible plugin. Without a structural plugin, source
 catalog, text retrieval, snapshot, freshness, and index-status capabilities
 remain available; unsupported operations fail explicitly.
 
+To build a new language engine, follow the [language plugin development
+guide](docs/plugin-development.md). It covers the SDK worker contract, closed
+registry contribution, provenance and incremental-analysis requirements,
+package integrity, activation, and the required test gates. The guide uses the
+JavaScript/TypeScript plugin as a reference while keeping the core language
+neutral.
+
 ### Context an agent can use directly
 
 `urdira_context` combines explicitly requested structural neighborhoods with

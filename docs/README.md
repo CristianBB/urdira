@@ -49,6 +49,10 @@ Contributors and coding agents must also read [AGENTS.md](../AGENTS.md),
 [CONTRIBUTING.md](../CONTRIBUTING.md), and
 [architecture/manifest.json](../architecture/manifest.json).
 
+Language-engine contributors should also read the [language plugin development
+guide](plugin-development.md), which explains how to add a new analyzer without
+leaking language-specific behavior into the core.
+
 ## Authority
 
 The authority order is:

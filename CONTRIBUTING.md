@@ -17,6 +17,10 @@ Read:
 - [`architecture/manifest.json`](architecture/manifest.json) for package
   ownership and allowed dependencies.
 
+When adding a language analyzer, also follow the [language plugin development
+guide](docs/plugin-development.md) and keep language-specific behavior inside
+the plugin boundary.
+
 If the requested behavior is not defined, do not invent a local interpretation
 in code. Add or update the appropriate architectural decision first, then
 derive the implementation design and tests from it.
