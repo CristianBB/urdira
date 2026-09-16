@@ -178,7 +178,11 @@ describeIfBuilt("v4 mutation harness end-to-end (real urdira-indexing-worker + n
           // below for why order matters here.
           mutation_kinds: ["create", "delete", "edit", "hub_edit"],
           repeat: 1,
-          readiness_timeout_ms: 20_000,
+          // macOS CI runners can spend several seconds starting the daemon
+          // and watcher before the first rename generation is observable.
+          // Keep the assertion bounded while allowing that documented setup
+          // variance.
+          readiness_timeout_ms: 60_000,
           poll_interval_ms: 200,
           hub_min_importers: 50,
         });

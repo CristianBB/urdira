@@ -47,8 +47,8 @@ describe("Phase 13 Urdira MCP adapter", () => {
     await server.connect(serverTransport);
     try {
       await client.connect(clientTransport);
-      expect(MCP_SERVER_VERSION).toBe("0.3.3");
-      expect(client.getServerVersion()).toEqual({ name: "urdira", version: "0.3.3" });
+      expect(MCP_SERVER_VERSION).toBe("0.4.0");
+      expect(client.getServerVersion()).toEqual({ name: "urdira", version: "0.4.0" });
       expect(client.getServerCapabilities()).toEqual({ tools: { listChanged: false } });
     } finally {
       await client.close();

@@ -241,8 +241,11 @@ describe("definitive direct campaign orchestrator", () => {
     const codex = join(root, "codex");
     writeFileSync(codex, "#!/bin/sh\nprintf '{not-json}\\n'\necho 'synthetic Codex stderr' >&2\nexit 0\n");
     chmodSync(codex, 0o755);
+    const codexHome = join(root, "codex-home");
+    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    writeFileSync(join(codexHome, "auth.json"), "synthetic-auth", { mode: 0o600 });
     const output = join(root, "output");
-    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", codex, "--commit", commit, "--worktree", repository, "--output-dir", output], { encoding: "utf8" });
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", codex, "--commit", commit, "--worktree", repository, "--output-dir", output], { encoding: "utf8", env: { ...process.env, CODEX_HOME: codexHome } });
     expect(result.status).toBe(1);
     const runId = "playwright-affected-tests-deterministic-baseline-1";
     const manifest = JSON.parse(readFileSync(join(output, `${runId}.json`), "utf8"));
@@ -270,9 +273,12 @@ describe("definitive direct campaign orchestrator", () => {
     const codex = join(root, "codex");
     writeFileSync(codex, "#!/bin/sh\nprintf '{\"type\":\"thread.started\",\"thread_id\":\"synthetic\"}\\n'\nexit 0\n");
     chmodSync(codex, 0o755);
+    const codexHome = join(root, "codex-home");
+    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    writeFileSync(join(codexHome, "auth.json"), "synthetic-auth", { mode: 0o600 });
     const output = join(root, "output");
     mkdirSync(join(output, "playwright-affected-tests-deterministic-baseline-1.turn-1.stdout.log"), { recursive: true });
-    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", codex, "--commit", commit, "--worktree", repository, "--output-dir", output], { encoding: "utf8" });
+    const result = spawnSync(process.execPath, [resolve("release/benchmarks/expanded-agent-benchmark-runner.mjs"), "--definitive", "--repository-id", "playwright", "--task-id", "affected-tests-deterministic", "--arm", "baseline", "--sample", "1", "--model", "gpt-5.6-luna", "--node", process.execPath, "--codex", codex, "--commit", commit, "--worktree", repository, "--output-dir", output], { encoding: "utf8", env: { ...process.env, CODEX_HOME: codexHome } });
     expect(result.status).toBe(1);
     const runId = "playwright-affected-tests-deterministic-baseline-1";
     const manifest = JSON.parse(readFileSync(join(output, `${runId}.json`), "utf8"));

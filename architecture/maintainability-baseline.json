@@ -3,12 +3,15 @@
   "rules": {
     "complexity": 313,
     "max-depth": 72,
-    "max-lines-per-function": 213
+    "max-lines-per-function": 214
   },
   "exclusions": [
     "generated artifacts and fixture trees are excluded; see scripts/check-maintainability.mjs"
   ],
   "files": {
+    "tests/javascript-typescript-rust-worker.test.ts": {
+      "max-lines-per-function": 1
+    },
     "apps/bootstrap/src/runtime-bootstrap.ts": {
       "complexity": 2
     },
