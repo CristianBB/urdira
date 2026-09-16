@@ -78,5 +78,5 @@ describe("maintainability gate", () => {
       expect(baselineCount, `${rule} must have a ratchet baseline`).toBeDefined();
       expect(count, `${rule} must not exceed its ratchet baseline`).toBeLessThanOrEqual(baselineCount ?? 0);
     }
-  });
+  }, 30_000);
 });

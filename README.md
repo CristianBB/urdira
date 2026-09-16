@@ -1149,7 +1149,10 @@ URDIRA_RELEASE_TARGET=<host-target> URDIRA_SKIP_INSTALL=1 pnpm release:acceptanc
 (the compiled addon plus the release `urdira-indexing-worker` build),
 `check:native` (`cargo fmt`/`clippy`), `test:native` (the Rust workspace test
 suite, including the `urdira-tsgo-client`/`urdira-indexing-worker` residual
-suites, which need `URDIRA_TSGO_BINARY`), `lint`, `test:coverage`, `typecheck`,
+suites). The native test runner resolves the platform-specific TypeScript
+compiler package and sets `URDIRA_TSGO_BINARY` itself, so the same command works
+on supported macOS, Linux, and Windows runners. Then it runs `lint`,
+`test:coverage`, `typecheck`,
 `check:coverage-gate`, and `check:publication` (documentation links,
 local-path leaks, and public-repository hygiene). Release steps and external
 prerequisites are documented in [docs/release.md](docs/release.md) and
