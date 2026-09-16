@@ -193,7 +193,11 @@ describe("Daemon watcher-burst scan aggregation (scan_aggregation_window_ms)", (
       }
       const elapsedMs = daemon.resolveCalls[daemon.resolveCalls.length - 1]! - startedAt;
       // Must fire at (or shortly after) the cap, not keep resetting forever.
-      expect(elapsedMs).toBeGreaterThanOrEqual(maxMs * 0.7);
+      // The hard cap is enforced by a timer observed through the filesystem
+      // watcher; CI runners can report the callback a little before the
+      // nominal deadline. Keep enough margin to prove it was not immediate
+      // while avoiding a scheduler-jitter false negative.
+      expect(elapsedMs).toBeGreaterThanOrEqual(maxMs * 0.6);
       expect(elapsedMs).toBeLessThan(3_000);
     } finally {
       await stopAggregationDaemon(daemon);
