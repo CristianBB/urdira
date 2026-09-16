@@ -4,33 +4,34 @@
 
 Status: **45 agent cells observed; 18 readiness attempts persisted with zero
 successful probes** (2026-09-16). The three campaign audits contain
-one sample for each of the 45 repository/task/arm identities. The additive
-offline consolidation records 43 task-solved rows (target coverage 2/2 with
-final changes present), 42 strict grader passes, two strict grader nonpasses,
-and one infrastructure row with unavailable outcome evidence. The C3 VS
-Code/Urdira row is task-solved and covered 2/2, but its strict grader reported
-a tool-validation incident. The remaining unsolved row is the C1 VS
-Code/codebase-memory execution-capacity failure at 0/2. The complete row index is embedded below and backed
-by the external v8 consolidation Markdown at
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.md`
+one sample for each of the 45 repository/task/arm identities. The append-only
+canonical correction records 44 task-solved rows (target coverage 2/2 with
+final changes present), 43 strict grader passes, and two strict grader
+nonpasses. The prior C1 Prisma/Urdira pre-agent attempt is retained only as a
+harness operational incident and excluded from the canonical result; the valid
+canonical row has measured outcome fields. The C3 VS Code/Urdira row is
+task-solved and covered 2/2, but its strict grader reported a tool-validation
+incident. The remaining unsolved row is the C1 VS Code/codebase-memory
+execution-capacity failure at 0/2. The
+complete canonical row index is embedded below and backed by the v6 correction
+at `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.md`
 and JSON at
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.json`
-(Markdown SHA-256 `030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`;
-JSON SHA-256 `622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`),
-which retain all measured fields.
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`
+(Markdown SHA-256 `5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`;
+JSON SHA-256 `ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`).
+The earlier v3/v4 snapshots remain preserved as source history.
 
 | Result set | Planned | Observed/started | Completed | Failed or blocked | Pending | Status |
 |---|---:|---:|---:|---:|---:|---|
-| Agent cells | 45 | 45 | 43 task-solved; 42 grader passes | 1 task unsolved + 1 infrastructure outcome unavailable; 2 strict grader nonpasses | 0 | complete as observed, with separated outcome axes |
+| Agent cells | 45 | 45 | 44 task-solved; 43 grader passes | 1 task unsolved; 2 strict grader nonpasses | 0 | complete as observed, with separated outcome axes |
 | Readiness probes | 18 | 18 persisted attempts | 0 | 18 failed, blocked, or interrupted | 0 | complete with failures; not readiness-qualified |
 
 The campaign separates task outcome, target coverage, execution, and strict
-grader outcome. Forty-three rows are task-solved from complete target coverage
+grader outcome. Forty-four rows are task-solved from complete target coverage
 and retained final changes. The C3 VS Code/Urdira row is task-solved despite a
 strict grader nonpass caused by the recorded tool-validation incident at
 `/request/query`; this is not classified as a task-correctness failure. The C1
-VS Code/codebase-memory row is an execution-capacity failure, and the C1
-Prisma/Urdira row has unavailable task outcome evidence. Agent, runner, and
+VS Code/codebase-memory row is an execution-capacity failure. Agent, runner, and
 grader exit codes are retained separately. A configured Urdira arm is also
 separate from observed tool use. Missing measurements are `null`, never zero.
 The cost card is input/cached input `$2/M` and output/reasoning `$8/M`; input,
@@ -101,45 +102,40 @@ The raw transcript records `core:unknown_field` for `/request/query` on line
 set and final changes are present; the strict grader is false because the
 request used an unregistered field. This is a tool-validation incident, not a
 task-correctness failure. No rm-f or test-blocked cause is attributed.
-The external v8 consolidation JSON SHA is
-`622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`; its
-Markdown SHA is
+The external v8 source consolidation remains preserved at JSON SHA
+`622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93` and
+Markdown SHA
 `030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`. The
+canonical v6 correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`
+(SHA-256 `ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`),
+with Markdown SHA-256
+`5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`. It
+replaces the invalid pre-agent harness attempt at C1 Prisma/Urdira while
+preserving the failed attempt only in incident history. The prior
 append-only reporting-axis correction is
 `/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
 (SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`);
 it leaves the v3 raw-derived consolidation unchanged and defines
 `task_solved`, `grader_pass`, and `tool_validation_incident` separately.
 
-### Supplemental C1 Prisma/Urdira recovery
+### C1 Prisma/Urdira canonical result
 
-The original C1 Prisma/Urdira row remains infrastructure-null in the strict
-45-row table. An authorized same-identity supplemental recovery completed on
-attempt 2; two pre-model recovery failures remain retained, followed by the
-successful authorized recovery, and no retry was counted after the successful
-model run. The supplemental row is a
-separate recovery measurement and substitutes for the original null only in
-the descriptive matrix in the append-only addendum below.
+The prior C1 Prisma/Urdira pre-agent harness attempt is retained as an
+operational harness incident and excluded from the result. The valid C1 result
+below replaces that invalid attempt at the same frozen identity and is part of
+the canonical 45-row matrix.
 
 | identity | model | turns | task solved | target coverage | agent/runner/grader exit | setup ms | elapsed ms | input | cached input | output | reasoning | total | cost USD | hooks total/served/fallback | shell | MCP | tgrep |
 |---|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|
 | C1 / Prisma / wire-name-validation / urdira-typescript | gpt-5.6-luna | 3 | true | 2/2 | 0/0/0 | 16430 | 206157 | 717705 | 655360 | 7340 | 2703 | 727748 | 1.515754 | 23/8/15 | 3 | 0 | 0 |
 
-The supplemental row observed 23 Urdira hook invocations (8 served, 15
-fallback), 3 shell calls, MCP 0, and tgrep 0. Its retained output metrics and
-provenance are in the addendum
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
-(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`),
-with JSON SHA-256
-`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`. The
-original strict Urdira cost summary remains unchanged at n=8, sum `$15.258346`,
-mean `$1.907293`, median `$1.648912`, range `$1.393008-$3.348610`; its strict-
-qualified subset is n=7, sum `$11.909736`, mean `$1.701391`, median `$1.638196`,
-range `$1.393008-$2.276602`. The supplemental-filled descriptive Urdira
-matrix is n=9, sum `$16.774100`, mean `$1.863789`, median `$1.638196`, range
-`$1.393008-$3.348610`. Strict-qualified substitution is n=8, sum `$13.425490`,
-mean `$1.678186`, median `$1.576975`, excluding the C3 VS Code/Urdira
-tool-validation incident. The C1 Prisma pair is Urdira `$1.515754` versus baseline `$2.946698`
+The canonical result observed 23 Urdira hook invocations (8 served, 15
+fallback), 3 shell calls, MCP 0, and tgrep 0. Canonical Urdira cost is n=9,
+sum `$16.774100`, mean `$1.863789`, median `$1.638196`, range
+`$1.393008-$3.348610`; strict-clean Urdira is n=8, sum `$13.425490`, mean
+`$1.678186`, median `$1.576975`, range `$1.393008-$2.276602`, excluding the
+C3 VS Code/Urdira tool-validation incident. The C1 Prisma pair is Urdira `$1.515754` versus baseline `$2.946698`
 (-48.560932%), tgrep `$4.415286` (-65.670310%), codegraph `$3.344146`
 (-54.674407%), and codebase-memory `$2.506416` (-39.525043%).
 
@@ -162,7 +158,7 @@ references identify the retained external repair evidence.
 |1|3|playwright|affected-tests-deterministic|codegraph|true|3|11652|229631|null|1129906|1021696|8993|2931|2.355204|0/0/null|24|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/campaign-1-codegraph-orphan-cleanup-v1.json (0d81e04761b19c805713b50f512e01311f9a85ddebe4f317b3e1f828790f82bf)|null|
 |1|4|playwright|affected-tests-deterministic|codebase-memory|true|3|68347|211819|null|938147|851456|8067|2922|1.964206|0/0/null|15|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
 |1|5|prisma|wire-name-validation|baseline|true|3|4756|261287|null|1416425|1329408|10114|4117|2.946698|0/0/null|8|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
-|1|6|prisma|wire-name-validation|urdira-typescript|null|null|null|null|null|null|null|null|null|null|null/null/null|null|null|null|1|null|null/null|null|null|null|passed|passed|null|null|
+|1|6|prisma|wire-name-validation|urdira-typescript|true|3|16430|206157|null|717705|655360|7340|2703|1.515754|23/8/15|3|0|0|0|0|0|2/2|true|true|false|null|
 |1|7|prisma|wire-name-validation|tgrep|true|3|5601|315205|null|2148247|2025472|10564|4285|4.415286|0/0/null|14|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
 |1|8|prisma|wire-name-validation|codegraph|true|3|15802|262732|null|1612897|1520640|10799|3995|3.344146|0/0/null|16|0|0|0|0|2/2|true|true|false|blocked|passed_after_separate_repair|/Users/Cristian/BenchmarkResults/urdira-definitive-campaign-20260915/series-v8/resume-coordinator/campaign-1-codegraph-orphan-cleanup-v2.json (312bb5eb69d29422a3b2c50ebc6b3c9dbee90e3de050c37d377e569757efb47c)|null|
 |1|9|prisma|wire-name-validation|codebase-memory|true|3|267757|239536|null|1191420|1119488|10805|4642|2.506416|0/0/null|10|0|0|0|0|2/2|true|true|false|passed|passed|null|null|
@@ -224,7 +220,7 @@ configured arm remains separate from observed tool use, and P95 remains
 |1|3|playwright|affected-tests-deterministic|codegraph|3/3|36|24|24/0/0|0/0/null|117774|117774|null|null|null|null|117774|0|0|0|899|0|24/24/0|null/null/24|0/0/0/0|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
 |1|4|playwright|affected-tests-deterministic|codebase-memory|3/3|20|15|15/0/0|0/0/null|81338|81338|null|null|null|null|81338|0|0|0|1155|0|15/15/0|null/null/15|0/0/0/0|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
 |1|5|prisma|wire-name-validation|baseline|3/3|17|8|8/0/0|0/0/null|182799|182799|null|null|null|null|182799|0|0|0|0|0|8/8/0|null/null/8|2/0/2/0|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
-|1|6|prisma|wire-name-validation|urdira-typescript|null/null|null|null|null/null/null|null/null/null|null|null|null|null|null|null|null|null|null|null|null|null|null/null/null|null/null/null|null/null/null/null|null|null|false|0|null|null|null/null|null|infrastructure_failure|null|no transcript/manifest; runner exited 1 before model|null|
+|1|6|prisma|wire-name-validation|urdira-typescript|3/3|20|11|3/0/0|23/8/15|51179|11879|34187|null|null|42|0|7/7/0|null/null/7|2/0/0/2|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|true|
 |1|7|prisma|wire-name-validation|tgrep|3/3|24|14|14/0/0|0/0/null|260607|260607|null|null|null|null|260607|0|0|0|0|0|14/14/0|null/null/14|2/0/1/1|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
 |1|8|prisma|wire-name-validation|codegraph|3/3|30|16|16/0/0|0/0/null|205433|205433|null|null|null|null|205433|0|0|0|0|0|16/16/0|null/null/16|2/0/2/0|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
 |1|9|prisma|wire-name-validation|codebase-memory|3/3|21|10|10/0/0|0/0/null|128404|128404|null|null|null|null|128404|0|0|0|0|0|10/10/0|null/null/10|2/0/1/1|null|null|false|0|matched|cumulative|3/3|null|correctness_pass|null|null|null|
@@ -266,20 +262,21 @@ configured arm remains separate from observed tool use, and P95 remains
 
 ### Measurement panels
 
-**Task outcome, grader, and coverage.** There are 43 `task_solved=true` rows
+**Task outcome, grader, and coverage.** There are 44 `task_solved=true` rows
 (target coverage 2/2 with final changes present), 42 `grader_pass=true` rows,
-two `grader_pass=false` rows, and one `grader_pass=null` infrastructure row.
+two `grader_pass=false` rows, and no `grader_pass=null` canonical row.
 The C3 VS Code/Urdira row is task-solved and covered 2/2, but has
 `grader_pass=false` and `tool_validation_incident=true` for
 `core:unknown_field` at `/request/query`. The C1 VS Code/codebase-memory row is
 `task_solved=false` at 0/2 after execution-capacity failure. The C1
-Prisma/Urdira row is `task_solved=null` and `grader_pass=null`. These axes are
-reported separately.
+Prisma/Urdira row is the canonical replacement with `task_solved=true` and
+`grader_pass=true`; its excluded harness incident is retained in v6 incident
+history. These axes are reported separately.
 
 **Tokens, cost, and timing.** Matched host evidence provides token fields for
-43 rows: input sum 53,231,751, cached input sum 49,232,384, output sum
-424,939, reasoning sum 168,406, and additive total sum 53,425,096. The
-corresponding frozen-card cost sum is $110.410262; this is a descriptive sum
+all 45 rows: input sum 53,549,456, cached input sum 49,887,744, output sum
+432,279, reasoning sum 171,109, and additive total sum 54,152,844. The
+corresponding frozen-card cost sum is $111.926016; this is a descriptive sum
 across task-solved observed and other observed rows, not a ranking. The C3
 VS Code/Urdira cost is included in observed descriptive aggregates despite its
 strict grader nonpass; strict-grader-qualified comparisons exclude that row.
@@ -299,9 +296,11 @@ overlap is null for all rows because the required source payload was
 unavailable; it is not interpreted as no overlap. Configured arm and observed
 tool use remain separate.
 
-**Failures and cleanup.** The C1 Prisma/Urdira row is an infrastructure
-failure with task outcome and grader unavailable. The C1 VS Code/codebase-memory
-row is an execution-capacity failure at 0/2. The C3 VS Code/Urdira row is
+**Failures and cleanup.** The prior C1 Prisma/Urdira pre-agent attempt was a
+harness operational incident and is excluded from the canonical result. The
+canonical C1 Prisma/Urdira row is task-solved with grader pass and its measured
+fields are included in the 45-row matrix. The C1 VS Code/codebase-memory row is
+an execution-capacity failure at 0/2. The C3 VS Code/Urdira row is
 task-solved at 2/2, with agent exit 0 and a strict grader exit 1 caused by the
 recorded tool-validation incident `core:unknown_field` at `/request/query`.
 Nine raw cleanup records were blocked by owned processes; each has separate

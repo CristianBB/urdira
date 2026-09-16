@@ -4,7 +4,7 @@
 
 This evidence records offline rendering completed on 2026-09-16 after the
 three agent campaigns and the 18 readiness attempts were retained. It does not
-launch models, probes, or tests. The agent matrix remains 45 rows: 43 task-solved rows, 42 strict grader passes, two strict grader nonpasses, and one unavailable infrastructure outcome. The C3 Urdira VS Code row is task-solved with a tool-validation incident; its strict grader is a nonpass. The readiness matrix has 18 persisted failed, blocked, or interrupted
+launch models, probes, or tests. The agent matrix remains 45 rows: 44 task-solved rows, 43 strict grader passes, two strict grader nonpasses, and no unavailable canonical outcome. The C3 Urdira VS Code row is task-solved with a tool-validation incident; its strict grader is a nonpass. The readiness matrix has 18 persisted failed, blocked, or interrupted
 rows, zero successful probes, and no readiness qualification.
 The readiness measurement objective was not achieved. This note records
 offline rendering and retained attempt evidence only; the post-campaign PATH
@@ -27,22 +27,23 @@ The complete readiness table is retained externally at
 (SHA-256 `d1ceded62ba66614b2775042bc633f0855a0c594bbd526d835559c43f763dd0c`)
 and is embedded in the dated results report.
 
-## Supplemental recovery measurement
+## C1 Prisma/Urdira canonical replacement
 
-The original C1 Prisma/Urdira infrastructure-null row remains unchanged in the
-45-row strict matrix. A separate same-identity recovery completed on attempt 2
-after two retained pre-model recovery failures, followed by the successful
-authorized recovery; no retry was counted after the successful model run. The
-row measured 3 turns, target coverage 2/2,
+The prior C1 Prisma/Urdira pre-agent harness attempt is retained only as an
+operational incident and excluded from the result. The valid C1 result replaces
+that invalid attempt at the same frozen identity in the canonical 45-row
+matrix; no retry was counted after the successful model run. The row measured
+3 turns, target coverage 2/2,
 agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed `206,157 ms`,
 input `717,705`, cached input `655,360`, output `7,340`, reasoning `2,703`,
 total `727,748`, cost `$1.515754`, hooks `23/8/15`, shell/MCP/tgrep `3/0/0`.
-This is a separate descriptive recovery measurement, not a replacement for the
-original row. The addendum Markdown is
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
-(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`);
+The canonical matrix has 44 task-solved rows and 43 strict grader passes; the
+excluded harness incident is retained in v6 incident history. The append-only
+canonical correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.md`
+(SHA-256 `5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`);
 JSON SHA-256 is
-`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+`ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`.
 
 ## Per-campaign frozen renderer outputs
 
@@ -57,6 +58,19 @@ unchanged.
 | 1 | `5b080878a19e5e3e600d37f2bd235dd85d24a55efdde557f18bb9842718d7e57` | 15 | 6 | 13 | `530317c4301796e01db13799f4f99e9d9c155b35dcd2ca33151a6341f2c5785e` | `a3affabc3f73f2029f3b58eacdab864de03da61bc620fd83254990d583b5ed6d` | false, 0/6 passed |
 | 2 | `21223cb21db4f490ad6f3c50069eb5a38c5be728920bbd4161bf765aec17794a` | 15 | 6 | 15 | `ac24dcb4ef1f942556756de2cf41e241b6613648a16f381d0fdae156192aabed` | `184594cc6af2f7b177b0c0de1451acf58c2106d3096775d0a83ba008951fa93e` | false, 0/6 passed |
 | 3 | `6ae626e94d0eb77b848af4049f8fb4e1cca703e54d53bf2b5ac32f119518a96e` | 15 | 6 | 14 | `708ecc119787a7fca6ce8e306ebbb8b7c882324f4fd69036925eee5ba6f973e2` | `e1a0f137908789c8a3f60b8245cd53e9d27f84bbe57fc4e89575b810ed58ab6f` | false, 0/6 passed |
+
+The campaign-1 renderer was also rerun against the append-only corrected audit
+that substitutes the valid C1 Prisma/Urdira result. It accepted 15 agent rows
+and wrote a new diagnostic pair: corrected audit SHA-256
+`e7cbf6d7af98d3c4a5b08170e289d6e38cb6445767039ea60f63b812035f6c47`, renderer
+JSON SHA-256
+`1026e92ee8ee834a6371728da42c1d0a3409b03920200e7b3f9bdf32d51be751`, and
+renderer Markdown SHA-256
+`9003b05570f492cbd5eeadfddd3f604dce97f7faa5b7f335b6c19850f011e80d`.
+The corrected audit and outputs are retained under
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/canonical-correction-v6/`.
+This renderer-local diagnostic is layout/provenance evidence; the v6 canonical
+correction remains authoritative for the 45-row axes and measured fields.
 
 Renderer outputs are per-campaign artifacts. The aggregate invocation was
 intentionally not bypassed: the frozen selected-45 guard rejects a 45-row,

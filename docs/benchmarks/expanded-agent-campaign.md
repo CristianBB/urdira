@@ -3,43 +3,40 @@
 ## Current v8 execution snapshot
 
 The v8 agent phase is complete as an observed three-campaign matrix: 45
-repository/task/arm rows, one sample per row. Forty-three rows are task-solved
-(target coverage 2/2 with final changes present), 42 have a strict grader pass,
-two have strict grader nonpasses, and one infrastructure row has unavailable
-outcome evidence. The C3 Urdira VS Code row is task-solved but has a
+repository/task/arm rows, one sample per row. Forty-four rows are task-solved
+(target coverage 2/2 with final changes present), 43 have a strict grader pass,
+two have strict grader nonpasses, and no canonical row has unavailable outcome
+evidence. The C3 Urdira VS Code row is task-solved but has a
 tool-validation incident; its strict grader remains a nonpass. Target coverage
-is 2/2 for 43 rows. The complete
+is 2/2 for 44 rows. The complete
 per-row index is embedded in the versioned [definitive results table](definitive-agent-benchmark-results-2026-09-15.md#complete-45-cell-measured-table),
-backed by its external JSON source at
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.json`
-(SHA-256 `622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`),
+backed by its append-only v6 canonical JSON at
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`
+(SHA-256 `ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`),
 which retains all measured fields including timings, token fields, costs, hook
 totals, served/fallback counts, shell/MCP usage, exits, cleanup, and P95.
-The external JSON SHA-256 is
-`622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93`; the
-Markdown SHA-256 is
-`030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`.
+The v6 Markdown SHA-256 is
+`5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`.
 
-The append-only reporting-axis correction is
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
-(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`);
-it defines `task_solved`, `grader_pass`, and `tool_validation_incident`
-separately while leaving the v3 raw-derived consolidation unchanged.
+The append-only canonical correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`
+(SHA-256 `ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`);
+the correction defines `task_solved`, `grader_pass`, and
+`tool_validation_incident` separately while preserving v3 and v4 snapshots.
 
-An authorized supplemental recovery completed the original C1 Prisma/Urdira
-identity on attempt 2 after two retained pre-model recovery failures, followed by
-the successful authorized recovery. It is a
-separate measurement and does not replace the original infrastructure-null row
-or alter the strict 45-row sample. The recovery measured 3 turns, target
-coverage 2/2, agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed
-`206,157 ms`, input `717,705`, cached input `655,360`, output `7,340`,
-reasoning `2,703`, additive total `727,748`, and cost `$1.515754`. Observed
-tool use was 23 Urdira hook calls (8 served, 15 fallback), 3 shell calls, MCP
-0, and tgrep 0. The append-only recovery addendum is
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
-(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`),
+The prior C1 Prisma/Urdira pre-agent harness attempt is retained as an
+operational harness incident and excluded from the result. The valid C1 result
+replaces that invalid attempt at the same frozen identity in the canonical
+45-row matrix: 3 turns, target coverage 2/2, agent/runner/grader exits 0/0/0,
+setup `16,430 ms`, elapsed `206,157 ms`, input `717,705`, cached input
+`655,360`, output `7,340`, reasoning `2,703`, additive total `727,748`, and
+cost `$1.515754`. Observed tool use was 23 Urdira hook calls (8 served, 15
+fallback), 3 shell calls, MCP 0, and tgrep 0. The append-only canonical
+correction is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.md`
+(SHA-256 `5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`),
 with JSON SHA-256
-`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+`ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`.
 
 The v8 source summaries are C1 SHA-256
 `ae6fb0eaf943dd9fd9f93587a632c78a09718deaa8ab12513a32fffcc0f4795e`, C2

@@ -3,19 +3,19 @@
 ## Definitive agent campaign status (v8, 2026-09-15)
 
 The v8 agent phase has 45 observed rows across three campaigns, one sample per
-repository/task/arm identity. Forty-three rows are task-solved (target coverage
-2/2 with final changes present), 42 have strict grader passes, two have strict
-grader nonpasses, and one infrastructure row has unavailable outcome evidence.
+repository/task/arm identity. Forty-four rows are task-solved (target coverage
+2/2 with final changes present), 43 have strict grader passes, and two have
+strict grader nonpasses; the canonical matrix has no unavailable outcome row.
 The C3 Urdira VS Code row is task-solved but has a tool-validation incident; its
-strict grader remains a nonpass. Target coverage is 2/2 for 43 rows. The
+strict grader remains a nonpass. Target coverage is 2/2 for 44 rows. The
 [complete 45-row table](benchmarks/definitive-agent-benchmark-results-2026-09-15.md#complete-45-cell-measured-table)
 is embedded in the versioned results report. The full JSON measurements are
-retained outside the repository at
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v3.json`;
+retained outside the repository at the append-only canonical correction
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`;
 JSON SHA-256 is
-`622be916d37ab86bcfe79f915b2e40652e5d7c3211e819e094946bdaddb4ce93` and
+`ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b` and
 Markdown SHA-256 is
-`030dcf4d92c954df9692655bee34676d0587aee3491d5e093ecb263660cb57a9`.
+`5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`.
 
 Correctness, target coverage, execution, efficiency, failures, and
 distributions are reported as separate fields. Agent, runner, and grader exit
@@ -69,25 +69,22 @@ nonpass `core:unknown_field` at `/request/query`, evidenced by diagnostic artifa
 (SHA-256 `ce4db120b97bd4f038abebcd1930d8a0f530c7c9ff49642b76d6600da646e500`).
 The row has agent exit 0, runner exit 1, grader exit 1, and target coverage
 2/2. Its task outcome is solved; the strict grader nonpass is the recorded
-tool-validation incident, not a task-correctness failure. This is separate
-from the C1 infrastructure-null row. The axis correction sidecar is
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v4-axis-correction.json`
-(SHA-256 `e62bdc06fbf8c5cbb19ba6f1c28ded008e7d1df1f20e540d2bbede0ff94025e3`).
+tool-validation incident, not a task-correctness failure. The canonical
+correction sidecar is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`
+(SHA-256 `ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`).
 v7 and v6
 evidence below remain historical and are not mixed into v8.
 
-The original C1 Prisma/Urdira infrastructure-null row remains unchanged. A
-separate authorized recovery of that same identity completed on attempt 2 after
-two retained pre-model recovery failures, followed by the successful authorized
-recovery: 3 turns, target coverage 2/2,
+The prior C1 Prisma/Urdira pre-agent harness attempt is retained only as an
+operational incident and excluded from the result. The valid C1 result replaces
+that invalid attempt at the same frozen identity: 3 turns, target coverage 2/2,
 agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed `206,157 ms`,
 input `717,705`, cached input `655,360`, output `7,340`, reasoning `2,703`,
 total `727,748`, cost `$1.515754`, and observed hooks `23/8/15` with shell/MCP/
-tgrep `3/0/0`. This recovery is used only for clearly labelled descriptive
-comparisons. Its append-only addendum is
-`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
-(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`);
-JSON SHA-256 `01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+tgrep `3/0/0`. This result is part of the canonical 45-row matrix. The
+append-only v6 correction is documented above; the excluded harness incident
+is retained in its incident history.
 
 ## Historical v7 retained definitive agent campaign status (2026-09-15)
 

@@ -830,10 +830,10 @@ These commands produce evidence only after the Phase 0 gates in the
 [definitive handoff](docs/benchmarks/definitive-agent-benchmark-handoff.md)
 pass.
 
-The current v8 evidence records 45 observed agent cells: 43 task-solved rows
-(target coverage 2/2 with final changes present), 42 strict grader passes, two
-strict grader nonpasses, and one infrastructure row with unavailable outcome
-evidence. One task-solved Urdira VS Code row has a tool-validation incident;
+The current v8 evidence records 45 observed agent cells: 44 task-solved rows
+(target coverage 2/2 with final changes present), 43 strict grader passes, two
+strict grader nonpasses, and no unavailable canonical outcome. One task-solved
+Urdira VS Code row has a tool-validation incident;
 its grader remains a nonpass. The 18 readiness attempts are closed with failures,
 zero successful probes, and no readiness qualification; P95 remains `null`
 because three campaign samples do not meet the frozen eligibility rule. See
@@ -841,15 +841,20 @@ the [versioned results report](docs/benchmarks/definitive-agent-benchmark-result
 for the complete measured table and separate failure, coverage, efficiency,
 and distribution fields. The report's append-only axis correction preserves the
 raw-derived consolidation while separating `task_solved`, `grader_pass`, and
-`tool_validation_incident`. A separate C1 Prisma/Urdira recovery measurement is
-documented in the results report; it does not replace the original
-infrastructure-null row or change the strict 45-row matrix.
-The supplemental recovery is documented separately and preserves the original
-45-row matrix; its pre-model failures and successful same-identity result are
-not counted as a new campaign retry.
+`tool_validation_incident`. The prior C1 Prisma/Urdira pre-agent harness
+attempt is retained as an operational incident and excluded from the result.
+The valid C1 result replaces that invalid attempt in the canonical 45-row
+matrix; its incident history and provenance are documented in the results
+report.
 The readiness measurement objective was not achieved: the persisted attempts
 contain no successful readiness measurement. The post-campaign PATH fix is not
 retroactive validation and produced no new readiness evidence.
+The canonical 45-row correction is retained in the versioned v6 JSON at
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.json`
+(`ac7c25ea0eb891b5a8ccb823ad571d38254e85a6a80c172e4c5af488e651170b`) and
+Markdown at
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v6-canonical-correction.md`
+(`5441efb4ad10bcd3e249c5b07547ee165e3ed73a745033b7d94fecefde1f177f`).
 
 Before a definitive cell or readiness pair starts, the orchestrator creates a
 fresh detached worktree and materializes that task's frozen dependency closure
