@@ -104,6 +104,8 @@ jobs:
           components: rustfmt, clippy
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build host native closure
+        run: pnpm build:native
       - name: Run platform tests
         run: pnpm test
 

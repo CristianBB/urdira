@@ -11,6 +11,8 @@ import { buildCodexExecArgs, buildCodexMcpArgs, buildCodexResumeArgs, effectiveC
 import { validateInstalledUrdiraCli } from "../release/benchmarks/urdira-installed-cli-preflight.mjs";
 
 const roots: string[] = [];
+const PINNED_CODEX_BINARY = process.env["URDIRA_CODEX_BINARY"] ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
+const hasPinnedCodexBinary = existsSync(PINNED_CODEX_BINARY);
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("definitive direct campaign orchestrator", () => {
@@ -36,21 +38,21 @@ describe("definitive direct campaign orchestrator", () => {
     expect(resolveCodexAuthRoute({ parentCodexHome: parentHome, isolatedCodexHome: join(root, "permissive-isolated") })).toMatchObject({ ok: true, route: "symlink", source_mode: 0o644, source_bytes: expect.any(Number) });
   });
 
-  it("validates the exact production Codex first/resume argv without starting a task", () => {
+  it.skipIf(!hasPinnedCodexBinary)("validates the exact production Codex first/resume argv without starting a task", () => {
     const first = buildCodexExecArgs({ model: "gpt-5.6-luna", worktree: "/tmp", integrated: false });
     const resume = buildCodexResumeArgs({ model: "gpt-5.6-luna", worktree: "/tmp", sessionId: "session-placeholder", integrated: false });
     expect(first).toEqual(["-m", "gpt-5.6-luna", "--dangerously-bypass-approvals-and-sandbox", "exec", "--json", "--skip-git-repo-check", "-C", "/tmp", "--ignore-user-config"]);
     expect(resume).toEqual(["-m", "gpt-5.6-luna", "--dangerously-bypass-approvals-and-sandbox", "-C", "/tmp", "exec", "resume", "session-placeholder", "--json", "--ignore-user-config", "--skip-git-repo-check"]);
     expect(buildCodexMcpArgs({ arm: "codegraph", codegraph: "/bin/echo", benchmarkTimeoutMs: 900_000 })).toEqual(["-c", "mcp_servers.codegraph.command=\"/bin/echo\"", "-c", "mcp_servers.codegraph.args=[\"serve\",\"--mcp\"]", "-c", "mcp_servers.codegraph.startup_timeout_sec=120", "-c", "mcp_servers.codegraph.tool_timeout_sec=900"]);
-    const diagnostic = validateCodexArgv({ codex: "/Applications/ChatGPT.app/Contents/Resources/codex", model: "gpt-5.6-luna", worktree: "/tmp", integrated: false });
+    const diagnostic = validateCodexArgv({ codex: PINNED_CODEX_BINARY, model: "gpt-5.6-luna", worktree: "/tmp", integrated: false });
     expect(diagnostic.ok).toBe(true);
     expect(diagnostic.first.args).toEqual(first.concat("--help"));
     expect(diagnostic.resume.args).toEqual(resume.concat("--help"));
     expect(diagnostic.binary_sha256).toMatch(/^[a-f0-9]{64}$/u);
   });
 
-  it("uses approval and sandbox flags admitted by the pinned Codex exec/resume help", () => {
-    const codex = "/Applications/ChatGPT.app/Contents/Resources/codex";
+  it.skipIf(!hasPinnedCodexBinary)("uses approval and sandbox flags admitted by the pinned Codex exec/resume help", () => {
+    const codex = PINNED_CODEX_BINARY;
     const approval = "--dangerously-bypass-approvals-and-sandbox";
     const execHelp = spawnSync(codex, ["-m", "gpt-5.6-luna", approval, "exec", "--json", "--skip-git-repo-check", "-C", "/tmp", "--ignore-user-config", "--help"], { encoding: "utf8" });
     const resumeHelp = spawnSync(codex, ["-m", "gpt-5.6-luna", approval, "-C", "/tmp", "exec", "resume", "session-placeholder", "--json", "--ignore-user-config", "--skip-git-repo-check", "--help"], { encoding: "utf8" });

@@ -80,8 +80,24 @@ describe("JavaScript/TypeScript persistent Rust syntax worker", () => {
         const recordIdentities = page.records.map((record) => record.identity_key);
         expect(recordIdentities.filter((identity) => identity.startsWith("jsts:") && !identity.startsWith("jsts:contains") && !identity.startsWith("jsts:import") && !identity.startsWith("jsts:export")))
           .toEqual(legacy.entities.filter((entity) => entity.path === path).map((entity) => entity.id));
-        expect(recordIdentities.filter((identity) => identity.startsWith("jsts:contains") || identity.startsWith("jsts:import") || identity.startsWith("jsts:export")))
-          .toEqual(legacy.relations.filter((relation) => relation.path === path).map((relation) => relation.id));
+        // Entity identities stay anchored to the declaration name. Relation
+        // identities may legitimately move when Rust widens a declaration
+        // span (the v4 full-declaration-span contract), so compare the
+        // stable graph endpoints and relation kind instead of byte offsets.
+        const rustRelations = page.records
+          .filter((record) => record.category === "relation")
+          .map((record) => {
+            const body = record.body as { readonly source_id?: string; readonly target_id?: string };
+            const kind = record.kind === "jsts:relation_contains" ? "core:contains" : record.kind === "jsts:relation_export" ? "core:export" : record.kind === "jsts:relation_import" ? "core:import" : record.kind;
+            const transportRecord = record as ProposedRecord & { source_id?: string | null; target_id?: string | null };
+            return { kind, source_id: transportRecord.source_id ?? body.source_id ?? null, target_id: transportRecord.target_id ?? body.target_id ?? null };
+          })
+          .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+        const legacyRelations = legacy.relations
+          .filter((relation) => relation.path === path)
+          .map((relation) => ({ kind: relation.kind, source_id: relation.source_id, target_id: relation.target_id ?? null }))
+          .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+        expect(rustRelations).toEqual(legacyRelations);
       }
       await transport.commitAnalysis({ project_key: projectKey, analysis_token: result.analysis_token });
     } finally {

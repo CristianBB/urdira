@@ -117,6 +117,27 @@ export interface RustSyntaxAnalysisResult {
   readonly metrics: { readonly bytes_read: number; readonly bytes_transferred: number; readonly bytes_copied: number; readonly bytes_decoded: number; readonly bytes_retained: number };
 }
 
+/**
+ * Transport representation emitted by the Rust syntax worker.
+ *
+ * The worker carries a few additive, indexing-only fields alongside the
+ * public `ProposedRecord` contract. Keeping that distinction explicit lets
+ * the wire validator remain closed while downstream fact-delta code continues
+ * to consume the contract-shaped portion of each record.
+ */
+export type RustSyntaxProposedRecord = ProposedRecord & {
+  readonly span_start_line: number;
+  readonly span_end_line: number;
+  readonly source_id: string | null;
+  readonly target_id: string | null;
+  readonly facets_list: readonly string[];
+};
+
+/** Additive transport field carried by Rust for stable cross-scan dependency identity. */
+export type RustSyntaxProposedRecordDependency = ProposedRecordDependency & {
+  readonly dependency_target_path: string;
+};
+
 export interface RustSyntaxFactsResult {
   readonly kind: "facts_result";
   readonly request_id: string;
@@ -129,8 +150,8 @@ export interface RustSyntaxFactsResult {
   readonly byte_length: number;
   readonly parsed: boolean;
   readonly direct_imports: readonly RustSyntaxDirectImport[];
-  readonly records: readonly ProposedRecord[];
-  readonly dependencies: readonly ProposedRecordDependency[];
+  readonly records: readonly RustSyntaxProposedRecord[];
+  readonly dependencies: readonly RustSyntaxProposedRecordDependency[];
   readonly diagnostics: readonly { readonly message: string; readonly start: number; readonly end: number }[];
   readonly next_cursor?: RustSyntaxFactCursor;
   readonly metrics: { readonly bytes_transferred: number; readonly bytes_copied: number };
@@ -220,19 +241,28 @@ function jsonObject(value: unknown, field: string): Readonly<Record<string, unkn
 }
 
 function validateProposedRecord(value: unknown): void {
-  const record = exactObject(value, ["proposal_record_key", "category", "kind", "universal_kind", "facets", "schema_version", "source_span", "identity_key", "body", "evidence_references"]);
+  const record = exactObject(value, ["proposal_record_key", "category", "kind", "universal_kind", "facets", "schema_version", "source_span", "span_start_line", "span_end_line", "identity_key", "body", "source_id", "target_id", "evidence_references", "facets_list"]);
   for (const field of ["proposal_record_key", "kind", "universal_kind", "identity_key"] as const) boundedText(record[field], `record ${field}`);
   if (!["entity", "relation", "diagnostic"].includes(String(record["category"]))) throw new Error("Rust syntax record category is invalid.");
   if (record["schema_version"] !== 1) throw new Error("Rust syntax record schema_version is invalid.");
+  nonNegativeInteger(record["span_start_line"], "record span_start_line");
+  nonNegativeInteger(record["span_end_line"], "record span_end_line");
+  if ((record["source_id"] !== null && record["source_id"] !== undefined) || (record["target_id"] !== null && record["target_id"] !== undefined)) {
+    if (record["source_id"] !== null) boundedText(record["source_id"], "record source_id");
+    if (record["target_id"] !== null) boundedText(record["target_id"], "record target_id");
+  }
   canonicalJsonText(record["facets"], "record facets");
   canonicalJsonText(record["source_span"], "record source_span");
   canonicalJsonText(record["evidence_references"], "record evidence_references");
+  if (!Array.isArray(record["facets_list"])) throw new Error("record facets_list is invalid.");
+  for (const facet of record["facets_list"] as unknown[]) boundedText(facet, "record facet");
   jsonObject(record["body"], "record body");
 }
 
 function validateProposedDependency(value: unknown): void {
-  const dependency = exactObject(value, ["proposed_dependency_id", "proposal_record_key", "dependency_artifact_id", "dependency_artifact_version_id", "dependency_role", "dependency_basis", "source_reference"]);
+  const dependency = exactObject(value, ["proposed_dependency_id", "proposal_record_key", "dependency_artifact_id", "dependency_artifact_version_id", "dependency_target_path", "dependency_role", "dependency_basis", "source_reference"]);
   for (const field of ["proposed_dependency_id", "proposal_record_key", "dependency_artifact_id", "dependency_artifact_version_id", "dependency_role", "dependency_basis"] as const) boundedText(dependency[field], `dependency ${field}`);
+  boundedText(dependency["dependency_target_path"], "dependency dependency_target_path");
   const source = dependency["source_reference"];
   const hasContentHash = source !== null && typeof source === "object" && Object.prototype.hasOwnProperty.call(source, "content_hash");
   const reference = exactObject(source, ["reference_type", "proposal_record_key", ...(hasContentHash ? ["content_hash"] : [])]);
