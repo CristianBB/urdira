@@ -196,7 +196,10 @@ fn flip_last_byte(path: &std::path::Path) {
 
 fn flip_byte_at(path: &std::path::Path, offset: usize) {
     let mut bytes = std::fs::read(path).unwrap();
-    assert!(offset < bytes.len(), "corruption offset must be inside the file");
+    assert!(
+        offset < bytes.len(),
+        "corruption offset must be inside the file"
+    );
     bytes[offset] ^= 0xFF;
     let mut file = OpenOptions::new().write(true).open(path).unwrap();
     file.seek(SeekFrom::Start(offset as u64)).unwrap();
