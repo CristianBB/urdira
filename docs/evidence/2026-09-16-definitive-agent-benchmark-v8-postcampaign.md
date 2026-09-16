@@ -27,6 +27,23 @@ The complete readiness table is retained externally at
 (SHA-256 `d1ceded62ba66614b2775042bc633f0855a0c594bbd526d835559c43f763dd0c`)
 and is embedded in the dated results report.
 
+## Supplemental recovery measurement
+
+The original C1 Prisma/Urdira infrastructure-null row remains unchanged in the
+45-row strict matrix. A separate same-identity recovery completed on attempt 2
+after two retained pre-model recovery failures, followed by the successful
+authorized recovery; no retry was counted after the successful model run. The
+row measured 3 turns, target coverage 2/2,
+agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed `206,157 ms`,
+input `717,705`, cached input `655,360`, output `7,340`, reasoning `2,703`,
+total `727,748`, cost `$1.515754`, hooks `23/8/15`, shell/MCP/tgrep `3/0/0`.
+This is a separate descriptive recovery measurement, not a replacement for the
+original row. The addendum Markdown is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
+(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`);
+JSON SHA-256 is
+`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+
 ## Per-campaign frozen renderer outputs
 
 The frozen renderer was invoked separately for each campaign, using that

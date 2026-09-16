@@ -26,6 +26,21 @@ The append-only reporting-axis correction is
 it defines `task_solved`, `grader_pass`, and `tool_validation_incident`
 separately while leaving the v3 raw-derived consolidation unchanged.
 
+An authorized supplemental recovery completed the original C1 Prisma/Urdira
+identity on attempt 2 after two retained pre-model recovery failures, followed by
+the successful authorized recovery. It is a
+separate measurement and does not replace the original infrastructure-null row
+or alter the strict 45-row sample. The recovery measured 3 turns, target
+coverage 2/2, agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed
+`206,157 ms`, input `717,705`, cached input `655,360`, output `7,340`,
+reasoning `2,703`, additive total `727,748`, and cost `$1.515754`. Observed
+tool use was 23 Urdira hook calls (8 served, 15 fallback), 3 shell calls, MCP
+0, and tgrep 0. The append-only recovery addendum is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
+(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`),
+with JSON SHA-256
+`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+
 The v8 source summaries are C1 SHA-256
 `ae6fb0eaf943dd9fd9f93587a632c78a09718deaa8ab12513a32fffcc0f4795e`, C2
 SHA-256 `54c61dbaaaa6a8c19dbcc3a3da8240edc4e355825fd3756e43a61cadb3ded2fd`,

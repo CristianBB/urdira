@@ -76,6 +76,19 @@ from the C1 infrastructure-null row. The axis correction sidecar is
 v7 and v6
 evidence below remain historical and are not mixed into v8.
 
+The original C1 Prisma/Urdira infrastructure-null row remains unchanged. A
+separate authorized recovery of that same identity completed on attempt 2 after
+two retained pre-model recovery failures, followed by the successful authorized
+recovery: 3 turns, target coverage 2/2,
+agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed `206,157 ms`,
+input `717,705`, cached input `655,360`, output `7,340`, reasoning `2,703`,
+total `727,748`, cost `$1.515754`, and observed hooks `23/8/15` with shell/MCP/
+tgrep `3/0/0`. This recovery is used only for clearly labelled descriptive
+comparisons. Its append-only addendum is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
+(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`);
+JSON SHA-256 `01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+
 ## Historical v7 retained definitive agent campaign status (2026-09-15)
 
 The historical v7 series is **blocked after two campaign-1 attempts**: one completed baseline cell and one Urdira infrastructure failure before model invocation. The retained matrix contains 45 planned agent cells, 2 attempted/observed, 1 successful, 1 infrastructure failure, and 43 not started. Readiness follows the authorized 45-then-18 order; 0 of 18 probes ran. No retry or replacement run is counted.

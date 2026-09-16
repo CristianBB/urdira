@@ -108,6 +108,24 @@ fields; its missing measurements remain `null`. The C1 VS Code/codebase-memory
 row is an execution-capacity failure at 0/2. These are separate from the 43
 rows whose task outcome is solved and the 42 strict grader passes.
 
+## Supplemental C1 Prisma/Urdira recovery
+
+The original C1 Prisma/Urdira infrastructure-null row remains in the strict
+45-row evidence. A separate authorized recovery of the same identity completed
+on attempt 2 after two retained pre-model recovery failures, followed by the
+successful authorized recovery; no retry was counted after the successful model
+run. It measured 3 turns, target coverage
+2/2, agent/runner/grader exits 0/0/0, setup `16,430 ms`, elapsed `206,157 ms`,
+input `717,705`, cached input `655,360`, output `7,340`, reasoning `2,703`,
+total `727,748`, cost `$1.515754`, and hook totals `23/8/15` with shell/MCP/
+tgrep `3/0/0`. The recovery is descriptive only and does not alter the
+original 42 strict grader passes, 43 task-solved rows, or original null row.
+The complete append-only recovery addendum is
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
+(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`),
+with JSON SHA-256
+`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`.
+
 The v7 and v6 campaign snapshots and their partial renderings are historical
 and remain separate from v8. This evidence note does not certify readiness or
 claim that all 45 observed rows are correct. The subsequent per-campaign

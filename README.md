@@ -841,7 +841,12 @@ the [versioned results report](docs/benchmarks/definitive-agent-benchmark-result
 for the complete measured table and separate failure, coverage, efficiency,
 and distribution fields. The report's append-only axis correction preserves the
 raw-derived consolidation while separating `task_solved`, `grader_pass`, and
-`tool_validation_incident`.
+`tool_validation_incident`. A separate C1 Prisma/Urdira recovery measurement is
+documented in the results report; it does not replace the original
+infrastructure-null row or change the strict 45-row matrix.
+The supplemental recovery is documented separately and preserves the original
+45-row matrix; its pre-model failures and successful same-identity result are
+not counted as a new campaign retry.
 The readiness measurement objective was not achieved: the persisted attempts
 contain no successful readiness measurement. The post-campaign PATH fix is not
 retroactive validation and produced no new readiness evidence.

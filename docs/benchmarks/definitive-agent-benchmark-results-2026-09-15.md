@@ -111,6 +111,38 @@ append-only reporting-axis correction is
 it leaves the v3 raw-derived consolidation unchanged and defines
 `task_solved`, `grader_pass`, and `tool_validation_incident` separately.
 
+### Supplemental C1 Prisma/Urdira recovery
+
+The original C1 Prisma/Urdira row remains infrastructure-null in the strict
+45-row table. An authorized same-identity supplemental recovery completed on
+attempt 2; two pre-model recovery failures remain retained, followed by the
+successful authorized recovery, and no retry was counted after the successful
+model run. The supplemental row is a
+separate recovery measurement and substitutes for the original null only in
+the descriptive matrix in the append-only addendum below.
+
+| identity | model | turns | task solved | target coverage | agent/runner/grader exit | setup ms | elapsed ms | input | cached input | output | reasoning | total | cost USD | hooks total/served/fallback | shell | MCP | tgrep |
+|---|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| C1 / Prisma / wire-name-validation / urdira-typescript | gpt-5.6-luna | 3 | true | 2/2 | 0/0/0 | 16430 | 206157 | 717705 | 655360 | 7340 | 2703 | 727748 | 1.515754 | 23/8/15 | 3 | 0 | 0 |
+
+The supplemental row observed 23 Urdira hook invocations (8 served, 15
+fallback), 3 shell calls, MCP 0, and tgrep 0. Its retained output metrics and
+provenance are in the addendum
+`/Users/Cristian/BenchmarkResults/urdira-v8-derived-luna-campaigns-1-3-v1/summary/benchmark-campaigns-1-3-v5-supplemental-prisma-urdira.md`
+(SHA-256 `92c754b7597b5847b19438302caeafb87400747622c1fa61f9bd77fb38931022`),
+with JSON SHA-256
+`01fbe484d537e1e933b3f414a00a78348b1a3c13f19b9e2ffa28ce3e73d7a4e4`. The
+original strict Urdira cost summary remains unchanged at n=8, sum `$15.258346`,
+mean `$1.907293`, median `$1.648912`, range `$1.393008-$3.348610`; its strict-
+qualified subset is n=7, sum `$11.909736`, mean `$1.701391`, median `$1.638196`,
+range `$1.393008-$2.276602`. The supplemental-filled descriptive Urdira
+matrix is n=9, sum `$16.774100`, mean `$1.863789`, median `$1.638196`, range
+`$1.393008-$3.348610`. Strict-qualified substitution is n=8, sum `$13.425490`,
+mean `$1.678186`, median `$1.576975`, excluding the C3 VS Code/Urdira
+tool-validation incident. The C1 Prisma pair is Urdira `$1.515754` versus baseline `$2.946698`
+(-48.560932%), tgrep `$4.415286` (-65.670310%), codegraph `$3.344146`
+(-54.674407%), and codebase-memory `$2.506416` (-39.525043%).
+
 The v7 and v6 reports below remain historical and are not mixed into these 45
 rows. The dated v8 evidence note is
 [`2026-09-15-definitive-agent-benchmark-v8.md`](../evidence/2026-09-15-definitive-agent-benchmark-v8.md).
