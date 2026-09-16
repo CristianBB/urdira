@@ -14,6 +14,8 @@ mod common;
 
 use common::*;
 use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 use urdira_structural_store::{
     CATEGORY_ENTITY, Dictionaries, NONE_U16, NONE_U32, RecordRow, SegmentWriter, StoreReader,
     nibble_of,
@@ -186,13 +188,20 @@ fn flip_last_byte(path: &std::path::Path) {
     assert!(!bytes.is_empty(), "cannot corrupt an empty file");
     let last = bytes.len() - 1;
     bytes[last] ^= 0xFF;
-    std::fs::write(path, &bytes).unwrap();
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(last as u64)).unwrap();
+    file.write_all(&bytes[last..=last]).unwrap();
+    file.sync_all().unwrap();
 }
 
 fn flip_byte_at(path: &std::path::Path, offset: usize) {
     let mut bytes = std::fs::read(path).unwrap();
+    assert!(offset < bytes.len(), "corruption offset must be inside the file");
     bytes[offset] ^= 0xFF;
-    std::fs::write(path, &bytes).unwrap();
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(&bytes[offset..=offset]).unwrap();
+    file.sync_all().unwrap();
 }
 
 /// A single flipped byte in `records.ident` (written via `write_base_
