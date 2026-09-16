@@ -4,7 +4,7 @@ import { access, lstat, mkdir, open, readFile, rename, rm, stat, writeFile, type
 import { homedir } from "node:os";
 import { basename, dirname, join, parse as parsePath, resolve, sep } from "node:path";
 
-export const BOOTSTRAP_VERSION = "0.3.3";
+export const BOOTSTRAP_VERSION = "0.4.0";
 export const RUNTIME_PACKAGE_NAME = "@urdira/runtime";
 export const RUNTIME_VERSION = BOOTSTRAP_VERSION;
 export const RUNTIME_REGISTRY = "https://registry.npmjs.org/";

@@ -25,12 +25,12 @@ describe("public npm package graph", () => {
   it("publishes only the production allowlist with exact internal versions", async () => {
     const versions = await productionPackageVersions();
     expect([...versions.keys()]).toEqual(NPM_PUBLIC_PACKAGE_NAMES);
-    expect(versions.get("urdira")).toBe("0.3.3");
-    expect(versions.get("@urdira/runtime")).toBe("0.3.3");
-    expect(versions.get("@urdira/cli")).toBe("0.3.3");
-    expect(versions.get("@urdira/daemon")).toBe("0.3.3");
-    expect(versions.get("@urdira/mcp")).toBe("0.3.3");
-    expect(versions.get("@urdira/web")).toBe("0.3.3");
+    expect(versions.get("urdira")).toBe("0.4.0");
+    expect(versions.get("@urdira/runtime")).toBe("0.4.0");
+    expect(versions.get("@urdira/cli")).toBe("0.4.0");
+    expect(versions.get("@urdira/daemon")).toBe("0.4.0");
+    expect(versions.get("@urdira/mcp")).toBe("0.4.0");
+    expect(versions.get("@urdira/web")).toBe("0.4.0");
     expect(versions.get("@urdira/plugin-javascript-typescript")).toBe("0.6.0");
     for (const name of NATIVE_NPM_PACKAGE_NAMES) expect(versions.get(name), name).toBe(versions.get("@urdira/native"));
     expect(versions.has("@urdira/testkit")).toBe(false);
@@ -50,7 +50,7 @@ describe("public npm package graph", () => {
       expect(manifest).not.toHaveProperty("private");
       if (name === "urdira") {
         expect(manifest.dependencies).toBeUndefined();
-        expect(manifest).toHaveProperty("urdiraRuntime", { package: "@urdira/runtime", version: "0.3.3" });
+        expect(manifest).toHaveProperty("urdiraRuntime", { package: "@urdira/runtime", version: "0.4.0" });
       }
       if (name === "@urdira/native") {
         expect(manifest["files"]).not.toContain("prebuilds");

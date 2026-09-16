@@ -3,10 +3,12 @@
 All notable user-visible changes are documented here. Urdira follows the
 repository's [semantic versioning policy](docs/versioning.md).
 
-## Unreleased
+## [0.4.0] - 2026-09-16 — v4 structural store and native query pipeline
 
-Changes implemented after 0.3.3; no new publication/version is claimed here.
-See [current state](docs/current-state.md) for evidence and remaining limits.
+Release package metadata is prepared at `0.4.0`. npm publication remains
+gated by the complete multi-target native workflow and protected release
+publishing configuration. See [the release process](docs/release.md) and
+[current state](docs/current-state.md) for qualification evidence and limits.
 
 - Rust-owned v3 structural publication and incremental root add/remove,
   priority and scan-aggregation improvements.

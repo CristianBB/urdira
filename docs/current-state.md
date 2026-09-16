@@ -250,10 +250,10 @@ The corrected v6 artifacts remain at
 
 ## Version and deployment boundary
 
-The repository still declares application/bootstrap version **0.3.3**. The
-changes after that version are recorded in [Unreleased](../CHANGELOG.md#unreleased);
-this document does not establish that they have been published to npm.
-The JS/TS plugin declares **0.6.0**, the native binding API is **17**, and the
+The repository declares application/bootstrap version **0.4.0**. Publication
+still follows the release gates and protected workflow; this document does not
+establish that the packages have been published to npm. The JS/TS plugin
+declares **0.6.0**, the native binding API is **18**, and the
 v4 segment header format is **6**. These identify different compatibility
 boundaries; v4 storage is not a package version or a new MCP API version.
 

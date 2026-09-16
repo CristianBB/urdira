@@ -138,7 +138,7 @@ oracle and by cold and incremental generations.
 
 ## Native observation projection
 
-Semantic process protocol 1.9 and native API v16 remove the producer-side
+Semantic process protocol 1.9 and native API v18 remove the producer-side
 logical-row loop. A language adapter sends a bounded group to a closed native
 projection profile. The generic envelope contains only `profile_id` and a
 profile-owned observation batch; unknown profile identities and unknown fields
@@ -153,7 +153,7 @@ streamed over the immutable canonical rows; the independent receiving core
 then reparses them and remains the only authority that may emit IDs, UCE
 payloads, registered digests and typed staging scalars.
 
-Native API v17 additionally moves the exact-vector top-K kernel to a resident
+Native API v18 additionally moves the exact-vector top-K kernel to a resident
 contiguous vector buffer with a single native call per query, replacing v16's
 per-query buffer construction; this is a semantic query-path optimization and
 does not change the observation projection contract above. `NATIVE_API_VERSION`

@@ -52,7 +52,7 @@ describe("expanded campaign smoke scope", () => {
       });
       const version = spawnSync(shim, ["--version"], { encoding: "utf8" });
       expect(version.status).toBe(0);
-      expect(version.stdout.trim()).toBe("0.3.3");
+      expect(version.stdout.trim()).toBe("0.4.0");
       const hook = spawnSync(shim, ["agent", "hook", "--client", "codex", "--payload", "{}"], { encoding: "utf8" });
       expect(hook.status).toBe(78);
       expect(hook.stderr).toContain("daemon endpoint is unavailable");

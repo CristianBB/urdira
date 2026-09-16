@@ -194,7 +194,7 @@ function App(): React.JSX.Element {
   };
   const refreshRef = useRef(refresh); refreshRef.current = refresh;
   useEffect(() => {
-    const mcp = new Client({ name: "urdira-web", version: "0.3.3" }, { versionNegotiation: { mode: "auto" } });
+    const mcp = new Client({ name: "urdira-web", version: "0.4.0" }, { versionNegotiation: { mode: "auto" } });
     const transport = new StreamableHTTPClientTransport(new URL("/mcp", location.origin));
     void mcp.connect(transport).then(async () => { setClient(mcp); setTools((await mcp.listTools()).tools); await refresh(); }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason))).finally(() => setLoading(false));
     return () => { void mcp.close(); };

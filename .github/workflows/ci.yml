@@ -197,7 +197,7 @@ jobs:
           URDIRA_RELEASE_TARGET: ${{ matrix.target }}
       - name: Run archive with system Node hidden
         shell: bash
-        run: pnpm smoke:native-archive "release/artifacts/urdira-${{ matrix.target }}-0.3.3.tar.gz"
+        run: pnpm smoke:native-archive "release/artifacts/urdira-${{ matrix.target }}-0.4.0.tar.gz"
       - name: Run target-scoped release acceptance
         run: pnpm release:acceptance
         env:

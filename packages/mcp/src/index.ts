@@ -17,7 +17,7 @@ import { operationErrorDefinitions, operationRegistry, queryAlgebraOperatorIds, 
 
 export const MCP_PROTOCOL_VERSION = "2026-07-28" as const;
 export const MCP_SERVER_NAME = "urdira" as const;
-export const MCP_SERVER_VERSION = "0.3.3" as const;
+export const MCP_SERVER_VERSION = "0.4.0" as const;
 
 export const MCP_TOOL_NAMES = [
   "urdira_index_status",

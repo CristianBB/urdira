@@ -483,7 +483,7 @@ describe("local Urdira web composition", () => {
     const client = new Client({ name: "urdira-web-test", version: "1" }, { versionNegotiation: { mode: "auto" } });
     const transport = new StreamableHTTPClientTransport(new URL("/mcp", handle.origin));
     await client.connect(transport);
-    expect(client.getDiscoverResult()?._meta?.["io.modelcontextprotocol/serverInfo"]).toEqual({ name: "urdira", version: "0.3.3" });
+    expect(client.getDiscoverResult()?._meta?.["io.modelcontextprotocol/serverInfo"]).toEqual({ name: "urdira", version: "0.4.0" });
     expect(client.getDiscoverResult()?.capabilities.tools).toEqual({ listChanged: false });
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name)).toEqual([

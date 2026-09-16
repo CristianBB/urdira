@@ -148,15 +148,15 @@ migration of already-registered v3 workspaces onto v4 remains unaddressed.
 
 | Coordinate | Value | Meaning |
 |---|---|---|
-| Application/bootstrap package | `0.3.3` | Manifest version; later local changes remain Unreleased until versioning and release gates are completed. |
+| Application/bootstrap package | `0.4.0` | v4 storage and observable behavior release coordinate; publication still requires the release gates and protected workflow. |
 | JS/TS plugin | `0.6.0` | Analyzer behavior/cache/lock identity, independent of the application version. |
-| Native binding API | `17` | Compiled addon handshake, including resident vector registration/top-K. |
+| Native binding API | `18` | Compiled addon handshake, including indexed selector pages and resident vector registration/top-K. |
 | v3 / v4 index contract | `0x33` / `0x34` | Per-workspace structural/digest format selection. |
 | v4 segment header | `6` | Native base/delta layout, including mandatory `entities.index`. |
 
-The v4 behavior/storage change still requires the version-policy treatment
-above before publication. This documentation update does not assign a new
-release number or claim that current local commits are published.
+The v4 behavior/storage change is assigned the `0.4.0` package coordinate.
+This documentation update does not by itself publish the packages; publication
+still requires the release gates and protected workflow.
 
 ## Checklist for bumping `NATIVE_API_VERSION`
 

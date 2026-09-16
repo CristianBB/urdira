@@ -93,7 +93,7 @@ export interface UrdiraRunOptions {
   readonly admin_request_timeout_ms?: number;
 }
 
-export const URDIRA_VERSION = "0.3.3";
+export const URDIRA_VERSION = "0.4.0";
 /** Exact runtime release identity. Bump automatically with every Urdira release. */
 export const URDIRA_ENGINE_BUILD_ID = `urdira-core-${URDIRA_VERSION}`;
 const DAEMON_HEALTH_PROBE_TIMEOUT_MS = 2_000;

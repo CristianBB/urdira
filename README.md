@@ -97,8 +97,8 @@ agent does not spend a model round discovering them through `ALL_TOOLS`.
 
 ## Install
 
-Urdira 0.3.3 requires Node.js `>=24.18.1`. The dependency-free 0.3.3 bootstrap
-prepares the exact `@urdira/runtime@0.3.3` application. Confirmed runtime preparation also
+Urdira 0.4.0 requires Node.js `>=24.18.1`. The dependency-free 0.4.0 bootstrap
+prepares the exact `@urdira/runtime@0.4.0` application. Confirmed runtime preparation also
 requires npm `>=11.16.0`, which supplies the strict install-script policy. Check
 with `npm --version`; if necessary, update the npm paired with the active Node
 installation before preparing the runtime:
@@ -212,9 +212,9 @@ default. v4 adds, over the v3 pipeline documented later in this file:
   operate on the native structural store directly, re-keying `workspace_id`
   on import and always running a `reconcile` scan afterward.
 
-The checkout still declares application version `0.3.3`; these later changes
-are listed under [Unreleased](CHANGELOG.md#unreleased), not claimed as a newly
-published npm release. The [current-state inventory](docs/current-state.md)
+The checkout declares application version `0.4.0`; publication remains subject
+to the qualification and protected workflow in [the release process](docs/release.md).
+The [current-state inventory](docs/current-state.md)
 consolidates implemented capabilities, measurements, and open limitations.
 
 Both formats share the same public MCP tools, CLI commands, and query
@@ -1061,7 +1061,7 @@ One bounded continuation drains several owner-delimited streams instead of
 performing one synchronous process round trip per owner. Those continuations
 carry Rust-sealed canonical record and dependency rows, not nested JavaScript
 object graphs or producer-owned staging columns. The host keeps those rows
-opaque: native API v17 reparses their exact canonical text, checks the target
+opaque: native API v18 reparses their exact canonical text, checks the target
 record definitions and emits compact accepted fields plus typed staging rows.
 Only the core-owned result can enter candidate staging; producer preseal is
 never acceptance authority.
@@ -1069,7 +1069,7 @@ The rule is shared by cold and incremental generations. Directory capture hashes
 source once, validates its filesystem boundary before and after the read, and
 hands a canonical prefix of up to 64 MiB of those exact bytes to CAS without
 reopening the source; remaining reads use eager registration and eight I/O
-lanes. For every Rust-owned structural generation, native API v17 also seals the exact
+lanes. For every Rust-owned structural generation, native API v18 also seals the exact
 typed record-publication scalars and UCE body bytes carried by those streams.
 SQLite promotes them into invisible candidate staging with fixed set-based SQL
 and publishes atomically. Progressive initial successors can use the same

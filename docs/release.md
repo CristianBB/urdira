@@ -1,16 +1,15 @@
 # Release Process
 
-This document is the operational checklist for Urdira 0.3.x. The normative
+This document is the operational checklist for Urdira 0.4.x. The normative
 distribution contract is [decision 10](decisions/10-daemon-mcp-packaging.md);
 the non-waivable qualification gates are [decision 08](decisions/08-performance-reliability-evaluation.md).
 
 ## Checkout status and qualification scope
 
-The checkout still declares `0.3.3`, while the [Unreleased changelog](../CHANGELOG.md#unreleased)
-contains the later v4 and query/semantic changes. Before publication, apply
-[the versioning policy](versioning.md) to these breaking storage/behavior
-changes and align the bootstrap/runtime/package manifests. A documentation
-refresh is not a release or an implicit waiver of any qualification gate.
+The checkout declares `0.4.0` for the v4 storage and behavior changes. Before
+publication, complete every qualification gate below and use the protected
+multi-target workflow. A version bump or documentation refresh is not an
+implicit waiver of any qualification gate.
 
 The [current-state inventory](current-state.md) indexes retained September
 measurements. Cold worker timing, daemon readiness/durability, full embedding
@@ -462,7 +461,7 @@ five-target matrix builds and executes the Rust closure on `darwin-arm64`,
 only that target's verified native files. Windows also runs the focused
 portability preflight.
 
-Native binding API v17 is the required exact private handshake
+Native binding API v18 is the required exact private handshake
 (`NATIVE_API_VERSION` in `packages/native/src/loader.ts` and
 `crates/urdira-native-node/src/lib.rs`; the loader rejects any other value,
 older or newer, before work). It retains the Rust-sealed typed
