@@ -501,10 +501,22 @@ mod physical_preallocation_tests {
 
     #[test]
     fn physical_preallocation_supports_parallel_disjoint_overwrites() {
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
         let path = std::env::temp_dir().join(format!(
             "urdira-physical-preallocation-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            thread_name
         ));
         let _ = std::fs::remove_file(&path);
         let file = OpenOptions::new()
