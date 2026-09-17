@@ -729,10 +729,14 @@ async function execFileWithEbadfRetry(command, args, options, attempts = 3, back
   throw lastError;
 }
 
-async function oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, tmpRoot, label, engineExports }) {
+async function oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, oracleRoot, label, engineExports }) {
   const incrementalDatabasePath = await getWorkspaceDatabasePath(dataRoot, workspaceId);
   const incrementalStructuralRoot = engineExports.structuralStoreDirFor(incrementalDatabasePath);
-  const freshDataDir = join(tmpRoot, `oracle-${label}`);
+  // `v4-scan.mjs` deliberately rejects `/tmp` data directories: oracle
+  // output is measurement evidence and must not be confused with ephemeral
+  // daemon scratch state. Keep this independent from `tmpRoot`, which is
+  // intentionally used for the daemon's short Unix-socket path.
+  const freshDataDir = join(oracleRoot, `oracle-${label}`);
   await mkdir(freshDataDir, { recursive: true });
   await execFileWithEbadfRetry(process.execPath, [resolve(repoRoot, "scripts/v4-scan.mjs"), corpusRoot, freshDataDir, "--force"], {
     env: { ...process.env, URDIRA_INDEXING_CORE_WORKER_PATH: workerPath },
@@ -819,6 +823,12 @@ export async function run(options) {
   // protected, so it alone satisfies the hard rule.
   const corpusIsProtected = isProtectedReadonlyCorpus(options.corpus);
   const tmpRoot = await mkdtemp(join(tmpdir(), "urdira-v4-mutation-"));
+  // Linux CI's `os.tmpdir()` is `/tmp`, but the cold-scan oracle has an
+  // explicit contract that its data directory must never live there. Use the
+  // durable benchmark scratch root for oracle artifacts on every platform;
+  // the directory is removed in `finally` just like the daemon scratch root.
+  await mkdir(MANDATED_SCRATCH_ROOT, { recursive: true });
+  const oracleRoot = await mkdtemp(join(MANDATED_SCRATCH_ROOT, "oracle-mutation-harness-"));
   const corpusParent = corpusIsProtected
     ? join(MANDATED_SCRATCH_ROOT, `scratch-mutation-harness-${randomBytes(4).toString("hex")}`)
     : tmpRoot;
@@ -942,7 +952,7 @@ export async function run(options) {
     let previous = { queryable_generation: coldReadiness.queryableGen, durable_generation: coldReadiness.durableGen };
 
     let coldOracle;
-    if (options.verify_roots === "each") coldOracle = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, tmpRoot, label: "cold", engineExports });
+    if (options.verify_roots === "each") coldOracle = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, oracleRoot, label: "cold", engineExports });
 
     const usedPaths = new Set();
     const runNonce = randomBytes(4).toString("hex");
@@ -991,7 +1001,7 @@ export async function run(options) {
       const timelineLatencies = deriveTimelineLatencies(readiness.timeline, daemonEpochOffsetMs, mutationWriteEpochMs);
       previous = { queryable_generation: readiness.queryableGen, durable_generation: readiness.durableGen };
       let rootsResult;
-      if (options.verify_roots === "each") rootsResult = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, tmpRoot, label: String(index), engineExports });
+      if (options.verify_roots === "each") rootsResult = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, oracleRoot, label: String(index), engineExports });
       const corpus_digest = await computeNativeAccelerationCorpusDigest(corpusRoot, excludedPaths);
       mutations.push({
         mutation_index: index,
@@ -1029,7 +1039,7 @@ export async function run(options) {
       // `stopDaemonOnce` doc comment above for why this is safe and what
       // bug it fixes.
       await stopDaemonOnce();
-      finalOracle = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, tmpRoot, label: "final", engineExports });
+      finalOracle = await oracleVerify({ corpusRoot, workerPath, dataRoot, workspaceId, oracleRoot, label: "final", engineExports });
     }
 
     return {
@@ -1049,6 +1059,7 @@ export async function run(options) {
     await stopDaemonOnce();
     await nativeClosure?.cleanup().catch(() => undefined);
     await rm(tmpRoot, { recursive: true, force: true }).catch(() => undefined);
+    await rm(oracleRoot, { recursive: true, force: true }).catch(() => undefined);
     if (corpusParent !== tmpRoot) await rm(corpusParent, { recursive: true, force: true }).catch(() => undefined);
   }
 }
