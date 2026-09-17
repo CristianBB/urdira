@@ -86,9 +86,13 @@ fn stat_metadata(metadata: &std::fs::Metadata) -> StatMetadata {
     StatMetadata {
         byte_length: metadata.len(),
         ctime_ms: metadata.creation_time() as f64 / 10_000.0,
-        device: u64::from(metadata.volume_serial_number().unwrap_or(0)),
-        inode: metadata.file_index().unwrap_or(0),
-        mode: 0,
+        // `volume_serial_number` and `file_index` are still unstable in
+        // Rust's Windows metadata extension (`windows_by_handle`). Keep the
+        // documented non-POSIX fallback portable by using the stable file
+        // attributes field and zero-valued identity fields instead.
+        device: 0,
+        inode: 0,
+        mode: metadata.file_attributes(),
         mtime_ms: modified_ticks as f64 / 10_000.0,
     }
 }
