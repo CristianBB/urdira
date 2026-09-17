@@ -484,6 +484,12 @@ impl BucketedMerkleSet {
             let file = writer.into_inner().map_err(|e| e.into_error())?;
             file.sync_all()?;
         }
+        // Windows cannot replace an existing file with `rename`.  Merkle
+        // trees are rewritten at every cold generation, so remove the old
+        // published tree before the atomic rename on that platform. Unix
+        // keeps the single replace operation.
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(path);
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     }

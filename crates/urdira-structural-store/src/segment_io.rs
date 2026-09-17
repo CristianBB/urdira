@@ -616,6 +616,12 @@ pub fn write_framed_file(
         f.write_all(&blob)?;
         f.sync_all()?;
     }
+    // Windows does not allow `rename` to replace an existing destination.
+    // Delta rewrites can legitimately target an already-published index
+    // file, so make the replacement explicit there while retaining the
+    // atomic replace semantics on Unix.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(path);
     std::fs::rename(&tmp_path, path)?;
     Ok((blob.len() as u64, hash))
 }
