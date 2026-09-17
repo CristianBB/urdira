@@ -368,6 +368,7 @@ fn verify_all_detects_corrupted_pending_sites_file() {
         .expect("freshly written store must verify clean");
     // Windows refuses writes to a file with an active memory mapping. Drop
     // the reader before mutating the fixture, then reopen it below.
+    reader.wait_prefault();
     drop(reader);
 
     let manifest = urdira_structural_store::Manifest::read(&dir.join("MANIFEST")).unwrap();
@@ -424,6 +425,7 @@ fn verify_all_detects_corrupted_closures_pending_section() {
         .expect("freshly written store must verify clean");
     // Windows refuses writes to a file with an active memory mapping. Drop
     // the reader before mutating the container, then reopen it below.
+    reader.wait_prefault();
     drop(reader);
 
     let manifest = urdira_structural_store::Manifest::read(&dir.join("MANIFEST")).unwrap();
