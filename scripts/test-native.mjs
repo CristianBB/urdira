@@ -29,13 +29,17 @@ function tsgoBinary() {
   if (packageDirectory === undefined) {
     throw new Error(`Missing @typescript/typescript-${target} package under ${pnpmRoot}`);
   }
+  // The native TypeScript package exposes a POSIX executable on Unix and a
+  // PE executable on Windows. Keep the platform-specific suffix explicit so
+  // this preflight does not report a missing compiler on Windows hosts.
+  const binaryName = platform === "win32" ? "tsc.exe" : "tsc";
   const binary = join(
     pnpmRoot,
     packageDirectory,
     "node_modules",
     `@typescript/typescript-${target}`,
     "lib",
-    "tsc",
+    binaryName,
   );
   if (!existsSync(binary)) throw new Error(`Missing TypeScript compiler binary: ${binary}`);
   return binary;
