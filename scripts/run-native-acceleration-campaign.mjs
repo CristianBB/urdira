@@ -552,11 +552,23 @@ async function inspectLinuxBlockDevice(source, resolvedPath) {
   const minor = (device & 0xff) | ((device >> 12) & 0xfff00);
   const sysfsDevice = `/sys/dev/block/${major}:${minor}`;
   try {
-    const resolvedSysfsDevice = await realpath(sysfsDevice);
-    const rotational = (await readFile(join(sysfsDevice, "queue", "rotational"), "utf8")).trim();
-    if (resolvedSysfsDevice.includes("/nvme")) return "local_nvme";
-    if (rotational === "0") return "local_ssd";
-    if (rotational === "1") return "local_hdd";
+    // A partition (for example `/dev/root` -> `sda1`) has no `queue`
+    // directory of its own. Walk from the resolved partition to its block
+    // device parent until the kernel exposes the rotational flag.
+    let candidate = await realpath(sysfsDevice);
+    while (candidate.startsWith("/sys/") && candidate !== "/sys") {
+      if (candidate.includes("/nvme")) return "local_nvme";
+      try {
+        const rotational = (await readFile(join(candidate, "queue", "rotational"), "utf8")).trim();
+        if (rotational === "0") return "local_ssd";
+        if (rotational === "1") return "local_hdd";
+      } catch {
+        // Continue with the parent when this node is a disk partition.
+      }
+      const parent = dirname(candidate);
+      if (parent === candidate) break;
+      candidate = parent;
+    }
   } catch {
     // Keep the evidence failure in the caller: unknown devices must not be
     // silently treated as a local disk class.
