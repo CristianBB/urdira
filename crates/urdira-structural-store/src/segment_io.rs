@@ -8,8 +8,8 @@
 //!
 //! P2-2m: every positional write into a `create_sized` (pre-`set_len`,
 //! hence zero-filled/sparse) file below MUST go through
-//! [`std::os::unix::fs::FileExt::write_all_at`], never the single-shot
-//! [`std::os::unix::fs::FileExt::write_at`]. `write_at` wraps exactly one
+//! the platform's positional-write primitive, never a single-shot write.
+//! Unix uses `write_at`; Windows uses `seek_write`. Each wraps exactly one
 //! `pwrite(2)` call and is explicitly allowed by POSIX to write fewer
 //! bytes than requested (a "short write") even for a plain regular file
 //! and even without returning an error; Rust's std does not retry a short
@@ -40,7 +40,10 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as UnixFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -331,8 +334,31 @@ fn materialize_real(file: &File, len: u64) -> std::io::Result<()> {
     let mut written = 0u64;
     while written < len {
         let take = CHUNK.min((len - written) as usize);
-        file.write_all_at(&zeros[..take], written)?;
+        write_all_at(file, &zeros[..take], written)?;
         written += take as u64;
+    }
+    Ok(())
+}
+
+/// Writes every byte at a fixed offset, retrying short positional writes on
+/// both Unix (`write_at`) and Windows (`seek_write`). The file cursor is never
+/// used, so concurrent callers can safely target disjoint ranges when their
+/// caller provides the required synchronization.
+fn write_all_at(file: &File, bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        #[cfg(unix)]
+        let count = UnixFileExt::write_at(file, &bytes[written..], offset)?;
+        #[cfg(windows)]
+        let count = WindowsFileExt::seek_write(file, &bytes[written..], offset)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positional write made no progress",
+            ));
+        }
+        written += count;
+        offset += count as u64;
     }
     Ok(())
 }
@@ -370,10 +396,11 @@ struct HotFile {
 
 impl HotFile {
     fn write_all_at(&self, bytes: &[u8], offset: u64) -> std::io::Result<()> {
-        self.file
+        let file = self
+            .file
             .lock()
-            .map_err(|_| std::io::Error::other("hot-file write lock poisoned"))?
-            .write_all_at(bytes, offset)
+            .map_err(|_| std::io::Error::other("hot-file write lock poisoned"))?;
+        write_all_at(&file, bytes, offset)
     }
 }
 
@@ -479,7 +506,7 @@ mod physical_preallocation_tests {
             for index in 0..16u64 {
                 let file = &file;
                 scope.spawn(move || {
-                    file.write_all_at(&[index as u8 + 1; 4096], index * 1024 * 1024)
+                    write_all_at(&file, &[index as u8 + 1; 4096], index * 1024 * 1024)
                         .expect("disjoint overwrite succeeds");
                 });
             }
