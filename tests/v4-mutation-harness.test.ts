@@ -287,6 +287,9 @@ describeIfBuilt("v4 mutation harness end-to-end (real urdira-indexing-worker + n
         await rm(outputDir, { recursive: true, force: true });
       }
     },
-    60_000,
+    // The harness itself may consume its full readiness timeout while a
+    // platform watcher settles; leave Vitest enough headroom for teardown and
+    // the final oracle comparison on loaded CI runners.
+    120_000,
   );
 });

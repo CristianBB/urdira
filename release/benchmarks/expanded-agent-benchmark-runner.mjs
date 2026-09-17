@@ -75,7 +75,14 @@ function validateRuntimePreflight() {
     throw error;
   }
   if (!model || model.trim().length === 0) throw new Error("Urdira benchmark preflight: --model must be non-empty.");
-  for (const requiredPath of ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json", "packages/mcp/dist/index.js", "packages/cli/dist/agent-integration.js", "apps/urdira/dist/cli.js", "apps/urdira/package.json"]) {
+  // Baseline and external-tool arms never load Urdira's runtime. Requiring
+  // runtime build output for those arms makes a valid model invocation look
+  // like a preflight failure on clean or partially built checkouts. Keep the
+  // universal project contract small and gate runtime artifacts only where
+  // the Urdira arm actually imports them below.
+  const requiredPaths = ["pnpm-lock.yaml", "packages/plugin-javascript-typescript/package.json"];
+  if (arm === "urdira-typescript") requiredPaths.push("packages/mcp/dist/index.js", "packages/cli/dist/agent-integration.js", "apps/urdira/dist/cli.js", "apps/urdira/package.json");
+  for (const requiredPath of requiredPaths) {
     if (!existsSync(join(root, requiredPath))) throw new Error(`Urdira benchmark preflight: required project artifact is missing: ${requiredPath}`);
   }
   if (arm === "urdira-typescript") {
