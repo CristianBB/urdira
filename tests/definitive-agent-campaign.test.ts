@@ -249,7 +249,7 @@ describe("definitive direct campaign orchestrator", () => {
     expect(result.status).toBe(1);
     const runId = "playwright-affected-tests-deterministic-baseline-1";
     const manifest = JSON.parse(readFileSync(join(output, `${runId}.json`), "utf8"));
-    expect(manifest.model_invoked).toBe(true);
+    expect(manifest.model_invoked, JSON.stringify(manifest)).toBe(true);
     expect(manifest.codex_invocations[0]).toMatchObject({ label: "turn-1", code: 0 });
     expect(manifest.transcript).toMatch(/\.jsonl$/u);
     expect(readFileSync(manifest.codex_invocations[0].stderr_path, "utf8")).toContain("synthetic Codex stderr");
@@ -282,7 +282,7 @@ describe("definitive direct campaign orchestrator", () => {
     expect(result.status).toBe(1);
     const runId = "playwright-affected-tests-deterministic-baseline-1";
     const manifest = JSON.parse(readFileSync(join(output, `${runId}.json`), "utf8"));
-    expect(manifest.model_invoked).toBe(true);
+    expect(manifest.model_invoked, JSON.stringify(manifest)).toBe(true);
     expect(manifest.codex_invocations).toHaveLength(1);
     expect(manifest.codex_invocations[0].capture_error).toMatch(/EISDIR|is a directory/u);
     expect(manifest.error).toMatch(/Codex output capture failed/u);

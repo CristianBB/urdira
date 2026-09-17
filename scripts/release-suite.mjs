@@ -147,8 +147,11 @@ export async function runReleaseSuite({ rootDir = ROOT, outputDir = join(rootDir
   };
   const finalReport = await writeReleaseReport(report, reportPath);
   if (status !== "passed") {
-    const failing = Object.entries(gates).filter(([, gate]) => gate.status !== "passed").map(([name]) => name).join(", ");
-    throw new Error(`Release acceptance failed at: ${failing}`);
+    const failing = Object.entries(gates)
+      .filter(([, gate]) => gate.status !== "passed")
+      .map(([name, gate]) => `${name}: ${typeof gate.output === "string" ? gate.output : JSON.stringify(gate)}`)
+      .join("\n\n");
+    throw new Error(`Release acceptance failed at:\n${failing}`);
   }
   return finalReport;
 }
