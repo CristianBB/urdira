@@ -238,6 +238,13 @@ const run = (command, args, options = {}) => new Promise((resolve, reject) => {
   prepareCapture(options.stdoutPath); prepareCapture(options.stderrPath);
   child.stdout.on("data", (chunk) => { stdout += chunk.toString(); captureChunk(options.stdoutPath, chunk); timingCapture?.ingest(chunk); });
   child.stderr.on("data", (chunk) => { stderr += chunk.toString(); captureChunk(options.stderrPath, chunk); });
+  // A short-lived Codex process may close its stdin before the parent has
+  // finished writing the prompt. Node reports that normal pipe-close race as
+  // an unhandled EPIPE unless stdin has its own error listener; the child's
+  // exit status and captured stderr remain the authoritative outcome.
+  child.stdin.on("error", (error) => {
+    if (error?.code !== "EPIPE") captureError ??= error instanceof Error ? error.message : String(error);
+  });
   if (options.input !== undefined) child.stdin.end(options.input); else child.stdin.end();
   child.on("error", (error) => { error.capture_error = captureError; error.command_output = { ...commandOutputMetadata(options.stdoutPath), stdout_path: options.stdoutPath ?? null, stdout_bytes: commandOutputMetadata(options.stdoutPath).bytes, stdout_sha256: commandOutputMetadata(options.stdoutPath).sha256, stderr_path: options.stderrPath ?? null, stderr_bytes: commandOutputMetadata(options.stderrPath).bytes, stderr_sha256: commandOutputMetadata(options.stderrPath).sha256 }; reject(error); });
   child.on("close", (code, signal) => resolve({ code: code ?? 1, signal, stdout, stderr, timing: timingCapture?.finish(), capture_error: captureError, stdout_path: options.stdoutPath ?? null, stderr_path: options.stderrPath ?? null, stdout_bytes: commandOutputMetadata(options.stdoutPath).bytes, stdout_sha256: commandOutputMetadata(options.stdoutPath).sha256, stderr_bytes: commandOutputMetadata(options.stderrPath).bytes, stderr_sha256: commandOutputMetadata(options.stderrPath).sha256 }));
