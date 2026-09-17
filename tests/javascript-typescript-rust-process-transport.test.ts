@@ -109,10 +109,14 @@ async function fakeWorker(buildIdentity: string, behavior: FakeWorkerBehavior = 
       if ((payload.kind === "read_facts" || payload.kind === "read_facts_group") && behavior === "hang_read") return;
       if (payload.kind === "analyze" && behavior === "stdout_eof") {
         process.stdout.end();
-        // Explicitly destroy the pipe after the graceful end request. Windows
-        // can otherwise keep the child stream open while the worker remains
-        // alive, making the transport's EOF guard race its request timeout.
-        setImmediate(() => process.stdout.destroy());
+        // Close the underlying pipe descriptor after requesting a graceful
+        // end. On Windows, destroying the JavaScript stream alone can leave
+        // the inherited pipe open while the worker remains alive, so the
+        // parent never observes EOF and eventually reports a timeout.
+        setImmediate(() => {
+          process.stdout.destroy();
+          process.stdout._handle?.close();
+        });
         setInterval(() => undefined, 1_000);
         return;
       }
