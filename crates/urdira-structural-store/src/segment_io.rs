@@ -506,7 +506,7 @@ mod physical_preallocation_tests {
             for index in 0..16u64 {
                 let file = &file;
                 scope.spawn(move || {
-                    write_all_at(&file, &[index as u8 + 1; 4096], index * 1024 * 1024)
+                    write_all_at(file, &[index as u8 + 1; 4096], index * 1024 * 1024)
                         .expect("disjoint overwrite succeeds");
                 });
             }

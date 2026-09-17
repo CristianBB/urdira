@@ -246,7 +246,9 @@ describeIfBuilt("v4 mutation harness end-to-end (real urdira-indexing-worker + n
           verify_roots: "each",
           mutation_kinds: ["rename"],
           repeat: 1,
-          readiness_timeout_ms: 60_000,
+          // Real watcher delivery can exceed one minute on a loaded hosted
+          // runner before the rename's structural generation is durable.
+          readiness_timeout_ms: 120_000,
           poll_interval_ms: 200,
           hub_min_importers: 50,
         });
