@@ -819,8 +819,17 @@ describeIfBuilt("v4 daemon end-to-end (real urdira-indexing-worker + native stru
 
       // `TaskRepository` (`repository/task-repository.ts`) -- the
       // `implements` clause's TARGET once the residual pass confirms it.
-      const repositoryInterfaceStreams = await queryStreams(client, workspaceId, "core:resolve_symbol", { reference: "TaskRepository", resolution_scope: "exports" });
-      const repositoryInterfaceDecl = (repositoryInterfaceStreams["declarations"]?.items ?? []).map((item) => item.value as Record<string, unknown>);
+      // Structural readiness settles the indexing generation, while the
+      // query projection can become visible on the next event-loop turn on
+      // slower runners. Poll briefly so this assertion checks the published
+      // contract rather than a transient empty projection.
+      const declarationDeadline = Date.now() + 10_000;
+      let repositoryInterfaceDecl: Array<Record<string, unknown>> = [];
+      while (Date.now() < declarationDeadline && repositoryInterfaceDecl.length === 0) {
+        const repositoryInterfaceStreams = await queryStreams(client, workspaceId, "core:resolve_symbol", { reference: "TaskRepository", resolution_scope: "exports" });
+        repositoryInterfaceDecl = (repositoryInterfaceStreams["declarations"]?.items ?? []).map((item) => item.value as Record<string, unknown>);
+        if (repositoryInterfaceDecl.length === 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+      }
       expect(repositoryInterfaceDecl.length).toBeGreaterThan(0);
       const repositoryInterfaceEntityId = repositoryInterfaceDecl[0]!["entity_id"];
       expect(typeof repositoryInterfaceEntityId).toBe("string");
