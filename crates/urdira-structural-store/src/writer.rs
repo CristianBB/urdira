@@ -257,6 +257,12 @@ impl SegmentWriter {
         generation: u64,
         pending_sites: &[PendingSiteRow],
     ) -> Result<SegmentSummary> {
+        assert_eq!(
+            partitions.len(),
+            N_NIBBLES,
+            "write_base_partitioned requires exactly {N_NIBBLES} nibble partitions"
+        );
+
         #[cfg(windows)]
         {
             // Windows runners reject the concurrent positional overwrite

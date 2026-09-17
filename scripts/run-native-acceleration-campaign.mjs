@@ -560,6 +560,30 @@ async function inspectLinuxFilesystem(path) {
     if (fields.some((field) => field.toLowerCase() === "nvme")) storageClass = "local_nvme";
     else if (fields.at(-1) === "0") storageClass = "local_ssd";
     else if (fields.at(-1) === "1") storageClass = "local_hdd";
+
+    // Some hosted ARM runners expose the root volume as `/dev/root`, for
+    // which `lsblk` returns no transport metadata. Resolve the mounted
+    // device through its Linux device number instead of guessing from the
+    // source name. The sysfs queue tells us whether it is rotational, while
+    // the resolved device path identifies NVMe namespaces and partitions.
+    if (storageClass === undefined) {
+      const device = (await stat(resolvedPath)).dev;
+      const major = (device >> 8) & 0xfff;
+      const minor = (device & 0xff) | ((device >> 12) & 0xfff00);
+      const sysfsDevice = `/sys/dev/block/${major}:${minor}`;
+      try {
+        const resolvedSysfsDevice = await realpath(sysfsDevice);
+        const rotational = (await readFile(join(sysfsDevice, "queue", "rotational"), "utf8")).trim();
+        if (resolvedSysfsDevice.includes("/nvme") || rotational === "0") {
+          storageClass = resolvedSysfsDevice.includes("/nvme") ? "local_nvme" : "local_ssd";
+        } else if (rotational === "1") {
+          storageClass = "local_hdd";
+        }
+      } catch {
+        // Keep the evidence failure below: an unknown device must not be
+        // silently treated as a local disk class.
+      }
+    }
   }
   if (storageClass === undefined) evidenceFail(`cannot determine storage class for ${path} on ${mount.source}.`);
   return { filesystem_type: mount.filesystem_type, storage_class: storageClass };
