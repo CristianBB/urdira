@@ -109,6 +109,10 @@ async function fakeWorker(buildIdentity: string, behavior: FakeWorkerBehavior = 
       if ((payload.kind === "read_facts" || payload.kind === "read_facts_group") && behavior === "hang_read") return;
       if (payload.kind === "analyze" && behavior === "stdout_eof") {
         process.stdout.end();
+        // Explicitly destroy the pipe after the graceful end request. Windows
+        // can otherwise keep the child stream open while the worker remains
+        // alive, making the transport's EOF guard race its request timeout.
+        setImmediate(() => process.stdout.destroy());
         setInterval(() => undefined, 1_000);
         return;
       }
