@@ -290,8 +290,9 @@ describeIfBuilt("v4 mutation harness end-to-end (real urdira-indexing-worker + n
       }
     },
     // The harness itself may consume its full readiness timeout while a
-    // platform watcher settles; leave Vitest enough headroom for teardown and
-    // the final oracle comparison on loaded CI runners.
-    120_000,
+    // platform watcher settles; each of the two rename variants may consume
+    // the full readiness timeout, so leave Vitest enough headroom for both
+    // waits, teardown, and the final oracle comparison on loaded CI runners.
+    300_000,
   );
 });
