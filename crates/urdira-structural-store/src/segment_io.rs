@@ -749,7 +749,10 @@ pub fn write_hot_and_secondary_files(
         (&ident_path, HEADER_LEN as u64 + total_ident),
     ])?;
 
-    let n_threads = n_threads.max(1);
+    // Windows hosted runners reject concurrent positional overwrites with
+    // `ERROR_ACCESS_DENIED`; serialize the nibble workers there while
+    // retaining the normal parallel path on Unix.
+    let n_threads = if cfg!(windows) { 1 } else { n_threads.max(1) };
     let mut partitions_per_thread: Vec<Vec<usize>> = vec![Vec::new(); n_threads];
     for nib in 0..N_NIBBLES {
         partitions_per_thread[nib % n_threads].push(nib);
