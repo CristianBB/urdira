@@ -1602,7 +1602,7 @@ type IdentityKeysetNext = (Vec<u8>, [u8; 32]);
 
 impl StoreReader {
     pub fn open(dir: &Path) -> Result<Self> {
-        let inner = StoreInner::load(dir)?;
+        let inner = load_during_publication(dir)?;
         let prefault = spawn_prefault(&inner);
         Ok(StoreReader {
             inner: Arc::new(Mutex::new(Arc::new(inner))),
@@ -2652,6 +2652,31 @@ impl StoreReader {
         }
         Ok(())
     }
+}
+
+/// Opens a store while tolerating the short replacement window used by the
+/// Windows publisher. Windows cannot rename over an existing file, so the
+/// publisher removes the old manifest/tree before renaming the fully-written
+/// replacement into place. A reader that lands in that gap should retry the
+/// load, not report a torn store to its caller.
+#[cfg(windows)]
+fn load_during_publication(dir: &Path) -> Result<StoreInner> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match StoreInner::load(dir) {
+            Ok(inner) => return Ok(inner),
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+    Err(last_error.expect("publication retry loop always records an error"))
+}
+
+#[cfg(not(windows))]
+fn load_during_publication(dir: &Path) -> Result<StoreInner> {
+    StoreInner::load(dir)
 }
 
 /// K-way merge cursor over every segment's `records.keys`, yielding

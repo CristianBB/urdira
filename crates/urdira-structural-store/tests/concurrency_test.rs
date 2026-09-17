@@ -46,6 +46,9 @@ fn readers_never_observe_a_torn_state_across_a_delta_publish() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let failures = Arc::new(AtomicUsize::new(0));
+    let open_failures = Arc::new(AtomicUsize::new(0));
+    let query_failures = Arc::new(AtomicUsize::new(0));
+    let verify_failures = Arc::new(AtomicUsize::new(0));
     let saw_gen1 = Arc::new(AtomicUsize::new(0));
     let saw_gen2 = Arc::new(AtomicUsize::new(0));
 
@@ -54,6 +57,9 @@ fn readers_never_observe_a_torn_state_across_a_delta_publish() {
         let dir = dir.clone();
         let stop = Arc::clone(&stop);
         let failures = Arc::clone(&failures);
+        let open_failures = Arc::clone(&open_failures);
+        let query_failures = Arc::clone(&query_failures);
+        let verify_failures = Arc::clone(&verify_failures);
         let saw_gen1 = Arc::clone(&saw_gen1);
         let saw_gen2 = Arc::clone(&saw_gen2);
         let reference_g1 = reference_g1.clone();
@@ -70,6 +76,7 @@ fn readers_never_observe_a_torn_state_across_a_delta_publish() {
                         // since MANIFEST already exists from write_base,
                         // so any open() failure here is a real bug.
                         failures.fetch_add(1, Ordering::Relaxed);
+                        open_failures.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
@@ -82,6 +89,7 @@ fn readers_never_observe_a_torn_state_across_a_delta_publish() {
                     &reference_g2
                 } else {
                     failures.fetch_add(1, Ordering::Relaxed);
+                    query_failures.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
 
@@ -93,12 +101,15 @@ fn readers_never_observe_a_torn_state_across_a_delta_publish() {
                 got.sort();
                 if got != reference.visible_ids_by_owner(0, g) {
                     failures.fetch_add(1, Ordering::Relaxed);
+                    query_failures.fetch_add(1, Ordering::Relaxed);
                 }
                 if reader.visible_count(g) != reference.visible_count(g) {
                     failures.fetch_add(1, Ordering::Relaxed);
+                    query_failures.fetch_add(1, Ordering::Relaxed);
                 }
                 if reader.verify_all().is_err() {
                     failures.fetch_add(1, Ordering::Relaxed);
+                    verify_failures.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }));
@@ -127,7 +138,10 @@ fn readers_never_observe_a_torn_state_across_a_delta_publish() {
     assert_eq!(
         failures.load(Ordering::Relaxed),
         0,
-        "no reader thread may observe an inconsistent/torn state"
+        "no reader thread may observe an inconsistent/torn state (open={}, query={}, verify={})",
+        open_failures.load(Ordering::Relaxed),
+        query_failures.load(Ordering::Relaxed),
+        verify_failures.load(Ordering::Relaxed)
     );
     assert!(
         saw_gen1.load(Ordering::Relaxed) > 0,
