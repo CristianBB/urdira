@@ -56,6 +56,27 @@ pub(crate) fn register(dir: &Path, segments: &[String]) -> Result<ReaderGuard> {
 /// background) compaction path, so a process spawn's cost is a
 /// non-issue.
 fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // `kill -0` is a POSIX probe and the Git-for-Windows shim reports
+        // "No such process" even for the current Rust test process. Keep
+        // the current process fast and use the Windows process listing for
+        // markers left by another process.
+        if pid == std::process::id() {
+            return true;
+        }
+        let filter = format!("PID eq {pid}");
+        return std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(windows))]
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
