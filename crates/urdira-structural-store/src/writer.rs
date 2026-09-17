@@ -257,6 +257,24 @@ impl SegmentWriter {
         generation: u64,
         pending_sites: &[PendingSiteRow],
     ) -> Result<SegmentSummary> {
+        #[cfg(windows)]
+        {
+            // Windows runners reject the concurrent positional overwrite
+            // pattern used by the partition-native hot writer with
+            // `ERROR_ACCESS_DENIED`. Preserve the exact bytes and manifest
+            // contract by using the already-correct flat writer on Windows;
+            // Unix keeps the partition-native path and its parallelism.
+            let rows: Vec<RecordRow> = partitions.iter().flatten().cloned().collect();
+            return self.write_base_with_pending(
+                dir,
+                &rows,
+                deps,
+                dicts,
+                generation,
+                pending_sites,
+            );
+        }
+
         // P2-2l item 4: per-phase timing, gated behind the same `URDIRA_
         // DEBUG_TIMING` env var `write_delta_with_reader` already uses --
         // this task's own brief asks to profile this function's per-file

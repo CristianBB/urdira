@@ -7428,6 +7428,7 @@ mod tests {
     use urdira_worker_protocol::AuthoritativeChangeSet;
 
     fn test_request() -> GenerationRequest {
+        let cas_root = std::env::temp_dir().join("urdira-cas");
         GenerationRequest {
             operation_id: "operation:worker-test".into(),
             workspace_id: "workspace:worker-test".into(),
@@ -7435,7 +7436,7 @@ mod tests {
             cancellation_path: None,
             direct_publication: false,
             source_snapshot_id: "snapshot:worker-test".into(),
-            cas_root: "/tmp/urdira-cas".into(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
             source_state_digest: "sha256:source".into(),
             base_generation: 0,
             registry_snapshot_id: "registry:worker-test".into(),

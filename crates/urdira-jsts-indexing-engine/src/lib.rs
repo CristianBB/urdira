@@ -164,6 +164,7 @@ mod tests {
     fn acknowledges_only_after_core_descriptor() {
         let mut engine = JavascriptTypescriptEngine::new("1", "sha256:engine");
         engine.enqueue_group("a.ts", group()).expect("enqueue");
+        let cas_root = std::env::temp_dir().join("urdira-cas");
         let request = GenerationRequest {
             operation_id: "operation:test".into(),
             workspace_id: "workspace:test".into(),
@@ -171,7 +172,7 @@ mod tests {
             cancellation_path: None,
             direct_publication: false,
             source_snapshot_id: "snapshot:test".into(),
-            cas_root: "/tmp/urdira-cas".into(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
             source_state_digest: "sha256:source".into(),
             base_generation: 0,
             registry_snapshot_id: "registry:test".into(),
