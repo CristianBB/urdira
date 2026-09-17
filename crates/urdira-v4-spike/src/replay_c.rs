@@ -12,7 +12,10 @@ use crate::util::{Timings, dir_size, fsync_path, remove_if_exists};
 use memmap2::{Mmap, MmapOptions};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as UnixFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +44,28 @@ fn write_str_dict(w: &mut impl Write, values: &[String]) -> std::io::Result<()> 
         let b = v.as_bytes();
         w.write_all(&(b.len() as u32).to_le_bytes())?;
         w.write_all(b)?;
+    }
+    Ok(())
+}
+
+/// Writes all bytes at a fixed offset using the platform's positional API.
+/// The Windows and Unix implementations both permit short writes, so retry
+/// until the complete buffer is durable or a real error occurs.
+fn write_all_at(file: &File, bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        #[cfg(unix)]
+        let count = UnixFileExt::write_at(file, &bytes[written..], offset)?;
+        #[cfg(windows)]
+        let count = WindowsFileExt::seek_write(file, &bytes[written..], offset)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "positional write made no progress",
+            ));
+        }
+        written += count;
+        offset += count as u64;
     }
     Ok(())
 }
@@ -211,11 +236,11 @@ pub fn run(store: &Store, out_dir: &Path) -> AnyResult<Timings> {
                     ident_buf.extend_from_slice(&row.identity_key);
                 }
 
-                keys_file.write_at(&keys_buf, (start * KEYS_STRIDE) as u64)?;
-                meta_file.write_at(&meta_buf, (start * META_STRIDE) as u64)?;
-                digests_file.write_at(&digests_buf, (start * DIGESTS_STRIDE) as u64)?;
-                body_file.write_at(&body_buf, body_off[start])?;
-                ident_file.write_at(&ident_buf, ident_off[start])?;
+                write_all_at(&keys_file, &keys_buf, (start * KEYS_STRIDE) as u64)?;
+                write_all_at(&meta_file, &meta_buf, (start * META_STRIDE) as u64)?;
+                write_all_at(&digests_file, &digests_buf, (start * DIGESTS_STRIDE) as u64)?;
+                write_all_at(&body_file, &body_buf, body_off[start])?;
+                write_all_at(&ident_file, &ident_buf, ident_off[start])?;
             }
             Ok(())
         }));
