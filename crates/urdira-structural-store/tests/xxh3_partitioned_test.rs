@@ -350,6 +350,9 @@ fn delta_with_several_nibbles_verifies_clean_and_detects_corruption() {
     let reader = StoreReader::open(&dir).unwrap();
     reader.verify_all().expect("delta must verify clean");
     assert_eq!(reader.visible_count(2), rows.len() as u64);
+    // Windows refuses writes to a file with an active memory mapping. Drop
+    // the reader before mutating the container, then reopen it below.
+    drop(reader);
 
     // Corrupt the delta container file itself -- flip a byte somewhere in
     // its back half, likely to land inside one of the larger sections

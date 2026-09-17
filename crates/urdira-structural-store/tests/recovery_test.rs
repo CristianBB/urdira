@@ -102,6 +102,9 @@ fn verify_all_reports_a_corrupted_file() {
     reader
         .verify_all()
         .expect("freshly written store must verify clean");
+    // Windows refuses writes to a file with an active memory mapping. Drop
+    // the reader before mutating the fixture, then reopen it below.
+    drop(reader);
 
     // Flip one byte in a file NOT covered by open()'s 4-file sample
     // (records.keys/meta/digests of the base, plus the newest segment's
