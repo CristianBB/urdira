@@ -40,10 +40,10 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as UnixFileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as WindowsFileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -340,17 +340,31 @@ fn materialize_real(file: &File, len: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes every byte at a fixed offset, retrying short positional writes on
-/// both Unix (`write_at`) and Windows (`seek_write`). The file cursor is never
-/// used, so concurrent callers can safely target disjoint ranges when their
-/// caller provides the required synchronization.
-fn write_all_at(file: &File, bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+/// Writes every byte at a fixed offset. Unix uses retrying `write_at` calls;
+/// Windows seeks a cloned synchronous handle and writes the complete buffer.
+/// The caller serializes writes per file, so each platform preserves the same
+/// positional semantics while rayon tasks continue to operate independently.
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // `FileExt::seek_write` is not reliable for the synchronous handles
+        // created by `OpenOptions` on the hosted Windows runners (it returns
+        // ERROR_ACCESS_DENIED even though the handle is writable).  The
+        // caller serializes writes for each file, so a cloned handle with an
+        // explicit seek preserves positional semantics without sharing a
+        // mutable cursor between rayon tasks.
+        let mut sequential = file.try_clone()?;
+        sequential.seek(SeekFrom::Start(offset))?;
+        sequential.write_all(bytes)?;
+        return Ok(());
+    }
+
     let mut written = 0usize;
+    #[cfg(unix)]
+    let mut offset = offset;
     while written < bytes.len() {
         #[cfg(unix)]
         let count = UnixFileExt::write_at(file, &bytes[written..], offset)?;
-        #[cfg(windows)]
-        let count = WindowsFileExt::seek_write(file, &bytes[written..], offset)?;
         if count == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
