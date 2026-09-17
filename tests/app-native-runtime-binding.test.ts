@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const nativeState = vi.hoisted(() => ({
@@ -157,7 +158,7 @@ describe("Urdira application native runtime binding", () => {
     const databasePath = join(root, "workspace.sqlite");
     const protocolPath = join(process.cwd(), "packages/plugin-javascript-typescript/dist/rust-protocol.js");
     await writeFile(workerPath, `#!/usr/bin/env node
-      import { encodeRustWorkerMessage } from ${JSON.stringify(protocolPath)};
+      import { encodeRustWorkerMessage } from ${JSON.stringify(pathToFileURL(protocolPath).href)};
       import { Buffer } from "node:buffer";
       let pending = Buffer.alloc(0); let sequence = 0;
       const readVarint = (body, state) => { let value = 0; let factor = 1; while (true) { const byte = body[state.offset++]; value += (byte & 127) * factor; if ((byte & 128) === 0) return value; factor *= 128; } };
