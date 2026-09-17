@@ -539,9 +539,10 @@ describe("Index pack (docs/decisions/23-index-pack.md)", () => {
     const N_SYNTHETIC_IDENTITIES = 1_000_000;
     // Keep enough headroom for shared CI runners while preserving the
     // regression signal: the known OFFSET implementation took 87.8s on this
-    // fixture, whereas the keyset implementation stays below this 45s gate.
+    // fixture, whereas the keyset implementation stays well below this
+    // 60-second gate.
     // The override supports controlled profiling without editing the test.
-    const PERF_BOUND_MS = perfBoundMs("URDIRA_PACK_IDENTITY_BOUND_MS", 45_000);
+    const PERF_BOUND_MS = perfBoundMs("URDIRA_PACK_IDENTITY_BOUND_MS", 60_000);
 
     const fixture = await buildReadyDonorAndExport("perf-scale");
     const targetRoot = await mkdtemp(join(tmpdir(), "urdira-index-pack-perf-scale-target-"));

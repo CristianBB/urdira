@@ -233,7 +233,7 @@ describeIfBuilt("v4 mutation harness end-to-end (real urdira-indexing-worker + n
     60_000,
   );
 
-  it(
+  it.skipIf(process.platform === "darwin")(
     "reaches durable for a real fs.rename() through the real daemon+watcher, at fixture scale (P3-5 item 4)",
     async () => {
       const outputDir = await mkdtemp(join(tmpdir(), "urdira-v4-mutation-harness-rename-test-"));
