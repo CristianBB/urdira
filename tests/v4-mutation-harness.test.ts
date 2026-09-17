@@ -246,9 +246,11 @@ describeIfBuilt("v4 mutation harness end-to-end (real urdira-indexing-worker + n
           verify_roots: "each",
           mutation_kinds: ["rename"],
           repeat: 1,
-          // Real watcher delivery can exceed one minute on a loaded hosted
-          // runner before the rename's structural generation is durable.
-          readiness_timeout_ms: 120_000,
+          // A hosted macOS runner can spend several minutes compiling and
+          // handing the watcher event to the daemon before the generation is
+          // durable. Keep this scenario bounded, but leave enough headroom
+          // for the real end-to-end path under CI contention.
+          readiness_timeout_ms: 300_000,
           poll_interval_ms: 200,
           hub_min_importers: 50,
         });
