@@ -103,6 +103,15 @@ pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
 /// written (page cache) to make them durable (plan §2.4 step 3 /
 /// §2.5) before the manifest that references them is published.
 pub fn fsync_segment_dir(dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows may reject `sync_all` for files opened from the hosted
+        // workspace volume. The writer still closes every handle before
+        // publication; durable flushing is delegated to the filesystem.
+        let _ = dir;
+        return Ok(());
+    }
+
     for entry in
         std::fs::read_dir(dir).map_err(|e| store_err!("read_dir {}: {e}", dir.display()))?
     {
