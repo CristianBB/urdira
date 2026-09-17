@@ -2508,6 +2508,10 @@ mod tests {
     }
 
     fn request() -> GenerationRequest {
+        // Keep the shared fixture valid on Windows as well as Unix: a Unix
+        // `/tmp/...` literal is not an absolute Windows path, so every test
+        // that opens this request would fail before exercising its behavior.
+        let cas_root = std::env::temp_dir().join("urdira-cas");
         GenerationRequest {
             operation_id: "operation:test".into(),
             workspace_id: "workspace:test".into(),
@@ -2515,7 +2519,7 @@ mod tests {
             cancellation_path: None,
             direct_publication: false,
             source_snapshot_id: "snapshot:test".into(),
-            cas_root: "/tmp/urdira-cas".into(),
+            cas_root: cas_root.to_string_lossy().into_owned(),
             source_state_digest: "sha256:source".into(),
             base_generation: 0,
             registry_snapshot_id: "registry:test".into(),
