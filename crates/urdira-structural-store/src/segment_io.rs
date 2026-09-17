@@ -45,7 +45,12 @@ use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as UnixFileExt;
 use std::path::Path;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+
+#[cfg(windows)]
+static WINDOWS_POSITIONAL_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub const N_NIBBLES: usize = 16;
 
@@ -353,6 +358,16 @@ fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
         // caller serializes writes for each file, so a cloned handle with an
         // explicit seek preserves positional semantics without sharing a
         // mutable cursor between rayon tasks.
+        // Windows duplicated handles share the underlying file pointer.  A
+        // seek followed by a write is therefore not atomic across threads:
+        // another writer can move the cursor between those two operations.
+        // Serialize this small critical section so the helper retains true
+        // positional-write semantics even for callers that intentionally
+        // issue disjoint writes concurrently (as the portability test does).
+        let _guard = WINDOWS_POSITIONAL_WRITE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("Windows positional-write lock is not poisoned");
         let mut sequential = file.try_clone()?;
         sequential.seek(SeekFrom::Start(offset))?;
         sequential.write_all(bytes)?;
