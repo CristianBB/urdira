@@ -359,20 +359,21 @@ fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let mut written = 0usize;
     #[cfg(unix)]
-    let mut offset = offset;
-    while written < bytes.len() {
-        #[cfg(unix)]
-        let count = UnixFileExt::write_at(file, &bytes[written..], offset)?;
-        if count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "positional write made no progress",
-            ));
+    {
+        let mut written = 0usize;
+        let mut offset = offset;
+        while written < bytes.len() {
+            let count = UnixFileExt::write_at(file, &bytes[written..], offset)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "positional write made no progress",
+                ));
+            }
+            written += count;
+            offset += count as u64;
         }
-        written += count;
-        offset += count as u64;
     }
     Ok(())
 }
