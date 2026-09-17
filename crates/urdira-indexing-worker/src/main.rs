@@ -7782,12 +7782,9 @@ mod tests {
             resolve_jsts_generation_input(&mut core, &request, envelope).expect("resolve");
         assert_eq!(resolved.root_names, vec!["a.ts"]);
         assert_eq!(resolved.files.len(), 1);
-        assert!(resolved.files[0].source_blob_path.contains("/sha256/aa/"));
-        assert!(
-            resolved.files[0]
-                .source_blob_path
-                .ends_with(&"a".repeat(62))
-        );
+        let source_blob_path = resolved.files[0].source_blob_path.replace('\\', "/");
+        assert!(source_blob_path.contains("/sha256/aa/"));
+        assert!(source_blob_path.ends_with(&"a".repeat(62)));
     }
 
     #[test]

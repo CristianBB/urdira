@@ -32,6 +32,8 @@ impl Manifest {
         tmp_name.push(".tmp");
         let tmp_path = path.with_file_name(tmp_name);
         std::fs::write(&tmp_path, &json)?;
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(path);
         std::fs::rename(&tmp_path, path)?;
         if let Some(parent) = path.parent() {
             fsync_dir(parent)?;
@@ -70,6 +72,8 @@ impl Manifest {
     pub fn publish_next(dir: &Path) -> Result<()> {
         let next = dir.join("MANIFEST.next");
         let published = dir.join("MANIFEST");
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(&published);
         std::fs::rename(&next, &published)
             .map_err(|e| store_err!("publish manifest in {}: {e}", dir.display()))?;
         fsync_dir(dir)?;
