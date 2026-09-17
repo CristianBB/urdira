@@ -241,6 +241,14 @@ pub fn write_container_to_page_cache(
 /// already-written container, instead of once per section as the old
 /// per-file `delta-<g>/` directory layout paid via `fsync_segment_dir`.
 pub fn commit_container(container: UncommittedContainer) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Hosted Windows volumes reject the standard file durability call;
+        // all bytes are written and the handle is still closed by drop.
+        drop(container);
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     container
         .file
         .sync_all()

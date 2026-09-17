@@ -482,6 +482,7 @@ impl BucketedMerkleSet {
                 writer.write_all(slot)?;
             }
             let file = writer.into_inner().map_err(|e| e.into_error())?;
+            #[cfg(not(windows))]
             file.sync_all()?;
         }
         // Windows cannot replace an existing file with `rename`.  Merkle
@@ -621,6 +622,7 @@ impl BucketedMerkleSet {
 
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&self.encode_header(kind, generation))?;
+        #[cfg(not(windows))]
         file.sync_all()?;
         Ok(())
     }

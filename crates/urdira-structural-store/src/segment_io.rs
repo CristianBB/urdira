@@ -614,6 +614,7 @@ pub fn write_framed_file(
     {
         let mut f = File::create(&tmp_path)?;
         f.write_all(&blob)?;
+        #[cfg(not(windows))]
         f.sync_all()?;
     }
     // Windows does not allow `rename` to replace an existing destination.
