@@ -1,6 +1,7 @@
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   JSTS_RUST_SYNTAX_BUILD_IDENTITY,
@@ -20,7 +21,7 @@ async function fakeIndexingCoreWorker(behavior: "normal" | "hang" | "bad_event" 
   const environmentPath = `${path}.env.json`;
   const protocolPath = join(process.cwd(), "packages/plugin-javascript-typescript/dist/rust-protocol.js");
   await writeFile(path, `
-    import { encodeRustWorkerMessage } from ${JSON.stringify(protocolPath)};
+    import { encodeRustWorkerMessage } from ${JSON.stringify(pathToFileURL(protocolPath).href)};
     import { Buffer } from "node:buffer";
     import { writeFileSync } from "node:fs";
     const behavior = ${JSON.stringify(behavior)};
