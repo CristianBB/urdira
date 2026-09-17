@@ -82,6 +82,16 @@ impl Manifest {
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows does not support opening a directory as a synchronizable
+        // file with the standard `File::open` flags. File contents are still
+        // flushed by `fsync_segment_dir`; only the directory-entry barrier is
+        // unavailable on this platform.
+        let _ = dir;
+        return Ok(());
+    }
+
     let f = std::fs::File::open(dir).map_err(|e| store_err!("open dir {}: {e}", dir.display()))?;
     f.sync_all()
         .map_err(|e| store_err!("fsync dir {}: {e}", dir.display()))?;
