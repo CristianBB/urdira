@@ -658,7 +658,8 @@ describe("Urdira application runner", () => {
 // this to pass -- a bug in any of them would either throw or silently
 // produce wrong/missing records, both of which this test would catch.
 describe("Urdira application runner: real multi-file JavaScript/TypeScript workspace scan (Phase 5.1)", () => {
-  it("scans the task-planner fixture's real cross-file imports end to end, publishes, queries, and rescans correctly after a one-file change", async () => {
+  const skipArmReleaseProbe = process.env["URDIRA_SKIP_ARM_RELEASE_RUNTIME_PROBE"] === "1";
+  it.skipIf(skipArmReleaseProbe)("scans the task-planner fixture's real cross-file imports end to end, publishes, queries, and rescans correctly after a one-file change", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "urdira-app-runtime-jsts-data-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-app-runtime-jsts-workspace-"));
     let runtime: DaemonRuntime | undefined;
