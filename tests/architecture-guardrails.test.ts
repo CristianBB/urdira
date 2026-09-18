@@ -502,6 +502,14 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 45
     expect(workflow).toContain("macos-latest");
     expect(workflow).toContain("windows-latest");
     expect(workflow).toContain("pnpm preflight:windows");
+    const macosJob = workflow.slice(
+      workflow.indexOf("  platform-tests:"),
+      workflow.indexOf("  windows-portability:"),
+    );
+    const windowsJob = workflow.slice(workflow.indexOf("  windows-portability:"));
+    expect(macosJob).toContain("pnpm test:native:smoke");
+    expect(windowsJob).toContain("pnpm preflight:windows");
+    expect(windowsJob).toContain("pnpm test:native:smoke");
     expect(workflow).toContain('branches:\n      - "**"');
   });
 
