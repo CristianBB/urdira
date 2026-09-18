@@ -58,19 +58,18 @@ passed; critical branches 100%; semantic regions 100%; 1199 publication files ch
 
 The live local probe
 `urdira workspace footprint --json` returned an empty `workspaces` array for
-the default `/Users/Cristian/.urdira` data root: no active indexes are
-currently registered there. Two historical benchmark catalogs remain under
-`/Users/Cristian/Proyectos/urdira-benchmark`, but their catalogued workspace
-database paths no longer exist, so they are not presented as current footprint
-measurements.
+the default local data root: no active indexes are currently registered there.
+Two historical benchmark catalogs remain in the isolated benchmark data root,
+but their catalogued workspace database paths no longer exist, so they are not
+presented as current footprint measurements.
 
 ## Fresh n8n benchmark-corpus measurement
 
-A fresh v4 index was generated from the benchmark corpus at
-`/Users/Cristian/Proyectos/n8n` (`b3a34fcd81659f6e33b5857a8c68816f7e105320`,
-dirty working tree) with the JavaScript/TypeScript plugin enabled and semantic
-indexing disabled. The isolated retained data root is
-`/Users/Cristian/Proyectos/urdira-benchmark/footprint-n8n-2026-09-17`.
+A fresh v4 index was generated from the n8n benchmark corpus
+(`b3a34fcd81659f6e33b5857a8c68816f7e105320`, dirty working tree) with the
+JavaScript/TypeScript plugin enabled and semantic indexing disabled. The
+isolated retained data root is the benchmark fixture's
+`footprint-n8n-2026-09-17` directory.
 The workspace reached a complete, current/equivalent source and structural
 frontier before measurement.
 
