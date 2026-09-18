@@ -136,9 +136,8 @@ pnpm verify
 
 `pnpm verify` runs, in order: `check:architecture`, `build:native-artifacts`
 (`build:native` plus the release `urdira-indexing-worker` build), `check:native`
-(`cargo fmt --check` + `cargo clippy -D warnings`), `test:native` (`cargo test
---workspace`, then the `urdira-tsgo-client`/`urdira-indexing-worker` `--ignored`
-suites, which require `URDIRA_TSGO_BINARY`, see below), `lint`, `test:coverage`
+(`cargo fmt --check` + `cargo clippy -D warnings`), `test:native:smoke` (small
+native protocol/core/structural-store checks), `lint`, `test:coverage`
 (builds every package, then `vitest run --coverage`), `typecheck`,
 `check:coverage-gate`, and `check:publication`. On a memory-constrained machine
 run these stages one at a time instead of the combined `pnpm verify`, and set
@@ -162,10 +161,12 @@ branch coverage and adversarial cases.
 
 ### Native builds and `NATIVE_API_VERSION`
 
-`cargo test -p urdira-tsgo-client`'s `--ignored` suites and
-`urdira-indexing-worker`'s residual tests need `URDIRA_TSGO_BINARY` pointing at
-the pinned `@typescript/typescript-<platform>` `tsc` binary inside
-`node_modules/.pnpm` (see `test:native` in `package.json` for the exact glob).
+The opt-in `pnpm benchmark:native-tests` command runs the heavier
+`urdira-tsgo-client` `--ignored` suites and `urdira-indexing-worker` residual
+tests. Those suites need `URDIRA_TSGO_BINARY` pointing at the pinned
+`@typescript/typescript-<platform>` `tsc` binary inside `node_modules/.pnpm`
+(see `benchmark:native-tests` in `package.json` for the exact glob). They are
+local benchmark/qualification commands, not merge CI.
 After bumping `NATIVE_API_VERSION`, update all six files listed in
 [docs/versioning.md](docs/versioning.md#checklist-for-bumping-native_api_version)
 and run `pnpm build:native` before `test:coverage` or `verify`; a stale

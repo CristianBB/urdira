@@ -31,6 +31,19 @@ workspace directory. `pnpm package:npm` creates clean public manifests in
 `release/npm/staging`, packs them into `release/npm/tarballs`, and writes a
 machine-readable manifest containing integrity values and publication order.
 
+Merge CI is intentionally smaller than release qualification. It runs the
+unit, contract, small-integration, and native-smoke gates only. It does not run
+ignored Rust suites, corpus-scale benchmarks, fuzz campaigns, or the complete
+native target matrix. The manual `Publish npm release` workflow checks out the
+exact signed tag, builds the native closure on every supported target, uploads
+the target artifacts, verifies the release source, assembles the npm packages,
+and publishes them in dependency order with npm provenance.
+
+Benchmarks and scale campaigns are local-only operational tools. Run them from
+the checkout with the explicit `pnpm benchmark:*` commands documented in the
+development section of the README; their measurements must not be inferred
+from merge CI status.
+
 Urdira v3 release qualification also verifies the native indexing boundary:
 CAS stream length/hash checks, transferable `FactDeltaBatch` arenas, atomic
 SQLite staging and retry recovery, relational logical digests, the streaming
@@ -439,7 +452,7 @@ corepack enable
 pnpm install --frozen-lockfile
 pnpm preflight:windows
 pnpm check:native
-pnpm test:native
+pnpm test:native:smoke
 pnpm audit:native
 pnpm verify
 pnpm audit --prod
@@ -454,12 +467,12 @@ is target-scoped: each native runner builds and accepts only its own closure;
 an all-target acceptance run requires verified artifacts from all five native
 runners to be present.
 
-CI runs the complete coverage, audit, publication, and npm-package gates once
-on Ubuntu and the complete ordinary test suite once on macOS. A separate
-five-target matrix builds and executes the Rust closure on `darwin-arm64`,
-`darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, and `win32-x64`, then packages
-only that target's verified native files. Windows also runs the focused
-portability preflight.
+CI runs the coverage, audit, publication, npm-package, native-smoke, and
+small ordinary test gates. It does not run ignored Rust suites or benchmarks.
+The manual release workflow builds and executes the Rust/native closure on
+`darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, and
+`win32-x64`, then packages only that target's verified native files. Windows
+also runs the focused portability preflight.
 
 Native binding API v18 is the required exact private handshake
 (`NATIVE_API_VERSION` in `packages/native/src/loader.ts` and

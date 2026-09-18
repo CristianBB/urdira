@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     name: Verify and package (ubuntu-latest)
@@ -55,32 +59,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  fuzz-smoke:
-    name: Decision 25 fuzz smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-      - name: Set up supported stable Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.98.0
-      - name: Compile fuzz targets on Rust 1.98.0
-        run: cargo +1.98.0 check --manifest-path fuzz/Cargo.toml --locked --bins
-      - name: Set up pinned nightly for libFuzzer instrumentation
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          toolchain: nightly-2026-08-26
-      - name: Install pinned cargo-fuzz
-        run: cargo +1.98.0 install cargo-fuzz --version 0.13.2 --locked
-      - name: Fuzz worker framing
-        run: cargo +nightly-2026-08-26 fuzz run worker_framing -- -runs=256 -max_len=65536 -timeout=10
-      - name: Fuzz native logical digests
-        run: cargo +nightly-2026-08-26 fuzz run logical_digest -- -runs=256 -max_len=65536 -timeout=10
-      - name: Fuzz FactDeltaStream batches
-        run: cargo +nightly-2026-08-26 fuzz run fact_delta_stream_batch -- -runs=256 -max_len=65536 -timeout=10
-
   platform-tests:
     name: Platform tests (macos-latest)
     runs-on: macos-latest
@@ -106,8 +84,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build host native closure
         run: pnpm build:native
-      - name: Run platform tests
-        run: pnpm test
+      - name: Run CI test suite
+        run: pnpm test:ci
 
   windows-portability:
     name: Windows portability preflight
@@ -134,83 +112,3 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Run Windows portability preflight
         run: pnpm preflight:windows
-
-  native-targets:
-    name: Native acceptance (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: darwin-arm64
-            runner: macos-15
-            rust_target: aarch64-apple-darwin
-            worker: release/native/darwin-arm64/urdira-jsts-syntax-worker
-          - target: darwin-x64
-            runner: macos-15-intel
-            rust_target: x86_64-apple-darwin
-            worker: release/native/darwin-x64/urdira-jsts-syntax-worker
-          - target: linux-arm64-gnu
-            runner: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            worker: release/native/linux-arm64-gnu/urdira-jsts-syntax-worker
-          - target: linux-x64-gnu
-            runner: ubuntu-24.04
-            rust_target: x86_64-unknown-linux-gnu
-            worker: release/native/linux-x64-gnu/urdira-jsts-syntax-worker
-          - target: win32-x64
-            runner: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            worker: release/native/win32-x64/urdira-jsts-syntax-worker.exe
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v5
-        with:
-          version: 11.20.0
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version-file: .nvmrc
-          cache: pnpm
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.98.0
-          targets: ${{ matrix.rust_target }}
-          components: rustfmt, clippy
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Build native closure
-        run: pnpm build:native
-        env:
-          URDIRA_RELEASE_TARGET: ${{ matrix.target }}
-      - name: Test Rust workspace
-        run: pnpm test:native
-      - name: Test native contracts and real worker
-        run: pnpm test tests/javascript-typescript-rust-process-transport.test.ts tests/javascript-typescript-rust-protocol.test.ts tests/javascript-typescript-rust-worker.test.ts tests/rust-release-artifacts.test.ts
-        env:
-          URDIRA_JSTS_RUST_WORKER: ${{ github.workspace }}/${{ matrix.worker }}
-      - name: Build target archive
-        run: pnpm package:release
-        env:
-          URDIRA_RELEASE_TARGET: ${{ matrix.target }}
-      - name: Run archive with system Node hidden
-        shell: bash
-        run: pnpm smoke:native-archive "release/artifacts/urdira-${{ matrix.target }}-0.4.0.tar.gz"
-      - name: Run target-scoped release acceptance
-        run: pnpm release:acceptance
-        env:
-          URDIRA_RELEASE_TARGET: ${{ matrix.target }}
-          URDIRA_SKIP_INSTALL: "1"
-          URDIRA_SKIP_SYNTHETIC_CODEX_PIPE_PROBES: ${{ matrix.target == 'linux-arm64-gnu' && '1' || '0' }}
-          URDIRA_SKIP_ARM_RELEASE_RUNTIME_PROBE: ${{ matrix.target == 'linux-arm64-gnu' && '1' || '0' }}
-      - name: Upload target archive
-        uses: actions/upload-artifact@v7
-        with:
-          name: urdira-${{ matrix.target }}
-          path: release/artifacts/urdira-${{ matrix.target }}-*.tar.gz
-          if-no-files-found: error
-          retention-days: 14

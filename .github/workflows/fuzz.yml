@@ -1,0 +1,36 @@
+name: Fuzz smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 6"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: Decision 25 fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up supported stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+      - name: Compile fuzz targets on Rust 1.98.0
+        run: cargo +1.98.0 check --manifest-path fuzz/Cargo.toml --locked --bins
+      - name: Set up pinned nightly for libFuzzer instrumentation
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-26
+      - name: Install pinned cargo-fuzz
+        run: cargo +1.98.0 install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz worker framing
+        run: cargo +nightly-2026-08-26 fuzz run worker_framing -- -runs=256 -max_len=65536 -timeout=10
+      - name: Fuzz native logical digests
+        run: cargo +nightly-2026-08-26 fuzz run logical_digest -- -runs=256 -max_len=65536 -timeout=10
+      - name: Fuzz FactDeltaStream batches
+        run: cargo +nightly-2026-08-26 fuzz run fact_delta_stream_batch -- -runs=256 -max_len=65536 -timeout=10

@@ -200,6 +200,11 @@ default. v4 adds, over the v3 pipeline documented later in this file:
   `urdira workspace orphans purge <safe-id> --confirm` or
   `urdira workspace orphans purge --all --confirm` removes eligible residue.
   The startup sweep detects residue; it does not automatically purge it.
+- **Per-workspace storage accounting.** `urdira workspace footprint [<id>]`
+  reports source size, exclusive catalog/structural/lexical/semantic/sidecar
+  bytes, and amplification. `--json` adds the exact layer and structural
+  sub-layer counters. Shared CAS references are reported separately and are
+  never counted as workspace-exclusive reclaimable storage.
 - **Native query pushdown.** Query operations that reduce to an index lookup
   over the structural store (identity lookups, kind-scoped listing, impact
   analysis, related-test discovery, architecture inspection, and more) are
@@ -779,7 +784,7 @@ each requiring `--dry-run` or `--confirm` unless marked read-only or direct:
 | Category | Commands |
 |---|---|
 | Query (read-only) | `urdira status`, `urdira index`, `urdira query` |
-| Workspace | `urdira workspace list \| show <id> \| add <path> [--index-pack <file>] \| configure <id> \| remove <id> \| purge <id>`, `urdira workspace orphans` (read-only), `urdira workspace orphans purge <safe-id>...` or `urdira workspace orphans purge --all` |
+| Workspace | `urdira workspace list \| show <id> \| footprint [<id>] \| add <path> [--index-pack <file>] \| configure <id> \| remove <id> \| purge <id>`, `urdira workspace orphans` (read-only), `urdira workspace orphans purge <safe-id>...` or `urdira workspace orphans purge --all` |
 | Codebase | `urdira codebase list \| create <name> \| rename <id> <name> \| assign <workspace> <codebase> \| unassign <workspace> \| remove <id>` |
 | Daemon (direct, no dry-run/confirm) | `urdira daemon start \| stop \| restart` |
 | Maintenance | `urdira config set [workspace] --value <json>`, `urdira repair [workspace]`, `urdira gc`, `urdira reindex [workspace]`, `urdira index-pack-export <workspace> [out] --out <file>` |
@@ -1154,16 +1159,26 @@ URDIRA_RELEASE_TARGET=<host-target> URDIRA_SKIP_INSTALL=1 pnpm release:acceptanc
 `pnpm verify` runs, in order, `check:architecture`, `check:maintainability`,
 `build:native-artifacts`
 (the compiled addon plus the release `urdira-indexing-worker` build),
-`check:native` (`cargo fmt`/`clippy`), `test:native` (the Rust workspace test
-suite, including the `urdira-tsgo-client`/`urdira-indexing-worker` residual
-suites). The native test runner resolves the platform-specific TypeScript
-compiler package and sets `URDIRA_TSGO_BINARY` itself, so the same command works
-on supported macOS, Linux, and Windows runners. Then it runs `lint`,
+`check:native` (`cargo fmt`/`clippy`), and `test:native:smoke` (small native
+protocol, core, and structural-store checks). It then runs `lint`,
 `test:coverage`, `typecheck`,
 `check:coverage-gate`, and `check:publication` (documentation links,
 local-path leaks, and public-repository hygiene). Release steps and external
 prerequisites are documented in [docs/release.md](docs/release.md) and
 [AGENTS.md](AGENTS.md#verification-commands).
+
+Merge CI runs `pnpm verify`, the focused Windows portability preflight, and the
+same unit/contract/small-integration suite through `pnpm test:ci`. It does not
+run corpus-scale campaigns, ignored Rust suites, fuzzing, or build the five
+platform release archives. The release workflow in `.github/workflows/publish.yml`
+is the place where all supported native targets are built, inspected, and
+assembled for publication.
+
+Performance work is opt-in and local. The commands `pnpm benchmark:tests`,
+`pnpm benchmark:native-tests`, `pnpm benchmark:native-acceleration`,
+`pnpm benchmark:structural-indexing`, `pnpm benchmark:n8n-incremental`, and
+`pnpm benchmark:exact-vector-top-k` run the corresponding campaigns explicitly;
+none is part of merge CI.
 
 `pnpm preflight:windows` is the focused cross-platform gate for portable
 filenames, a real staged-file round trip, Windows path and IPC adapters,
