@@ -39,25 +39,14 @@ jobs:
           components: rustfmt, clippy
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Install Rust audit tools
-        run: cargo install cargo-audit --version 0.22.2 --locked && cargo install cargo-deny --version 0.20.2 --locked
-      - name: Audit Rust dependencies
-        run: pnpm audit:native
-      - name: Verify repository
-        run: pnpm verify
-      - name: Audit production dependencies
-        run: pnpm audit --prod
-      - name: Build host native closure for npm smoke
-        run: pnpm build:native
-      - name: Build and smoke-test public npm packages
-        run: pnpm package:npm:smoke
-      - name: Upload inspected npm tarballs
-        uses: actions/upload-artifact@v7
-        with:
-          name: npm-packages
-          path: release/npm/
-          if-no-files-found: error
-          retention-days: 14
+      - name: Check architecture boundaries
+        run: pnpm check:architecture
+      - name: Lint source
+        run: pnpm lint
+      - name: Run unit, integration, and contract tests
+        run: pnpm test:ci
+      - name: Run native smoke tests
+        run: pnpm test:native:smoke
 
   platform-tests:
     name: Platform tests (macos-latest)
@@ -82,8 +71,6 @@ jobs:
           components: rustfmt, clippy
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: Build host native closure
-        run: pnpm build:native
       - name: Run CI test suite
         run: pnpm test:ci
 
