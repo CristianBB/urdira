@@ -485,15 +485,19 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 45
     ).rejects.toThrow();
   });
 
-  it("requires CI to run the canonical verification, audit, and npm package smoke gates", async () => {
+  it("keeps merge CI focused and leaves release gates to the publish workflow", async () => {
     const workflow = await readFile(
       join(repositoryRoot, ".github/workflows/ci.yml"),
       "utf8",
     );
 
-    expect(workflow).toContain("pnpm verify");
-    expect(workflow).toContain("pnpm audit --prod");
-    expect(workflow).toContain("pnpm package:npm:smoke");
+    expect(workflow).toContain("pnpm check:architecture");
+    expect(workflow).toContain("pnpm lint");
+    expect(workflow).toContain("pnpm test:ci");
+    expect(workflow).toContain("pnpm test:native:smoke");
+    expect(workflow).not.toContain("pnpm verify");
+    expect(workflow).not.toContain("pnpm audit --prod");
+    expect(workflow).not.toContain("pnpm package:npm:smoke");
     expect(workflow).toContain("ubuntu-latest");
     expect(workflow).toContain("macos-latest");
     expect(workflow).toContain("windows-latest");
@@ -512,7 +516,7 @@ describe("architecture guardrails", { timeout: process.env["CI"] === "true" ? 45
     );
     const workflows = `${ciWorkflow}\n${publishWorkflow}`;
 
-    expect(ciWorkflow).toContain("actions/upload-artifact@v7");
+    expect(publishWorkflow).toContain("actions/upload-artifact@v7");
     for (const workflow of [ciWorkflow, publishWorkflow]) {
       expect(workflow).toContain("actions/checkout@v7");
       expect(workflow).toContain("actions/setup-node@v7");
