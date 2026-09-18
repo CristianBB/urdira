@@ -1,7 +1,7 @@
 import { AGENT_CLIENTS, agentStatus, installAgent, normalizeAgentClient, runAgentHook, uninstallAgent, type AgentClient } from "./agent-integration.js";
 export * from "./agent-integration.js";
 
-export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "restart" | "workspace-list" | "workspace-show" | "workspace-add" | "workspace-remove" | "workspace-purge" | "workspace-configure" | "workspace-orphans" | "workspace-orphans-purge" | "codebase-list" | "codebase-create" | "codebase-rename" | "codebase-assign" | "codebase-unassign" | "codebase-remove" | "config-set" | "repair" | "gc" | "reindex" | "index-pack-export" | "agent-status" | "agent-install" | "agent-uninstall" | "agent-hook";
+export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "restart" | "workspace-list" | "workspace-show" | "workspace-footprint" | "workspace-add" | "workspace-remove" | "workspace-purge" | "workspace-configure" | "workspace-orphans" | "workspace-orphans-purge" | "codebase-list" | "codebase-create" | "codebase-rename" | "codebase-assign" | "codebase-unassign" | "codebase-remove" | "config-set" | "repair" | "gc" | "reindex" | "index-pack-export" | "agent-status" | "agent-install" | "agent-uninstall" | "agent-hook";
 // `index-pack-export` (docs/decisions/23-index-pack.md) never mutates
 // `workspace_registry` or any published generation -- it only writes a pack
 // file to local disk -- but it is routed through the MUTATING_COMMANDS
@@ -24,7 +24,7 @@ export type CliCommandName = "status" | "query" | "index" | "start" | "stop" | "
 // follows the ordinary `--dry-run`/`--confirm` gate every other destructive
 // command here does.
 export const MUTATING_COMMANDS = ["start", "stop", "restart", "workspace-add", "workspace-remove", "workspace-purge", "workspace-configure", "workspace-orphans-purge", "codebase-create", "codebase-rename", "codebase-assign", "codebase-unassign", "codebase-remove", "config-set", "repair", "gc", "reindex", "index-pack-export"] as const satisfies ReadonlyArray<CliCommandName>;
-const READ_ONLY_COMMANDS = ["status", "query", "index", "workspace-list", "workspace-show", "workspace-orphans", "codebase-list", "agent-status"] as const satisfies ReadonlyArray<CliCommandName>;
+const READ_ONLY_COMMANDS = ["status", "query", "index", "workspace-list", "workspace-show", "workspace-footprint", "workspace-orphans", "codebase-list", "agent-status"] as const satisfies ReadonlyArray<CliCommandName>;
 const ALL_COMMANDS = new Set<CliCommandName>([...READ_ONLY_COMMANDS, ...MUTATING_COMMANDS, "agent-install", "agent-uninstall", "agent-hook"]);
 
 export interface CliCommandDescriptor {
@@ -57,7 +57,7 @@ const arg = (name: string, description: string, required = true): CliCommandDesc
 /** Authoritative, closed command catalog consumed by both the terminal parser and the local web UI. */
 export const CLI_COMMAND_CATALOG: readonly CliCommandDescriptor[] = [
   descriptor("status", "Status", "query", "read_only", "none", [], ["json", "debug-timing"]), descriptor("index", "Index status", "query", "read_only", "none", [], ["workspace", "json", "debug-timing"]), descriptor("query", "Query", "query", "read_only", "none", [], ["payload", "workspace", "json", "debug-timing"]),
-  descriptor("workspace-list", "List workspaces", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-show", "Show workspace", "workspace", "read_only", "none", [arg("workspace", "Workspace identifier")], ["json", "debug-timing"]), descriptor("workspace-add", "Add workspace", "workspace", "administrative", "proposal", [arg("path", "Workspace directory")], ["path", "payload", "proposal-id", "index-pack", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-configure", "Configure workspace", "workspace", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-remove", "Remove workspace", "workspace", "administrative", "destructive", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-purge", "Purge workspace", "workspace", "administrative", "destructive", [arg("workspace", "Removed workspace identifier")], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-orphans", "List orphaned workspace data", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-orphans-purge", "Purge orphaned workspace data", "workspace", "administrative", "destructive", [], ["all", "dry-run", "confirm", "json", "debug-timing"]),
+  descriptor("workspace-list", "List workspaces", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-show", "Show workspace", "workspace", "read_only", "none", [arg("workspace", "Workspace identifier")], ["json", "debug-timing"]), descriptor("workspace-footprint", "Measure workspace storage", "workspace", "read_only", "none", [arg("workspace", "Optional workspace identifier", false)], ["json", "debug-timing"]), descriptor("workspace-add", "Add workspace", "workspace", "administrative", "proposal", [arg("path", "Workspace directory")], ["path", "payload", "proposal-id", "index-pack", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-configure", "Configure workspace", "workspace", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-remove", "Remove workspace", "workspace", "administrative", "destructive", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-purge", "Purge workspace", "workspace", "administrative", "destructive", [arg("workspace", "Removed workspace identifier")], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("workspace-orphans", "List orphaned workspace data", "workspace", "read_only", "none", [], ["json", "debug-timing"]), descriptor("workspace-orphans-purge", "Purge orphaned workspace data", "workspace", "administrative", "destructive", [], ["all", "dry-run", "confirm", "json", "debug-timing"]),
   descriptor("codebase-list", "List codebases", "codebase", "read_only", "none", [], ["json", "debug-timing"]), descriptor("codebase-create", "Create codebase", "codebase", "administrative", "proposal", [arg("display_name", "Project display name")], ["vcs-identity", "dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-rename", "Rename project", "codebase", "administrative", "proposal", [arg("codebase", "Codebase identifier"), arg("display_name", "New project display name")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-assign", "Assign workspace", "codebase", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("codebase", "Codebase identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-unassign", "Unassign workspace", "codebase", "administrative", "proposal", [arg("workspace", "Workspace identifier")], ["dry-run", "confirm", "json", "debug-timing"]), descriptor("codebase-remove", "Remove codebase", "codebase", "administrative", "destructive", [arg("codebase", "Codebase identifier")], ["dry-run", "confirm", "json", "debug-timing"]),
   descriptor("start", "Start daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("stop", "Stop daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("restart", "Restart daemon", "daemon", "administrative", "none", [], ["dry-run", "json", "debug-timing"]), descriptor("mcp", "MCP service", "service", "service_active", "none"), descriptor("web", "Web service", "service", "service_active", "none"),
   descriptor("config-set", "Set configuration", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "value", "payload", "proposal-id", "dry-run", "confirm", "json", "debug-timing"]), descriptor("repair", "Repair", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("gc", "Collect garbage", "maintenance", "administrative", "proposal", [], ["payload", "dry-run", "confirm", "json", "debug-timing"]), descriptor("reindex", "Reindex", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier", false)], ["workspace", "dry-run", "confirm", "json", "debug-timing"]), descriptor("index-pack-export", "Export index pack", "maintenance", "administrative", "proposal", [arg("workspace", "Workspace identifier"), arg("out", "Output file", false)], ["workspace", "out", "require-git-clean", "timeout", "dry-run", "confirm", "json", "debug-timing"]),
@@ -78,7 +78,7 @@ const OPTION_NAMES = new Set(["json", "dry-run", "confirm", "debug-timing", "pay
 // request payload. It is therefore accepted uniformly on read-only commands
 // as well as lifecycle/admin commands; the app entrypoint consumes it before
 // creating a daemon or client.
-const READ_ONLY_OPTIONS: Readonly<Record<(typeof READ_ONLY_COMMANDS)[number], ReadonlySet<string>>> = { status: new Set(["json", "debug-timing"]), query: new Set(["json", "payload", "workspace", "debug-timing"]), index: new Set(["json", "workspace", "debug-timing"]), "workspace-list": new Set(["json", "debug-timing"]), "workspace-show": new Set(["json", "debug-timing"]), "workspace-orphans": new Set(["json", "debug-timing"]), "codebase-list": new Set(["json", "debug-timing"]), "agent-status": new Set(["json", "client", "workspace", "debug-timing"]) };
+const READ_ONLY_OPTIONS: Readonly<Record<(typeof READ_ONLY_COMMANDS)[number], ReadonlySet<string>>> = { status: new Set(["json", "debug-timing"]), query: new Set(["json", "payload", "workspace", "debug-timing"]), index: new Set(["json", "workspace", "debug-timing"]), "workspace-list": new Set(["json", "debug-timing"]), "workspace-show": new Set(["json", "debug-timing"]), "workspace-footprint": new Set(["json", "debug-timing"]), "workspace-orphans": new Set(["json", "debug-timing"]), "codebase-list": new Set(["json", "debug-timing"]), "agent-status": new Set(["json", "client", "workspace", "debug-timing"]) };
 const INTERACTIVE_AGENT_CLIENTS: readonly AgentClient[] = AGENT_CLIENTS;
 function interactiveAgentSelection(value: string | boolean): { readonly native: ReadonlyArray<AgentClient>; readonly unknown: ReadonlyArray<string> } {
   if (value === true) return { native: INTERACTIVE_AGENT_CLIENTS, unknown: [] };
@@ -107,7 +107,7 @@ export function parseCliArgs(argv: ReadonlyArray<string>): CliCommand {
     tokens = tokens.slice(tokens[1] === "purge" ? 2 : 1);
   } else if (rawName === "workspace" || rawName === "codebase" || rawName === "config" || rawName === "daemon") {
     const action = tokens[0];
-    const normalized = rawName === "workspace" && (action === "list" || action === "show" || action === "add" || action === "remove" || action === "purge" || action === "configure") ? `workspace-${action}` : rawName === "codebase" && (action === "list" || action === "create" || action === "rename" || action === "assign" || action === "unassign" || action === "remove") ? `codebase-${action}` : rawName === "config" && action === "set" ? "config-set" : rawName === "daemon" && (action === "start" || action === "stop" || action === "restart") ? action : undefined;
+    const normalized = rawName === "workspace" && (action === "list" || action === "show" || action === "footprint" || action === "add" || action === "remove" || action === "purge" || action === "configure") ? `workspace-${action}` : rawName === "codebase" && (action === "list" || action === "create" || action === "rename" || action === "assign" || action === "unassign" || action === "remove") ? `codebase-${action}` : rawName === "config" && action === "set" ? "config-set" : rawName === "daemon" && (action === "start" || action === "stop" || action === "restart") ? action : undefined;
     if (normalized) { rawName = normalized; tokens = tokens.slice(1); }
   }
   if (rawName === "agent") {
@@ -177,6 +177,52 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function padColumn(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
+}
+
+function formatByteCount(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "-";
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"] as const;
+  let scaled = value;
+  let unit: (typeof units)[number] = units[0];
+  for (const candidate of units) {
+    scaled /= 1024;
+    unit = candidate;
+    if (scaled < 1024 || candidate === units.at(-1)) break;
+  }
+  return `${scaled >= 100 ? scaled.toFixed(0) : scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)} ${unit}`;
+}
+
+/** Human-readable summary; `--json` retains the exact byte counters and per-entry detail. */
+function formatWorkspaceFootprintResult(resultPayload: unknown): string | undefined {
+  const record = isPlainRecord(resultPayload) ? resultPayload : {};
+  const workspaces = Array.isArray(record["workspaces"]) ? record["workspaces"].filter(isPlainRecord) : undefined;
+  if (workspaces === undefined) return undefined;
+  if (workspaces.length === 0) return "no workspaces registered";
+  const headers = ["WORKSPACE", "SOURCE", "CATALOG", "STRUCTURAL", "LEXICAL", "SEMANTIC", "SIDECAR", "EXCLUSIVE", "CAS_REF", "RATIO"] as const;
+  const rows = workspaces.map((workspace) => {
+    const layers = isPlainRecord(workspace["layers"]) ? workspace["layers"] : {};
+    const bytes = (layer: string): unknown => isPlainRecord(layers[layer]) ? layers[layer]!["allocated_bytes"] ?? layers[layer]!["logical_bytes"] : undefined;
+    const id = typeof workspace["workspace_id"] === "string" ? workspace["workspace_id"] : "?";
+    const root = typeof workspace["display_root"] === "string" ? workspace["display_root"] : undefined;
+    const ratio = typeof workspace["exclusive_amplification_ratio"] === "number" ? `${workspace["exclusive_amplification_ratio"].toFixed(2)}x` : "-";
+    const cas = isPlainRecord(workspace["referenced_cas"]) ? workspace["referenced_cas"] : {};
+    return [
+      root === undefined ? id : `${id} (${root})`,
+      formatByteCount(workspace["indexed_source_bytes"]),
+      formatByteCount(bytes("catalog")),
+      formatByteCount(bytes("structural")),
+      formatByteCount(bytes("lexical")),
+      formatByteCount(bytes("semantic")),
+      formatByteCount(bytes("scan_sidecar")),
+      formatByteCount(workspace["exclusive_allocated_bytes"] ?? workspace["exclusive_logical_bytes"]),
+      formatByteCount(cas["allocated_bytes"] ?? cas["logical_bytes"]),
+      ratio,
+    ];
+  });
+  const widths = headers.map((header, column) => Math.max(header.length, ...rows.map((row) => row[column]!.length)));
+  const renderRow = (cells: readonly string[]): string => cells.map((cell, column) => padColumn(cell, widths[column]!)).join("  ").trimEnd();
+  return [renderRow(headers), ...rows.map(renderRow), "CAS_REF is referenced shared storage and is not included in EXCLUSIVE."].join("\n");
 }
 
 /**
@@ -442,9 +488,10 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
     : command.name === "index" ? "core:index_status"
       : command.name === "workspace-list" ? "core:workspace_admin_list"
         : command.name === "workspace-show" ? "core:workspace_admin_show"
-          : command.name === "workspace-orphans" ? "core:workspace_orphans_list"
-            : command.name === "codebase-list" ? "core:codebase_list"
-              : continuationEnvelope === undefined ? "core:query" : "core:query_continue";
+          : command.name === "workspace-footprint" ? "core:workspace_footprint"
+            : command.name === "workspace-orphans" ? "core:workspace_orphans_list"
+              : command.name === "codebase-list" ? "core:codebase_list"
+                : continuationEnvelope === undefined ? "core:query" : "core:query_continue";
   const data = await dependencies.client.call(call, continuationEnvelope ?? queryEnvelope ?? suppliedPayload);
   const resultPayload = data.payload ?? data.error ?? data;
   // `--json` always passes the raw payload through verbatim (per this
@@ -455,6 +502,7 @@ export async function runCli(argv: ReadonlyArray<string>, dependencies: CliDepen
   const rendered = command.name === "index" && !command.options.json && data.outcome === "success" ? formatIndexStatusTable(resultPayload)
     : command.name === "workspace-orphans" && !command.options.json && data.outcome === "success" ? formatOrphanCommandResult("workspace-orphans", resultPayload) ?? resultPayload
       : command.name === "workspace-show" && !command.options.json && data.outcome === "success" ? formatWorkspaceShowResult(resultPayload) ?? resultPayload
-        : resultPayload;
+        : command.name === "workspace-footprint" && !command.options.json && data.outcome === "success" ? formatWorkspaceFootprintResult(resultPayload) ?? resultPayload
+          : resultPayload;
   return { exit_code: data.outcome === "success" ? 0 : 1, data: resultPayload, stdout: output(rendered, command.options.json) };
 }

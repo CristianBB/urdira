@@ -103,6 +103,17 @@ By default all mutable state lives under the platform's per-user application-dat
 
 Installation catalog, workspace databases, source CAS, query manifests, model assets, backups, plugin packages, scratch space, and logs have separate subdirectories and quotas. Temporary files are created in the destination filesystem with unpredictable names and are atomically installed or removed. Cleanup never follows symlinks and validates every target beneath its configured root.
 
+Local administrators can inspect a workspace's storage footprint without
+mutating or checkpointing it. Accounting separates workspace-exclusive files
+(catalog, structural, lexical, semantic, scan sidecar, and locks) from
+installation-wide CAS objects merely referenced by that workspace. CAS bytes
+are never presented as exclusively reclaimable because identical objects may
+be shared. Logical-byte amplification uses the current indexed source bytes as
+its declared denominator; allocated filesystem bytes remain a separate
+measurement. The live measurement is explicitly best-effort rather than an
+atomic index snapshot. The exact response contract is defined in the
+[workspace administration contract](../protocol/workspace-administration-contract.md).
+
 The initial release provides no bespoke application-level database or CAS encryption. At-rest confidentiality relies on operating-system full-disk or encrypted-volume facilities, which preserve deterministic content addressing and crash recovery without introducing an unreviewed key system. Urdira reports whether its storage root is known to be protected when the platform exposes that information but never claims secure encryption it cannot verify. Transport is local authenticated IPC as defined by the daemon specification.
 
 ## Network and model-pack installation

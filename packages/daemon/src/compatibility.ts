@@ -28,6 +28,7 @@ const WORKSPACE_RPC_CAPABILITIES = [
   "core:workspace_admin_list",
   "core:workspace_admin_show",
   "core:workspace_configure",
+  "core:workspace_footprint",
   "core:workspace_orphans_list",
   "core:workspace_orphans_purge",
   "core:workspace_purge",

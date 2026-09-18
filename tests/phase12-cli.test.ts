@@ -14,6 +14,8 @@ describe("Phase 12 closed CLI", () => {
   it("parses workspace inspection and codebase administration aliases", () => {
     expect(parseCliArgs(["workspace", "list"]).name).toBe("workspace-list");
     expect(parseCliArgs(["workspace", "show", "workspace-1"]).name).toBe("workspace-show");
+    expect(parseCliArgs(["workspace", "footprint"]).name).toBe("workspace-footprint");
+    expect(parseCliArgs(["workspace", "footprint", "workspace-1", "--json"])).toMatchObject({ name: "workspace-footprint", args: ["workspace-1"], options: { json: true } });
     expect(parseCliArgs(["codebase", "create", "Project", "--confirm"]).name).toBe("codebase-create");
     expect(parseCliArgs(["codebase", "unassign", "workspace-1", "--confirm"]).name).toBe("codebase-unassign");
     expect(parseCliArgs(["agent", "install", "--client", "codex", "--dry-run"]).name).toBe("agent-install");
@@ -46,7 +48,36 @@ describe("Phase 12 closed CLI", () => {
     await expect(runCli(["status"], { client })).resolves.toMatchObject({ exit_code: 0, data: { call: "core:status" } });
     await expect(runCli(["query", "--payload", "{\"query\":true}"], { client })).resolves.toMatchObject({ exit_code: 0, data: { call: "core:query" } });
     await expect(runCli(["index"], { client })).resolves.toMatchObject({ exit_code: 0, data: { call: "core:index_status" } });
+    await expect(runCli(["workspace", "footprint", "workspace-1", "--json"], { client })).resolves.toMatchObject({ exit_code: 0, data: { call: "core:workspace_footprint" } });
     expect(() => parseCliArgs(["status", "--payload", "{}"])).toThrowError(CliError);
+  });
+
+  it("renders a compact footprint table while preserving exact counters for --json", async () => {
+    const footprint = {
+      workspaces: [{
+        workspace_id: "workspace-1",
+        display_root: "repo",
+        indexed_source_bytes: 100,
+        exclusive_logical_bytes: 250,
+        exclusive_allocated_bytes: 4096,
+        exclusive_amplification_ratio: 2.5,
+        layers: {
+          catalog: { logical_bytes: 10, allocated_bytes: 4096 },
+          structural: { logical_bytes: 200, allocated_bytes: 8192 },
+          lexical: { logical_bytes: 20, allocated_bytes: 4096 },
+          semantic: { logical_bytes: 15, allocated_bytes: 4096 },
+          scan_sidecar: { logical_bytes: 5, allocated_bytes: 4096 },
+        },
+        referenced_cas: { logical_bytes: 75, allocated_bytes: 4096 },
+      }],
+    };
+    const footprintClient: CliDaemonClient = { call: vi.fn(async () => ({ outcome: "success", payload: footprint })) };
+    const human = await runCli(["workspace", "footprint", "workspace-1"], { client: footprintClient });
+    expect(human.stdout).toContain("WORKSPACE");
+    expect(human.stdout).toContain("STRUCTURAL");
+    expect(human.stdout).toContain("2.50x");
+    expect(human.stdout).toContain("CAS_REF is referenced shared storage");
+    await expect(runCli(["workspace", "footprint", "workspace-1", "--json"], { client: footprintClient })).resolves.toMatchObject({ data: footprint });
   });
 
   it("routes a literal MORE envelope through query continuation", async () => {

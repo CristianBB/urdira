@@ -87,6 +87,44 @@ of one named removed workspace (`workspace purge`, `core:workspace_purge`)
 remains a separate destructive operation and is never implied by removing a
 Workspace from the local UI.
 
+## Workspace storage footprint
+
+`workspace footprint [<workspace_id>]` (`core:workspace_footprint`) is a
+read-only local-administration operation. With an identifier it measures one
+active workspace; without one it measures every active workspace in stable
+registry order. Removed tombstones and orphaned footprints are excluded and
+remain visible through the lifecycle and orphan operations described below.
+
+The response reports exact integer byte counters for the workspace-exclusive
+catalog, structural store, lexical sidecar, semantic sidecar, scan sidecar,
+and lock files. Structural storage is additionally divided into base segments,
+deltas, Merkle data, reader markers, manifests, and other structural files.
+Logical bytes are file lengths. Allocated bytes use filesystem block counts
+when the platform exposes them and are otherwise `null`. Entry names are safe
+basenames; private storage-root paths are not returned.
+
+`indexed_source_bytes` is the sum of the artifact versions visible at the
+current source generation. `exclusive_amplification_ratio` is
+`exclusive_logical_bytes / indexed_source_bytes`, or `null` when the source
+denominator is zero. Ratios always declare `ratio_basis: logical_bytes` so
+sparse files and filesystem allocation do not silently change their meaning.
+
+CAS objects are installation-wide, content-addressed, and may be shared by
+multiple workspaces. The operation therefore reports them separately under
+`referenced_cas` with `attribution: referenced_not_exclusive` and
+`included_in_exclusive_total: false`. References are deduplicated within the
+workspace and classified as source history, lexical, semantic, query cache,
+or lifecycle roots. `upper_bound_with_referenced_cas_ratio` adds the bytes of
+currently present referenced objects as an attribution upper bound; it is not
+a claim that those bytes could be reclaimed by removing the workspace.
+Missing referenced objects are counted explicitly.
+
+Measurement is `live_best_effort`: the daemon opens databases read-only and
+does not pause indexing, checkpoint WAL files, rerank data, or mutate an index.
+Consequently a scan or maintenance pass may change files between individual
+filesystem observations. The result includes a measurement timestamp and must
+not be presented as an atomic snapshot.
+
 ## Orphaned workspace data
 
 `workspace orphans` (`core:workspace_orphans_list`, read-only) reports

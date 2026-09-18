@@ -9,7 +9,7 @@ import { DaemonError } from "./errors.js";
 import { basename, dirname, join, resolve } from "node:path";
 import { administrativeState, DEFAULT_WORKSPACE_INCLUSION, ISOMORPHIC_GIT_OBJECT_PORT, attemptIndexPackImport, attemptWorkspaceFork, buildQueryAdmissionPlan, CanonicalRecordQueryDataPort, createLocalHashProvider, CursorCache, ensureV4Workspace, importV4IndexPack, NativeCanonicalQuerySnapshotPort, onRustWorkspaceUpgradeCompleted, QueryEngine, QueryOperationTelemetry, reconcileSemanticProjection, RecordBodyInterner, runRustWorkspaceScan, semanticMaterializationIdentity, sidecarDatabasePathFor, sidecarScanDirFor, SqliteCanonicalQuerySnapshotPort, structuralStoreDirFor, WorkspaceConfigurationCoordinator, detectWorkspaceTechnologies, summarizeWorkspaceTechnologyProposal, ParcelWatcherAdapter, watcherOptionsForSourceProvider, countFilesUpToBudget, KQUEUE_FILE_WATCH_BUDGET, reconcileLexicalProjection, resolveIndexStatusRequest, runProgressiveWorkspaceScan, runSourceOnlyWorkspaceScan, WorkspaceWatcherManager, type CanonicalQuerySnapshotPort, type ChangedPath, type QueryExecutionPage, type QueryOperationTelemetrySummary, type ReconcileSemanticProjectionResult, type ReconcileSummary, type RegisteredWorkspace, type ResolvedSemanticProvider, type RustWorkspaceScanTransport, type ScanScope, type ScanTimings, type WorkspacePluginCatalogEntry, type WorkspaceRegistry, type WorkspaceScanBudget, type WorkspaceScanPluginProvider, type QueryAdmissionPlan, type QueryFrontier, type RustIndexingCoreGenerationPort, type V4WorkspacePaths, type WorkspaceScanRequest, type WorkspaceScanUpgradeCompleted } from "@urdira/engine";
 import { operationRegistry, recipeDefinitions, type PluginCapabilityDeclaration, type QueryRequest, type SemanticMaterializationStatusView, type WorkspaceStructuralProgressView } from "@urdira/contracts";
-import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
+import { createDurableStorage, isOutdatedWorkspaceError, isWorkspaceDatabaseFileOpen, measureDiskUsage, measureWorkspaceFootprint, openSqliteDatabase, readStructuralStore, recreateOutdatedWorkspaceDatabase, removeWorkspaceFootprint, workspaceFootprintEntries, workspaceSafeId, WorkspaceProjectionRepository, WORKSPACE_WRITER_BUSY_CODE, type CollectionOptions, type DurableStorage, type RepairComponentKind, type RepairRequest, type SqliteDatabase, type WorkspaceDatabase, type WorkspaceFootprintEntry } from "@urdira/storage";
 import { sweepWorkspaceDataDir, type OrphanReport } from "./orphan-sweep.js";
 import { existsSync } from "node:fs";
 import { runIndexPackExportInThread } from "./index-pack-export-thread.js";
@@ -1589,6 +1589,120 @@ function attachIndexFreshness<T extends QueryExecutionPage>(page: T, workspace: 
 
 function requestRecord(payload: unknown): Record<string, unknown> {
   return payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
+}
+
+type FootprintCasRole = "source_history" | "lexical" | "semantic" | "query_cache" | "lifecycle";
+interface FootprintCasRow extends Record<string, unknown> { readonly content_hash: string; readonly byte_length: number; }
+
+function isMissingTable(error: unknown): boolean {
+  return error instanceof Error && /no such table/u.test(error.message);
+}
+
+async function optionalCasRows(database: SqliteDatabase, sql: string): Promise<readonly FootprintCasRow[]> {
+  try { return await database.all<FootprintCasRow>(sql); }
+  catch (error) { if (isMissingTable(error)) return []; throw error; }
+}
+
+async function withOptionalReadOnlyDatabase<T>(filename: string, callback: (database: SqliteDatabase) => Promise<T>, fallback: T): Promise<T> {
+  try { await stat(filename); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return fallback; throw error; }
+  const database = await openSqliteDatabase({ filename, read_only: true });
+  try { return await callback(database); }
+  finally { await database.close(); }
+}
+
+function footprintRatio(numerator: number, denominator: number): number | null {
+  return denominator > 0 ? numerator / denominator : null;
+}
+
+async function workspaceFootprintReport(storage: DurableStorage, workspace: RegisteredWorkspace): Promise<Readonly<Record<string, unknown>>> {
+  const registration = await storage.catalog.getWorkspace(workspace.workspace_id);
+  if (registration === undefined) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
+  const databasePath = registration.database_path;
+  const safeId = basename(databasePath).endsWith(".sqlite") ? basename(databasePath).slice(0, -".sqlite".length) : basename(databasePath);
+  const physical = await measureWorkspaceFootprint(dirname(databasePath), safeId);
+  const handle = await storage.openWorkspaceReadOnly(workspace.workspace_id);
+  const references = new Map<string, { readonly declared_bytes: number; readonly roles: Set<FootprintCasRole> }>();
+  const roleMembers = new Map<FootprintCasRole, Map<string, number>>();
+  const addRows = (role: FootprintCasRole, rows: readonly FootprintCasRow[]): void => {
+    const members = roleMembers.get(role) ?? new Map<string, number>();
+    roleMembers.set(role, members);
+    for (const row of rows) {
+      if (typeof row.content_hash !== "string" || !Number.isSafeInteger(row.byte_length) || row.byte_length < 0) continue;
+      members.set(row.content_hash, row.byte_length);
+      const existing = references.get(row.content_hash);
+      if (existing === undefined) references.set(row.content_hash, { declared_bytes: row.byte_length, roles: new Set([role]) });
+      else existing.roles.add(role);
+    }
+  };
+  try {
+    const source = await handle.database.get<{ artifact_count: number; indexed_source_bytes: number }>(`
+      SELECT COUNT(*) AS artifact_count, COALESCE(SUM(artifact_versions.byte_length), 0) AS indexed_source_bytes
+      FROM artifact_versions
+      JOIN source_index_state ON source_index_state.workspace_id = artifact_versions.workspace_id
+      WHERE artifact_versions.workspace_id = ?
+        AND artifact_versions.valid_from_generation <= source_index_state.current_generation
+        AND (artifact_versions.valid_to_generation IS NULL OR artifact_versions.valid_to_generation > source_index_state.current_generation)
+    `, [workspace.workspace_id]);
+    addRows("source_history", await optionalCasRows(handle.database, "SELECT content_hash, byte_length FROM content_blobs WHERE storage_reference LIKE 'cas:%'"));
+    addRows("lexical", await optionalCasRows(handle.database, "SELECT content_hash, byte_length FROM lexical_documents WHERE storage_reference LIKE 'cas:%'"));
+    addRows("semantic", await optionalCasRows(handle.database, "SELECT content_hash, byte_length FROM vector_shards WHERE storage_reference LIKE 'cas:%'"));
+    addRows("query_cache", await optionalCasRows(handle.database, "SELECT content_digest AS content_hash, byte_length FROM query_manifest_segments WHERE storage_reference LIKE 'cas:%'"));
+    addRows("lifecycle", await optionalCasRows(handle.database, "SELECT content_hash, 0 AS byte_length FROM lifecycle_cas_pins UNION SELECT content_hash, 0 AS byte_length FROM lifecycle_roots"));
+
+    const stem = databasePath.endsWith(".sqlite") ? databasePath.slice(0, -".sqlite".length) : databasePath;
+    await withOptionalReadOnlyDatabase(`${stem}.lexical.sqlite`, async (database) => addRows("lexical", await optionalCasRows(database, "SELECT content_hash, byte_length FROM lexical_documents WHERE storage_reference LIKE 'cas:%'")), undefined);
+    await withOptionalReadOnlyDatabase(`${stem}.semantic.sqlite`, async (database) => addRows("semantic", await optionalCasRows(database, "SELECT content_hash, byte_length FROM vector_shards WHERE storage_reference LIKE 'cas:%'")), undefined);
+
+    let casLogicalBytes = 0;
+    let casAllocatedBytes: number | null = 0;
+    let missingCasObjects = 0;
+    const referenceEntries = [...references.entries()];
+    for (let start = 0; start < referenceEntries.length; start += 32) {
+      const chunk = referenceEntries.slice(start, start + 32);
+      const measured = await Promise.all(chunk.map(async ([hash]) => measureDiskUsage(storage.cas.objectPath(hash))));
+      for (const usage of measured) {
+        if (!usage.present) { missingCasObjects += 1; continue; }
+        casLogicalBytes += usage.logical_bytes;
+        casAllocatedBytes = casAllocatedBytes === null || usage.allocated_bytes === null ? null : casAllocatedBytes + usage.allocated_bytes;
+      }
+    }
+    const indexedSourceBytes = source?.indexed_source_bytes ?? 0;
+    const exclusiveLogicalBytes = physical.total.logical_bytes;
+    const ratio = footprintRatio(exclusiveLogicalBytes, indexedSourceBytes);
+    const upperBoundRatio = footprintRatio(exclusiveLogicalBytes + casLogicalBytes, indexedSourceBytes);
+    const roles = Object.fromEntries((["source_history", "lexical", "semantic", "query_cache", "lifecycle"] as const).map((role) => {
+      const members = roleMembers.get(role) ?? new Map<string, number>();
+      return [role, { object_count: members.size, declared_bytes: [...members.values()].reduce((sum, value) => sum + value, 0) }];
+    }));
+    return {
+      workspace_id: workspace.workspace_id,
+      display_root: workspace.display_root,
+      status: workspace.status,
+      storage_format: await readStructuralStore(handle.database) === "native" ? "v4" : "v3",
+      measured_at: new Date().toISOString(),
+      measurement_consistency: "live_best_effort",
+      indexed_artifact_count: source?.artifact_count ?? 0,
+      indexed_source_bytes: indexedSourceBytes,
+      exclusive_logical_bytes: exclusiveLogicalBytes,
+      exclusive_allocated_bytes: physical.total.allocated_bytes,
+      exclusive_amplification_ratio: ratio,
+      upper_bound_with_referenced_cas_ratio: upperBoundRatio,
+      ratio_basis: "logical_bytes",
+      layers: physical.layers,
+      structural: physical.structural,
+      entries: physical.entries,
+      referenced_cas: {
+        attribution: "referenced_not_exclusive",
+        included_in_exclusive_total: false,
+        object_count: references.size,
+        missing_object_count: missingCasObjects,
+        logical_bytes: casLogicalBytes,
+        allocated_bytes: casAllocatedBytes,
+        roles,
+      },
+    };
+  } finally { await handle.close(); }
 }
 
 /**
@@ -4826,6 +4940,25 @@ export class DaemonRuntime {
           const workspace = workspaceId === undefined ? undefined : options.workspace_registry.get(workspaceId);
           if (!workspace) throw new DaemonError("core:workspace_not_found", "Workspace is not registered.");
           return { api_version: 1, workspace: workspaceAdministrativeView(options.workspace_registry, workspace, scanActivities.get(workspace.workspace_id)) };
+        }
+        if (options.workspace_registry && indexingStorage && request.call === "core:workspace_footprint") {
+          const payload = requestRecord(request.payload);
+          const args = Array.isArray(payload["args"]) ? payload["args"] : [];
+          if (args.length > 1) throw new DaemonError("core:ipc_request_invalid", "workspace footprint accepts at most one workspace identifier.");
+          const values = requestRecord(payload["values"]);
+          const workspaceId = typeof args[0] === "string" ? args[0] : typeof values["workspace"] === "string" ? values["workspace"] as string : undefined;
+          const active = options.workspace_registry.list();
+          const selected = workspaceId === undefined ? active : active.filter((workspace) => workspace.workspace_id === workspaceId);
+          if (workspaceId !== undefined && selected.length === 0) throw new DaemonError("core:workspace_not_found", "Workspace is not registered or is not active.");
+          const workspaces: Readonly<Record<string, unknown>>[] = [];
+          for (const workspace of selected) workspaces.push(await workspaceFootprintReport(indexingStorage, workspace));
+          return {
+            api_version: 1,
+            measurement_consistency: "live_best_effort",
+            ratio_basis: "logical_bytes",
+            cas_attribution: "referenced_not_exclusive",
+            workspaces,
+          };
         }
         if (options.workspace_registry && request.call === "core:codebase_list") {
           return { api_version: 1, codebases: options.workspace_registry.listCodebases().map((codebase) => ({ ...codebase, project_name: codebase.display_name, workspace_count: options.workspace_registry!.members(codebase.codebase_id).length })), workspaces: options.workspace_registry.list().map((workspace) => workspaceAdministrativeView(options.workspace_registry!, workspace, scanActivities.get(workspace.workspace_id))) };

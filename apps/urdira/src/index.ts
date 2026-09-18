@@ -121,7 +121,7 @@ const INDEX_PACK_EXPORT_DEFAULT_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const debugTimingEnabled = (): boolean => process.env["URDIRA_DEBUG_TIMING"] === "1";
 
 function urdiraHelpLegacy(): string {
-  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace list|show|add|configure|remove|purge\n  urdira codebase list|create|rename|assign|unassign|remove\n  urdira daemon start\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n  urdira web\n\nWorkspace add/configure and daemon start/stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
+  return `Urdira ${URDIRA_VERSION}\n\nUsage:\n  urdira status [--json]\n  urdira index [--json] [--workspace <id>]\n  urdira query --payload <json> [--json]\n  urdira workspace list|show|footprint|add|configure|remove|purge\n  urdira codebase list|create|rename|assign|unassign|remove\n  urdira daemon start\n  urdira daemon stop [--dry-run]\n  urdira agent status --client all\n  urdira mcp\n  urdira web\n\nWorkspace add/configure and daemon start/stop run directly; use --dry-run only to preview. Destructive commands accept --confirm to execute.\nSource-reading MCP calls always require explicit workspace scope.\n`;
 }
 
 export function urdiraHelp(): string {
@@ -2655,6 +2655,7 @@ function requiredRpcCapabilities(command: CliCommand): readonly string[] {
     restart: "core:daemon_restart",
     "workspace-list": "core:workspace_admin_list",
     "workspace-show": "core:workspace_admin_show",
+    "workspace-footprint": "core:workspace_footprint",
     "workspace-add": "core:workspace_add",
     "workspace-remove": "core:workspace_remove",
     "workspace-purge": "core:workspace_purge",

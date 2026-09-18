@@ -1,5 +1,5 @@
-import { rm } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readdir, rm } from "node:fs/promises";
+import { basename, join, relative, sep } from "node:path";
 
 /**
  * v4 (plan `generic-waddling-hartmanis.md` §6, Frente H): the single
@@ -24,6 +24,118 @@ export interface WorkspaceFootprintEntry {
   readonly path: string;
   readonly kind: WorkspaceFootprintEntryKind;
   readonly is_directory: boolean;
+}
+
+export interface DiskUsage {
+  readonly logical_bytes: number;
+  readonly allocated_bytes: number | null;
+  readonly file_count: number;
+  readonly directory_count: number;
+}
+
+export interface MeasuredWorkspaceFootprintEntry extends DiskUsage {
+  readonly name: string;
+  readonly kind: WorkspaceFootprintEntryKind;
+  readonly present: boolean;
+}
+
+export interface WorkspaceFootprintMeasurement {
+  readonly total: DiskUsage;
+  readonly layers: Readonly<Record<"catalog" | "structural" | "lexical" | "semantic" | "scan_sidecar" | "locks", DiskUsage>>;
+  readonly structural: Readonly<Record<"base" | "deltas" | "merkle" | "readers" | "manifests" | "other", DiskUsage>>;
+  readonly entries: readonly MeasuredWorkspaceFootprintEntry[];
+}
+
+const emptyUsage = (): DiskUsage => ({ logical_bytes: 0, allocated_bytes: 0, file_count: 0, directory_count: 0 });
+
+function addUsage(left: DiskUsage, right: DiskUsage): DiskUsage {
+  return {
+    logical_bytes: left.logical_bytes + right.logical_bytes,
+    allocated_bytes: left.allocated_bytes === null || right.allocated_bytes === null ? null : left.allocated_bytes + right.allocated_bytes,
+    file_count: left.file_count + right.file_count,
+    directory_count: left.directory_count + right.directory_count,
+  };
+}
+
+function allocatedBytes(blocks: unknown): number | null {
+  return typeof blocks === "number" && Number.isSafeInteger(blocks) && blocks >= 0 ? blocks * 512 : null;
+}
+
+/**
+ * Measures one file tree without following symbolic links. Logical bytes are
+ * regular-file/symlink lengths; allocated bytes use POSIX stat blocks when
+ * available and are `null` on platforms that do not expose them.
+ */
+export async function measureDiskUsage(path: string): Promise<DiskUsage & { readonly present: boolean }> {
+  let metadata;
+  try { metadata = await lstat(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...emptyUsage(), present: false };
+    throw error;
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    return { logical_bytes: metadata.size, allocated_bytes: allocatedBytes(metadata.blocks), file_count: 1, directory_count: 0, present: true };
+  }
+  let usage: DiskUsage = { logical_bytes: 0, allocated_bytes: allocatedBytes(metadata.blocks), file_count: 0, directory_count: 1 };
+  for (const child of await readdir(path)) {
+    const measured = await measureDiskUsage(join(path, child));
+    usage = addUsage(usage, measured);
+  }
+  return { ...usage, present: true };
+}
+
+function structuralSection(structuralRoot: string, path: string): keyof WorkspaceFootprintMeasurement["structural"] {
+  const components = relative(structuralRoot, path).split(sep);
+  const first = components[0] ?? "";
+  if (first.startsWith("base-")) return "base";
+  if (first.startsWith("delta-")) return "deltas";
+  if (first === "merkle") return "merkle";
+  if (first === ".readers") return "readers";
+  if (first === "MANIFEST" || first.startsWith("MANIFEST.")) return "manifests";
+  return "other";
+}
+
+async function measureStructuralSections(structuralRoot: string): Promise<WorkspaceFootprintMeasurement["structural"]> {
+  const sections: Record<keyof WorkspaceFootprintMeasurement["structural"], DiskUsage> = {
+    base: emptyUsage(), deltas: emptyUsage(), merkle: emptyUsage(), readers: emptyUsage(), manifests: emptyUsage(), other: emptyUsage(),
+  };
+  let children: string[];
+  try { children = await readdir(structuralRoot); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return sections;
+    throw error;
+  }
+  for (const child of children) {
+    const path = join(structuralRoot, child);
+    const section = structuralSection(structuralRoot, path);
+    sections[section] = addUsage(sections[section], await measureDiskUsage(path));
+  }
+  return sections;
+}
+
+/** Read-only, live/best-effort accounting of one workspace-owned footprint. */
+export async function measureWorkspaceFootprint(directory: string, safeId: string): Promise<WorkspaceFootprintMeasurement> {
+  const canonicalEntries = workspaceFootprintEntries(directory, safeId);
+  const entries: MeasuredWorkspaceFootprintEntry[] = [];
+  for (const entry of canonicalEntries) {
+    const measured = await measureDiskUsage(entry.path);
+    entries.push({ name: basename(entry.path), kind: entry.kind, ...measured });
+  }
+  const byKinds = (...kinds: readonly WorkspaceFootprintEntryKind[]): DiskUsage => entries.filter((entry) => kinds.includes(entry.kind)).reduce<DiskUsage>(addUsage, emptyUsage());
+  const total = entries.reduce<DiskUsage>(addUsage, emptyUsage());
+  return {
+    total,
+    layers: {
+      catalog: byKinds("database"),
+      structural: byKinds("structural"),
+      lexical: byKinds("lexical"),
+      semantic: byKinds("semantic"),
+      scan_sidecar: byKinds("sidecar"),
+      locks: byKinds("lock"),
+    },
+    structural: await measureStructuralSections(join(directory, `${safeId}.structural`)),
+    entries,
+  };
 }
 
 /**

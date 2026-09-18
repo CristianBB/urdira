@@ -46,7 +46,7 @@ import {
   languageForPath,
 } from "../packages/plugin-javascript-typescript/src/index.js";
 import { DaemonClient, DaemonRuntime, type DaemonRuntimeOptions } from "../packages/daemon/src/index.js";
-import { createDurableStorage, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
+import { createDurableStorage, workspaceSafeId, type DurableStorage, type WorkspaceDatabase } from "../packages/storage/src/index.js";
 
 // Same private-field/dist-vs-src type-branding workaround documented in
 // `tests/phase-daemon-indexing-integration.test.ts`.
@@ -581,6 +581,80 @@ function syncFilePersistence(path: string): WorkspaceRegistryPersistence {
     save: (state) => { writeFileSync(path, JSON.stringify(state), "utf8"); },
   };
 }
+
+describe("Daemon workspace footprint accounting", () => {
+  it("reports active workspaces, layer bytes, ratios, and separately attributed CAS references without mutating the index", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-footprint-data-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "urdira-daemon-footprint-workspace-"));
+    const registry = new WorkspaceRegistry({ create_id: (kind) => `${kind}:footprint` });
+    let runtime: DaemonRuntime | undefined;
+    try {
+      const identity = `sha256:${"7".repeat(64)}`;
+      const registered = registry.register({
+        display_root: resolve(workspaceRoot),
+        provider: {
+          source_provider_binding_id: "binding:footprint",
+          source_provider: "core:directory_source_provider",
+          source_provider_version: "1",
+          provider_role: "primary",
+          binding_identity: identity,
+          configuration_digest: `sha256:${"8".repeat(64)}`,
+        },
+        description: {
+          provider_kind: "core:directory_source_provider",
+          immutable_binding_identity: identity,
+          features: JSON.stringify({ supports_watch: true, supports_complete_enumeration: true, supports_stable_reconciliation: true, read_only: false }),
+          source_state_fingerprint: identity,
+        },
+        selected_technology_ids: [],
+        selected_plugin_ids: [],
+      });
+      const seedStorage = await createDurableStorage({ rootDir: dataRoot });
+      await seedStorage.catalog.registerWorkspace({ workspace_id: registered.workspace_id, canonical_root: registered.canonical_root, display_root: registered.display_root, source_provider_bindings: [registered.provider], status: "registered", registered_at: registered.registered_at });
+      await seedStorage.openWorkspace(registered.workspace_id).then(async (database) => database.close());
+      await seedStorage.close();
+      const structuralRoot = join(dataRoot, "workspaces", `${workspaceSafeId(registered.workspace_id)}.structural`);
+      await mkdir(structuralRoot, { recursive: true });
+      await writeFile(join(structuralRoot, "delta-1.seg"), Buffer.alloc(41));
+
+      runtime = await DaemonRuntime.start({
+        data_root: dataRoot,
+        engine_build_id: "build-daemon-footprint",
+        workspace_registry: asDaemonWorkspaceRegistry(registry),
+        resolve_plugin_provider: resolvePluginProvider,
+        scheduler: { pool_concurrency: { source: 1, structural: 1, semantic: 1, query: 1 }, max_active: 4, client_quotas: {} },
+      });
+      const client = new DaemonClient(runtime.endpoint);
+      const response = await client.call("core:workspace_footprint", { args: [registered.workspace_id] });
+      expect(response.outcome, JSON.stringify(response)).toBe("success");
+      const payload = response.payload as {
+        readonly measurement_consistency: string;
+        readonly cas_attribution: string;
+        readonly workspaces: ReadonlyArray<Record<string, unknown>>;
+      };
+      expect(payload).toMatchObject({ measurement_consistency: "live_best_effort", cas_attribution: "referenced_not_exclusive" });
+      expect(payload.workspaces).toHaveLength(1);
+      expect(payload.workspaces[0]).toMatchObject({
+        workspace_id: registered.workspace_id,
+        indexed_source_bytes: 0,
+        exclusive_amplification_ratio: null,
+        measurement_consistency: "live_best_effort",
+        referenced_cas: { attribution: "referenced_not_exclusive", included_in_exclusive_total: false, object_count: 0 },
+        structural: { deltas: { logical_bytes: 41 } },
+      });
+      expect((payload.workspaces[0]!["exclusive_logical_bytes"] as number)).toBeGreaterThanOrEqual(41);
+
+      const all = await client.call("core:workspace_footprint", { args: [] });
+      expect((all.payload as { readonly workspaces: readonly unknown[] }).workspaces).toHaveLength(1);
+      const missing = await client.call("core:workspace_footprint", { args: ["workspace:missing"] });
+      expect(missing).toMatchObject({ outcome: "error", error: { code: "core:workspace_not_found" } });
+    } finally {
+      if (runtime) await runtime.stop();
+      await rm(dataRoot, { recursive: true, force: true });
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
 
 describe("Daemon startup crash recovery for stuck \"indexing\" workspaces", () => {
   it("retries a workspace left \"indexing\" by a prior process life, reaching \"ready\" without any client action", async () => {
